@@ -1,5 +1,5 @@
-// Glancebar — one menu bar item for disk + battery at a glance. Click for a native
-// popover with storage, battery, and system summaries plus a deeper details window.
+// Glancebar — one configurable menu bar item at a glance. Click for a native popover
+// with storage, battery, system, and AI summaries plus a deeper details window.
 // Single-file Objective-C/AppKit. Zero dependencies, no sudo. Pure logic in pure.{h,m}.
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
@@ -349,6 +349,348 @@ static NSColor *CPUColor(double cpu) {
     return [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
 }
 
+#pragma mark - AI usage
+
+@interface AIUsage : NSObject
+@property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
+@property BOOL available, stale, limitStatusAvailable;
+@property double remainingFraction;
+@property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
+@property (strong) NSDate *lastActivity;
+@property (copy) NSArray<NSDictionary *> *models;
+@end
+@implementation AIUsage @end
+
+static NSString *FmtCompact(long long n) {
+    double v = (double)llabs(n);
+    NSString *sign = n < 0 ? @"-" : @"";
+    if (v >= 1000000000.0) return [NSString stringWithFormat:@"%@%.1fB", sign, v / 1000000000.0];
+    if (v >= 1000000.0) return [NSString stringWithFormat:@"%@%.1fM", sign, v / 1000000.0];
+    if (v >= 1000.0) return [NSString stringWithFormat:@"%@%.0fK", sign, v / 1000.0];
+    return [NSString stringWithFormat:@"%lld", n];
+}
+
+static NSString *FmtTokenCount(long long tokens) {
+    return [NSString stringWithFormat:@"%@ tokens", FmtCompact(tokens)];
+}
+
+static NSDateFormatter *DateOnlyFormatter(void) {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd";
+    });
+    return fmt;
+}
+
+static NSDate *StartOfLocalDay(NSDate *date) {
+    return [NSCalendar.currentCalendar startOfDayForDate:date ?: NSDate.date];
+}
+
+static NSString *LocalDateString(NSDate *date) {
+    return [DateOnlyFormatter() stringFromDate:date ?: NSDate.date];
+}
+
+static NSString *ShortDateText(NSString *yyyyMMdd) {
+    NSDate *date = [DateOnlyFormatter() dateFromString:yyyyMMdd ?: @""];
+    if (!date) return yyyyMMdd ?: @"unknown";
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"MMM d";
+    return [fmt stringFromDate:date];
+}
+
+static NSString *ClockText(NSDate *date) {
+    if (!date) return @"unknown";
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.timeStyle = NSDateFormatterShortStyle;
+    fmt.dateStyle = NSDateFormatterNoStyle;
+    return [fmt stringFromDate:date];
+}
+
+static NSString *ResetTextFromDate(NSDate *date) {
+    if (!date) return nil;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    BOOL today = [NSCalendar.currentCalendar isDate:date inSameDayAsDate:NSDate.date];
+    fmt.dateStyle = today ? NSDateFormatterNoStyle : NSDateFormatterShortStyle;
+    fmt.timeStyle = NSDateFormatterShortStyle;
+    return [NSString stringWithFormat:@"Reset %@", [fmt stringFromDate:date]];
+}
+
+static NSDictionary *JSONDictionaryAtPath(NSString *path) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:nil];
+    if (!data.length) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+}
+
+static long long SumNumbersInDictionary(NSDictionary *d) {
+    long long total = 0;
+    for (id v in d.allValues) if ([v isKindOfClass:NSNumber.class]) total += [v longLongValue];
+    return total;
+}
+
+static NSArray<NSDictionary *> *ModelRowsFromTokenDictionary(NSDictionary *tokensByModel) {
+    if (![tokensByModel isKindOfClass:NSDictionary.class]) return @[];
+    NSArray *keys = [tokensByModel keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [b compare:a];
+    }];
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSString *model in keys) {
+        NSNumber *tokens = tokensByModel[model];
+        if (![tokens isKindOfClass:NSNumber.class] || tokens.longLongValue <= 0) continue;
+        [rows addObject:@{@"name": model, @"tokens": tokens}];
+    }
+    return rows;
+}
+
+static NSString *ShortModelName(NSString *model) {
+    if (!model.length) return @"unknown";
+    NSString *s = model;
+    for (NSString *prefix in @[@"claude-", @"openai/"]) {
+        if ([s hasPrefix:prefix]) s = [s substringFromIndex:prefix.length];
+    }
+    return s;
+}
+
+static AIUsage *UnavailableAIUsage(NSString *name, NSString *source) {
+    AIUsage *u = [AIUsage new];
+    u.name = name;
+    u.source = source;
+    u.remainingFraction = -1;
+    u.resetText = @"Not exposed locally";
+    u.statusText = @"Local state not found";
+    u.statusReason = @"No limit status source";
+    u.models = @[];
+    return u;
+}
+
+static NSNumber *StatusNumberForKeys(NSDictionary *d, NSArray<NSString *> *keys) {
+    for (NSString *key in keys) {
+        id v = d[key];
+        if ([v isKindOfClass:NSNumber.class]) return v;
+        if ([v isKindOfClass:NSString.class]) {
+            NSScanner *scanner = [NSScanner scannerWithString:v];
+            double n = 0;
+            if ([scanner scanDouble:&n]) return @(n);
+        }
+    }
+    return nil;
+}
+
+static NSString *StatusStringForKeys(NSDictionary *d, NSArray<NSString *> *keys) {
+    for (NSString *key in keys) {
+        id v = d[key];
+        if ([v isKindOfClass:NSString.class] && [v length]) return v;
+    }
+    return nil;
+}
+
+static NSDate *DateFromStatusString(NSString *s) {
+    if (!s.length) return nil;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    NSDate *date = [iso dateFromString:s];
+    if (date) return date;
+
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    for (NSString *format in @[@"yyyy-MM-dd HH:mm:ss ZZZZZ", @"yyyy-MM-dd HH:mm:ss", @"yyyy-MM-dd'T'HH:mm:ssZZZZZ"]) {
+        fmt.dateFormat = format;
+        date = [fmt dateFromString:s];
+        if (date) return date;
+    }
+    return nil;
+}
+
+static NSDictionary *AIStatusEntry(NSDictionary *root, NSString *name) {
+    if (![root isKindOfClass:NSDictionary.class] || !name.length) return nil;
+    NSString *lower = name.lowercaseString;
+    for (NSString *key in @[name, lower]) {
+        id entry = root[key];
+        if ([entry isKindOfClass:NSDictionary.class]) return entry;
+    }
+    NSDictionary *providers = [root[@"providers"] isKindOfClass:NSDictionary.class] ? root[@"providers"] : nil;
+    if (providers) {
+        for (NSString *key in @[name, lower]) {
+            id entry = providers[key];
+            if ([entry isKindOfClass:NSDictionary.class]) return entry;
+        }
+    }
+    return nil;
+}
+
+static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) {
+    NSDictionary *entry = AIStatusEntry(root, u.name);
+    if (!entry) return;
+
+    NSNumber *remaining = StatusNumberForKeys(entry, @[@"remainingFraction", @"remaining", @"fractionRemaining",
+                                                       @"remainingPercent", @"percentRemaining", @"percentageRemaining"]);
+    if (remaining) {
+        double v = remaining.doubleValue;
+        if (v > 1.0) v /= 100.0;
+        u.remainingFraction = MIN(1.0, MAX(0.0, v));
+        u.limitStatusAvailable = YES;
+    }
+
+    NSString *reset = StatusStringForKeys(entry, @[@"resetText", @"reset", @"resets"]);
+    NSString *resetAt = StatusStringForKeys(entry, @[@"resetAt", @"resetTime", @"resetsAt"]);
+    NSDate *resetDate = DateFromStatusString(resetAt);
+    if (resetDate) reset = ResetTextFromDate(resetDate);
+    if (reset.length) {
+        u.resetText = reset;
+        u.limitStatusAvailable = YES;
+    }
+
+    NSString *reason = StatusStringForKeys(entry, @[@"status", @"detail", @"reason"]);
+    u.statusSource = source;
+    u.statusReason = reason.length ? reason : @"Limit status from local status file";
+}
+
+static AIUsage *ReadClaudeUsage(void) {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@".claude/stats-cache.json"];
+    NSDictionary *root = JSONDictionaryAtPath(path);
+    if (!root) return UnavailableAIUsage(@"Claude", @"~/.claude/stats-cache.json");
+
+    AIUsage *u = [AIUsage new];
+    u.name = @"Claude";
+    u.source = @"~/.claude/stats-cache.json";
+    u.available = YES;
+    u.remainingFraction = -1;
+    u.resetText = @"Not exposed locally";
+    u.statusReason = @"Claude's local stats cache does not expose limit remaining or reset time";
+
+    NSDate *now = NSDate.date;
+    NSDate *todayStart = StartOfLocalDay(now);
+    NSDate *weekStart = [NSDate dateWithTimeInterval:-6 * 24 * 60 * 60 sinceDate:todayStart];
+    NSString *today = LocalDateString(now);
+    NSString *lastComputed = [root[@"lastComputedDate"] isKindOfClass:NSString.class] ? root[@"lastComputedDate"] : nil;
+    u.stale = lastComputed.length && ![lastComputed isEqualToString:today];
+    u.statusText = u.stale ? [NSString stringWithFormat:@"Stats through %@", ShortDateText(lastComputed)] : @"Local stats current";
+
+    NSDictionary *latestTokensByModel = nil;
+    NSString *latestDate = nil;
+    for (NSDictionary *row in ([root[@"dailyModelTokens"] isKindOfClass:NSArray.class] ? root[@"dailyModelTokens"] : @[])) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSString *dateString = [row[@"date"] isKindOfClass:NSString.class] ? row[@"date"] : nil;
+        NSDictionary *tokensByModel = [row[@"tokensByModel"] isKindOfClass:NSDictionary.class] ? row[@"tokensByModel"] : nil;
+        NSDate *date = [DateOnlyFormatter() dateFromString:dateString ?: @""];
+        if (!date || !tokensByModel) continue;
+        if ([date compare:weekStart] != NSOrderedAscending && [date compare:now] != NSOrderedDescending)
+            u.weekTokens += SumNumbersInDictionary(tokensByModel);
+        if ([dateString isEqualToString:today])
+            u.todayTokens = SumNumbersInDictionary(tokensByModel);
+        if (!latestDate || [dateString compare:latestDate] == NSOrderedDescending) {
+            latestDate = dateString;
+            latestTokensByModel = tokensByModel;
+        }
+    }
+
+    NSDictionary *displayTokens = nil;
+    if (u.todayTokens > 0) {
+        for (NSDictionary *row in ([root[@"dailyModelTokens"] isKindOfClass:NSArray.class] ? root[@"dailyModelTokens"] : @[])) {
+            if ([row[@"date"] isEqualToString:today]) { displayTokens = row[@"tokensByModel"]; break; }
+        }
+    }
+    if (!displayTokens) displayTokens = latestTokensByModel;
+    u.models = ModelRowsFromTokenDictionary(displayTokens);
+    if (u.models.count) u.topModel = u.models.firstObject[@"name"];
+
+    for (NSDictionary *row in ([root[@"dailyActivity"] isKindOfClass:NSArray.class] ? root[@"dailyActivity"] : @[])) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSString *dateString = [row[@"date"] isKindOfClass:NSString.class] ? row[@"date"] : nil;
+        NSDate *date = [DateOnlyFormatter() dateFromString:dateString ?: @""];
+        if (!date) continue;
+        if ([dateString isEqualToString:today]) {
+            u.todayMessages = [row[@"messageCount"] longLongValue];
+            u.todaySessions = [row[@"sessionCount"] longLongValue];
+            u.todayToolCalls = [row[@"toolCallCount"] longLongValue];
+        }
+        if ([date compare:weekStart] != NSOrderedAscending && [date compare:now] != NSOrderedDescending)
+            u.weekSessions += [row[@"sessionCount"] longLongValue];
+    }
+
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    NSDate *mtime = attrs[NSFileModificationDate];
+    if (mtime) u.lastActivity = mtime;
+    return u;
+}
+
+static NSArray<NSString *> *SQLiteFields(NSString *line) {
+    if (!line.length) return @[];
+    return [line componentsSeparatedByString:@"\t"];
+}
+
+static NSString *RunSQLite(NSString *path, NSString *sql) {
+    if (![NSFileManager.defaultManager fileExistsAtPath:path]) return nil;
+    return RunTaskOutput(@"/usr/bin/sqlite3", @[@"-readonly", @"-separator", @"\t", path, sql]);
+}
+
+static AIUsage *ReadCodexUsage(void) {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:path])
+        return UnavailableAIUsage(@"Codex", @"~/.codex/state_5.sqlite");
+
+    NSDate *todayStart = StartOfLocalDay(NSDate.date);
+    long long todayEpoch = (long long)todayStart.timeIntervalSince1970;
+    long long weekEpoch = todayEpoch - 6LL * 24LL * 60LL * 60LL;
+
+    NSString *todaySQL = [NSString stringWithFormat:
+        @"select count(*), coalesce(sum(tokens_used),0), coalesce(max(updated_at),0) "
+         "from threads where updated_at >= %lld;", todayEpoch];
+    NSArray<NSString *> *todayFields = SQLiteFields([[RunSQLite(path, todaySQL)
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@"\n"].firstObject);
+    if (todayFields.count < 3) return UnavailableAIUsage(@"Codex", @"~/.codex/state_5.sqlite");
+
+    NSString *weekSQL = [NSString stringWithFormat:
+        @"select count(*), coalesce(sum(tokens_used),0), coalesce(max(updated_at),0) "
+         "from threads where updated_at >= %lld;", weekEpoch];
+    NSArray<NSString *> *weekFields = SQLiteFields([[RunSQLite(path, weekSQL)
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@"\n"].firstObject);
+
+    long long modelStart = [todayFields[1] longLongValue] > 0 ? todayEpoch : weekEpoch;
+    NSString *modelsSQL = [NSString stringWithFormat:
+        @"select coalesce(nullif(model,''),'unknown'), count(*), coalesce(sum(tokens_used),0) "
+         "from threads where updated_at >= %lld group by coalesce(nullif(model,''),'unknown') "
+         "order by sum(tokens_used) desc limit 5;", modelStart];
+    NSString *modelsOut = RunSQLite(path, modelsSQL);
+    NSMutableArray *models = [NSMutableArray array];
+    for (NSString *line in [modelsOut componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *fields = SQLiteFields([line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+        if (fields.count < 3) continue;
+        [models addObject:@{@"name": fields[0], @"sessions": @([fields[1] longLongValue]),
+                            @"tokens": @([fields[2] longLongValue])}];
+    }
+
+    AIUsage *u = [AIUsage new];
+    u.name = @"Codex";
+    u.source = @"~/.codex/state_5.sqlite";
+    u.available = YES;
+    u.remainingFraction = -1;
+    u.resetText = @"Not exposed locally";
+    u.statusText = @"Local thread totals";
+    u.statusReason = @"Codex's local thread store does not expose limit remaining or reset time";
+    u.todaySessions = [todayFields[0] longLongValue];
+    u.todayTokens = [todayFields[1] longLongValue];
+    u.weekSessions = weekFields.count >= 1 ? [weekFields[0] longLongValue] : 0;
+    u.weekTokens = weekFields.count >= 2 ? [weekFields[1] longLongValue] : 0;
+    long long last = MAX([todayFields[2] longLongValue], weekFields.count >= 3 ? [weekFields[2] longLongValue] : 0);
+    if (last > 0) u.lastActivity = [NSDate dateWithTimeIntervalSince1970:last];
+    u.models = models;
+    if (models.count) u.topModel = models.firstObject[@"name"];
+    return u;
+}
+
+static NSArray<AIUsage *> *ReadAIUsage(void) {
+    NSArray<AIUsage *> *usage = @[ReadClaudeUsage(), ReadCodexUsage()];
+    NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
+    NSDictionary *status = JSONDictionaryAtPath(statusPath);
+    if (status) {
+        for (AIUsage *u in usage) ApplyAIStatusFile(u, status, @"~/.glancebar/ai-status.json");
+    }
+    return usage;
+}
+
 #pragma mark - colors / small views
 
 static NSColor *DiskColor(double frac) {
@@ -375,7 +717,7 @@ static NSColor *BattBarColor(int pct) {
 @interface FlippedView : NSView @end
 @implementation FlippedView - (BOOL)isFlipped { return YES; } @end
 
-#pragma mark - bar image (disk glyph + % + battery glyph + %)
+#pragma mark - bar image
 
 static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColor *color) {
     NSImage *img = varValue >= 0
@@ -395,45 +737,52 @@ static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColo
     return out;
 }
 
-// Builds the menu-bar image. Symbols/text use `fg` (the adaptive menu-bar text color)
-// except a low battery or near-full disk, whose percentage is tinted to warn.
-static NSImage *BarImage(int diskPct, BatteryState b, NSColor *fg) {
+// Builds the menu-bar image from selected metric segments.
+static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
     CGFloat pt = 13, gap = 4, pad = 2;
     NSFont *font = [NSFont monospacedDigitSystemFontOfSize:12.5 weight:NSFontWeightRegular];
-
-    double diskFrac = diskPct / 100.0;
-    NSColor *diskTxt = diskFrac >= 0.85 ? DiskColor(diskFrac) : fg;
-    NSColor *battTxt = b.valid && b.percent <= 20 && !b.acConnected ? BattBarColor(b.percent) : fg;
-
-    NSImage *diskSym = TintedSymbol(@"internaldrive", -1, pt, fg);
-    NSString *battName = b.acConnected ? @"battery.100percent.bolt"
-                       : b.percent <= 20 ? @"battery.25percent" : @"battery.100percent";
-    NSImage *battSym = b.valid ? TintedSymbol(battName, b.percent/100.0, pt, fg) : nil;
-
-    NSString *diskStr = [NSString stringWithFormat:@" %d%%", diskPct];
-    NSString *battStr = b.valid ? [NSString stringWithFormat:@" %d%%", b.percent] : @" —";
-    NSSize dsz = [diskStr sizeWithAttributes:@{NSFontAttributeName:font}];
-    NSSize bsz = [battStr sizeWithAttributes:@{NSFontAttributeName:font}];
+    if (!segments.count)
+        segments = @[@{@"symbol": @"gauge.with.dots.needle.50percent", @"text": @"Glancebar"}];
 
     CGFloat h = 18;
-    CGFloat w = pad + diskSym.size.width + dsz.width + gap*2
-              + (battSym ? battSym.size.width : 0) + bsz.width + pad;
+    CGFloat w = pad;
+    NSMutableArray<NSDictionary *> *draw = [NSMutableArray array];
+    for (NSDictionary *seg in segments) {
+        NSString *symbol = [seg[@"symbol"] isKindOfClass:NSString.class] ? seg[@"symbol"] : nil;
+        NSNumber *var = [seg[@"var"] isKindOfClass:NSNumber.class] ? seg[@"var"] : nil;
+        NSString *text = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : @"";
+        NSImage *sym = symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil;
+        NSString *drawText = [NSString stringWithFormat:@" %@", text];
+        NSSize textSize = [drawText sizeWithAttributes:@{NSFontAttributeName:font}];
+        CGFloat segW = (sym ? sym.size.width : 0) + textSize.width;
+        if (draw.count) w += gap*2;
+        w += segW;
+        [draw addObject:@{@"image": sym ?: [NSNull null], @"text": drawText,
+                          @"textSize": [NSValue valueWithSize:textSize],
+                          @"color": seg[@"color"] ?: fg}];
+    }
+    w += pad;
+
     NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(ceil(w), h)];
     [img lockFocus];
-    CGFloat x = pad, cy;
-    cy = (h - diskSym.size.height)/2;
-    [diskSym drawAtPoint:NSMakePoint(x, cy) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
-    x += diskSym.size.width;
-    [diskStr drawAtPoint:NSMakePoint(x, (h - dsz.height)/2)
-          withAttributes:@{NSFontAttributeName:font, NSForegroundColorAttributeName:diskTxt}];
-    x += dsz.width + gap*2;
-    if (battSym) {
-        cy = (h - battSym.size.height)/2;
-        [battSym drawAtPoint:NSMakePoint(x, cy) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
-        x += battSym.size.width;
+    CGFloat x = pad;
+    BOOL first = YES;
+    for (NSDictionary *seg in draw) {
+        if (!first) x += gap*2;
+        first = NO;
+        NSImage *sym = [seg[@"image"] isKindOfClass:NSImage.class] ? seg[@"image"] : nil;
+        NSString *text = seg[@"text"];
+        NSSize textSize = [seg[@"textSize"] sizeValue];
+        if (sym) {
+            [sym drawAtPoint:NSMakePoint(x, (h - sym.size.height)/2)
+                    fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
+            x += sym.size.width;
+        }
+        [text drawAtPoint:NSMakePoint(x, (h - textSize.height)/2)
+           withAttributes:@{NSFontAttributeName:font,
+                            NSForegroundColorAttributeName:(seg[@"color"] ?: fg)}];
+        x += textSize.width;
     }
-    [battStr drawAtPoint:NSMakePoint(x, (h - bsz.height)/2)
-          withAttributes:@{NSFontAttributeName:font, NSForegroundColorAttributeName:battTxt}];
     [img unlockFocus];
     img.template = NO;  // we already used the adaptive fg color
     return img;
@@ -459,19 +808,28 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     BatteryState _bat;
     SystemState _sys;
     CPUCounters _cpuPrev;
+    NSArray<AIUsage *> *_aiUsage;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
     NSMutableArray<NSNumber *> *_ampHistory;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
+    BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
     BOOL _procStatsLoading, _procStatsUnavailable;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES}];
+    [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
+                           @"barShowDisk": @YES, @"barShowBattery": @YES,
+                           @"barShowSystem": @NO, @"barShowAI": @NO}];
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
+    _barShowDisk = [ud boolForKey:@"barShowDisk"];
+    _barShowBattery = [ud boolForKey:@"barShowBattery"];
+    _barShowSystem = [ud boolForKey:@"barShowSystem"];
+    _barShowAI = [ud boolForKey:@"barShowAI"];
     _ampHistory = [NSMutableArray array];
+    _aiUsage = @[];
     _hogs = @[];
     _topCPU = @[];
     _topMem = @[];
@@ -505,11 +863,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _vols = ScanVolumes();
     _bat = ReadBattery();
     _sys = ReadSystemState(&_cpuPrev);
+    _aiUsage = ReadAIUsage();
     if (_bat.valid) {
         [_ampHistory addObject:@(_bat.amperage_mA)];
         while (_ampHistory.count > 6) [_ampHistory removeObjectAtIndex:0];
     }
     [self updateBar];
+    if (_popover.isShown) [self rebuildContent];
+    if (_detailsWindow.isVisible) [self rebuildDetails];
 }
 
 - (double)avgAmp {
@@ -523,8 +884,63 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : 0;
 }
 
+- (AIUsage *)lowestAIStatus {
+    AIUsage *lowest = nil;
+    for (AIUsage *u in _aiUsage) {
+        if (!u.limitStatusAvailable || u.remainingFraction < 0) continue;
+        if (!lowest || u.remainingFraction < lowest.remainingFraction) lowest = u;
+    }
+    return lowest;
+}
+
+- (NSString *)aiPercentText:(AIUsage *)u {
+    if (!u.limitStatusAvailable || u.remainingFraction < 0) return @"—";
+    return [NSString stringWithFormat:@"%d%%", (int)lround(u.remainingFraction * 100)];
+}
+
+- (NSColor *)aiStatusColor:(AIUsage *)u {
+    if (!u.limitStatusAvailable || u.remainingFraction < 0) return NSColor.tertiaryLabelColor;
+    if (u.remainingFraction <= 0.15) return NSColor.systemRedColor;
+    if (u.remainingFraction <= 0.35) return NSColor.systemOrangeColor;
+    if (u.remainingFraction <= 0.60) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
+    return NSColor.systemGreenColor;
+}
+
+- (NSArray<NSDictionary *> *)barSegments {
+    NSMutableArray *segments = [NSMutableArray array];
+    NSColor *fg = NSColor.controlTextColor;
+    if (_barShowDisk) {
+        int pct = [self rootDiskPct];
+        double frac = pct / 100.0;
+        [segments addObject:@{@"symbol": @"internaldrive",
+                              @"text": [NSString stringWithFormat:@"%d%%", pct],
+                              @"color": frac >= 0.85 ? DiskColor(frac) : fg}];
+    }
+    if (_barShowBattery) {
+        NSString *symbol = _bat.acConnected ? @"battery.100percent.bolt"
+                         : _bat.percent <= 20 ? @"battery.25percent" : @"battery.100percent";
+        NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
+        NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
+        NSMutableDictionary *seg = [@{@"symbol": symbol, @"text": text, @"color": color} mutableCopy];
+        if (_bat.valid) seg[@"var"] = @(_bat.percent / 100.0);
+        [segments addObject:seg];
+    }
+    if (_barShowSystem) {
+        NSString *level = SystemPressureLevel(_sys);
+        NSString *text = _sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(_sys.cpu * 100)] : @"SYS";
+        [segments addObject:@{@"symbol": @"cpu", @"text": text, @"color": SystemPressureColor(level)}];
+    }
+    if (_barShowAI) {
+        AIUsage *lowest = [self lowestAIStatus];
+        NSString *text = lowest ? [NSString stringWithFormat:@"AI %@", [self aiPercentText:lowest]] : @"AI ?";
+        [segments addObject:@{@"symbol": @"sparkles", @"text": text,
+                              @"color": lowest ? [self aiStatusColor:lowest] : NSColor.secondaryLabelColor}];
+    }
+    return segments;
+}
+
 - (void)updateBar {
-    _item.button.image = BarImage([self rootDiskPct], _bat, NSColor.controlTextColor);
+    _item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
 }
 
 #pragma mark popover
@@ -616,6 +1032,70 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return [self processMetricRow:h right:right fraction:fraction color:color width:kW pad:kPad at:y];
 }
 
+- (NSView *)compactSignalRow:(NSString *)title right:(NSString *)right fraction:(double)fraction color:(NSColor *)color
+                       width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 28)];
+    CGFloat inner = width - 2*pad;
+    CGFloat rightW = 82;
+    [row addSubview:[self text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
+                          at:NSMakeRect(pad, 11, inner-rightW-8, 15) align:NSTextAlignmentLeft]];
+    [row addSubview:[self text:right font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
+                         color:NSColor.secondaryLabelColor at:NSMakeRect(width-pad-rightW, 11, rightW, 15)
+                         align:NSTextAlignmentRight]];
+    Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(pad, 3, inner, 4)];
+    g.fraction = MIN(1.0, MAX(0.0, fraction));
+    g.color = color ?: NSColor.controlAccentColor;
+    [row addSubview:g];
+    return row;
+}
+
+- (NSString *)compactResetText:(AIUsage *)u {
+    NSString *reset = u.resetText ?: @"Not exposed locally";
+    if ([reset isEqualToString:@"Not exposed locally"]) return @"No local reset";
+    return [NSString stringWithFormat:@"Reset: %@", reset];
+}
+
+- (NSString *)aiStatusSubtext:(AIUsage *)u {
+    if (u.limitStatusAvailable) return [self compactResetText:u];
+    if (!u.available) return @"No local state";
+    return @"No limit status";
+}
+
+- (NSString *)aiResetDetailText:(AIUsage *)u {
+    if (!u.limitStatusAvailable) return @"Not available";
+    NSString *reset = u.resetText ?: @"";
+    if (!reset.length || [reset isEqualToString:@"Not exposed locally"]) return @"Not provided";
+    return reset;
+}
+
+- (NSView *)aiStatusRow:(AIUsage *)u width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 44)];
+    CGFloat inner = width - 2*pad;
+    CGFloat rightW = 54;
+    CGFloat titleW = 74;
+    CGFloat barX = pad + titleW + 8;
+    CGFloat barW = inner - titleW - rightW - 18;
+    NSString *title = u.name ?: @"AI";
+    [row addSubview:[self text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
+                          at:NSMakeRect(pad, 25, titleW, 15) align:NSTextAlignmentLeft]];
+    [row addSubview:[self text:[self aiPercentText:u] font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
+                         color:[self aiStatusColor:u] at:NSMakeRect(width-pad-rightW, 23, rightW, 17) align:NSTextAlignmentRight]];
+    Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, MAX(20, barW), 7)];
+    g.fraction = u.limitStatusAvailable && u.remainingFraction >= 0 ? u.remainingFraction : 0;
+    g.color = [self aiStatusColor:u];
+    [row addSubview:g];
+    [row addSubview:[self text:[self aiStatusSubtext:u] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                          at:NSMakeRect(pad, 7, inner, 14) align:NSTextAlignmentLeft]];
+    return row;
+}
+
+- (NSString *)aiOverviewText {
+    AIUsage *lowest = [self lowestAIStatus];
+    if (lowest) return [NSString stringWithFormat:@"%@ %@ remaining · %@",
+                        lowest.name, [self aiPercentText:lowest], [self aiStatusSubtext:lowest]];
+    return @"Limit status unavailable";
+}
+
 - (void)rebuildContent {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
     CGFloat y = kPad;
@@ -670,7 +1150,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     // battery pressure
     [root addSubview:[self text:@"Battery pressure" font:[NSFont systemFontOfSize:11]
                           color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
-    y += 20;
+    y += 18;
     if (_hogs.count == 0) {
         NSString *status = _hogsLoading ? @"measuring…" : (_hogsUnavailable ? @"Unavailable" : @"No active apps");
         [root addSubview:[self text:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
@@ -678,44 +1158,34 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     } else {
         double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
         if (total <= 0) for (NSDictionary *h in _hogs) total += [h[@"impact"] doubleValue];
-        NSUInteger shown = 0;
-        for (NSDictionary *h in _hogs) {
-            if (shown++ >= 3) break;
-            double impact = [h[@"impact"] doubleValue];
-            double share = total > 0 ? impact / total : 0;
-            NSDictionary *info = ProcessDisplayInfo(h);
-            NSString *right = [NSString stringWithFormat:@"%@  %d%%", PressureLevel(share), (int)lround(share * 100)];
-            NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 42)];
-            CGFloat inner = kW - 2*kPad;
-            [row addSubview:[self text:info[@"title"] font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
-                                  at:NSMakeRect(kPad, 24, inner-84, 15) align:NSTextAlignmentLeft]];
-            [row addSubview:[self text:right
-                                  font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
-                                 color:NSColor.secondaryLabelColor at:NSMakeRect(kW-kPad-82, 24, 82, 15) align:NSTextAlignmentRight]];
-            [row addSubview:[self text:info[@"detail"] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                                  at:NSMakeRect(kPad, 9, inner, 13) align:NSTextAlignmentLeft]];
-            Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 3.5)];
-            g.fraction = share;
-            g.color = PressureColor(share);
-            [row addSubview:g];
-            [root addSubview:row]; y += 42;
-        }
+        NSDictionary *h = _hogs.firstObject;
+        double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
+        NSDictionary *info = ProcessDisplayInfo(h);
+        NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround(share * 100)];
+        [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:share color:PressureColor(share)
+                                          width:kW pad:kPad at:y]];
+        y += 30;
     }
 
-    if (_showWatts && _bat.valid && _bat.voltage_mV > 0) {
-        double watts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
-        NSString *s = _bat.amperage_mA == 0 ? @"Drawing — (on AC)"
-            : [NSString stringWithFormat:@"%@ %.1f W", _bat.amperage_mA < 0 ? @"Drawing" : @"Charging at", watts];
-        y += 4;
-        [root addSubview:[self text:s font:[NSFont systemFontOfSize:12] color:nil
-                               at:NSMakeRect(kPad, y, kW-2*kPad, 16) align:NSTextAlignmentLeft]]; y += 19;
-    }
-    if (_showHealth && _bat.valid && _bat.designCap_mAh > 0) {
-        [root addSubview:[self text:[NSString stringWithFormat:@"Health %d%% · %ld/%ld mAh · %ld cycles",
-                                     (int)lround(100.0*_bat.rawMax_mAh/_bat.designCap_mAh),
-                                     _bat.rawMax_mAh, _bat.designCap_mAh, _bat.cycleCount]
-                               font:[NSFont systemFontOfSize:11] color:NSColor.secondaryLabelColor
-                                 at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]]; y += 18;
+    if (_bat.valid && ((_showWatts && _bat.voltage_mV > 0) || (_showHealth && _bat.designCap_mAh > 0))) {
+        NSMutableArray<NSString *> *bits = [NSMutableArray array];
+        if (_showWatts && _bat.voltage_mV > 0) {
+            double watts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
+            NSString *s = _bat.amperage_mA == 0 ? (_bat.acConnected ? @"On AC" : @"Drawing —")
+                : [NSString stringWithFormat:@"%@ %.1f W", _bat.amperage_mA < 0 ? @"Drawing" : @"Charging", watts];
+            [bits addObject:s];
+        }
+        if (_showHealth && _bat.designCap_mAh > 0) {
+            [bits addObject:[NSString stringWithFormat:@"Health %d%%",
+                             (int)lround(100.0*_bat.rawMax_mAh/_bat.designCap_mAh)]];
+        }
+        if (bits.count) {
+            y += 2;
+            [root addSubview:[self text:[bits componentsJoinedByString:@" · "] font:[NSFont systemFontOfSize:11]
+                                  color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14)
+                                  align:NSTextAlignmentLeft]];
+            y += 18;
+        }
     }
 
     // ---------- SYSTEM ----------
@@ -747,27 +1217,40 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         y += 22;
     } else {
         if (_topCPU.count) {
-            [root addSubview:[self text:@"Top CPU" font:[NSFont systemFontOfSize:11]
-                                  color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, inner, 14) align:NSTextAlignmentLeft]];
-            y += 18;
             NSDictionary *h = _topCPU.firstObject;
             double cpu = [h[@"cpu"] doubleValue] / 100.0;
-            NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround([h[@"cpu"] doubleValue])];
-            [root addSubview:[self processMetricRow:h right:right fraction:(cpu < 1.0 ? cpu : 1.0) color:CPUColor(cpu) at:y]];
-            y += 38;
+            NSDictionary *info = ProcessDisplayInfo(h);
+            NSString *right = [NSString stringWithFormat:@"CPU %d%%", (int)lround([h[@"cpu"] doubleValue])];
+            [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:(cpu < 1.0 ? cpu : 1.0)
+                                              color:CPUColor(cpu) width:kW pad:kPad at:y]];
+            y += 30;
         }
         if (_topMem.count) {
-            y += 3;
-            [root addSubview:[self text:@"Top memory" font:[NSFont systemFontOfSize:11]
-                                  color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, inner, 14) align:NSTextAlignmentLeft]];
-            y += 18;
             uint64_t memTotal = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : [_topMem.firstObject[@"bytes"] unsignedLongLongValue];
             NSDictionary *h = _topMem.firstObject;
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             double frac = memTotal > 0 ? (double)bytes / (double)memTotal : 0;
-            [root addSubview:[self processMetricRow:h right:FmtBytes(bytes) fraction:(frac < 1.0 ? frac : 1.0)
-                                              color:SystemPressureColor(MemoryPressureLevel(_sys)) at:y]];
-            y += 38;
+            NSDictionary *info = ProcessDisplayInfo(h);
+            [root addSubview:[self compactSignalRow:info[@"title"] right:FmtBytes(bytes)
+                                           fraction:(frac < 1.0 ? frac : 1.0)
+                                              color:SystemPressureColor(MemoryPressureLevel(_sys))
+                                              width:kW pad:kPad at:y]];
+            y += 30;
+        }
+    }
+
+    // ---------- AI STATUS ----------
+    y += 4;
+    [root addSubview:[self dividerAt:y]]; y += 13;
+    [root addSubview:[self sectionHeader:@"AI Status" at:y]]; y += 22;
+    if (!_aiUsage.count) {
+        [root addSubview:[self text:@"Limit status unavailable" font:[NSFont systemFontOfSize:12]
+                              color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, inner, 16) align:NSTextAlignmentLeft]];
+        y += 22;
+    } else {
+        for (AIUsage *u in _aiUsage) {
+            [root addSubview:[self aiStatusRow:u width:kW pad:kPad at:y]];
+            y += 44;
         }
     }
 
@@ -792,12 +1275,38 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
     y += kPad - 6;
     root.frame = NSMakeRect(0, 0, kW, y);
-    _popover.contentSize = NSMakeSize(kW, y);
-    _popover.contentViewController.view = root;
+    CGFloat maxPopoverH = 720;
+    if (y > maxPopoverH) {
+        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, kW, maxPopoverH)];
+        scroll.borderType = NSNoBorder;
+        scroll.drawsBackground = NO;
+        scroll.hasVerticalScroller = YES;
+        scroll.autohidesScrollers = YES;
+        scroll.documentView = root;
+        [scroll.contentView scrollToPoint:NSMakePoint(0, 0)];
+        [scroll reflectScrolledClipView:scroll.contentView];
+        _popover.contentSize = NSMakeSize(kW, maxPopoverH);
+        _popover.contentViewController.view = scroll;
+    } else {
+        _popover.contentSize = NSMakeSize(kW, y);
+        _popover.contentViewController.view = root;
+    }
 }
 
 - (void)showOptions:(NSButton *)sender {
     NSMenu *m = [NSMenu new];
+    NSMenuItem *barTitle = [m addItemWithTitle:@"Menu bar" action:nil keyEquivalent:@""];
+    barTitle.enabled = NO;
+    NSMenuItem *disk = [m addItemWithTitle:@"Show storage" action:@selector(toggleBarDisk:) keyEquivalent:@""];
+    disk.target = self; disk.state = _barShowDisk ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *battery = [m addItemWithTitle:@"Show battery" action:@selector(toggleBarBattery:) keyEquivalent:@""];
+    battery.target = self; battery.state = _barShowBattery ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *system = [m addItemWithTitle:@"Show system" action:@selector(toggleBarSystem:) keyEquivalent:@""];
+    system.target = self; system.state = _barShowSystem ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *ai = [m addItemWithTitle:@"Show AI status" action:@selector(toggleBarAI:) keyEquivalent:@""];
+    ai.target = self; ai.state = _barShowAI ? NSControlStateValueOn : NSControlStateValueOff;
+    [m addItem:NSMenuItem.separatorItem];
+
     NSMenuItem *w = [m addItemWithTitle:@"Show current draw" action:@selector(toggleWatts:) keyEquivalent:@""];
     w.target = self; w.state = _showWatts ? NSControlStateValueOn : NSControlStateValueOff;
     NSMenuItem *h = [m addItemWithTitle:@"Show battery health" action:@selector(toggleHealth:) keyEquivalent:@""];
@@ -806,6 +1315,37 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
+
+- (NSUInteger)enabledBarMetricCount {
+    return (_barShowDisk ? 1 : 0) + (_barShowBattery ? 1 : 0) + (_barShowSystem ? 1 : 0) + (_barShowAI ? 1 : 0);
+}
+
+- (BOOL)canDisableBarMetric:(BOOL)current {
+    return !current || [self enabledBarMetricCount] > 1;
+}
+
+- (void)saveBarOption:(NSString *)key value:(BOOL)value {
+    [NSUserDefaults.standardUserDefaults setBool:value forKey:key];
+    [self updateBar];
+    if (_popover.isShown) [self rebuildContent];
+}
+
+- (void)toggleBarDisk:(id)s {
+    if (![self canDisableBarMetric:_barShowDisk]) return;
+    _barShowDisk = !_barShowDisk; [self saveBarOption:@"barShowDisk" value:_barShowDisk];
+}
+- (void)toggleBarBattery:(id)s {
+    if (![self canDisableBarMetric:_barShowBattery]) return;
+    _barShowBattery = !_barShowBattery; [self saveBarOption:@"barShowBattery" value:_barShowBattery];
+}
+- (void)toggleBarSystem:(id)s {
+    if (![self canDisableBarMetric:_barShowSystem]) return;
+    _barShowSystem = !_barShowSystem; [self saveBarOption:@"barShowSystem" value:_barShowSystem];
+}
+- (void)toggleBarAI:(id)s {
+    if (![self canDisableBarMetric:_barShowAI]) return;
+    _barShowAI = !_barShowAI; [self saveBarOption:@"barShowAI" value:_barShowAI];
+}
 
 - (Volume *)primaryVolume {
     for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return v;
@@ -889,6 +1429,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self addDetailKey:@"System" value:[NSString stringWithFormat:@"%@ · %@",
                                         SystemPressureLevel(_sys), SystemSummaryText(_sys)]
                     to:root y:&y width:kDetailW];
+    [self addDetailKey:@"AI status" value:[self aiOverviewText] to:root y:&y width:kDetailW];
 
     [self addDetailHeading:@"Top Signals" to:root y:&y width:kDetailW];
     if (_hogsLoading || _procStatsLoading) {
@@ -966,6 +1507,63 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return [self detailScrollForRoot:root height:y];
 }
 
+- (NSScrollView *)aiDetailsView {
+    FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
+    CGFloat y = kDetailPad;
+    [self addDetailHeading:@"AI Status" to:root y:&y width:kDetailW];
+
+    for (AIUsage *u in _aiUsage) {
+        [self addDetailHeading:u.name ?: @"AI" to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Remaining" value:[self aiPercentText:u] to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Reset" value:[self aiResetDetailText:u] to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
+                                                                   : (u.statusReason ?: @"No limit status source")
+                        to:root y:&y width:kDetailW];
+        if (u.statusSource)
+            [self addDetailKey:@"Status source" value:u.statusSource to:root y:&y width:kDetailW];
+    }
+
+    [self addDetailHeading:@"Local History" to:root y:&y width:kDetailW];
+    for (AIUsage *u in _aiUsage) {
+        [self addDetailHeading:u.name ?: @"AI" to:root y:&y width:kDetailW];
+        if (!u.available) {
+            [self addDetailStatus:u.statusText ?: @"Local state not found" to:root y:&y width:kDetailW];
+            [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
+            continue;
+        }
+        [self addDetailKey:@"Today" value:u.todayTokens > 0 ? FmtTokenCount(u.todayTokens) : @"No local usage today"
+                        to:root y:&y width:kDetailW];
+        [self addDetailKey:@"7 days" value:u.weekTokens > 0 ? FmtTokenCount(u.weekTokens) : @"No local usage"
+                        to:root y:&y width:kDetailW];
+        if (u.todaySessions > 0 || u.weekSessions > 0) {
+            NSString *sessions = [NSString stringWithFormat:@"%lld today · %lld in 7d", u.todaySessions, u.weekSessions];
+            [self addDetailKey:@"Sessions" value:sessions to:root y:&y width:kDetailW];
+        }
+        if (u.todayMessages > 0) {
+            NSString *activity = [NSString stringWithFormat:@"%lld messages · %lld tool calls",
+                                  u.todayMessages, u.todayToolCalls];
+            [self addDetailKey:@"Activity" value:activity to:root y:&y width:kDetailW];
+        }
+        [self addDetailKey:@"Status" value:u.statusText ?: @"Local stats" to:root y:&y width:kDetailW];
+        if (u.lastActivity)
+            [self addDetailKey:@"Updated" value:ClockText(u.lastActivity) to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
+
+        if (u.models.count) {
+            [self addDetailHeading:@"Models" to:root y:&y width:kDetailW];
+            for (NSDictionary *model in u.models) {
+                NSString *name = ShortModelName(model[@"name"]);
+                NSNumber *tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? model[@"tokens"] : @0;
+                NSNumber *sessions = [model[@"sessions"] isKindOfClass:NSNumber.class] ? model[@"sessions"] : nil;
+                NSString *right = sessions ? [NSString stringWithFormat:@"%@ · %@ sessions", FmtTokenCount(tokens.longLongValue), sessions]
+                                           : FmtTokenCount(tokens.longLongValue);
+                [self addDetailKey:name value:right to:root y:&y width:kDetailW];
+            }
+        }
+    }
+    return [self detailScrollForRoot:root height:y];
+}
+
 - (NSScrollView *)systemDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
     CGFloat y = kDetailPad;
@@ -1028,6 +1626,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [tabs addTabViewItem:[self detailTabWithIdentifier:@"overview" title:@"Overview" view:[self overviewDetailsView]]];
     [tabs addTabViewItem:[self detailTabWithIdentifier:@"battery" title:@"Battery" view:[self batteryDetailsView]]];
     [tabs addTabViewItem:[self detailTabWithIdentifier:@"system" title:@"System" view:[self systemDetailsView]]];
+    [tabs addTabViewItem:[self detailTabWithIdentifier:@"ai" title:@"AI" view:[self aiDetailsView]]];
     [content addSubview:tabs];
     _detailsWindow.contentView = content;
 
@@ -1112,6 +1711,21 @@ static void Dump(void) {
             printf("  %6s  %-18s %s\n", [FmtBytes([h[@"bytes"] unsignedLongLongValue]) UTF8String],
                    [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
         }
+    }
+
+    printf("ai status:\n");
+    for (AIUsage *u in ReadAIUsage()) {
+        NSString *remaining = u.limitStatusAvailable ? [NSString stringWithFormat:@"%d%% remaining",
+                                                         (int)lround(u.remainingFraction * 100)]
+                                                      : @"remaining unavailable";
+        NSString *reset = @"reset unavailable";
+        if (u.limitStatusAvailable) {
+            reset = (u.resetText.length && ![u.resetText isEqualToString:@"Not exposed locally"]) ? u.resetText : @"reset not provided";
+        }
+        printf("  %-7s %s · %s\n",
+               u.name.UTF8String,
+               remaining.UTF8String,
+               reset.UTF8String);
     }
 }
 

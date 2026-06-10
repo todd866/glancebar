@@ -1,5 +1,5 @@
 // Renders a generic Glancebar mockup PNG (example data, no real disk/battery info)
-// showing the compact Storage + Battery + System popover. Output: docs/screenshot.png
+// showing the compact Storage + Battery + System + AI Status popover. Output: docs/screenshot.png
 #import <Cocoa/Cocoa.h>
 
 static const CGFloat kW = 320, kPad = 16;
@@ -46,7 +46,7 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
 @interface App : NSObject <NSApplicationDelegate> @end
 @implementation App
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
-    Flip *card = [[Flip alloc] initWithFrame:NSMakeRect(0,0,kW,720)];
+    Flip *card = [[Flip alloc] initWithFrame:NSMakeRect(0,0,kW,820)];
     card.wantsLayer = YES;
     card.layer.backgroundColor = [NSColor colorWithWhite:0.98 alpha:1].CGColor;
     card.layer.cornerRadius = 12; card.layer.borderWidth = 0.5;
@@ -89,29 +89,14 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     y += 44;
     [card addSubview:L(@"Battery pressure", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
                        NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 20;
-    NSArray *pressure = @[
-        @[@"Google Chrome", @"Chrome Helper processes", @0.48, @"High"],
-        @[@"System Policy", @"syspolicyd · app security checks", @0.18, @"Medium"],
-        @[@"Display Server", @"WindowServer · macOS display compositor", @0.12, @"Low"]
-    ];
-    for (NSArray *h in pressure) {
-        double share = [h[2] doubleValue];
-        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 42)];
-        [row addSubview:L(h[0], [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
-                          NSMakeRect(kPad, 24, inner-84, 15), NSTextAlignmentLeft)];
-        [row addSubview:L([NSString stringWithFormat:@"%@  %.0f%%", h[3], share*100],
-                          [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
-                          NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 24, 82, 15), NSTextAlignmentRight)];
-        [row addSubview:L(h[1], [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
-                          NSMakeRect(kPad, 9, inner, 13), NSTextAlignmentLeft)];
-        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 3.5)]; g.fraction=share;
-        g.color=Pressure(share); [row addSubview:g];
-        [card addSubview:row];
-        y += 42;
-    }
-    y += 4;
-    [card addSubview:L(@"Drawing 12.4 W", [NSFont systemFontOfSize:12], nil, NSMakeRect(kPad, y, inner, 16), NSTextAlignmentLeft)]; y+=19;
-    [card addSubview:L(@"Health 94% · 4870/5180 mAh · 142 cycles", [NSFont systemFontOfSize:11], NSColor.secondaryLabelColor,
+    NSView *pressureRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
+    [pressureRow addSubview:L(@"Google Chrome", [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
+                              NSMakeRect(kPad, 11, inner-82, 15), NSTextAlignmentLeft)];
+    [pressureRow addSubview:L(@"48%", [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
+                              NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 11, 82, 15), NSTextAlignmentRight)];
+    Gauge *pg=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 4)]; pg.fraction=0.48; pg.color=Pressure(0.48);
+    [pressureRow addSubview:pg]; [card addSubview:pressureRow]; y += 32;
+    [card addSubview:L(@"Drawing 12.4 W · Health 94%", [NSFont systemFontOfSize:11], NSColor.secondaryLabelColor,
                        NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y+=18;
 
     y += 4;
@@ -126,27 +111,39 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     cpu.fraction=0.38; cpu.color=[NSColor.systemYellowColor colorWithAlphaComponent:0.9]; [card addSubview:cpu];
     y += 50;
 
-    void (^proc)(NSString *, NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *detail, NSString *right, double frac, NSColor *color){
-        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 38)];
+    void (^proc)(NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, double frac, NSColor *color){
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
         [row addSubview:L(name, [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
-                          NSMakeRect(kPad, 21, inner-84, 15), NSTextAlignmentLeft)];
+                          NSMakeRect(kPad, 11, inner-82, 15), NSTextAlignmentLeft)];
         [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
-                          NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 21, 82, 15), NSTextAlignmentRight)];
-        [row addSubview:L(detail, [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
-                          NSMakeRect(kPad, 6, inner, 13), NSTextAlignmentLeft)];
-        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 2, inner, 3.5)]; g.fraction=frac; g.color=color;
-        [row addSubview:g]; [card addSubview:row]; y += 38;
+                          NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 11, 82, 15), NSTextAlignmentRight)];
+        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 4)]; g.fraction=frac; g.color=color;
+        [row addSubview:g]; [card addSubview:row]; y += 30;
     };
-    [card addSubview:L(@"Top CPU", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
-                       NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 18;
-    proc(@"Google Chrome", @"Chrome Helper processes", @"32%", 0.32, NSColor.systemYellowColor);
-    y += 3;
-    [card addSubview:L(@"Top memory", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
-                       NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 18;
-    proc(@"Adobe Acrobat", @"AdobeAcrobat process", @"2.4 GB", 0.15, NSColor.systemGreenColor);
+    proc(@"Google Chrome", @"CPU 32%", 0.32, NSColor.systemYellowColor);
+    proc(@"Adobe Acrobat", @"2.4 GB", 0.15, NSColor.systemGreenColor);
 
     y += 4;
-    NSBox *d3=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d3.boxType=NSBoxSeparator; [card addSubview:d3]; y+=9;
+    NSBox *d3=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d3.boxType=NSBoxSeparator; [card addSubview:d3]; y+=13;
+    hdr(@"AI Status"); y += 22;
+    void (^ai)(NSString *, NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, NSString *detail, double frac, NSColor *color){
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 44)];
+        CGFloat titleW=74, rightW=54, barX=kPad+titleW+8, barW=inner-titleW-rightW-18;
+        [row addSubview:L(name, [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
+                          NSMakeRect(kPad, 25, titleW, 15), NSTextAlignmentLeft)];
+        [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold],
+                          color, NSMakeRect(kW-kPad-rightW, 23, rightW, 17), NSTextAlignmentRight)];
+        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, barW, 7)]; g.fraction=frac; g.color=color;
+        [row addSubview:g];
+        [row addSubview:L(detail, [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
+                          NSMakeRect(kPad, 7, inner, 14), NSTextAlignmentLeft)];
+        [card addSubview:row]; y += 44;
+    };
+    ai(@"Claude", @"42%", @"Reset 7:00 PM", 0.42, NSColor.systemYellowColor);
+    ai(@"Codex", @"—", @"No limit status", 0.0, NSColor.tertiaryLabelColor);
+
+    y += 4;
+    NSBox *d4=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d4.boxType=NSBoxSeparator; [card addSubview:d4]; y+=9;
     NSImageView *opts=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"slider.horizontal.3" accessibilityDescription:nil]];
     opts.contentTintColor=NSColor.secondaryLabelColor; opts.frame=NSMakeRect(kPad-1, y+3, 17, 15); [card addSubview:opts];
     [card addSubview:L(@"Details…", [NSFont systemFontOfSize:12], NSColor.secondaryLabelColor,
@@ -158,8 +155,8 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     y += kPad - 6;
     CGFloat cardH = y; card.frame = NSMakeRect(0,0,kW,cardH);
 
-    // pill: disk + battery
-    CGFloat pillW=128, pillH=24;
+    // pill: storage + battery + optional system + optional AI status
+    CGFloat pillW=262, pillH=24;
     Pill *pill=[[Pill alloc] initWithFrame:NSMakeRect(0,0,pillW,pillH)];
     pill.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     NSImageView *di=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:nil]];
@@ -170,6 +167,14 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     bi.contentTintColor=NSColor.whiteColor; bi.frame=NSMakeRect(66,5,26,14); [pill addSubview:bi];
     [pill addSubview:L(@"76%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
                        NSMakeRect(96,4,38,16), NSTextAlignmentLeft)];
+    NSImageView *ci=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"cpu" accessibilityDescription:nil]];
+    ci.contentTintColor=NSColor.whiteColor; ci.frame=NSMakeRect(136,5,16,14); [pill addSubview:ci];
+    [pill addSubview:L(@"38%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
+                       NSMakeRect(154,4,38,16), NSTextAlignmentLeft)];
+    NSImageView *aii=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil]];
+    aii.contentTintColor=NSColor.whiteColor; aii.frame=NSMakeRect(192,5,16,14); [pill addSubview:aii];
+    [pill addSubview:L(@"AI 42%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
+                       NSMakeRect(210,4,52,16), NSTextAlignmentLeft)];
 
     CGFloat margin=34, gap=10, W=kW+2*margin, H=pillH+gap+cardH+2*margin;
     Grad *canvas=[[Grad alloc] initWithFrame:NSMakeRect(0,0,W,H)];
