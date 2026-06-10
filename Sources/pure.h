@@ -31,6 +31,30 @@ NSString *FmtDuration(int minutes);
 NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
                                    NSString *(^groupForPid)(pid_t));
 
+// --- Codex rollout parsing ---
+// Codex CLI writes per-session JSONL rollouts (~/.codex/sessions/YYYY/MM/DD/*.jsonl,
+// moving to ~/.codex/archived_sessions/ on archive). Each turn logs a token_count
+// event whose last_token_usage is a verified per-turn delta, alongside the official
+// rate-limit gauges. These are the only accurate per-day usage source: the sqlite
+// threads.tokens_used column is a lifetime counter and cannot be windowed.
+
+// Parses one rollout line. Returns nil unless it is a token_count event:
+// @{@"ts": ISO-8601 string, @"tokens": @(per-turn total), @"limits": rate_limits dict (optional)}
+NSDictionary *ParseTokenCountLine(NSString *line);
+
+// Buckets parsed events into per-local-day token totals, merged over existingDays.
+// Returns @{@"days": @{@"yyyy-MM-dd": @(tokens)}, and when any event carried limits,
+// @"latestLimits": rate_limits dict, @"latestTs": its ISO timestamp}.
+NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSNumber *> *existingDays,
+                                    NSArray<NSDictionary *> *events, NSTimeZone *tz);
+
+// Picks the most constrained, still-current window from a Codex rate_limits dict
+// (primary = 5h, secondary = weekly; resets_at is epoch seconds — windows whose reset
+// has passed are obsolete and skipped). Returns nil when none is current, else
+// @{@"remainingFraction": @(0..1), @"window": @"5-hour"/@"weekly"/…,
+//   @"resetsAt": @(epoch) (optional), @"plan": plan string (optional)}.
+NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

@@ -76,6 +76,94 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
     return out;
 }
 
+NSDictionary *ParseTokenCountLine(NSString *line) {
+    if (![line containsString:@"\"token_count\""]) return nil;   // cheap pre-filter
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) return nil;
+    NSDictionary *obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![obj isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *payload = [obj[@"payload"] isKindOfClass:NSDictionary.class] ? obj[@"payload"] : nil;
+    if (![payload[@"type"] isKindOfClass:NSString.class] || ![payload[@"type"] isEqualToString:@"token_count"]) return nil;
+    NSString *ts = [obj[@"timestamp"] isKindOfClass:NSString.class] ? obj[@"timestamp"] : nil;
+    if (!ts.length) return nil;
+
+    NSDictionary *info = [payload[@"info"] isKindOfClass:NSDictionary.class] ? payload[@"info"] : nil;
+    NSDictionary *last = [info[@"last_token_usage"] isKindOfClass:NSDictionary.class] ? info[@"last_token_usage"] : nil;
+    NSNumber *total = [last[@"total_tokens"] isKindOfClass:NSNumber.class] ? last[@"total_tokens"] : nil;
+    NSDictionary *limits = [payload[@"rate_limits"] isKindOfClass:NSDictionary.class] ? payload[@"rate_limits"] : nil;
+    if (!total && !limits) return nil;
+
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    out[@"ts"] = ts;
+    out[@"tokens"] = total ?: @0;
+    if (limits) out[@"limits"] = limits;
+    return out;
+}
+
+static NSDate *DateFromISO8601(NSString *s) {
+    static NSISO8601DateFormatter *plain, *fractional;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        plain = [NSISO8601DateFormatter new];
+        fractional = [NSISO8601DateFormatter new];
+        fractional.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    });
+    return [fractional dateFromString:s] ?: [plain dateFromString:s];
+}
+
+NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSNumber *> *existingDays,
+                                    NSArray<NSDictionary *> *events, NSTimeZone *tz) {
+    NSMutableDictionary *days = existingDays ? [existingDays mutableCopy] : [NSMutableDictionary dictionary];
+    NSDictionary *latestLimits = nil;
+    NSString *latestTs = nil;
+    NSDateFormatter *dayFmt = [NSDateFormatter new];
+    dayFmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    dayFmt.dateFormat = @"yyyy-MM-dd";
+    dayFmt.timeZone = tz ?: NSTimeZone.localTimeZone;
+    for (NSDictionary *e in events) {
+        NSString *ts = [e[@"ts"] isKindOfClass:NSString.class] ? e[@"ts"] : nil;
+        NSDate *date = ts ? DateFromISO8601(ts) : nil;
+        if (!date) continue;
+        long long tokens = [e[@"tokens"] longLongValue];
+        if (tokens > 0) {
+            NSString *day = [dayFmt stringFromDate:date];
+            days[day] = @([days[day] longLongValue] + tokens);
+        }
+        if (e[@"limits"] && (!latestTs || [ts compare:latestTs] == NSOrderedDescending)) {
+            latestTs = ts;
+            latestLimits = e[@"limits"];
+        }
+    }
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:days forKey:@"days"];
+    if (latestLimits) { out[@"latestLimits"] = latestLimits; out[@"latestTs"] = latestTs; }
+    return out;
+}
+
+NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
+    if (![rateLimits isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *best = nil;
+    double bestRemaining = 2;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
+        if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
+        double resets = [w[@"resets_at"] doubleValue];
+        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
+        double remaining = 1.0 - [w[@"used_percent"] doubleValue] / 100.0;
+        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+        if (remaining >= bestRemaining) continue;
+        bestRemaining = remaining;
+        long mins = [w[@"window_minutes"] longValue];
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"remainingFraction"] = @(remaining);
+        d[@"window"] = mins == 10080 ? @"weekly" : mins == 300 ? @"5-hour"
+                     : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
+        if (resets > 0) d[@"resetsAt"] = @(resets);
+        if ([rateLimits[@"plan_type"] isKindOfClass:NSString.class]) d[@"plan"] = rateLimits[@"plan_type"];
+        best = d;
+    }
+    return best;
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }

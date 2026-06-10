@@ -65,6 +65,46 @@ int main(void) {
         check([stats2[@"memory"][1][@"bytes"] unsignedLongLongValue] == 300000ULL * 1024ULL,
               @"zero footprint falls back to RSS (grouped helpers summed)");
 
+        // --- ParseTokenCountLine ---
+        NSString *tok = @"{\"timestamp\":\"2026-06-10T09:04:20.778Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":104303},\"last_token_usage\":{\"input_tokens\":74038,\"cached_input_tokens\":63360,\"output_tokens\":668,\"total_tokens\":74706},\"model_context_window\":272000},\"rate_limits\":{\"primary\":{\"used_percent\":83.0,\"window_minutes\":300,\"resets_at\":1781093380},\"secondary\":{\"used_percent\":90.0,\"window_minutes\":10080,\"resets_at\":1781179715},\"plan_type\":\"prolite\"}}}";
+        NSDictionary *ev = ParseTokenCountLine(tok);
+        check(ev != nil, @"token_count line parses");
+        check([ev[@"tokens"] longLongValue] == 74706, @"per-turn token delta extracted");
+        check([ev[@"ts"] isEqual:@"2026-06-10T09:04:20.778Z"], @"timestamp extracted");
+        check([ev[@"limits"][@"plan_type"] isEqual:@"prolite"], @"rate limits captured");
+        check(ParseTokenCountLine(@"{\"timestamp\":\"t\",\"payload\":{\"type\":\"user_message\"}}") == nil,
+              @"non-token line skipped");
+        check(ParseTokenCountLine(@"not json but mentions token_count") == nil, @"malformed line skipped");
+        NSDictionary *startEv = ParseTokenCountLine(@"{\"timestamp\":\"2026-06-10T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{},\"rate_limits\":{\"primary\":{\"used_percent\":10.0,\"window_minutes\":300,\"resets_at\":99}}}}");
+        check(startEv && [startEv[@"tokens"] longLongValue] == 0, @"session-start event keeps limits, zero tokens");
+
+        // --- AccumulateTokenEvents ---
+        NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:10 * 3600];
+        NSDictionary *acc = AccumulateTokenEvents(nil, @[
+            @{@"ts": @"2026-06-09T20:00:00Z", @"tokens": @100},
+            @{@"ts": @"2026-06-09T10:00:00Z", @"tokens": @50},
+            @{@"ts": @"2026-06-10T01:00:00.500Z", @"tokens": @7, @"limits": @{@"plan_type": @"prolite"}},
+        ], tz);
+        check([acc[@"days"][@"2026-06-10"] longLongValue] == 107, @"UTC events bucket into local day");
+        check([acc[@"days"][@"2026-06-09"] longLongValue] == 50, @"earlier event stays previous local day");
+        check([acc[@"latestLimits"][@"plan_type"] isEqual:@"prolite"], @"latest limits surfaced");
+        NSDictionary *acc2 = AccumulateTokenEvents(acc[@"days"],
+            @[@{@"ts": @"2026-06-10T02:00:00Z", @"tokens": @3}], tz);
+        check([acc2[@"days"][@"2026-06-10"] longLongValue] == 110, @"accumulation merges into existing days");
+
+        // --- PickLimitWindow ---
+        NSDictionary *limits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @2000},
+                                 @"secondary": @{@"used_percent": @90.0, @"window_minutes": @10080, @"resets_at": @5000},
+                                 @"plan_type": @"prolite"};
+        NSDictionary *pick = PickLimitWindow(limits, 1000);
+        check(fabs([pick[@"remainingFraction"] doubleValue] - 0.10) < 0.001, @"most constrained window wins");
+        check([pick[@"window"] isEqual:@"weekly"], @"weekly window labeled");
+        check([pick[@"plan"] isEqual:@"prolite"], @"plan surfaced");
+        check(PickLimitWindow(limits, 6000) == nil, @"all-obsolete windows yield nil");
+        NSDictionary *pick3 = PickLimitWindow(limits, 3000);
+        check([pick3[@"window"] isEqual:@"weekly"], @"reset window excluded, current one kept");
+        check(PickLimitWindow(nil, 1000) == nil, @"nil limits yield nil");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

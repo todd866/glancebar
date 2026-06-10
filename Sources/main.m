@@ -419,8 +419,9 @@ static NSColor *CPUColor(double cpu) {
 static NSString *FmtCompact(long long n) {
     double v = (double)llabs(n);
     NSString *sign = n < 0 ? @"-" : @"";
-    if (v >= 1000000000.0) return [NSString stringWithFormat:@"%@%.1fB", sign, v / 1000000000.0];
-    if (v >= 1000000.0) return [NSString stringWithFormat:@"%@%.1fM", sign, v / 1000000.0];
+    // Tier thresholds sit at the rounding boundary so 999.6M prints 1.0B, not 1000.0M.
+    if (v >= 999500000.0) return [NSString stringWithFormat:@"%@%.1fB", sign, v / 1000000000.0];
+    if (v >= 999500.0) return [NSString stringWithFormat:@"%@%.1fM", sign, v / 1000000.0];
     if (v >= 1000.0) return [NSString stringWithFormat:@"%@%.0fK", sign, v / 1000.0];
     return [NSString stringWithFormat:@"%lld", n];
 }
@@ -464,13 +465,14 @@ static NSString *ClockText(NSDate *date) {
     return [fmt stringFromDate:date];
 }
 
+// Bare formatted time — callers add their own "Reset"/"Reset:" framing.
 static NSString *ResetTextFromDate(NSDate *date) {
     if (!date) return nil;
     NSDateFormatter *fmt = [NSDateFormatter new];
     BOOL today = [NSCalendar.currentCalendar isDate:date inSameDayAsDate:NSDate.date];
     fmt.dateStyle = today ? NSDateFormatterNoStyle : NSDateFormatterShortStyle;
     fmt.timeStyle = NSDateFormatterShortStyle;
-    return [NSString stringWithFormat:@"Reset %@", [fmt stringFromDate:date]];
+    return [fmt stringFromDate:date];
 }
 
 static NSDictionary *JSONDictionaryAtPath(NSString *path) {
@@ -546,6 +548,10 @@ static NSDate *DateFromStatusString(NSString *s) {
     if (!s.length) return nil;
     NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
     NSDate *date = [iso dateFromString:s];
+    if (!date) {
+        iso.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+        date = [iso dateFromString:s];
+    }
     if (date) return date;
 
     NSDateFormatter *fmt = [NSDateFormatter new];
@@ -579,11 +585,12 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSDictionary *entry = AIStatusEntry(root, u.name);
     if (!entry) return;
 
-    NSNumber *remaining = StatusNumberForKeys(entry, @[@"remainingFraction", @"remaining", @"fractionRemaining",
-                                                       @"remainingPercent", @"percentRemaining", @"percentageRemaining"]);
-    if (remaining) {
-        double v = remaining.doubleValue;
-        if (v > 1.0) v /= 100.0;
+    // Interpret by key, not magnitude: a "guess the unit" heuristic misreads 0.9%
+    // remaining as 90% — exactly when the number matters most.
+    NSNumber *fraction = StatusNumberForKeys(entry, @[@"remainingFraction", @"fractionRemaining"]);
+    NSNumber *percent = StatusNumberForKeys(entry, @[@"remainingPercent", @"percentRemaining", @"percentageRemaining"]);
+    double v = fraction ? fraction.doubleValue : (percent ? percent.doubleValue / 100.0 : -1);
+    if (v >= 0) {
         u.remainingFraction = MIN(1.0, MAX(0.0, v));
         u.limitStatusAvailable = YES;
     }
@@ -617,11 +624,16 @@ static AIUsage *ReadClaudeUsage(void) {
 
     NSDate *now = NSDate.date;
     NSDate *todayStart = StartOfLocalDay(now);
-    NSDate *weekStart = [NSDate dateWithTimeInterval:-6 * 24 * 60 * 60 sinceDate:todayStart];
+    // Calendar arithmetic, not 6*86400: a DST transition makes the fixed-seconds week
+    // window silently drop its oldest day.
+    NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay
+                                                               value:-6 toDate:todayStart options:0] ?: todayStart;
     NSString *today = LocalDateString(now);
     NSString *lastComputed = [root[@"lastComputedDate"] isKindOfClass:NSString.class] ? root[@"lastComputedDate"] : nil;
     u.stale = lastComputed.length && ![lastComputed isEqualToString:today];
-    u.statusText = u.stale ? [NSString stringWithFormat:@"Stats through %@", ShortDateText(lastComputed)] : @"Local stats current";
+    u.statusText = !lastComputed.length ? @"Local stats (freshness unknown)"
+                 : u.stale ? [NSString stringWithFormat:@"Stats through %@", ShortDateText(lastComputed)]
+                 : @"Local stats current";
 
     NSDictionary *latestTokensByModel = nil;
     NSString *latestDate = nil;
@@ -681,63 +693,204 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
     return RunTaskOutput(@"/usr/bin/sqlite3", @[@"-readonly", @"-separator", @"\t", path, sql]);
 }
 
-static AIUsage *ReadCodexUsage(void) {
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@".codex/state_5.sqlite"];
-    if (![NSFileManager.defaultManager fileExistsAtPath:path])
-        return UnavailableAIUsage(@"Codex", @"~/.codex/state_5.sqlite");
-
-    NSDate *todayStart = StartOfLocalDay(NSDate.date);
-    long long todayEpoch = (long long)todayStart.timeIntervalSince1970;
-    long long weekEpoch = todayEpoch - 6LL * 24LL * 60LL * 60LL;
-
-    NSString *todaySQL = [NSString stringWithFormat:
-        @"select count(*), coalesce(sum(tokens_used),0), coalesce(max(updated_at),0) "
-         "from threads where updated_at >= %lld;", todayEpoch];
-    NSArray<NSString *> *todayFields = SQLiteFields([[RunSQLite(path, todaySQL)
-        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@"\n"].firstObject);
-    if (todayFields.count < 3) return UnavailableAIUsage(@"Codex", @"~/.codex/state_5.sqlite");
-
-    NSString *weekSQL = [NSString stringWithFormat:
-        @"select count(*), coalesce(sum(tokens_used),0), coalesce(max(updated_at),0) "
-         "from threads where updated_at >= %lld;", weekEpoch];
-    NSArray<NSString *> *weekFields = SQLiteFields([[RunSQLite(path, weekSQL)
-        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@"\n"].firstObject);
-
-    long long modelStart = [todayFields[1] longLongValue] > 0 ? todayEpoch : weekEpoch;
-    NSString *modelsSQL = [NSString stringWithFormat:
-        @"select coalesce(nullif(model,''),'unknown'), count(*), coalesce(sum(tokens_used),0) "
-         "from threads where updated_at >= %lld group by coalesce(nullif(model,''),'unknown') "
-         "order by sum(tokens_used) desc limit 5;", modelStart];
-    NSString *modelsOut = RunSQLite(path, modelsSQL);
-    NSMutableArray *models = [NSMutableArray array];
-    for (NSString *line in [modelsOut componentsSeparatedByString:@"\n"]) {
-        NSArray<NSString *> *fields = SQLiteFields([line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
-        if (fields.count < 3) continue;
-        [models addObject:@{@"name": fields[0], @"sessions": @([fields[1] longLongValue]),
-                            @"tokens": @([fields[2] longLongValue])}];
+// Codex's sqlite schema versions its filename (state_5.sqlite today); pick the
+// highest-versioned one so a Codex update doesn't silently blank the panel.
+static NSString *CodexStatePath(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@".codex"];
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+    NSString *best = nil;
+    long bestVersion = -1;
+    for (NSString *name in names) {
+        if (![name hasPrefix:@"state_"] || ![name hasSuffix:@".sqlite"] || name.length <= 13) continue;
+        long v = [name substringWithRange:NSMakeRange(6, name.length - 13)].integerValue;
+        if (v > bestVersion) { bestVersion = v; best = name; }
     }
+    return best ? [dir stringByAppendingPathComponent:best] : nil;
+}
+
+static NSDate *FileMTime(NSString *path) {
+    return [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+}
+
+// Reads AI usage state. Codex tokens come from the per-turn token_count events in the
+// session rollout JSONLs — the only accurate per-day source (the sqlite tokens_used
+// column is a lifetime counter, so windowing it attributes a resumed thread's whole
+// history to "today"). Rollouts are append-only; per-file byte offsets make the steady
+// state a handful of stats per tick. Stateful and not reentrant: call from one serial
+// queue only (the --dump path makes its own throwaway instance).
+@interface AIReader : NSObject
+- (NSArray<AIUsage *> *)read;
+@end
+
+@implementation AIReader {
+    NSMutableDictionary<NSString *, NSNumber *> *_offsets;   // rollout basename -> consumed bytes
+    NSMutableDictionary<NSString *, NSNumber *> *_days;      // local "yyyy-MM-dd" -> tokens
+    NSDictionary *_limits;          // newest rate_limits seen
+    NSString *_limitsTs;
+    NSDate *_dbStamp;               // change detection for the sqlite extras
+    NSString *_dbDay;
+    long long _sessionsToday;
+    NSArray<NSDictionary *> *_models;
+    NSDate *_lastActivity;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _offsets = [NSMutableDictionary dictionary];
+        _days = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+// Rollout files keep their unique basename when they move from sessions/ to
+// archived_sessions/, so offsets keyed by basename survive archiving without
+// double-counting.
+- (void)scanRollouts {
+    NSString *home = NSHomeDirectory();
+    NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-8 * 24 * 3600];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSString *dir in @[@".codex/sessions", @".codex/archived_sessions"]) {
+        NSString *base = [home stringByAppendingPathComponent:dir];
+        NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtPath:base];
+        for (NSString *rel in en) {
+            if (![rel.pathExtension isEqualToString:@"jsonl"]) continue;
+            NSDictionary *attrs = en.fileAttributes;
+            if ([attrs[NSFileModificationDate] compare:cutoff] == NSOrderedAscending) continue;
+            NSString *key = rel.lastPathComponent;
+            [seen addObject:key];
+            unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+            unsigned long long offset = [_offsets[key] unsignedLongLongValue];
+            if (size <= offset) continue;   // nothing appended (append-only files)
+            [self consumeFile:[base stringByAppendingPathComponent:rel] key:key fromOffset:offset];
+        }
+    }
+    // Offsets for files that aged out of the window are dead weight.
+    for (NSString *key in _offsets.allKeys) if (![seen containsObject:key]) [_offsets removeObjectForKey:key];
+    // Keep only the trailing 7 local days of totals.
+    NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-6
+                                                              toDate:StartOfLocalDay(NSDate.date) options:0];
+    NSString *weekStartDay = LocalDateString(weekStart);
+    for (NSString *day in _days.allKeys)
+        if ([day compare:weekStartDay] == NSOrderedAscending) [_days removeObjectForKey:day];
+}
+
+- (void)consumeFile:(NSString *)path key:(NSString *)key fromOffset:(unsigned long long)offset {
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) return;
+    [fh seekToFileOffset:offset];
+    NSData *data = [fh readDataToEndOfFile];
+    [fh closeFile];
+    // Only consume complete lines; a partially-written trailing line is re-read next pass.
+    const char *bytes = data.bytes;
+    NSUInteger consume = 0;
+    for (NSUInteger i = data.length; i > 0; i--) {
+        if (bytes[i - 1] == '\n') { consume = i; break; }
+    }
+    if (!consume) return;
+    _offsets[key] = @(offset + consume);
+    NSString *chunk = [[NSString alloc] initWithBytes:bytes length:consume encoding:NSUTF8StringEncoding];
+    if (!chunk) return;
+
+    NSMutableArray *events = [NSMutableArray array];
+    for (NSString *line in [chunk componentsSeparatedByString:@"\n"]) {
+        NSDictionary *e = ParseTokenCountLine(line);
+        if (e) [events addObject:e];
+    }
+    if (!events.count) return;
+    NSDictionary *acc = AccumulateTokenEvents(_days, events, nil);
+    _days = [acc[@"days"] mutableCopy];
+    NSString *ts = acc[@"latestTs"];
+    if (ts && (!_limitsTs || [ts compare:_limitsTs] == NSOrderedDescending)) {
+        _limits = acc[@"latestLimits"];
+        _limitsTs = ts;
+    }
+}
+
+// Session counts, per-model split, and last activity still come from the sqlite thread
+// store (the rollouts don't carry the model); re-queried only when the db changes.
+- (void)refreshDBExtras {
+    NSString *path = CodexStatePath();
+    if (!path) { _sessionsToday = 0; _models = @[]; _lastActivity = nil; return; }
+    NSDate *m1 = FileMTime(path), *m2 = FileMTime([path stringByAppendingString:@"-wal"]);
+    NSDate *stamp = (m2 && (!m1 || [m2 compare:m1] == NSOrderedDescending)) ? m2 : m1;
+    NSString *today = LocalDateString(NSDate.date);
+    if (_dbStamp && stamp && [stamp isEqualToDate:_dbStamp] && [today isEqualToString:_dbDay]) return;
+    _dbStamp = stamp;
+    _dbDay = today;
+
+    long long todayEpoch = (long long)StartOfLocalDay(NSDate.date).timeIntervalSince1970;
+    NSString *todaySQL = [NSString stringWithFormat:
+        @"select count(*), coalesce(max(updated_at),0) from threads where updated_at >= %lld;", todayEpoch];
+    NSArray<NSString *> *fields = SQLiteFields([[RunSQLite(path, todaySQL)
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        componentsSeparatedByString:@"\n"].firstObject);
+    _sessionsToday = fields.count >= 1 ? [fields[0] longLongValue] : 0;
+    long long last = fields.count >= 2 ? [fields[1] longLongValue] : 0;
+    _lastActivity = last > 0 ? [NSDate dateWithTimeIntervalSince1970:last] : nil;
+
+    // Sessions per model are accurate; per-model token sums would be lifetime-inflated,
+    // so deliberately don't fetch them.
+    NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-6
+                                                              toDate:StartOfLocalDay(NSDate.date) options:0];
+    NSString *modelsSQL = [NSString stringWithFormat:
+        @"select coalesce(nullif(model,''),'unknown'), count(*) from threads "
+         "where updated_at >= %lld group by 1 order by 2 desc limit 5;",
+        (long long)weekStart.timeIntervalSince1970];
+    NSMutableArray *models = [NSMutableArray array];
+    for (NSString *line in [RunSQLite(path, modelsSQL) componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *cols = SQLiteFields([line stringByTrimmingCharactersInSet:
+                                                  NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+        if (cols.count < 2 || !cols[0].length) continue;
+        [models addObject:@{@"name": cols[0], @"sessions": @([cols[1] longLongValue])}];
+    }
+    _models = models;
+}
+
+- (AIUsage *)codexUsage {
+    [self scanRollouts];
+    [self refreshDBExtras];
 
     AIUsage *u = [AIUsage new];
     u.name = @"Codex";
-    u.source = @"~/.codex/state_5.sqlite";
-    u.available = YES;
+    u.source = @"~/.codex session logs";
     u.remainingFraction = -1;
     u.resetText = @"Not exposed locally";
-    u.statusText = @"Local thread totals";
-    u.statusReason = @"Codex's local thread store does not expose limit remaining or reset time";
-    u.todaySessions = [todayFields[0] longLongValue];
-    u.todayTokens = [todayFields[1] longLongValue];
-    u.weekSessions = weekFields.count >= 1 ? [weekFields[0] longLongValue] : 0;
-    u.weekTokens = weekFields.count >= 2 ? [weekFields[1] longLongValue] : 0;
-    long long last = MAX([todayFields[2] longLongValue], weekFields.count >= 3 ? [weekFields[2] longLongValue] : 0);
-    if (last > 0) u.lastActivity = [NSDate dateWithTimeIntervalSince1970:last];
-    u.models = models;
-    if (models.count) u.topModel = models.firstObject[@"name"];
+    u.models = _models ?: @[];
+    u.available = _offsets.count > 0;
+    if (!u.available) {
+        u.statusText = @"Local state not found";
+        u.statusReason = @"No Codex session logs under ~/.codex";
+        return u;
+    }
+    u.statusText = @"Per-turn session logs";
+    u.statusReason = @"Codex session logs do not carry limit status";
+
+    NSString *today = LocalDateString(NSDate.date);
+    u.todayTokens = [_days[today] longLongValue];
+    long long week = 0;
+    for (NSNumber *tokens in _days.allValues) week += tokens.longLongValue;   // _days is pruned to 7 days
+    u.weekTokens = week;
+    u.todaySessions = _sessionsToday;
+    u.lastActivity = _lastActivity;
+    if (u.models.count) u.topModel = u.models.firstObject[@"name"];
+
+    NSDictionary *pick = PickLimitWindow(_limits, NSDate.date.timeIntervalSince1970);
+    if (pick) {
+        u.limitStatusAvailable = YES;
+        u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
+        NSNumber *resets = pick[@"resetsAt"];
+        if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+        NSString *plan = [pick[@"plan"] isKindOfClass:NSString.class] ? pick[@"plan"] : nil;
+        u.statusReason = plan.length
+            ? [NSString stringWithFormat:@"%@ window · %@ plan", pick[@"window"], plan]
+            : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
+        u.statusSource = @"~/.codex session logs";
+    }
     return u;
 }
 
-static NSArray<AIUsage *> *ReadAIUsage(void) {
-    NSArray<AIUsage *> *usage = @[ReadClaudeUsage(), ReadCodexUsage()];
+- (NSArray<AIUsage *> *)read {
+    NSArray<AIUsage *> *usage = @[ReadClaudeUsage(), [self codexUsage]];
     NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
     NSDictionary *status = JSONDictionaryAtPath(statusPath);
     if (status) {
@@ -745,6 +898,8 @@ static NSArray<AIUsage *> *ReadAIUsage(void) {
     }
     return usage;
 }
+
+@end
 
 #pragma mark - colors / small views
 
@@ -867,6 +1022,10 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     double _lastCPU;
     BOOL _lastCPUValid;
     NSArray<AIUsage *> *_aiUsage;
+    AIReader *_aiReader;            // touched only on _aiQueue
+    dispatch_queue_t _aiQueue;
+    BOOL _aiLoading;
+    NSString *_aiSignature;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
     NSMutableArray<NSNumber *> *_ampHistory;
@@ -890,6 +1049,8 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     _barShowAI = [ud boolForKey:@"barShowAI"];
     _ampHistory = [NSMutableArray array];
     _aiUsage = @[];
+    _aiReader = [AIReader new];
+    _aiQueue = dispatch_queue_create("com.iantodd.glancebar.ai", DISPATCH_QUEUE_SERIAL);
     _hogs = @[];
     _topCPU = @[];
     _topMem = @[];
@@ -941,7 +1102,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (s.cpuValid) { _lastCPU = s.cpu; _lastCPUValid = YES; }
     else if (_lastCPUValid) { s.cpu = _lastCPU; s.cpuValid = YES; }
     _sys = s;
-    _aiUsage = ReadAIUsage();
+    [self refreshAIUsageAsync];
     if (_bat.valid) {
         [_ampHistory addObject:@(_bat.amperage_mA)];
         while (_ampHistory.count > 6) [_ampHistory removeObjectAtIndex:0];
@@ -954,6 +1115,31 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (_detailsWindow.isVisible && !_hogsLoading && !_procStatsLoading &&
         CFAbsoluteTimeGetCurrent() - _lastSampleTime >= 30)
         [self beginSampling];
+}
+
+// AI state lives in local files plus sqlite child processes — never read it on the
+// main thread (refresh fires every 15s and on IOPS bursts). Single-flight: a tick
+// that arrives mid-read is skipped; the next one catches up.
+- (void)refreshAIUsageAsync {
+    if (_aiLoading) return;
+    _aiLoading = YES;
+    dispatch_async(_aiQueue, ^{
+        NSArray<AIUsage *> *usage = [self->_aiReader read];
+        NSMutableString *sig = [NSMutableString string];
+        for (AIUsage *u in usage)
+            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%.4f|%@|%@;", u.name, u.available,
+             u.limitStatusAvailable, u.todayTokens, u.weekTokens, u.todaySessions,
+             u.remainingFraction, u.resetText, u.statusText];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_aiLoading = NO;
+            self->_aiUsage = usage;
+            if ([sig isEqualToString:self->_aiSignature]) return;   // nothing user-visible changed
+            self->_aiSignature = sig;
+            [self updateBar];
+            if (self->_popover.isShown) [self rebuildContent];
+            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+        });
+    });
 }
 
 - (double)avgAmp {
@@ -1659,18 +1845,19 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             [self addDetailKey:@"Activity" value:activity to:root y:&y width:kDetailW];
         }
         [self addDetailKey:@"Status" value:u.statusText ?: @"Local stats" to:root y:&y width:kDetailW];
-        if (u.lastActivity)
-            [self addDetailKey:@"Updated" value:ClockText(u.lastActivity) to:root y:&y width:kDetailW];
+        if (u.lastActivity)   // file/db activity time — distinct from "stats computed through"
+            [self addDetailKey:@"State updated" value:ClockText(u.lastActivity) to:root y:&y width:kDetailW];
         [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
 
         if (u.models.count) {
             [self addDetailHeading:@"Models" to:root y:&y width:kDetailW];
             for (NSDictionary *model in u.models) {
                 NSString *name = ShortModelName(model[@"name"]);
-                NSNumber *tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? model[@"tokens"] : @0;
+                long long tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? [model[@"tokens"] longLongValue] : 0;
                 NSNumber *sessions = [model[@"sessions"] isKindOfClass:NSNumber.class] ? model[@"sessions"] : nil;
-                NSString *right = sessions ? [NSString stringWithFormat:@"%@ · %@ sessions", FmtTokenCount(tokens.longLongValue), sessions]
-                                           : FmtTokenCount(tokens.longLongValue);
+                NSString *right = tokens > 0 && sessions ? [NSString stringWithFormat:@"%@ · %@ sessions", FmtTokenCount(tokens), sessions]
+                                : sessions ? [NSString stringWithFormat:@"%@ sessions", sessions]
+                                : FmtTokenCount(tokens);
                 [self addDetailKey:name value:right to:root y:&y width:kDetailW];
             }
         }
@@ -1850,18 +2037,21 @@ static void Dump(void) {
     }
 
     printf("ai status:\n");
-    for (AIUsage *u in ReadAIUsage()) {
+    for (AIUsage *u in [[AIReader new] read]) {
         NSString *remaining = u.limitStatusAvailable ? [NSString stringWithFormat:@"%d%% remaining",
                                                          (int)lround(u.remainingFraction * 100)]
                                                       : @"remaining unavailable";
         NSString *reset = @"reset unavailable";
         if (u.limitStatusAvailable) {
-            reset = (u.resetText.length && ![u.resetText isEqualToString:@"Not exposed locally"]) ? u.resetText : @"reset not provided";
+            reset = (u.resetText.length && ![u.resetText isEqualToString:@"Not exposed locally"])
+                ? [NSString stringWithFormat:@"resets %@", u.resetText] : @"reset not provided";
         }
-        printf("  %-7s %s · %s\n",
+        printf("  %-7s %s · %s · today %s · 7d %s\n",
                u.name.UTF8String,
                remaining.UTF8String,
-               reset.UTF8String);
+               reset.UTF8String,
+               FmtTokenCount(u.todayTokens).UTF8String,
+               FmtTokenCount(u.weekTokens).UTF8String);
     }
 }
 
