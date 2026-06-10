@@ -42,6 +42,37 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     NSTextField *t=[NSTextField labelWithString:s]; t.font=f; if(c)t.textColor=c; t.alignment=a; t.frame=fr;
     t.lineBreakMode=NSLineBreakByTruncatingTail; return t;
 }
+static NSImage *DriveMeter(double frac, NSColor *fg, NSColor *fill) {
+    NSImage *img=[[NSImage alloc] initWithSize:NSMakeSize(17,14)];
+    [img lockFocus];
+    NSRect body=NSMakeRect(1.5,3,14,9);
+    NSBezierPath *outer=[NSBezierPath bezierPathWithRoundedRect:body xRadius:2.2 yRadius:2.2];
+    [[fg colorWithAlphaComponent:0.25] setFill]; [outer fill];
+    NSBezierPath *clip=[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body,1.2,1.2) xRadius:1.2 yRadius:1.2];
+    [NSGraphicsContext saveGraphicsState]; [clip addClip];
+    [(fill ?: fg) setFill];
+    NSRect r=NSInsetRect(body,1.2,1.2); r.size.width*=MIN(1,MAX(0,frac)); NSRectFill(r);
+    [NSGraphicsContext restoreGraphicsState];
+    [fg setStroke]; outer.lineWidth=1.2; [outer stroke];
+    NSBezierPath *slot=[NSBezierPath bezierPath]; [slot moveToPoint:NSMakePoint(5,5)]; [slot lineToPoint:NSMakePoint(12,5)];
+    [[fg colorWithAlphaComponent:0.75] setStroke]; slot.lineWidth=1; [slot stroke];
+    [img unlockFocus]; img.template=NO; return img;
+}
+static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
+    NSImage *img=[[NSImage alloc] initWithSize:NSMakeSize(24,14)];
+    [img lockFocus];
+    NSRect body=NSMakeRect(1.5,3,18,8);
+    NSBezierPath *outer=[NSBezierPath bezierPathWithRoundedRect:body xRadius:2 yRadius:2];
+    [[fg colorWithAlphaComponent:0.25] setFill]; [outer fill];
+    NSBezierPath *clip=[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body,1.4,1.4) xRadius:1 yRadius:1];
+    [NSGraphicsContext saveGraphicsState]; [clip addClip];
+    [(fill ?: fg) setFill];
+    NSRect r=NSInsetRect(body,1.4,1.4); r.size.width*=MIN(1,MAX(0,frac)); NSRectFill(r);
+    [NSGraphicsContext restoreGraphicsState];
+    [fg setStroke]; outer.lineWidth=1.2; [outer stroke];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(20.2,5,2.3,4) xRadius:0.8 yRadius:0.8] fill];
+    [img unlockFocus]; img.template=NO; return img;
+}
 
 @interface App : NSObject <NSApplicationDelegate> @end
 @implementation App
@@ -86,7 +117,9 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
                        NSMakeRect(kPad, y, inner, 20), NSTextAlignmentLeft)];
     [card addSubview:L(@"76% remaining", [NSFont systemFontOfSize:11], NSColor.secondaryLabelColor,
                        NSMakeRect(kPad, y+19, inner, 14), NSTextAlignmentLeft)];
-    y += 44;
+    Gauge *bg=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, y+38, inner, 5)];
+    bg.fraction=0.76; bg.color=NSColor.systemGreenColor; [card addSubview:bg];
+    y += 54;
     [card addSubview:L(@"Battery pressure", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
                        NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 20;
     NSView *pressureRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
@@ -163,12 +196,12 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     CGFloat pillW=262, pillH=24;
     Pill *pill=[[Pill alloc] initWithFrame:NSMakeRect(0,0,pillW,pillH)];
     pill.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-    NSImageView *di=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"internaldrive" accessibilityDescription:nil]];
-    di.contentTintColor=NSColor.whiteColor; di.frame=NSMakeRect(10,5,16,14); [pill addSubview:di];
+    NSImageView *di=[NSImageView imageViewWithImage:DriveMeter(0.61, NSColor.whiteColor, NSColor.whiteColor)];
+    di.frame=NSMakeRect(10,5,17,14); [pill addSubview:di];
     [pill addSubview:L(@"61%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
                        NSMakeRect(28,4,38,16), NSTextAlignmentLeft)];
-    NSImageView *bi=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"battery.100percent" variableValue:0.76 accessibilityDescription:nil]];
-    bi.contentTintColor=NSColor.whiteColor; bi.frame=NSMakeRect(66,5,26,14); [pill addSubview:bi];
+    NSImageView *bi=[NSImageView imageViewWithImage:BatteryMeter(0.76, NSColor.whiteColor, NSColor.whiteColor)];
+    bi.frame=NSMakeRect(66,5,24,14); [pill addSubview:bi];
     [pill addSubview:L(@"76%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
                        NSMakeRect(96,4,38,16), NSTextAlignmentLeft)];
     NSImageView *ci=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"cpu" accessibilityDescription:nil]];

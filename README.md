@@ -79,18 +79,18 @@ battery pressure, system pressure, and AI status to the terminal.
   the most constrained window that is still current. The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed. Headline counts are
   **fresh tokens** (non-cached input + output); the raw total is ~16× larger because
-  cached context is re-read every turn, and is shown alongside. Claude's token counts
-  come the same way — live from the per-message usage records in
-  `~/.claude/projects/**.jsonl` transcripts. All log files are append-only and read
-  incrementally by byte offset on a background queue, so the steady-state cost is a
-  handful of `stat` calls.
+  cached context is re-read every turn, and is shown alongside. If enabled, Claude's
+  token counts come the same way — live from the per-message usage records in
+  `~/.claude/projects/**.jsonl` transcripts. JSONL files are append-only and read
+  incrementally by byte offset on a background queue, with per-tick read limits.
 
   Claude's *quota* gauge has no on-disk source (Claude Code fetches it from the API at
   display time), so it fills in one of two ways. The options menu has an **opt-in**
-  "Claude account for limit status" toggle (off by default): it reads the OAuth token
-  Claude Code already maintains in your Keychain (macOS asks for permission once) and
-  polls Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at
-  most every 5 minutes. The token is never stored, refreshed, or sent anywhere except
+  "Claude account via Keychain/API" toggle (off by default): it reads the OAuth token
+  Claude Code already maintains in your Keychain (macOS asks for permission) and polls
+  Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at most
+  every 5 minutes. The token is cached in memory only until expiry, never written by
+  Glancebar, never refreshed by Glancebar, and never sent anywhere except
   `api.anthropic.com`. Or provide `~/.glancebar/ai-status.json`, which overrides either
   provider's gauge:
 
@@ -100,8 +100,19 @@ battery pressure, system pressure, and AI status to the terminal.
   }
   ```
 
-  With the toggle off, Glancebar reads local state only — never auth files — and sends
-  no network requests.
+  Claude transcript token totals are a separate **opt-in** toggle because transcript
+  JSONL files contain conversation records even though Glancebar only extracts usage
+  counters. With both Claude toggles off, Glancebar reads local aggregate state only —
+  never Claude auth files or transcripts — and sends no network requests.
+
+  `--dump` is local-only by default. To allow account-backed Claude status in a dump,
+  pass `--online` or set `GLANCEBAR_ALLOW_ACCOUNT=1`.
+
+  Local development builds are ad-hoc signed by default. macOS Keychain "Always Allow"
+  grants are tied to the app's signing requirement; ad-hoc rebuilt binaries can prompt
+  again after each rebuild. Set `GLANCEBAR_CODESIGN_IDENTITY` to a stable local or
+  Developer ID signing identity before running `./build.sh` to make that prompt stick
+  across updates.
 
 The time estimator, battery-pressure grouping, process-stat grouping, and log parsing
 are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`,

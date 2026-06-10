@@ -624,7 +624,7 @@ static AIUsage *ReadClaudeUsage(void) {
     u.available = YES;
     u.remainingFraction = -1;
     u.resetText = @"Not exposed locally";
-    u.statusReason = @"Claude's local stats cache does not expose limit remaining or reset time";
+    u.statusReason = @"Claude account access is off";
 
     NSDate *now = NSDate.date;
     NSDate *todayStart = StartOfLocalDay(now);
@@ -704,7 +704,7 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
 // gate), the item is missing, access is denied, or the token has expired (Claude Code
 // refreshes it while it runs; never refresh it ourselves — that could rotate the
 // refresh token out from under Claude Code).
-static NSString *ClaudeAccessTokenFromKeychain(void) {
+static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
     NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
                             (__bridge id)kSecAttrService: @"Claude Code-credentials",
                             (__bridge id)kSecReturnData: @YES,
@@ -717,7 +717,7 @@ static NSString *ClaudeAccessTokenFromKeychain(void) {
     NSString *token = [oauth[@"accessToken"] isKindOfClass:NSString.class] ? oauth[@"accessToken"] : nil;
     double expiresAt = [oauth[@"expiresAt"] doubleValue] / 1000.0;   // ms epoch
     if (!token.length || (expiresAt > 0 && expiresAt <= NSDate.date.timeIntervalSince1970)) return nil;
-    return token;
+    return @{@"token": token, @"expiresAt": @(expiresAt)};
 }
 
 // One GET to Anthropic's OAuth usage endpoint — the same data Claude Code's /usage
@@ -726,17 +726,34 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
         [NSURL URLWithString:@"https://api.anthropic.com/api/oauth/usage"]];
     req.timeoutInterval = 10;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
     [req setValue:@"oauth-2025-04-20" forHTTPHeaderField:@"anthropic-beta"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+
+    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    cfg.URLCache = nil;
+    cfg.HTTPCookieStorage = nil;
+    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    cfg.HTTPShouldSetCookies = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block NSDictionary *json = nil;
-    [[NSURLSession.sharedSession dataTaskWithRequest:req
+    __block BOOL completed = NO;
+    [[session dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            if ([obj isKindOfClass:NSDictionary.class]) json = obj;
+            NSHTTPURLResponse *http = [resp isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)resp : nil;
+            if (!err && http.statusCode == 200 && data.length) {
+                id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if ([obj isKindOfClass:NSDictionary.class]) json = obj;
+            }
+            completed = YES;
+            [session finishTasksAndInvalidate];
             dispatch_semaphore_signal(done);
         }] resume];
     dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    if (!completed) [session invalidateAndCancel];
     return json;
 }
 
@@ -766,6 +783,8 @@ static NSDate *FileMTime(NSString *path) {
 // state a handful of stats per tick. Stateful and not reentrant: call from one serial
 // queue only (the --dump path makes its own throwaway instance).
 @interface AIReader : NSObject
+@property BOOL allowClaudeAccount;
+@property BOOL allowClaudeTranscripts;
 - (NSArray<AIUsage *> *)read;
 @end
 
@@ -784,6 +803,9 @@ static NSDate *FileMTime(NSString *path) {
     NSMutableSet<NSString *> *_claudeSeenIds;   // duplicate transcript lines share a message id
     NSDictionary *_claudeUsageJSON;             // last good OAuth usage response
     double _claudeNextFetch;                    // epoch; throttles the usage endpoint
+    NSString *_claudeAccessToken;               // memory-only; never persisted by Glancebar
+    double _claudeAccessTokenExpiresAt;
+    double _claudeKeychainNextTry;
 }
 
 - (instancetype)init {
@@ -801,16 +823,24 @@ static NSDate *FileMTime(NSString *path) {
 // and advances it; a partially-written trailing line is re-read next pass.
 - (NSData *)newLineDataAtPath:(NSString *)path key:(NSString *)key
                       offsets:(NSMutableDictionary<NSString *, NSNumber *> *)offsets {
+    static const NSUInteger kMaxLogReadBytes = 1024 * 1024;
     unsigned long long offset = [offsets[key] unsignedLongLongValue];
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return nil;
+    unsigned long long size = [fh seekToEndOfFile];
+    if (offset > size) offset = 0;   // file was truncated/recreated
     [fh seekToFileOffset:offset];
-    NSData *data = [fh readDataToEndOfFile];
+    NSData *data = [fh readDataOfLength:kMaxLogReadBytes];
     [fh closeFile];
+    if (!data.length) return nil;
     const char *bytes = data.bytes;
     NSUInteger consume = 0;
     for (NSUInteger i = data.length; i > 0; i--) {
         if (bytes[i - 1] == '\n') { consume = i; break; }
+    }
+    if (!consume && data.length >= kMaxLogReadBytes) {
+        offsets[key] = @(offset + data.length);   // drop a pathological overlong line
+        return nil;
     }
     if (!consume) return nil;
     offsets[key] = @(offset + consume);
@@ -930,30 +960,60 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     if (_claudeSeenIds.count > 100000) [_claudeSeenIds removeAllObjects];   // bounded; dupes are rare
 }
 
+- (NSString *)claudeAccessTokenForNow:(double)now {
+    if (_claudeAccessToken.length && (_claudeAccessTokenExpiresAt <= 0 || _claudeAccessTokenExpiresAt > now + 60))
+        return _claudeAccessToken;
+    if (now < _claudeKeychainNextTry) return nil;
+
+    NSDictionary *cred = ClaudeAccessTokenFromKeychain();
+    NSString *token = [cred[@"token"] isKindOfClass:NSString.class] ? cred[@"token"] : nil;
+    double expiresAt = [cred[@"expiresAt"] doubleValue];
+    if (!token.length) {
+        _claudeAccessToken = nil;
+        _claudeAccessTokenExpiresAt = 0;
+        _claudeKeychainNextTry = now + 3600;   // denied/missing/expired: don't keep prompting
+        return nil;
+    }
+
+    _claudeAccessToken = token;
+    _claudeAccessTokenExpiresAt = expiresAt;
+    _claudeKeychainNextTry = 0;
+    return _claudeAccessToken;
+}
+
 - (AIUsage *)claudeUsage {
     AIUsage *u = ReadClaudeUsage();   // stats-cache: sessions/messages/models (day-stale)
-    [self scanClaudeTranscripts];
-    if (!_claudeOffsets.count) return u;   // no transcripts — cache numbers stand
-    NSString *today = LocalDateString(NSDate.date);
-    u.todayTokens = [_claudeDays[today][@"f"] longLongValue];
-    u.todayTokensAll = [_claudeDays[today][@"t"] longLongValue];
-    long long week = 0, weekAll = 0;
-    for (NSDictionary *day in _claudeDays.allValues) {
-        week += [day[@"f"] longLongValue];
-        weekAll += [day[@"t"] longLongValue];
+    if (self.allowClaudeTranscripts) {
+        [self scanClaudeTranscripts];
+        if (_claudeOffsets.count) {
+            NSString *today = LocalDateString(NSDate.date);
+            u.todayTokens = [_claudeDays[today][@"f"] longLongValue];
+            u.todayTokensAll = [_claudeDays[today][@"t"] longLongValue];
+            long long week = 0, weekAll = 0;
+            for (NSDictionary *day in _claudeDays.allValues) {
+                week += [day[@"f"] longLongValue];
+                weekAll += [day[@"t"] longLongValue];
+            }
+            u.weekTokens = week;
+            u.weekTokensAll = weekAll;
+            u.available = YES;
+            u.stale = NO;   // token counts are live now; only the activity counts lag a day
+            u.statusText = @"Tokens live from local transcripts";
+            u.source = @"~/.claude transcripts + stats cache";
+        }
+    } else {
+        [_claudeOffsets removeAllObjects];
+        [_claudeDays removeAllObjects];
+        [_claudeSeenIds removeAllObjects];
+        if (u.statusText.length)
+            u.statusText = [u.statusText stringByAppendingString:@" · transcript totals off"];
     }
-    u.weekTokens = week;
-    u.weekTokensAll = weekAll;
-    u.available = YES;
-    u.stale = NO;   // token counts are live now; only the activity counts lag a day
-    u.statusText = @"Tokens live from local transcripts";
-    u.source = @"~/.claude transcripts + stats cache";
 
-    if ([NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]) {
+    if (self.allowClaudeAccount) {
         double now = NSDate.date.timeIntervalSince1970;
         if (now >= _claudeNextFetch) {
             _claudeNextFetch = now + 300;   // the endpoint rate-limits readily; 5 min cap
-            NSString *token = ClaudeAccessTokenFromKeychain();
+            NSString *token = [self claudeAccessTokenForNow:now];
             NSDictionary *json = token ? FetchClaudeUsageJSON(token) : nil;
             if (json && !json[@"error"]) _claudeUsageJSON = json;
         }
@@ -965,6 +1025,9 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
             u.statusReason = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
             u.statusSource = @"Anthropic usage API (opt-in)";
+        } else {
+            u.statusReason = _claudeUsageJSON ? @"Claude account response did not include a current limit window"
+                                              : @"Claude account status unavailable";
         }
         NSDictionary *extra = [_claudeUsageJSON[@"extra_usage"] isKindOfClass:NSDictionary.class]
             ? _claudeUsageJSON[@"extra_usage"] : nil;
@@ -974,6 +1037,10 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
                             [extra[@"used_credits"] doubleValue], extra[@"monthly_limit"],
                             currency, [extra[@"utilization"] doubleValue]];
         }
+    } else {
+        _claudeAccessToken = nil;
+        _claudeAccessTokenExpiresAt = 0;
+        _claudeUsageJSON = nil;
     }
     return u;
 }
@@ -1124,6 +1191,91 @@ static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColo
     return out;
 }
 
+static NSColor *BarIconTrackColor(NSColor *fg) {
+    return [fg colorWithAlphaComponent:0.25];
+}
+
+static NSImage *DriveMeterIcon(double fraction, NSColor *fg, NSColor *fill) {
+    CGFloat w = 17, h = 14;
+    fraction = MIN(1.0, MAX(0.0, fraction));
+    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
+    [img lockFocus];
+
+    NSRect body = NSMakeRect(1.5, 3.0, 14.0, 9.0);
+    NSBezierPath *outer = [NSBezierPath bezierPathWithRoundedRect:body xRadius:2.2 yRadius:2.2];
+    [BarIconTrackColor(fg) setFill];
+    [outer fill];
+
+    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body, 1.2, 1.2) xRadius:1.2 yRadius:1.2];
+    [NSGraphicsContext saveGraphicsState];
+    [clip addClip];
+    [(fill ?: fg) setFill];
+    NSRect fillRect = NSInsetRect(body, 1.2, 1.2);
+    fillRect.size.width *= fraction;
+    NSRectFill(fillRect);
+    [NSGraphicsContext restoreGraphicsState];
+
+    [fg setStroke];
+    outer.lineWidth = 1.2;
+    [outer stroke];
+    [[fg colorWithAlphaComponent:0.75] setStroke];
+    NSBezierPath *slot = [NSBezierPath bezierPath];
+    [slot moveToPoint:NSMakePoint(5.0, 5.0)];
+    [slot lineToPoint:NSMakePoint(12.0, 5.0)];
+    slot.lineWidth = 1.0;
+    [slot stroke];
+
+    [img unlockFocus];
+    img.template = NO;
+    return img;
+}
+
+static NSImage *BatteryMeterIcon(BatteryState b, NSColor *fg, NSColor *fill) {
+    CGFloat w = 24, h = 14;
+    double fraction = b.valid ? MIN(1.0, MAX(0.0, b.percent / 100.0)) : 0.0;
+    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
+    [img lockFocus];
+
+    NSRect body = NSMakeRect(1.5, 3.0, 18.0, 8.0);
+    NSBezierPath *outer = [NSBezierPath bezierPathWithRoundedRect:body xRadius:2.0 yRadius:2.0];
+    [BarIconTrackColor(fg) setFill];
+    [outer fill];
+
+    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body, 1.4, 1.4) xRadius:1.0 yRadius:1.0];
+    [NSGraphicsContext saveGraphicsState];
+    [clip addClip];
+    [(fill ?: fg) setFill];
+    NSRect fillRect = NSInsetRect(body, 1.4, 1.4);
+    fillRect.size.width *= fraction;
+    NSRectFill(fillRect);
+    [NSGraphicsContext restoreGraphicsState];
+
+    [fg setStroke];
+    outer.lineWidth = 1.2;
+    [outer stroke];
+    NSBezierPath *cap = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(20.2, 5.0, 2.3, 4.0)
+                                                        xRadius:0.8 yRadius:0.8];
+    [fg setFill];
+    [cap fill];
+
+    if (b.valid && b.acConnected) {
+        NSBezierPath *bolt = [NSBezierPath bezierPath];
+        [bolt moveToPoint:NSMakePoint(11.6, 10.2)];
+        [bolt lineToPoint:NSMakePoint(8.8, 6.5)];
+        [bolt lineToPoint:NSMakePoint(11.0, 6.5)];
+        [bolt lineToPoint:NSMakePoint(9.7, 3.8)];
+        [bolt lineToPoint:NSMakePoint(14.1, 8.0)];
+        [bolt lineToPoint:NSMakePoint(11.8, 8.0)];
+        [bolt closePath];
+        [[NSColor colorWithWhite:0 alpha:0.38] setFill];
+        [bolt fill];
+    }
+
+    [img unlockFocus];
+    img.template = NO;
+    return img;
+}
+
 // Builds the menu-bar image from selected metric segments.
 static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
     CGFloat pt = 13, gap = 4, pad = 2;
@@ -1138,7 +1290,8 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
         NSString *symbol = [seg[@"symbol"] isKindOfClass:NSString.class] ? seg[@"symbol"] : nil;
         NSNumber *var = [seg[@"var"] isKindOfClass:NSNumber.class] ? seg[@"var"] : nil;
         NSString *text = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : @"";
-        NSImage *sym = symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil;
+        NSImage *customImage = [seg[@"image"] isKindOfClass:NSImage.class] ? seg[@"image"] : nil;
+        NSImage *sym = customImage ?: (symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil);
         NSString *drawText = [NSString stringWithFormat:@" %@", text];
         NSSize textSize = [drawText sizeWithAttributes:@{NSFontAttributeName:font}];
         CGFloat segW = (sym ? sym.size.width : 0) + textSize.width;
@@ -1201,7 +1354,7 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     NSArray<AIUsage *> *_aiUsage;
     AIReader *_aiReader;            // touched only on _aiQueue
     dispatch_queue_t _aiQueue;
-    BOOL _aiLoading;
+    BOOL _aiLoading, _aiRefreshPending;
     NSString *_aiSignature;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
@@ -1217,7 +1370,8 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
-                           @"barShowSystem": @NO, @"barShowAI": @NO}];
+                           @"barShowSystem": @NO, @"barShowAI": @NO,
+                           @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO}];
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
@@ -1298,9 +1452,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 // main thread (refresh fires every 15s and on IOPS bursts). Single-flight: a tick
 // that arrives mid-read is skipped; the next one catches up.
 - (void)refreshAIUsageAsync {
-    if (_aiLoading) return;
+    if (_aiLoading) { _aiRefreshPending = YES; return; }
     _aiLoading = YES;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL showAI = _barShowAI || _popover.isShown || _detailsWindow.isVisible;
+    BOOL allowAccount = showAI && [ud boolForKey:@"useClaudeAccount"];
+    BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     dispatch_async(_aiQueue, ^{
+        self->_aiReader.allowClaudeAccount = allowAccount;
+        self->_aiReader.allowClaudeTranscripts = allowTranscripts;
         NSArray<AIUsage *> *usage = [self->_aiReader read];
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
@@ -1309,12 +1469,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
              u.remainingFraction, u.resetText, u.statusText];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_aiLoading = NO;
+            BOOL rerun = self->_aiRefreshPending;
+            self->_aiRefreshPending = NO;
             self->_aiUsage = usage;
-            if ([sig isEqualToString:self->_aiSignature]) return;   // nothing user-visible changed
-            self->_aiSignature = sig;
-            [self updateBar];
-            if (self->_popover.isShown) [self rebuildContent];
-            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+            if (![sig isEqualToString:self->_aiSignature]) {
+                self->_aiSignature = sig;
+                [self updateBar];
+                if (self->_popover.isShown) [self rebuildContent];
+                if (self->_detailsWindow.isVisible) [self rebuildDetails];
+            }
+            if (rerun) [self refreshAIUsageAsync];
         });
     });
 }
@@ -1358,18 +1522,18 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (_barShowDisk) {
         int pct = [self rootDiskPct];
         double frac = pct / 100.0;
-        [segments addObject:@{@"symbol": @"internaldrive",
+        NSColor *driveTextColor = frac >= 0.85 ? DiskColor(frac) : fg;
+        [segments addObject:@{@"image": DriveMeterIcon(frac, fg, fg),
                               @"text": [NSString stringWithFormat:@"%d%%", pct],
-                              @"color": frac >= 0.85 ? DiskColor(frac) : fg}];
+                              @"color": driveTextColor}];
     }
     if (_barShowBattery) {
         NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
         NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
         NSMutableDictionary *seg = [@{@"text": text, @"color": color} mutableCopy];
         if (_bat.valid) {   // no battery (desktop Mac): text-only, no misleading empty glyph
-            seg[@"symbol"] = _bat.acConnected ? @"battery.100percent.bolt"
-                           : _bat.percent <= 20 ? @"battery.25percent" : @"battery.100percent";
-            seg[@"var"] = @(_bat.percent / 100.0);
+            NSColor *fill = (_bat.percent <= 20 && !_bat.acConnected) ? BattBarColor(_bat.percent) : fg;
+            seg[@"image"] = BatteryMeterIcon(_bat, fg, fill);
         }
         [segments addObject:seg];
     }
@@ -1400,6 +1564,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self refresh];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    [self refreshAIUsageAsync];
     [self beginSampling];
 }
 
@@ -1609,12 +1774,17 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             big = [NSString stringWithFormat:@"%@ until 20%%", FmtDuration(MinutesTo20(_bat, [self avgAmp]))];
             sub = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
         }
-        NSView *hl = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 40)];
+        NSView *hl = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
+        CGFloat inner = kW - 2*kPad;
         [hl addSubview:[self text:big font:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold] color:nil
-                             at:NSMakeRect(kPad, 18, kW-2*kPad, 20) align:NSTextAlignmentLeft]];
+                             at:NSMakeRect(kPad, 28, inner, 20) align:NSTextAlignmentLeft]];
         [hl addSubview:[self text:sub font:[NSFont systemFontOfSize:11] color:NSColor.secondaryLabelColor
-                             at:NSMakeRect(kPad, 3, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
-        [root addSubview:hl]; y += 44;
+                             at:NSMakeRect(kPad, 13, inner, 14) align:NSTextAlignmentLeft]];
+        Gauge *chargeGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 4, inner, 5)];
+        chargeGauge.fraction = _bat.percent / 100.0;
+        chargeGauge.color = BattBarColor(_bat.percent);
+        [hl addSubview:chargeGauge];
+        [root addSubview:hl]; y += 54;
     }
 
     // battery pressure
@@ -1797,7 +1967,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     NSMenuItem *h = [m addItemWithTitle:@"Show battery health" action:@selector(toggleHealth:) keyEquivalent:@""];
     h.target = self; h.state = _showHealth ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
-    NSMenuItem *acct = [m addItemWithTitle:@"Claude account for limit status"
+    NSMenuItem *transcripts = [m addItemWithTitle:@"Claude transcript token totals"
+                                           action:@selector(toggleClaudeTranscripts:) keyEquivalent:@""];
+    transcripts.target = self;
+    transcripts.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeTranscripts"]
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *acct = [m addItemWithTitle:@"Claude account via Keychain/API"
                                     action:@selector(toggleClaudeAccount:) keyEquivalent:@""];
     acct.target = self;
     acct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]
@@ -1810,6 +1985,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (void)toggleClaudeAccount:(id)s {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud setBool:![ud boolForKey:@"useClaudeAccount"] forKey:@"useClaudeAccount"];
+    [self refresh];
+}
+- (void)toggleClaudeTranscripts:(id)s {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setBool:![ud boolForKey:@"useClaudeTranscripts"] forKey:@"useClaudeTranscripts"];
     [self refresh];
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
@@ -1826,6 +2006,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (void)saveBarOption:(NSString *)key value:(BOOL)value {
     [NSUserDefaults.standardUserDefaults setBool:value forKey:key];
     [self updateBar];
+    [self refreshAIUsageAsync];
     if (_popover.isShown) [self rebuildContent];
 }
 
@@ -1975,6 +2156,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (!_bat.valid) {
         [self addDetailStatus:@"Battery unavailable" to:root y:&y width:kDetailW];
     } else {
+        [root addSubview:[self compactSignalRow:@"Charge level"
+                                          right:[NSString stringWithFormat:@"%d%%", _bat.percent]
+                                       fraction:_bat.percent / 100.0
+                                          color:BattBarColor(_bat.percent)
+                                          width:kDetailW pad:kDetailPad at:y]];
+        y += 34;
         [self addDetailKey:@"Charge" value:[self batteryStatusText] to:root y:&y width:kDetailW];
         [self addDetailKey:@"Power" value:[self batteryPowerText] to:root y:&y width:kDetailW];
         if (!_bat.acConnected)
@@ -2023,6 +2210,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         if (u.statusSource)
             [self addDetailKey:@"Status source" value:u.statusSource to:root y:&y width:kDetailW];
     }
+
+    [self addDetailHeading:@"Privacy & Sources" to:root y:&y width:kDetailW];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [self addDetailKey:@"Claude account"
+                 value:[ud boolForKey:@"useClaudeAccount"] ? @"On · Keychain token + api.anthropic.com" : @"Off · no Keychain/API access"
+                    to:root y:&y width:kDetailW];
+    [self addDetailKey:@"Claude transcripts"
+                 value:[ud boolForKey:@"useClaudeTranscripts"] ? @"On · local ~/.claude/projects JSONL" : @"Off · transcripts not read"
+                    to:root y:&y width:kDetailW];
+    [self addDetailKey:@"Codex logs" value:@"On · local ~/.codex session JSONL"
+                    to:root y:&y width:kDetailW];
+    NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
+    NSString *statusState = [NSFileManager.defaultManager fileExistsAtPath:statusPath]
+        ? @"Present · overrides provider gauges" : @"Not found";
+    [self addDetailKey:@"Status file" value:statusState to:root y:&y width:kDetailW];
 
     [self addDetailHeading:@"Local History" to:root y:&y width:kDetailW];
     for (AIUsage *u in _aiUsage) {
@@ -2186,6 +2388,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [_detailsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     [_popover close];
+    [self refreshAIUsageAsync];
     [self beginSampling];
 }
 
@@ -2193,7 +2396,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 #pragma mark - main
 
-static void Dump(void) {
+static void Dump(BOOL allowOnline) {
     for (Volume *v in ScanVolumes())
         printf("disk  %-16s %3d%%  %s free\n",
                v.name.UTF8String, (int)lround(v.fraction*100), FmtBytes(v.available).UTF8String);
@@ -2242,7 +2445,11 @@ static void Dump(void) {
     }
 
     printf("ai status:\n");
-    for (AIUsage *u in [[AIReader new] read]) {
+    AIReader *reader = [AIReader new];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    reader.allowClaudeAccount = allowOnline && [ud boolForKey:@"useClaudeAccount"];
+    reader.allowClaudeTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
+    for (AIUsage *u in [reader read]) {
         NSString *remaining = u.limitStatusAvailable ? [NSString stringWithFormat:@"%d%% remaining",
                                                          (int)lround(u.remainingFraction * 100)]
                                                       : @"remaining unavailable";
@@ -2268,7 +2475,13 @@ static void Dump(void) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        if (argc > 1 && strcmp(argv[1], "--dump") == 0) { Dump(); return 0; }
+        if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
+            BOOL allowOnline = getenv("GLANCEBAR_ALLOW_ACCOUNT") != NULL;
+            for (int i = 2; i < argc; i++)
+                if (strcmp(argv[i], "--online") == 0) allowOnline = YES;
+            Dump(allowOnline);
+            return 0;
+        }
         NSApplication *app = NSApplication.sharedApplication;
         Controller *c = [Controller new];
         app.delegate = c;

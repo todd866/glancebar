@@ -11,7 +11,7 @@ clang -fobjc-arc -O2 -mmacosx-version-min=13.0 Sources/pure.m Sources/main.m \
     -framework Cocoa -framework IOKit -framework Security \
     -o "$APP/Contents/MacOS/Glancebar"
 cp Info.plist "$APP/Contents/Info.plist"
-codesign --force --sign - "$APP"
+codesign --force --sign "${GLANCEBAR_CODESIGN_IDENTITY:--}" "$APP"
 
 echo "Built $APP"
 echo "Run:     open $APP"
