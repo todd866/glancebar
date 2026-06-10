@@ -65,6 +65,12 @@ NSDictionary *ParseClaudeUsageLine(NSString *line);
 //   @"resetsAt": @(epoch) (optional), @"plan": plan string (optional)}.
 NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
 
+// Picks the most constrained, still-current window from Anthropic's OAuth usage
+// response (window dicts like five_hour/seven_day carrying utilization + resets_at).
+// Tolerates fraction or percent utilization and ISO-8601 or epoch resets_at. Returns
+// nil when nothing is current, else the same shape as PickLimitWindow.
+NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

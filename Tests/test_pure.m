@@ -121,6 +121,30 @@ int main(void) {
         check([pick3[@"window"] isEqual:@"weekly"], @"reset window excluded, current one kept");
         check(PickLimitWindow(nil, 1000) == nil, @"nil limits yield nil");
 
+        // --- PickClaudeLimitWindow ---
+        NSDictionary *cu = @{@"five_hour": @{@"utilization": @37, @"resets_at": @"1970-01-01T00:33:20Z"},
+                             @"seven_day": @{@"utilization": @81, @"resets_at": @5000}};
+        NSDictionary *cpick = PickClaudeLimitWindow(cu, 1000);
+        check(fabs([cpick[@"remainingFraction"] doubleValue] - 0.19) < 0.001, @"claude most constrained window wins");
+        check([cpick[@"window"] isEqual:@"weekly"], @"claude weekly labeled");
+        NSDictionary *cpick2 = PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @0.4, @"resets_at": @9000}}, 1000);
+        check(fabs([cpick2[@"remainingFraction"] doubleValue] - 0.6) < 0.001, @"fraction utilization tolerated");
+        check(PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @37, @"resets_at": @500}}, 1000) == nil,
+              @"claude obsolete window skipped");
+        check(PickClaudeLimitWindow(@{@"error": @{@"type": @"rate_limit_error"}}, 1000) == nil,
+              @"error response yields nil");
+        // Real response shape: percent utilization, microsecond ISO resets, null windows,
+        // and an extra_usage credit budget that must not win the picker.
+        NSDictionary *real = @{@"five_hour": @{@"utilization": @76.0, @"resets_at": @"2026-06-10T13:40:00.730662+00:00"},
+                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @"2026-06-16T13:00:00.730687+00:00"},
+                               @"seven_day_opus": NSNull.null,
+                               @"extra_usage": @{@"utilization": @91.22, @"monthly_limit": @10000}};
+        NSDictionary *rpick = PickClaudeLimitWindow(real, 1781000000.0);   // 2026-06-09
+        check(fabs([rpick[@"remainingFraction"] doubleValue] - 0.24) < 0.001,
+              @"extra_usage excluded; 5-hour window wins");
+        check([rpick[@"window"] isEqual:@"5-hour"], @"5-hour window labeled");
+        check([rpick[@"resetsAt"] doubleValue] > 1781000000.0, @"microsecond ISO reset parsed");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

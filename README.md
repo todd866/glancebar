@@ -96,8 +96,13 @@ battery pressure, system pressure, and AI status to the terminal.
   }
   ```
 
-  That file overrides either provider's gauge. Glancebar reads local state only — never
-  auth files — and sends no network requests.
+  That file overrides either provider's gauge. Alternatively, the options menu has an
+  **opt-in** "Claude account for limit status" toggle (off by default): it reads the
+  OAuth token Claude Code already maintains in your Keychain (macOS asks for permission
+  once) and polls Anthropic's usage endpoint — the same data Claude Code's `/usage`
+  shows — at most every 5 minutes. The token is never stored, refreshed, or sent
+  anywhere except `api.anthropic.com`. With the toggle off, Glancebar reads local state
+  only — never auth files — and sends no network requests.
 
 The time estimator, battery-pressure grouping, process-stat grouping, and rollout-log
 parsing are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`,

@@ -4,6 +4,7 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
+#import <Security/Security.h>
 #import <libproc.h>
 #import <mach/mach.h>
 #import <sys/mount.h>
@@ -409,6 +410,7 @@ static NSColor *CPUColor(double cpu) {
 
 @interface AIUsage : NSObject
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
+@property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
 @property BOOL available, stale, limitStatusAvailable;
 @property double remainingFraction;
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
@@ -695,6 +697,49 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
     return RunTaskOutput(@"/usr/bin/sqlite3", @[@"-readonly", @"-separator", @"\t", path, sql]);
 }
 
+// Opt-in only (the "Claude account for limit status" toggle): Claude Code keeps no
+// quota state on disk — its /usage panel fetches from the API — so the only true gauge
+// source is the same OAuth endpoint, authenticated with the token Claude Code already
+// maintains in the Keychain. Returns nil when the toggle is off conceptually (callers
+// gate), the item is missing, access is denied, or the token has expired (Claude Code
+// refreshes it while it runs; never refresh it ourselves — that could rotate the
+// refresh token out from under Claude Code).
+static NSString *ClaudeAccessTokenFromKeychain(void) {
+    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: @"Claude Code-credentials",
+                            (__bridge id)kSecReturnData: @YES,
+                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne};
+    CFTypeRef result = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)query, &result) != errSecSuccess || !result) return nil;
+    NSData *data = CFBridgingRelease(result);
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSDictionary *oauth = [json[@"claudeAiOauth"] isKindOfClass:NSDictionary.class] ? json[@"claudeAiOauth"] : nil;
+    NSString *token = [oauth[@"accessToken"] isKindOfClass:NSString.class] ? oauth[@"accessToken"] : nil;
+    double expiresAt = [oauth[@"expiresAt"] doubleValue] / 1000.0;   // ms epoch
+    if (!token.length || (expiresAt > 0 && expiresAt <= NSDate.date.timeIntervalSince1970)) return nil;
+    return token;
+}
+
+// One GET to Anthropic's OAuth usage endpoint — the same data Claude Code's /usage
+// shows. Synchronous by design: callers run on the AI queue, never the main thread.
+static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"https://api.anthropic.com/api/oauth/usage"]];
+    req.timeoutInterval = 10;
+    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"oauth-2025-04-20" forHTTPHeaderField:@"anthropic-beta"];
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSDictionary *json = nil;
+    [[NSURLSession.sharedSession dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            if ([obj isKindOfClass:NSDictionary.class]) json = obj;
+            dispatch_semaphore_signal(done);
+        }] resume];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    return json;
+}
+
 // Codex's sqlite schema versions its filename (state_5.sqlite today); pick the
 // highest-versioned one so a Codex update doesn't silently blank the panel.
 static NSString *CodexStatePath(void) {
@@ -737,6 +782,8 @@ static NSDate *FileMTime(NSString *path) {
     NSMutableDictionary<NSString *, NSNumber *> *_claudeOffsets;  // transcript rel path -> consumed bytes
     NSMutableDictionary<NSString *, NSDictionary *> *_claudeDays;
     NSMutableSet<NSString *> *_claudeSeenIds;   // duplicate transcript lines share a message id
+    NSDictionary *_claudeUsageJSON;             // last good OAuth usage response
+    double _claudeNextFetch;                    // epoch; throttles the usage endpoint
 }
 
 - (instancetype)init {
@@ -901,6 +948,33 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     u.stale = NO;   // token counts are live now; only the activity counts lag a day
     u.statusText = @"Tokens live from local transcripts";
     u.source = @"~/.claude transcripts + stats cache";
+
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]) {
+        double now = NSDate.date.timeIntervalSince1970;
+        if (now >= _claudeNextFetch) {
+            _claudeNextFetch = now + 300;   // the endpoint rate-limits readily; 5 min cap
+            NSString *token = ClaudeAccessTokenFromKeychain();
+            NSDictionary *json = token ? FetchClaudeUsageJSON(token) : nil;
+            if (json && !json[@"error"]) _claudeUsageJSON = json;
+        }
+        NSDictionary *pick = PickClaudeLimitWindow(_claudeUsageJSON, NSDate.date.timeIntervalSince1970);
+        if (pick) {
+            u.limitStatusAvailable = YES;
+            u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
+            NSNumber *resets = pick[@"resetsAt"];
+            if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+            u.statusReason = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
+            u.statusSource = @"Anthropic usage API (opt-in)";
+        }
+        NSDictionary *extra = [_claudeUsageJSON[@"extra_usage"] isKindOfClass:NSDictionary.class]
+            ? _claudeUsageJSON[@"extra_usage"] : nil;
+        if ([extra[@"is_enabled"] boolValue] && [extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) {
+            NSString *currency = [extra[@"currency"] isKindOfClass:NSString.class] ? extra[@"currency"] : @"";
+            u.extraUsage = [NSString stringWithFormat:@"%.0f of %@ %@ (%.0f%%)",
+                            [extra[@"used_credits"] doubleValue], extra[@"monthly_limit"],
+                            currency, [extra[@"utilization"] doubleValue]];
+        }
+    }
     return u;
 }
 
@@ -1722,7 +1796,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     w.target = self; w.state = _showWatts ? NSControlStateValueOn : NSControlStateValueOff;
     NSMenuItem *h = [m addItemWithTitle:@"Show battery health" action:@selector(toggleHealth:) keyEquivalent:@""];
     h.target = self; h.state = _showHealth ? NSControlStateValueOn : NSControlStateValueOff;
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenuItem *acct = [m addItemWithTitle:@"Claude account for limit status"
+                                    action:@selector(toggleClaudeAccount:) keyEquivalent:@""];
+    acct.target = self;
+    acct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]
+        ? NSControlStateValueOn : NSControlStateValueOff;
     [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
+}
+
+// Opt-in: reads the Claude Code OAuth token from the Keychain (macOS will ask once)
+// and polls Anthropic's usage endpoint for the real limit gauge. Off by default.
+- (void)toggleClaudeAccount:(id)s {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setBool:![ud boolForKey:@"useClaudeAccount"] forKey:@"useClaudeAccount"];
+    [self refresh];
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
@@ -1930,6 +2018,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
                                                                    : (u.statusReason ?: @"No limit status source")
                         to:root y:&y width:kDetailW];
+        if (u.extraUsage)
+            [self addDetailKey:@"Extra usage" value:u.extraUsage to:root y:&y width:kDetailW];
         if (u.statusSource)
             [self addDetailKey:@"Status source" value:u.statusSource to:root y:&y width:kDetailW];
     }

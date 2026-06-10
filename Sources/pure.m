@@ -138,7 +138,16 @@ static NSDate *DateFromISO8601(NSString *s) {
         fractional = [NSISO8601DateFormatter new];
         fractional.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
     });
-    return [fractional dateFromString:s] ?: [plain dateFromString:s];
+    NSDate *date = [fractional dateFromString:s] ?: [plain dateFromString:s];
+    if (date) return date;
+    // Anthropic's usage endpoint emits microsecond fractions ("...00.730662+00:00"),
+    // which NSISO8601DateFormatter rejects; strip the fraction and retry.
+    NSRange dot = [s rangeOfString:@"."];
+    if (dot.location == NSNotFound) return nil;
+    NSUInteger end = dot.location + 1;
+    while (end < s.length && isdigit([s characterAtIndex:end])) end++;
+    NSString *stripped = [[s substringToIndex:dot.location] stringByAppendingString:[s substringFromIndex:end]];
+    return [plain dateFromString:stripped];
 }
 
 NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
@@ -192,6 +201,37 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
                      : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
         if (resets > 0) d[@"resetsAt"] = @(resets);
         if ([rateLimits[@"plan_type"] isKindOfClass:NSString.class]) d[@"plan"] = rateLimits[@"plan_type"];
+        best = d;
+    }
+    return best;
+}
+
+NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch) {
+    if (![usage isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
+                             @"seven_day_opus": @"weekly Opus", @"seven_day_sonnet": @"weekly Sonnet"};
+    NSDictionary *best = nil;
+    double bestRemaining = 2;
+    for (NSString *key in usage) {
+        if ([key isEqualToString:@"extra_usage"]) continue;   // a credit budget, not a rate window
+        NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
+        id util = w[@"utilization"];
+        if (![util isKindOfClass:NSNumber.class]) continue;
+        double used = [util doubleValue];
+        if (used > 1.0) used /= 100.0;          // tolerate percent or fraction
+        double resets = 0;
+        id resetsAt = w[@"resets_at"];
+        if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
+        else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
+        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
+        double remaining = 1.0 - used;
+        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+        if (remaining >= bestRemaining) continue;
+        bestRemaining = remaining;
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"remainingFraction"] = @(remaining);
+        d[@"window"] = labels[key] ?: key;
+        if (resets > 0) d[@"resetsAt"] = @(resets);
         best = d;
     }
     return best;

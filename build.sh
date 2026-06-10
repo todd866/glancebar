@@ -8,7 +8,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
 clang -fobjc-arc -O2 -mmacosx-version-min=13.0 Sources/pure.m Sources/main.m \
-    -framework Cocoa -framework IOKit \
+    -framework Cocoa -framework IOKit -framework Security \
     -o "$APP/Contents/MacOS/Glancebar"
 cp Info.plist "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP"
