@@ -12,33 +12,32 @@
 
 ## Overview
 
-Glancebar shows selected glance metrics in one compact menu bar item (`💾 61%  🔋 76%` by
-default). Click it for one native popover with **Storage**, **Battery**, **System**, and
-**AI Status** summaries: volume gauges, time until 20%, leading battery/system signals,
-and Claude/Codex limit status. A
-**Details…** window keeps fuller battery, system, and AI lists behind tabs without
-crowding the popover. One item, one slot, **no dependencies, no daemons or helpers —
-everything runs inside the one app you can quit — and no admin rights**.
+Glancebar puts the numbers that ruin your day in one compact menu bar item
+(`💾 61%  🔋 76%` by default). Click it for a single native popover with **Storage**,
+**Battery**, **System**, and **AI Status** summaries: volume gauges, time until 20%,
+the leading battery/system culprits in plain English, and Claude/Codex limit gauges.
+A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
-It merges two earlier single-purpose apps — [Diskbar](https://github.com/todd866/diskbar)
-and Voltbar (battery) — into one, so they stop competing for space next to the notch.
+One item, one slot, **no dependencies, no daemons or helpers — everything runs inside
+the one app you can quit — and no admin rights**.
 
-## Key Results
+## Features
 
-- **Configurable glance** — choose which menu-bar segments appear: storage, battery,
-  system, and/or AI status.
 - **Storage** — every volume (internal + external/NTFS) with Finder-accurate free space
   (purgeable counts as free); gauges turn orange past 85%, red past 95%.
-- **Battery** — "3:14 until 20%" (not a bare percentage), plus battery pressure grouped by
+- **Battery** — "3:14 until 20%" (not a bare percentage), battery pressure grouped by
   app/process with raw process names and plain-English context, live draw in watts, and
   battery health / cycle count.
-- **System** — overall CPU, memory pressure, swap usage, and top CPU/memory apps grouped
-  with the same raw-process-plus-context treatment; the popover shows the lead signals
-  while Details keeps the longer lists.
-- **AI status** — Codex's official remaining-quota percentage and reset time, read from
-  its own session logs; exact per-day token totals; Claude's gauge fills in via an
-  optional local status file. Usage history stays in Details.
-- **Self-contained** — one binary, native popover UI, no runtime, no installer, no `sudo`.
+- **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
+  swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
+  popover shows the lead signals, Details keeps the longer lists.
+- **AI status** — Codex's official remaining-quota percentage and reset time from its
+  own session logs; an opt-in gauge for your Claude account; live per-day token totals
+  for both, counted the way a human would (cached context re-reads shown separately).
+- **Configurable glance** — choose which menu-bar segments appear: storage, battery,
+  system, and/or AI status.
+- **Self-contained** — one binary, native AppKit, no runtime, no installer, no `sudo`,
+  no network requests unless you opt in.
 
 ## Build & Install
 
@@ -67,28 +66,33 @@ battery pressure, system pressure, and AI status to the terminal.
 - **Battery pressure** — `top -l 2 -stats pid,command,power`, reading the second sample,
   grouped under the **outermost `.app` bundle in each executable path** where possible so
   helpers roll up under their parent app. Rows show the share of sampled app/process
-  pressure, while preserving raw process names such as `syspolicyd`.
-- **System pressure** — CPU is calculated from Mach processor tick deltas; memory uses
-  Mach VM statistics plus `hw.memsize`; swap uses `vm.swapusage`. Top CPU and top memory
-  apps come from `ps -axo pid=,pcpu=,rss=,comm=` and are grouped under parent apps where
-  possible. If CPU and memory cannot be sampled, Glancebar reports the system state as
-  unknown rather than treating missing data as low pressure.
+  pressure, while preserving raw process names such as `syspolicyd`. Process sampling
+  runs only while the popover or Details window is open.
+- **System pressure** — CPU from Mach processor tick deltas; memory pressure from
+  `kern.memorystatus_vm_pressure_level` (the kernel's own verdict); swap from
+  `vm.swapusage`. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
+  and measured by physical footprint (what Activity Monitor shows), grouped under parent
+  apps where possible.
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
   turn in `~/.codex/sessions/**.jsonl` records OpenAI's official rate-limit state
   (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
   the most constrained window that is still current. The same per-turn records carry
-  exact token deltas, which is how today/7-day totals are computed (the sqlite thread
-  store only keeps lifetime counters per thread, which can't be windowed honestly).
-  Headline counts are **fresh tokens** (non-cached input + output); the raw total is
-  ~16× larger because cached context is re-read every turn, and is shown alongside.
-  Rollout files are append-only and read incrementally by byte offset on a background
-  queue, so the steady-state cost is a handful of `stat` calls. Claude's token counts
+  exact token deltas, which is how today/7-day totals are computed. Headline counts are
+  **fresh tokens** (non-cached input + output); the raw total is ~16× larger because
+  cached context is re-read every turn, and is shown alongside. Claude's token counts
   come the same way — live from the per-message usage records in
-  `~/.claude/projects/**.jsonl` transcripts, with the same fresh/cached split (the
-  stats cache still supplies session/message counts). Claude's *quota* gauge is a
-  different story: Claude Code fetches limit status from the API at display time and
-  never persists it locally, so the gauge stays empty unless you provide
-  `~/.glancebar/ai-status.json`:
+  `~/.claude/projects/**.jsonl` transcripts. All log files are append-only and read
+  incrementally by byte offset on a background queue, so the steady-state cost is a
+  handful of `stat` calls.
+
+  Claude's *quota* gauge has no on-disk source (Claude Code fetches it from the API at
+  display time), so it fills in one of two ways. The options menu has an **opt-in**
+  "Claude account for limit status" toggle (off by default): it reads the OAuth token
+  Claude Code already maintains in your Keychain (macOS asks for permission once) and
+  polls Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at
+  most every 5 minutes. The token is never stored, refreshed, or sent anywhere except
+  `api.anthropic.com`. Or provide `~/.glancebar/ai-status.json`, which overrides either
+  provider's gauge:
 
   ```json
   {
@@ -96,24 +100,19 @@ battery pressure, system pressure, and AI status to the terminal.
   }
   ```
 
-  That file overrides either provider's gauge. Alternatively, the options menu has an
-  **opt-in** "Claude account for limit status" toggle (off by default): it reads the
-  OAuth token Claude Code already maintains in your Keychain (macOS asks for permission
-  once) and polls Anthropic's usage endpoint — the same data Claude Code's `/usage`
-  shows — at most every 5 minutes. The token is never stored, refreshed, or sent
-  anywhere except `api.anthropic.com`. With the toggle off, Glancebar reads local state
-  only — never auth files — and sends no network requests.
+  With the toggle off, Glancebar reads local state only — never auth files — and sends
+  no network requests.
 
-The time estimator, battery-pressure grouping, process-stat grouping, and rollout-log
-parsing are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`,
-`ps`, and local AI state plumbing live in the app shell.
+The time estimator, battery-pressure grouping, process-stat grouping, and log parsing
+are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`,
+and local AI state plumbing live in the app shell.
 
 ## Repository
 
 ```
 glancebar/
-├── Sources/pure.{h,m}   # pure, testable logic: time-to-20% + process grouping
-├── Sources/main.m       # app shell: disk + battery readers, top sampling, popover UI
+├── Sources/pure.{h,m}   # pure, testable logic: estimators, grouping, log parsing
+├── Sources/main.m       # app shell: readers, sampling, popover + details UI
 ├── Tests/test_pure.m    # unit tests for the pure functions
 ├── tools/mockup.m       # renders docs/screenshot.png
 ├── build.sh  ·  tests.sh  ·  Info.plist
@@ -125,16 +124,11 @@ glancebar/
 macOS adds new menu bar items at the left end of the status area, so on a notched MacBook
 a fresh icon can land under the notch and look invisible. Free up space (System Settings →
 Control Center → set icons you don't need to "Don't Show in Menu Bar") and it appears.
-Glancebar being a single item — rather than two — makes this far less likely.
-
-## Related
-
-- **[Diskbar](https://github.com/todd866/diskbar)** — the disk-only predecessor, merged
-  into Glancebar. (A battery-only predecessor, Voltbar, was also merged in.)
+Glancebar being a single item makes this far less likely.
 
 ## Credits
 
-Designed and built by **Claude Fable 5** (Anthropic), working from Ian Todd's brief and
+Built by Claude (Anthropic) and Codex (OpenAI), working from Ian Todd's brief and
 direction — design, implementation, tests, the rendered screenshot, and this README.
 
 ## License
