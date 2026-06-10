@@ -143,7 +143,9 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
     NSTask *t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:path];
     t.arguments = args;
-    NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe; t.standardError = [NSPipe pipe];
+    t.environment = @{@"LC_ALL": @"C"};   // ps/top honor LC_NUMERIC; force '.' decimals
+    NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
+    t.standardError = NSFileHandle.fileHandleWithNullDevice;
     if (![t launchAndReturnError:nil]) return nil;
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
     [t waitUntilExit];
