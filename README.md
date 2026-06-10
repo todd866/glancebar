@@ -17,8 +17,8 @@ default). Click it for one native popover with **Storage**, **Battery**, **Syste
 **AI Status** summaries: volume gauges, time until 20%, leading battery/system signals,
 and Claude/Codex limit status. A
 **Details…** window keeps fuller battery, system, and AI lists behind tabs without
-crowding the popover. One item, one slot, **no dependencies, no background services, and
-no admin rights**.
+crowding the popover. One item, one slot, **no dependencies, no daemons or helpers —
+everything runs inside the one app you can quit — and no admin rights**.
 
 It merges two earlier single-purpose apps — [Diskbar](https://github.com/todd866/diskbar)
 and Voltbar (battery) — into one, so they stop competing for space next to the notch.
@@ -35,8 +35,9 @@ and Voltbar (battery) — into one, so they stop competing for space next to the
 - **System** — overall CPU, memory pressure, swap usage, and top CPU/memory apps grouped
   with the same raw-process-plus-context treatment; the popover shows the lead signals
   while Details keeps the longer lists.
-- **AI status** — Claude/Codex remaining percentage and reset time when a local status
-  source provides them; historical local usage stays in Details.
+- **AI status** — Codex's official remaining-quota percentage and reset time, read from
+  its own session logs; exact per-day token totals; Claude's gauge fills in via an
+  optional local status file. Usage history stays in Details.
 - **Self-contained** — one binary, native popover UI, no runtime, no installer, no `sudo`.
 
 ## Build & Install
@@ -72,25 +73,29 @@ battery pressure, system pressure, and AI status to the terminal.
   apps come from `ps -axo pid=,pcpu=,rss=,comm=` and are grouped under parent apps where
   possible. If CPU and memory cannot be sampled, Glancebar reports the system state as
   unknown rather than treating missing data as low pressure.
-- **AI status** — Glancebar can read exact remaining/reset status from
-  `~/.glancebar/ai-status.json`, for example:
+- **AI status** — Codex's limit gauge comes straight from its own session logs: each
+  turn in `~/.codex/sessions/**.jsonl` records OpenAI's official rate-limit state
+  (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
+  the most constrained window that is still current. The same per-turn records carry
+  exact token deltas, which is how today/7-day totals are computed (the sqlite thread
+  store only keeps lifetime counters per thread, which can't be windowed honestly).
+  Rollout files are append-only and read incrementally by byte offset on a background
+  queue, so the steady-state cost is a handful of `stat` calls. Claude's local stats
+  cache (`~/.claude/stats-cache.json`) has usage history but no quota data, so its gauge
+  stays empty unless you provide `~/.glancebar/ai-status.json`:
 
   ```json
   {
-    "Claude": { "remainingPercent": 42, "resetAt": "2026-06-10T19:00:00+10:00" },
-    "Codex": { "remainingPercent": 67, "resetText": "Reset 8:15 PM" }
+    "Claude": { "remainingPercent": 42, "resetAt": "2026-06-10T19:00:00+10:00" }
   }
   ```
 
-  Without that file, limit status is shown as unavailable because the local Claude and
-  Codex history caches do not expose quota remaining or reset time. Historical Claude
-  usage is still read from `~/.claude/stats-cache.json`, and historical Codex usage from
-  aggregate fields in `~/.codex/state_5.sqlite`, for the Details tab only. Glancebar does
-  not read auth files or send network requests.
+  That file overrides either provider's gauge. Glancebar reads local state only — never
+  auth files — and sends no network requests.
 
-The time estimator, battery-pressure grouping, and process-stat grouping are pure functions
-with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`, and local AI state
-plumbing live in the app shell.
+The time estimator, battery-pressure grouping, process-stat grouping, and rollout-log
+parsing are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`,
+`ps`, and local AI state plumbing live in the app shell.
 
 ## Repository
 

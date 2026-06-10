@@ -139,8 +139,10 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
                           NSMakeRect(kPad, 7, inner, 14), NSTextAlignmentLeft)];
         [card addSubview:row]; y += 44;
     };
-    ai(@"Claude", @"42%", @"Reset 7:00 PM", 0.42, NSColor.systemYellowColor);
-    ai(@"Codex", @"—", @"No limit status", 0.0, NSColor.tertiaryLabelColor);
+    // Codex's gauge is read from its own session logs; Claude has no local quota
+    // source, so its gauge is empty unless ~/.glancebar/ai-status.json provides one.
+    ai(@"Claude", @"—", @"No limit status", 0.0, NSColor.tertiaryLabelColor);
+    ai(@"Codex", @"27%", @"Reset: 10:08 PM", 0.27, NSColor.systemOrangeColor);
 
     y += 4;
     NSBox *d4=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d4.boxType=NSBoxSeparator; [card addSubview:d4]; y+=9;
@@ -173,7 +175,7 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
                        NSMakeRect(154,4,38,16), NSTextAlignmentLeft)];
     NSImageView *aii=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil]];
     aii.contentTintColor=NSColor.whiteColor; aii.frame=NSMakeRect(192,5,16,14); [pill addSubview:aii];
-    [pill addSubview:L(@"AI 42%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
+    [pill addSubview:L(@"AI 27%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
                        NSMakeRect(210,4,52,16), NSTextAlignmentLeft)];
 
     CGFloat margin=34, gap=10, W=kW+2*margin, H=pillH+gap+cardH+2*margin;
