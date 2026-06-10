@@ -37,6 +37,7 @@ static const CGFloat kW = 320, kPad = 16;
 @end
 
 static NSColor *Disk(double f){ return f>=0.95?NSColor.systemRedColor:f>=0.85?NSColor.systemOrangeColor:NSColor.controlAccentColor; }
+static NSColor *Pressure(double f){ return f>=0.35?NSColor.systemOrangeColor:f>=0.15?[NSColor.systemYellowColor colorWithAlphaComponent:0.9]:[NSColor.systemGreenColor colorWithAlphaComponent:0.85]; }
 static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlignment a){
     NSTextField *t=[NSTextField labelWithString:s]; t.font=f; if(c)t.textColor=c; t.alignment=a; t.frame=fr;
     t.lineBreakMode=NSLineBreakByTruncatingTail; return t;
@@ -86,18 +87,27 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     [card addSubview:L(@"76% remaining", [NSFont systemFontOfSize:11], NSColor.secondaryLabelColor,
                        NSMakeRect(kPad, y+19, inner, 14), NSTextAlignmentLeft)];
     y += 44;
-    [card addSubview:L(@"Energy use by app", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
+    [card addSubview:L(@"Battery pressure", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
                        NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 20;
-    NSArray *hogs = @[@[@"Google Chrome",@42.0], @[@"Slack",@28.0], @[@"Final Cut Pro",@19.0]];
-    double mx = 42;
-    for (NSArray *h in hogs) {
-        double v = [h[1] doubleValue];
-        [card addSubview:L(h[0], [NSFont systemFontOfSize:12], nil, NSMakeRect(kPad, y+7, inner-50, 15), NSTextAlignmentLeft)];
-        [card addSubview:L([NSString stringWithFormat:@"%.0f",v], [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular],
-                           NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-44, y+7, 44, 15), NSTextAlignmentRight)];
-        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, y+3, inner, 3.5)]; g.fraction=v/mx;
-        g.color=[NSColor.systemYellowColor colorWithAlphaComponent:0.9]; [card addSubview:g];
-        y += 24;
+    NSArray *pressure = @[
+        @[@"Google Chrome", @"Chrome Helper processes", @0.48, @"High"],
+        @[@"System Policy", @"syspolicyd · app security checks", @0.18, @"Medium"],
+        @[@"Display Server", @"WindowServer · macOS display compositor", @0.12, @"Low"]
+    ];
+    for (NSArray *h in pressure) {
+        double share = [h[2] doubleValue];
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 42)];
+        [row addSubview:L(h[0], [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
+                          NSMakeRect(kPad, 24, inner-84, 15), NSTextAlignmentLeft)];
+        [row addSubview:L([NSString stringWithFormat:@"%@  %.0f%%", h[3], share*100],
+                          [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
+                          NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 24, 82, 15), NSTextAlignmentRight)];
+        [row addSubview:L(h[1], [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
+                          NSMakeRect(kPad, 9, inner, 13), NSTextAlignmentLeft)];
+        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 3.5)]; g.fraction=share;
+        g.color=Pressure(share); [row addSubview:g];
+        [card addSubview:row];
+        y += 42;
     }
     y += 4;
     [card addSubview:L(@"Drawing 12.4 W", [NSFont systemFontOfSize:12], nil, NSMakeRect(kPad, y, inner, 16), NSTextAlignmentLeft)]; y+=19;

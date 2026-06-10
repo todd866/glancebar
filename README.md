@@ -14,8 +14,8 @@
 
 Glancebar shows your disk usage and battery charge in a single compact menu bar item
 (`💾 61%  🔋 76%`). Click it for one native popover with two sections: **Storage**
-(every mounted volume with a usage gauge) and **Battery** (time until 20%, the top
-energy-using apps, current draw, and health). One item, one slot, **no dependencies, no
+(every mounted volume with a usage gauge) and **Battery** (time until 20%, battery
+pressure by app/process, current draw, and health). One item, one slot, **no dependencies, no
 background services, and no admin rights**.
 
 It merges two earlier single-purpose apps — [Diskbar](https://github.com/todd866/diskbar)
@@ -26,8 +26,9 @@ and Voltbar (battery) — into one, so they stop competing for space next to the
 - **Both at a glance** — disk % and battery % share one tidy menu bar item.
 - **Storage** — every volume (internal + external/NTFS) with Finder-accurate free space
   (purgeable counts as free); gauges turn orange past 85%, red past 95%.
-- **Battery** — "3:14 until 20%" (not a bare percentage), plus energy hogs grouped by app
-  the way Activity Monitor does, live draw in watts, and battery health / cycle count.
+- **Battery** — "3:14 until 20%" (not a bare percentage), plus battery pressure grouped by
+  app/process with raw process names and plain-English context, live draw in watts, and
+  battery health / cycle count.
 - **Self-contained** — one binary, native popover UI, no runtime, no installer, no `sudo`.
 
 ## Build & Install
@@ -43,7 +44,7 @@ Start at login: **System Settings → General → Login Items → +** and add Gl
 Requires the Xcode Command Line Tools (`xcode-select --install`).
 
 Headless readout: `Glancebar.app/Contents/MacOS/Glancebar --dump` prints disk, battery,
-and energy hogs to the terminal.
+and battery pressure to the terminal.
 
 ## How It Works
 
@@ -54,18 +55,19 @@ and energy hogs to the terminal.
   instantly on plug/unplug via an `IOPSNotification`, otherwise every 15s.
 - **Time until 20%** — macOS's smoothed minutes-to-empty scaled by `(charge − 20)/charge`,
   with an amperage-based fallback.
-- **Energy hogs** — `top -l 2 -stats pid,command,power`, reading the second sample, with
-  each process grouped under the **outermost `.app` bundle in its executable path** so
-  helpers roll up under their parent app.
+- **Battery pressure** — `top -l 2 -stats pid,command,power`, reading the second sample,
+  grouped under the **outermost `.app` bundle in each executable path** where possible so
+  helpers roll up under their parent app. Rows show the share of sampled app/process
+  pressure, while preserving raw process names such as `syspolicyd`.
 
-The time estimator and energy-grouping are pure functions with unit tests (`./tests.sh`);
+The time estimator and battery-pressure grouping are pure functions with unit tests (`./tests.sh`);
 the IORegistry, disk, and `top` plumbing live in the app shell.
 
 ## Repository
 
 ```
 glancebar/
-├── Sources/pure.{h,m}   # pure, testable logic: time-to-20% + energy grouping
+├── Sources/pure.{h,m}   # pure, testable logic: time-to-20% + battery-pressure grouping
 ├── Sources/main.m       # app shell: disk + battery readers, top sampling, popover UI
 ├── Tests/test_pure.m    # unit tests for the pure functions
 ├── tools/mockup.m       # renders docs/screenshot.png

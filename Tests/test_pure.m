@@ -31,7 +31,10 @@ int main(void) {
         check(hogs.count == 3, @"3 groups after rollup");
         check([hogs[0][@"name"] isEqual:@"Google Chrome"], @"Chrome top after rollup (20+15=35)");
         check([hogs[0][@"impact"] doubleValue] == 35.0, @"Chrome helpers summed to 35");
+        check(fabs([hogs[0][@"totalImpact"] doubleValue] - 65.7) < 0.001, @"total impact preserves full sample");
+        check([hogs[0][@"commands"] containsObject:@"Chrome Helper"], @"Chrome row preserves raw helper command");
         check([hogs[1][@"name"] isEqual:@"WindowServer"], @"WindowServer second (26.7)");
+        check([hogs[1][@"commands"] containsObject:@"WindowServer"], @"WindowServer row preserves raw command");
         check([hogs[2][@"name"] isEqual:@"iTerm2"], @"iTerm2 third (4.0)");
         double ws = 0; for (NSDictionary *h in hogs) if ([h[@"name"] isEqual:@"WindowServer"]) ws = [h[@"impact"] doubleValue];
         check(ws == 26.7, @"WindowServer = 26.7 (second frame only)");

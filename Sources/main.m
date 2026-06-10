@@ -149,6 +149,72 @@ static NSArray<NSDictionary *> *SampleHogs(int topN) {
     return ParseHogs(out ?: @"", topN, ^NSString *(pid_t pid){ return AppGroupForPid(pid); });
 }
 
+static NSArray<NSString *> *CommandsForHog(NSDictionary *h) {
+    id commands = h[@"commands"];
+    return [commands isKindOfClass:NSArray.class] ? commands : @[];
+}
+
+static NSString *CommandSummary(NSArray<NSString *> *commands) {
+    if (!commands.count) return @"process";
+    if (commands.count == 1) return [NSString stringWithFormat:@"%@ process", commands.firstObject];
+    if (commands.count == 2) return [NSString stringWithFormat:@"%@ + %@", commands[0], commands[1]];
+    return [NSString stringWithFormat:@"%@ + %@ + %lu more",
+            commands[0], commands[1], (unsigned long)commands.count - 2];
+}
+
+static NSDictionary *KnownProcessInfo(NSString *name) {
+    static NSDictionary *known;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        known = @{
+            @"WindowServer": @{@"title": @"Display Server", @"detail": @"WindowServer · macOS display compositor"},
+            @"syspolicyd": @{@"title": @"System Policy", @"detail": @"syspolicyd · app security checks"},
+            @"trustd": @{@"title": @"Certificate Trust", @"detail": @"trustd · certificate checks"},
+            @"securityd": @{@"title": @"Security Service", @"detail": @"securityd · keychain and authorization"},
+            @"kernel_task": @{@"title": @"Kernel", @"detail": @"kernel_task · macOS core system work"},
+            @"launchservicesd": @{@"title": @"Launch Services", @"detail": @"launchservicesd · app launch database"},
+            @"cfprefsd": @{@"title": @"Preferences Service", @"detail": @"cfprefsd · app settings cache"},
+            @"distnoted": @{@"title": @"Notifications", @"detail": @"distnoted · system notification routing"},
+            @"logd": @{@"title": @"Logging", @"detail": @"logd · system log service"},
+            @"runningboardd": @{@"title": @"App Lifecycle", @"detail": @"runningboardd · app state management"},
+            @"sysmond": @{@"title": @"System Monitor", @"detail": @"sysmond · system activity tracking"},
+            @"mds": @{@"title": @"Spotlight", @"detail": @"mds · search indexing"},
+            @"mds_stores": @{@"title": @"Spotlight", @"detail": @"mds_stores · search index database"},
+            @"mdworker_shared": @{@"title": @"Spotlight Worker", @"detail": @"mdworker_shared · file indexing"},
+            @"backupd": @{@"title": @"Time Machine", @"detail": @"backupd · backup service"},
+            @"cloudd": @{@"title": @"iCloud", @"detail": @"cloudd · iCloud sync"},
+            @"nsurlsessiond": @{@"title": @"Background Transfers", @"detail": @"nsurlsessiond · downloads and uploads"},
+            @"locationd": @{@"title": @"Location Services", @"detail": @"locationd · location access"},
+            @"bluetoothd": @{@"title": @"Bluetooth", @"detail": @"bluetoothd · Bluetooth service"},
+            @"airportd": @{@"title": @"Wi-Fi", @"detail": @"airportd · wireless networking"},
+            @"mediaanalysisd": @{@"title": @"Media Analysis", @"detail": @"mediaanalysisd · photo and media analysis"}
+        };
+    });
+    return known[name];
+}
+
+static NSDictionary *BatteryPressureInfo(NSDictionary *h) {
+    NSString *name = [h[@"name"] isKindOfClass:NSString.class] ? h[@"name"] : @"Process";
+    NSDictionary *known = KnownProcessInfo(name);
+    if (known) return known;
+
+    NSArray<NSString *> *commands = CommandsForHog(h);
+    NSString *detail = CommandSummary(commands);
+    if (commands.count == 1 && [commands.firstObject isEqualToString:name])
+        detail = [name hasSuffix:@"d"] ? @"background service" : @"process";
+    return @{@"title": name, @"detail": detail};
+}
+
+static NSString *PressureLevel(double share) {
+    return share >= 0.35 ? @"High" : share >= 0.15 ? @"Medium" : @"Low";
+}
+
+static NSColor *PressureColor(double share) {
+    if (share >= 0.35) return NSColor.systemOrangeColor;
+    if (share >= 0.15) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
+    return [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+}
+
 #pragma mark - colors / small views
 
 static NSColor *DiskColor(double frac) {
@@ -409,8 +475,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [root addSubview:hl]; y += 44;
     }
 
-    // energy hogs
-    [root addSubview:[self text:@"Energy use by app" font:[NSFont systemFontOfSize:11]
+    // battery pressure
+    [root addSubview:[self text:@"Battery pressure" font:[NSFont systemFontOfSize:11]
                           color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
     y += 20;
     if (_hogs.count == 0) {
@@ -418,20 +484,27 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [root addSubview:[self text:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
                                at:NSMakeRect(kPad, y, kW-2*kPad, 16) align:NSTextAlignmentLeft]]; y += 22;
     } else {
-        double mx = [_hogs.firstObject[@"impact"] doubleValue];
+        double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
+        if (total <= 0) for (NSDictionary *h in _hogs) total += [h[@"impact"] doubleValue];
         for (NSDictionary *h in _hogs) {
-            NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 24)];
+            double impact = [h[@"impact"] doubleValue];
+            double share = total > 0 ? impact / total : 0;
+            NSDictionary *info = BatteryPressureInfo(h);
+            NSString *right = [NSString stringWithFormat:@"%@  %d%%", PressureLevel(share), (int)lround(share * 100)];
+            NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 42)];
             CGFloat inner = kW - 2*kPad;
-            [row addSubview:[self text:h[@"name"] font:[NSFont systemFontOfSize:12] color:nil
-                                  at:NSMakeRect(kPad, 7, inner-50, 15) align:NSTextAlignmentLeft]];
-            [row addSubview:[self text:[NSString stringWithFormat:@"%.0f", [h[@"impact"] doubleValue]]
-                                  font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
-                                 color:NSColor.secondaryLabelColor at:NSMakeRect(kW-kPad-44, 7, 44, 15) align:NSTextAlignmentRight]];
+            [row addSubview:[self text:info[@"title"] font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
+                                  at:NSMakeRect(kPad, 24, inner-84, 15) align:NSTextAlignmentLeft]];
+            [row addSubview:[self text:right
+                                  font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
+                                 color:NSColor.secondaryLabelColor at:NSMakeRect(kW-kPad-82, 24, 82, 15) align:NSTextAlignmentRight]];
+            [row addSubview:[self text:info[@"detail"] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                                  at:NSMakeRect(kPad, 9, inner, 13) align:NSTextAlignmentLeft]];
             Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 3.5)];
-            g.fraction = mx > 0 ? [h[@"impact"] doubleValue]/mx : 0;
-            g.color = [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
+            g.fraction = share;
+            g.color = PressureColor(share);
             [row addSubview:g];
-            [root addSubview:row]; y += 24;
+            [root addSubview:row]; y += 42;
         }
     }
 
@@ -497,10 +570,17 @@ static void Dump(void) {
         if (b.designCap_mAh > 0)
             printf("      health %d%% · %ld cycles\n", (int)lround(100.0*b.rawMax_mAh/b.designCap_mAh), b.cycleCount);
     }
-    printf("energy hogs:\n");
+    printf("battery pressure:\n");
     NSArray *hogs = SampleHogs(5);
     if (!hogs.count) printf("  unavailable\n");
-    for (NSDictionary *h in hogs) printf("  %6.0f  %s\n", [h[@"impact"] doubleValue], [h[@"name"] UTF8String]);
+    double total = [hogs.firstObject[@"totalImpact"] doubleValue];
+    if (total <= 0) for (NSDictionary *h in hogs) total += [h[@"impact"] doubleValue];
+    for (NSDictionary *h in hogs) {
+        double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
+        NSDictionary *info = BatteryPressureInfo(h);
+        printf("  %3d%%  %-18s %s\n", (int)lround(share * 100),
+               [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
+    }
 }
 
 int main(int argc, const char **argv) {

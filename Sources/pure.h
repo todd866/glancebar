@@ -25,7 +25,8 @@ int MinutesTo20(BatteryState b, double avgAmp_mA);
 NSString *FmtDuration(int minutes);
 
 // Parse `top -l 2 …` output: keep the SECOND "PID … POWER" frame, sum each process's
-// energy impact into a group (groupForPid(pid) ?: the command token), return the top-N
-// groups as @[@{@"name":…, @"impact":@(…)}] sorted by impact descending.
+// energy impact into a group (groupForPid(pid) ?: the command token), and preserve the
+// raw command names under @"commands". Returns the top-N groups sorted by impact:
+// @[@{@"name":…, @"impact":@(…), @"totalImpact":@(…), @"commands":@[…]}].
 NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
                                    NSString *(^groupForPid)(pid_t));
