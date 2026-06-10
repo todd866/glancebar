@@ -842,6 +842,8 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
     NSMutableArray<NSNumber *> *_ampHistory;
+    NSUInteger _sampleGen;
+    CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
     BOOL _procStatsLoading, _procStatsUnavailable;
@@ -910,6 +912,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self updateBar];
     if (_popover.isShown) [self rebuildContent];
     if (_detailsWindow.isVisible) [self rebuildDetails];
+    // The details window stays open indefinitely; refresh its one-shot process samples
+    // on a slow cadence so they don't masquerade as live data next to live numbers.
+    if (_detailsWindow.isVisible && !_hogsLoading && !_procStatsLoading &&
+        CFAbsoluteTimeGetCurrent() - _lastSampleTime >= 30)
+        [self beginSampling];
 }
 
 - (double)avgAmp {
@@ -986,14 +993,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (void)togglePopover:(id)sender {
     if (_popover.isShown) { [_popover close]; return; }
+    // Reset the content view so the rebuild starts at the top on a fresh open.
+    _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
     [self refresh];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    [self beginSampling];
+}
+
+// Starts both process samplers, invalidating any still-in-flight results: top takes
+// >1s, so a close/reopen can otherwise interleave an old sample over a newer one.
+- (void)beginSampling {
+    _sampleGen++;
+    _lastSampleTime = CFAbsoluteTimeGetCurrent();
     [self sampleHogsAsync];
     [self sampleProcessStatsAsync];
 }
 
 - (void)sampleHogsAsync {
+    NSUInteger gen = _sampleGen;
     _hogs = @[];
     _hogsLoading = YES;
     _hogsUnavailable = NO;
@@ -1002,6 +1020,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSArray *hogs = SampleHogs(5);
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (gen != self->_sampleGen) return;   // superseded by a newer sampling pass
             self->_hogs = hogs ? hogs : @[];
             self->_hogsLoading = NO;
             self->_hogsUnavailable = self->_hogs.count == 0;
@@ -1012,6 +1031,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)sampleProcessStatsAsync {
+    NSUInteger gen = _sampleGen;
     _topCPU = @[];
     _topMem = @[];
     _procStatsLoading = YES;
@@ -1023,6 +1043,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSArray *cpu = stats[@"cpu"] ? stats[@"cpu"] : @[];
         NSArray *memory = stats[@"memory"] ? stats[@"memory"] : @[];
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (gen != self->_sampleGen) return;   // superseded by a newer sampling pass
             self->_topCPU = cpu;
             self->_topMem = memory;
             self->_procStatsLoading = NO;
@@ -1696,8 +1717,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [_detailsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     [_popover close];
-    [self sampleHogsAsync];
-    [self sampleProcessStatsAsync];
+    [self beginSampling];
 }
 
 @end
