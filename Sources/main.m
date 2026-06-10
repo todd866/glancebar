@@ -242,12 +242,21 @@ typedef struct {
     uint64_t memTotal, memUsed, memAvailable, swapUsed;
 } SystemState;
 
+// mach_host_self() returns a send right each call and the urefs are never returned;
+// fetch it once.
+static host_t HostPort(void) {
+    static host_t port;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ port = mach_host_self(); });
+    return port;
+}
+
 static CPUCounters ReadCPUCounters(void) {
     CPUCounters c = {0};
     natural_t cpuCount = 0;
     processor_info_array_t cpuInfo = NULL;
     mach_msg_type_number_t cpuInfoCount = 0;
-    kern_return_t kr = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
+    kern_return_t kr = host_processor_info(HostPort(), PROCESSOR_CPU_LOAD_INFO,
                                            &cpuCount, &cpuInfo, &cpuInfoCount);
     if (kr != KERN_SUCCESS || !cpuInfo) return c;
     processor_cpu_load_info_t loads = (processor_cpu_load_info_t)cpuInfo;
@@ -266,7 +275,11 @@ static SystemState ReadSystemState(CPUCounters *previous) {
     SystemState s = {0};
 
     CPUCounters now = ReadCPUCounters();
-    if (now.valid && previous && previous->valid) {
+    // Per-CPU tick counters are 32-bit and can wrap on long uptimes; a wrapped delta
+    // would underflow to ~2^64. Discard the sample instead.
+    if (now.valid && previous && previous->valid &&
+        now.user >= previous->user && now.system >= previous->system &&
+        now.nice >= previous->nice && now.idle >= previous->idle) {
         uint64_t busy = (now.user - previous->user) + (now.system - previous->system) + (now.nice - previous->nice);
         uint64_t idle = now.idle - previous->idle;
         uint64_t total = busy + idle;
@@ -280,8 +293,8 @@ static SystemState ReadSystemState(CPUCounters *previous) {
         vm_size_t pageSize = 0;
         vm_statistics64_data_t vm = {0};
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-        if (host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS &&
-            host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS) {
+        if (host_page_size(HostPort(), &pageSize) == KERN_SUCCESS &&
+            host_statistics64(HostPort(), HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS) {
             uint64_t usedPages = (uint64_t)vm.active_count + vm.wire_count + vm.compressor_page_count;
             uint64_t used = usedPages * (uint64_t)pageSize;
             if (used > memTotal) used = memTotal;
@@ -810,6 +823,9 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     BatteryState _bat;
     SystemState _sys;
     CPUCounters _cpuPrev;
+    CFAbsoluteTime _cpuBaselineTime;
+    double _lastCPU;
+    BOOL _lastCPUValid;
     NSArray<AIUsage *> *_aiUsage;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
@@ -864,7 +880,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (void)refresh {
     _vols = ScanVolumes();
     _bat = ReadBattery();
-    _sys = ReadSystemState(&_cpuPrev);
+    // refresh fires from three uncoordinated sources (15s timer, IOPS notification
+    // bursts, popover open); only advance the CPU tick baseline when the window is
+    // wide enough to be meaningful, and reuse the last good reading otherwise.
+    double nowT = CFAbsoluteTimeGetCurrent();
+    BOOL advance = nowT - _cpuBaselineTime >= 2.0;
+    SystemState s = ReadSystemState(advance ? &_cpuPrev : NULL);
+    if (advance) _cpuBaselineTime = nowT;
+    if (s.cpuValid) { _lastCPU = s.cpu; _lastCPUValid = YES; }
+    else if (_lastCPUValid) { s.cpu = _lastCPU; s.cpuValid = YES; }
+    _sys = s;
     _aiUsage = ReadAIUsage();
     if (_bat.valid) {
         [_ampHistory addObject:@(_bat.amperage_mA)];
