@@ -240,6 +240,7 @@ typedef struct {
     BOOL cpuValid, memValid, swapValid;
     double cpu;
     uint64_t memTotal, memUsed, memAvailable, swapUsed;
+    int kernPressure;   // kern.memorystatus_vm_pressure_level: 1/2/4, 0 = unknown
 } SystemState;
 
 // mach_host_self() returns a send right each call and the urefs are never returned;
@@ -312,10 +313,21 @@ static SystemState ReadSystemState(CPUCounters *previous) {
         s.swapValid = YES;
     }
 
+    int pressure = 0;
+    size_t pressureSize = sizeof(pressure);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &pressureSize, NULL, 0) == 0)
+        s.kernPressure = pressure;
+
     return s;
 }
 
 static NSString *MemoryPressureLevel(SystemState s) {
+    // Prefer the kernel memorystatus subsystem's own verdict: Apple Silicon swaps
+    // aggressively while perfectly healthy, so fixed swap thresholds cry wolf.
+    if (s.kernPressure == 4) return @"High";
+    if (s.kernPressure == 2) return @"Medium";
+    if (s.kernPressure == 1) return @"Low";
+    // Fallback heuristic when the sysctl is unavailable:
     if (!s.memValid || s.memTotal == 0) return @"Unknown";
     double available = (double)s.memAvailable / (double)s.memTotal;
     if (available < 0.08 || (s.swapValid && s.swapUsed >= 2ULL * 1024ULL * 1024ULL * 1024ULL)) return @"High";
