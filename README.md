@@ -82,9 +82,13 @@ battery pressure, system pressure, and AI status to the terminal.
   Headline counts are **fresh tokens** (non-cached input + output); the raw total is
   ~16× larger because cached context is re-read every turn, and is shown alongside.
   Rollout files are append-only and read incrementally by byte offset on a background
-  queue, so the steady-state cost is a handful of `stat` calls. Claude's local stats
-  cache (`~/.claude/stats-cache.json`) has usage history but no quota data, so its gauge
-  stays empty unless you provide `~/.glancebar/ai-status.json`:
+  queue, so the steady-state cost is a handful of `stat` calls. Claude's token counts
+  come the same way — live from the per-message usage records in
+  `~/.claude/projects/**.jsonl` transcripts, with the same fresh/cached split (the
+  stats cache still supplies session/message counts). Claude's *quota* gauge is a
+  different story: Claude Code fetches limit status from the API at display time and
+  never persists it locally, so the gauge stays empty unless you provide
+  `~/.glancebar/ai-status.json`:
 
   ```json
   {

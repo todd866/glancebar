@@ -79,6 +79,18 @@ int main(void) {
         NSDictionary *startEv = ParseTokenCountLine(@"{\"timestamp\":\"2026-06-10T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{},\"rate_limits\":{\"primary\":{\"used_percent\":10.0,\"window_minutes\":300,\"resets_at\":99}}}}");
         check(startEv && [startEv[@"tokens"] longLongValue] == 0, @"session-start event keeps limits, zero tokens");
 
+        // --- ParseClaudeUsageLine ---
+        NSString *cl = @"{\"parentUuid\":\"x\",\"isSidechain\":false,\"message\":{\"id\":\"msg_abc\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":12041,\"cache_creation_input_tokens\":5048,\"cache_read_input_tokens\":16924,\"output_tokens\":643}},\"type\":\"assistant\",\"timestamp\":\"2026-06-09T22:57:36.419Z\"}";
+        NSDictionary *cev = ParseClaudeUsageLine(cl);
+        check(cev != nil, @"claude usage line parses");
+        check([cev[@"fresh"] longLongValue] == 12041 + 643, @"claude fresh = input + output");
+        check([cev[@"tokens"] longLongValue] == 12041 + 643 + 5048 + 16924, @"claude total includes cache");
+        check([cev[@"id"] isEqual:@"msg_abc"], @"message id surfaced for dedupe");
+        check([cev[@"ts"] isEqual:@"2026-06-09T22:57:36.419Z"], @"claude timestamp extracted");
+        check(ParseClaudeUsageLine(@"{\"type\":\"user\",\"message\":{\"role\":\"user\"}}") == nil,
+              @"non-usage line skipped");
+        check(ParseClaudeUsageLine(@"junk with \"usage\" inside") == nil, @"malformed claude line skipped");
+
         // --- AccumulateTokenEvents ---
         NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:10 * 3600];
         NSDictionary *acc = AccumulateTokenEvents(nil, @[

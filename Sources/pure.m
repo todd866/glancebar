@@ -107,6 +107,29 @@ NSDictionary *ParseTokenCountLine(NSString *line) {
     return out;
 }
 
+NSDictionary *ParseClaudeUsageLine(NSString *line) {
+    if (![line containsString:@"\"usage\""]) return nil;   // cheap pre-filter
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) return nil;
+    NSDictionary *obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![obj isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *message = [obj[@"message"] isKindOfClass:NSDictionary.class] ? obj[@"message"] : nil;
+    NSDictionary *usage = [message[@"usage"] isKindOfClass:NSDictionary.class] ? message[@"usage"] : nil;
+    NSString *ts = [obj[@"timestamp"] isKindOfClass:NSString.class] ? obj[@"timestamp"] : nil;
+    if (!usage || !ts.length) return nil;
+
+    long long input = [usage[@"input_tokens"] longLongValue];
+    long long output = [usage[@"output_tokens"] longLongValue];
+    long long cacheCreate = [usage[@"cache_creation_input_tokens"] longLongValue];
+    long long cacheRead = [usage[@"cache_read_input_tokens"] longLongValue];
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    out[@"ts"] = ts;
+    out[@"fresh"] = @(input + output);                            // input is already non-cached
+    out[@"tokens"] = @(input + output + cacheCreate + cacheRead);
+    if ([message[@"id"] isKindOfClass:NSString.class]) out[@"id"] = message[@"id"];
+    return out;
+}
+
 static NSDate *DateFromISO8601(NSString *s) {
     static NSISO8601DateFormatter *plain, *fractional;
     static dispatch_once_t once;

@@ -734,14 +734,69 @@ static NSDate *FileMTime(NSString *path) {
     long long _sessionsToday;
     NSArray<NSDictionary *> *_models;
     NSDate *_lastActivity;
+    NSMutableDictionary<NSString *, NSNumber *> *_claudeOffsets;  // transcript rel path -> consumed bytes
+    NSMutableDictionary<NSString *, NSDictionary *> *_claudeDays;
+    NSMutableSet<NSString *> *_claudeSeenIds;   // duplicate transcript lines share a message id
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
         _offsets = [NSMutableDictionary dictionary];
         _days = [NSMutableDictionary dictionary];
+        _claudeOffsets = [NSMutableDictionary dictionary];
+        _claudeDays = [NSMutableDictionary dictionary];
+        _claudeSeenIds = [NSMutableSet set];
     }
     return self;
+}
+
+// Reads the complete lines appended to an append-only file since the recorded offset
+// and advances it; a partially-written trailing line is re-read next pass.
+- (NSData *)newLineDataAtPath:(NSString *)path key:(NSString *)key
+                      offsets:(NSMutableDictionary<NSString *, NSNumber *> *)offsets {
+    unsigned long long offset = [offsets[key] unsignedLongLongValue];
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) return nil;
+    [fh seekToFileOffset:offset];
+    NSData *data = [fh readDataToEndOfFile];
+    [fh closeFile];
+    const char *bytes = data.bytes;
+    NSUInteger consume = 0;
+    for (NSUInteger i = data.length; i > 0; i--) {
+        if (bytes[i - 1] == '\n') { consume = i; break; }
+    }
+    if (!consume) return nil;
+    offsets[key] = @(offset + consume);
+    return [data subdataWithRange:NSMakeRange(0, consume)];
+}
+
+// Byte-level line iteration: transcripts run to gigabytes, so only lines containing
+// `needle` are ever converted to NSString (the conversion dominates a naive scan).
+static void ForEachMatchingLine(NSData *data, const char *needle, void (^block)(NSString *line)) {
+    const char *bytes = data.bytes;
+    size_t len = data.length, needleLen = strlen(needle), start = 0;
+    while (start < len) {
+        const char *nl = memchr(bytes + start, '\n', len - start);
+        size_t lineLen = nl ? (size_t)(nl - (bytes + start)) : len - start;
+        if (lineLen >= needleLen && memmem(bytes + start, lineLen, needle, needleLen)) {
+            NSString *line = [[NSString alloc] initWithBytes:bytes + start length:lineLen
+                                                    encoding:NSUTF8StringEncoding];
+            if (line) block(line);
+        }
+        if (!nl) break;
+        start += lineLen + 1;
+    }
+}
+
+static NSString *WeekStartDayString(void) {
+    NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-6
+                                                              toDate:StartOfLocalDay(NSDate.date) options:0];
+    return LocalDateString(weekStart);
+}
+
+static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
+    for (NSString *day in days.allKeys)
+        if ([day compare:weekStartDay] == NSOrderedAscending) [days removeObjectForKey:day];
 }
 
 // Rollout files keep their unique basename when they move from sessions/ to
@@ -768,36 +823,17 @@ static NSDate *FileMTime(NSString *path) {
     }
     // Offsets for files that aged out of the window are dead weight.
     for (NSString *key in _offsets.allKeys) if (![seen containsObject:key]) [_offsets removeObjectForKey:key];
-    // Keep only the trailing 7 local days of totals.
-    NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-6
-                                                              toDate:StartOfLocalDay(NSDate.date) options:0];
-    NSString *weekStartDay = LocalDateString(weekStart);
-    for (NSString *day in _days.allKeys)
-        if ([day compare:weekStartDay] == NSOrderedAscending) [_days removeObjectForKey:day];
+    PruneDays(_days, WeekStartDayString());
 }
 
 - (void)consumeFile:(NSString *)path key:(NSString *)key fromOffset:(unsigned long long)offset {
-    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
-    if (!fh) return;
-    [fh seekToFileOffset:offset];
-    NSData *data = [fh readDataToEndOfFile];
-    [fh closeFile];
-    // Only consume complete lines; a partially-written trailing line is re-read next pass.
-    const char *bytes = data.bytes;
-    NSUInteger consume = 0;
-    for (NSUInteger i = data.length; i > 0; i--) {
-        if (bytes[i - 1] == '\n') { consume = i; break; }
-    }
-    if (!consume) return;
-    _offsets[key] = @(offset + consume);
-    NSString *chunk = [[NSString alloc] initWithBytes:bytes length:consume encoding:NSUTF8StringEncoding];
+    NSData *chunk = [self newLineDataAtPath:path key:key offsets:_offsets];
     if (!chunk) return;
-
     NSMutableArray *events = [NSMutableArray array];
-    for (NSString *line in [chunk componentsSeparatedByString:@"\n"]) {
+    ForEachMatchingLine(chunk, "\"token_count\"", ^(NSString *line) {
         NSDictionary *e = ParseTokenCountLine(line);
         if (e) [events addObject:e];
-    }
+    });
     if (!events.count) return;
     NSDictionary *acc = AccumulateTokenEvents(_days, events, nil);
     _days = [acc[@"days"] mutableCopy];
@@ -806,6 +842,66 @@ static NSDate *FileMTime(NSString *path) {
         _limits = acc[@"latestLimits"];
         _limitsTs = ts;
     }
+}
+
+// Claude Code's per-session transcripts carry per-message usage — the only live source
+// for today's Claude tokens (~/.claude/stats-cache.json computes through yesterday and
+// its aggregation isn't reproducible). Same incremental pattern as the Codex rollouts.
+- (void)scanClaudeTranscripts {
+    NSString *base = [NSHomeDirectory() stringByAppendingPathComponent:@".claude/projects"];
+    NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-8 * 24 * 3600];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtPath:base];
+    for (NSString *rel in en) {
+        if (![rel.pathExtension isEqualToString:@"jsonl"]) continue;
+        NSDictionary *attrs = en.fileAttributes;
+        if ([attrs[NSFileModificationDate] compare:cutoff] == NSOrderedAscending) continue;
+        [seen addObject:rel];
+        unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+        if (size <= [_claudeOffsets[rel] unsignedLongLongValue]) continue;
+        NSData *chunk = [self newLineDataAtPath:[base stringByAppendingPathComponent:rel]
+                                            key:rel offsets:_claudeOffsets];
+        if (!chunk) continue;
+        NSMutableArray *events = [NSMutableArray array];
+        NSMutableSet *seenIds = _claudeSeenIds;
+        ForEachMatchingLine(chunk, "\"usage\"", ^(NSString *line) {
+            NSDictionary *e = ParseClaudeUsageLine(line);
+            if (!e) return;
+            NSString *messageId = e[@"id"];
+            if (messageId) {   // a message amended across lines must only count once
+                if ([seenIds containsObject:messageId]) return;
+                [seenIds addObject:messageId];
+            }
+            [events addObject:e];
+        });
+        if (events.count)
+            _claudeDays = [AccumulateTokenEvents(_claudeDays, events, nil)[@"days"] mutableCopy];
+    }
+    for (NSString *key in _claudeOffsets.allKeys)
+        if (![seen containsObject:key]) [_claudeOffsets removeObjectForKey:key];
+    PruneDays(_claudeDays, WeekStartDayString());
+    if (_claudeSeenIds.count > 100000) [_claudeSeenIds removeAllObjects];   // bounded; dupes are rare
+}
+
+- (AIUsage *)claudeUsage {
+    AIUsage *u = ReadClaudeUsage();   // stats-cache: sessions/messages/models (day-stale)
+    [self scanClaudeTranscripts];
+    if (!_claudeOffsets.count) return u;   // no transcripts — cache numbers stand
+    NSString *today = LocalDateString(NSDate.date);
+    u.todayTokens = [_claudeDays[today][@"f"] longLongValue];
+    u.todayTokensAll = [_claudeDays[today][@"t"] longLongValue];
+    long long week = 0, weekAll = 0;
+    for (NSDictionary *day in _claudeDays.allValues) {
+        week += [day[@"f"] longLongValue];
+        weekAll += [day[@"t"] longLongValue];
+    }
+    u.weekTokens = week;
+    u.weekTokensAll = weekAll;
+    u.available = YES;
+    u.stale = NO;   // token counts are live now; only the activity counts lag a day
+    u.statusText = @"Tokens live from local transcripts";
+    u.source = @"~/.claude transcripts + stats cache";
+    return u;
 }
 
 // Session counts, per-model split, and last activity still come from the sqlite thread
@@ -897,7 +993,7 @@ static NSDate *FileMTime(NSString *path) {
 }
 
 - (NSArray<AIUsage *> *)read {
-    NSArray<AIUsage *> *usage = @[ReadClaudeUsage(), [self codexUsage]];
+    NSArray<AIUsage *> *usage = @[[self claudeUsage], [self codexUsage]];
     NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
     NSDictionary *status = JSONDictionaryAtPath(statusPath);
     if (status) {

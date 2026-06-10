@@ -50,6 +50,14 @@ NSDictionary *ParseTokenCountLine(NSString *line);
 NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
                                     NSArray<NSDictionary *> *events, NSTimeZone *tz);
 
+// Parses one Claude Code transcript line (~/.claude/projects/**/*.jsonl). Returns nil
+// unless it is an assistant message carrying usage. Anthropic semantics: input_tokens
+// is already non-cached, so fresh = input + output and the all-inclusive total adds
+// cache_creation + cache_read. Shape:
+// @{@"ts": ISO-8601 string, @"tokens": @(all-inclusive), @"fresh": @(input+output),
+//   @"id": message id when present (for duplicate-line dedupe)}
+NSDictionary *ParseClaudeUsageLine(NSString *line);
+
 // Picks the most constrained, still-current window from a Codex rate_limits dict
 // (primary = 5h, secondary = weekly; resets_at is epoch seconds — windows whose reset
 // has passed are obsolete and skipped). Returns nil when none is current, else
