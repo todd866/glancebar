@@ -5,6 +5,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <libproc.h>
+#import <sys/mount.h>
 #import "pure.h"
 
 #pragma mark - Disk
@@ -23,6 +24,45 @@ static NSString *FmtBytes(long long b) {
     return [NSByteCountFormatter stringFromByteCount:b countStyle:NSByteCountFormatterCountStyleFile];
 }
 
+static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
+    NSDictionary *v = [url resourceValuesForKeys:keys error:nil];
+    NSNumber *total = v[NSURLVolumeTotalCapacityKey];
+    NSString *name = v[NSURLVolumeNameKey];
+    if (total.longLongValue <= 0) return nil;
+
+    long long avail = [v[NSURLVolumeAvailableCapacityKey] longLongValue];
+    NSNumber *important = [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
+                                               error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
+    if (important.longLongValue > 0) avail = important.longLongValue;
+
+    Volume *vol = [Volume new];
+    vol.path = url.path.length ? url.path : @"/";
+    vol.name = name.length ? name : [NSFileManager.defaultManager displayNameAtPath:vol.path];
+    if (!vol.name.length) vol.name = vol.path;
+    vol.total = total.longLongValue; vol.available = avail;
+    vol.isInternal = [v[NSURLVolumeIsInternalKey] boolValue] || [vol.path isEqualToString:@"/"];
+    return vol;
+}
+
+static Volume *RootVolumeFallback(void) {
+    NSURL *root = [NSURL fileURLWithPath:@"/" isDirectory:YES];
+    NSArray *keys = @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
+                      NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey];
+    Volume *fromURL = VolumeFromURL(root, keys);
+    if (fromURL) return fromURL;
+
+    struct statfs s;
+    if (statfs("/", &s) != 0 || s.f_blocks <= 0) return nil;
+    Volume *vol = [Volume new];
+    vol.path = @"/";
+    NSString *displayName = [NSFileManager.defaultManager displayNameAtPath:@"/"];
+    vol.name = displayName.length ? displayName : @"Macintosh HD";
+    vol.total = (long long)s.f_blocks * (long long)s.f_bsize;
+    vol.available = (long long)s.f_bavail * (long long)s.f_bsize;
+    vol.isInternal = YES;
+    return vol;
+}
+
 static NSArray<Volume *> *ScanVolumes(void) {
     NSArray *keys = @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
                       NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey];
@@ -30,23 +70,19 @@ static NSArray<Volume *> *ScanVolumes(void) {
         mountedVolumeURLsIncludingResourceValuesForKeys:keys
                                                 options:NSVolumeEnumerationSkipHiddenVolumes];
     NSMutableArray<Volume *> *found = [NSMutableArray array];
+    BOOL hasRoot = NO;
     for (NSURL *url in urls) {
-        NSDictionary *v = [url resourceValuesForKeys:keys error:nil];
-        NSNumber *total = v[NSURLVolumeTotalCapacityKey];
-        NSString *name = v[NSURLVolumeNameKey];
-        if (total.longLongValue <= 0 || !name) continue;
-        long long avail = [v[NSURLVolumeAvailableCapacityKey] longLongValue];
-        NSNumber *important = [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
-                                                   error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
-        if (important.longLongValue > 0) avail = important.longLongValue;
-        Volume *vol = [Volume new];
-        vol.path = url.path; vol.name = name;
-        vol.total = total.longLongValue; vol.available = avail;
-        vol.isInternal = [v[NSURLVolumeIsInternalKey] boolValue] || [url.path isEqual:@"/"];
+        Volume *vol = VolumeFromURL(url, keys);
+        if (!vol) continue;
+        if ([vol.path isEqualToString:@"/"]) hasRoot = YES;
         [found addObject:vol];
     }
+    if (!hasRoot) {
+        Volume *root = RootVolumeFallback();
+        if (root) [found addObject:root];
+    }
     [found sortUsingComparator:^NSComparisonResult(Volume *a, Volume *b) {
-        BOOL ar = [a.path isEqual:@"/"], br = [b.path isEqual:@"/"];
+        BOOL ar = [a.path isEqualToString:@"/"], br = [b.path isEqualToString:@"/"];
         if (ar != br) return ar ? NSOrderedAscending : NSOrderedDescending;
         return [a.name localizedStandardCompare:b.name];
     }];
@@ -217,7 +253,7 @@ static const CGFloat kW = 320, kPad = 16;
     BatteryState _bat;
     NSArray<NSDictionary *> *_hogs;
     NSMutableArray<NSNumber *> *_ampHistory;
-    BOOL _showWatts, _showHealth;
+    BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -245,7 +281,10 @@ static const CGFloat kW = 320, kPad = 16;
                        dispatch_get_main_queue(), ^{ [self togglePopover:nil]; });
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
-    if (src) CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
+    if (src) {
+        CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
+        CFRelease(src);
+    }
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
@@ -267,7 +306,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (int)rootDiskPct {
-    for (Volume *v in _vols) if ([v.path isEqual:@"/"]) return (int)lround(v.fraction*100);
+    for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return (int)lround(v.fraction*100);
     return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : 0;
 }
 
@@ -286,10 +325,17 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)sampleHogsAsync {
+    _hogs = @[];
+    _hogsLoading = YES;
+    _hogsUnavailable = NO;
+    if (_popover.isShown) [self rebuildContent];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSArray *hogs = SampleHogs(5);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (hogs.count) { self->_hogs = hogs; if (self->_popover.isShown) [self rebuildContent]; }
+            self->_hogs = hogs ? hogs : @[];
+            self->_hogsLoading = NO;
+            self->_hogsUnavailable = self->_hogs.count == 0;
+            if (self->_popover.isShown) [self rebuildContent];
         });
     });
 }
@@ -368,7 +414,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                           color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
     y += 20;
     if (_hogs.count == 0) {
-        [root addSubview:[self text:@"measuring…" font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
+        NSString *status = _hogsLoading ? @"measuring…" : (_hogsUnavailable ? @"Unavailable" : @"No active apps");
+        [root addSubview:[self text:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
                                at:NSMakeRect(kPad, y, kW-2*kPad, 16) align:NSTextAlignmentLeft]]; y += 22;
     } else {
         double mx = [_hogs.firstObject[@"impact"] doubleValue];
@@ -451,7 +498,9 @@ static void Dump(void) {
             printf("      health %d%% · %ld cycles\n", (int)lround(100.0*b.rawMax_mAh/b.designCap_mAh), b.cycleCount);
     }
     printf("energy hogs:\n");
-    for (NSDictionary *h in SampleHogs(5)) printf("  %6.0f  %s\n", [h[@"impact"] doubleValue], [h[@"name"] UTF8String]);
+    NSArray *hogs = SampleHogs(5);
+    if (!hogs.count) printf("  unavailable\n");
+    for (NSDictionary *h in hogs) printf("  %6.0f  %s\n", [h[@"impact"] doubleValue], [h[@"name"] UTF8String]);
 }
 
 int main(int argc, const char **argv) {
