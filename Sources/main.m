@@ -411,7 +411,7 @@ static NSColor *CPUColor(double cpu) {
 @interface AIUsage : NSObject
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
 @property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
-@property BOOL available, stale, limitStatusAvailable;
+@property BOOL available, stale, limitStatusAvailable, overageActive;
 @property double remainingFraction;
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
 @property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
@@ -1081,10 +1081,20 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         NSDictionary *extra = [_claudeUsageJSON[@"extra_usage"] isKindOfClass:NSDictionary.class]
             ? _claudeUsageJSON[@"extra_usage"] : nil;
         if ([extra[@"is_enabled"] boolValue] && [extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) {
+            double utilization = [extra[@"utilization"] doubleValue];
+            double usedCredits = [extra[@"used_credits"] doubleValue];
+            double monthlyLimit = [extra[@"monthly_limit"] doubleValue];
             NSString *currency = [extra[@"currency"] isKindOfClass:NSString.class] ? extra[@"currency"] : @"";
             u.extraUsage = [NSString stringWithFormat:@"%.0f of %@ %@ (%.0f%%)",
-                            [extra[@"used_credits"] doubleValue], extra[@"monthly_limit"],
-                            currency, [extra[@"utilization"] doubleValue]];
+                            usedCredits, extra[@"monthly_limit"], currency, utilization];
+            if (utilization >= 100.0 || (monthlyLimit > 0 && usedCredits >= monthlyLimit)) {
+                u.limitStatusAvailable = YES;
+                u.remainingFraction = 0;
+                u.overageActive = YES;
+                u.resetText = @"Not provided";
+                u.statusReason = @"Overage billing active";
+                u.statusSource = @"Anthropic usage API (opt-in)";
+            }
         }
     } else {
         _claudeAccessToken = nil;
@@ -1733,6 +1743,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
+    if (u.overageActive && u.statusReason.length) return u.statusReason;
     if (u.limitStatusAvailable) return [self compactResetText:u];
     if (!u.available) return @"No local state";
     if (u.statusReason.length) return u.statusReason;
@@ -2515,7 +2526,7 @@ static void Dump(BOOL allowOnline) {
         NSString *week = FmtTokenCount(u.weekTokens);
         if (u.weekTokensAll > u.weekTokens)
             week = [week stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.weekTokensAll)];
-        NSString *reason = (!u.limitStatusAvailable && u.statusReason.length)
+        NSString *reason = ((!u.limitStatusAvailable || u.overageActive) && u.statusReason.length)
             ? [@" · " stringByAppendingString:u.statusReason] : @"";
         printf("  %-7s %s · %s · today %s · 7d %s%s\n",
                u.name.UTF8String,

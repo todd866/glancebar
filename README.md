@@ -91,8 +91,9 @@ battery pressure, system pressure, and AI status to the terminal.
   Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at most
   every 15 minutes. The token is cached in memory only until expiry, never written by
   Glancebar, never refreshed by Glancebar, and never sent anywhere except
-  `api.anthropic.com`. Or provide `~/.glancebar/ai-status.json`, which overrides either
-  provider's gauge:
+  `api.anthropic.com`. If the account response reports paid overage usage at or above
+  100%, Glancebar shows that as an explicit red 0% status instead of a missing gauge.
+  Or provide `~/.glancebar/ai-status.json`, which overrides either provider's gauge:
 
   ```json
   {
