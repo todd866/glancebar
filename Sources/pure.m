@@ -108,7 +108,8 @@ static NSArray<NSDictionary *> *RowsSortedBy(NSDictionary<NSString *, NSMutableD
 }
 
 NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString *psOutput, int topN,
-                                                                        NSString *(^groupForPid)(pid_t)) {
+                                                                        NSString *(^groupForPid)(pid_t),
+                                                                        unsigned long long (^bytesForPid)(pid_t)) {
     if (topN <= 0) return @{@"cpu": @[], @"memory": @[]};
     NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
     for (NSString *line in [psOutput componentsSeparatedByString:@"\n"]) {
@@ -122,7 +123,8 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
         pid_t pid = (pid_t)parts[0].intValue;
         if (pid <= 0) continue;
         double cpu = parts[1].doubleValue;
-        unsigned long long bytes = (unsigned long long)parts[2].longLongValue * 1024ULL;
+        unsigned long long bytes = bytesForPid ? bytesForPid(pid) : 0;
+        if (bytes == 0) bytes = (unsigned long long)parts[2].longLongValue * 1024ULL;
         NSString *command = [[parts subarrayWithRange:NSMakeRange(3, parts.count - 3)] componentsJoinedByString:@" "];
 
         NSString *group = groupForPid(pid);

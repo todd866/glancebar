@@ -32,8 +32,10 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
                                    NSString *(^groupForPid)(pid_t));
 
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
-// RSS is returned as bytes. Shape:
+// bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
+// the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:
 // @{@"cpu": @[@{@"name":…, @"cpu":@(…), @"bytes":@(…), @"commands":@[…]}],
 //   @"memory": @[…]}.
 NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString *psOutput, int topN,
-                                                                        NSString *(^groupForPid)(pid_t));
+                                                                        NSString *(^groupForPid)(pid_t),
+                                                                        unsigned long long (^bytesForPid)(pid_t));

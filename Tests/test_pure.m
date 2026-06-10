@@ -47,13 +47,23 @@ int main(void) {
              "104  0.2 400000 /Applications/Adobe Acrobat.app/Contents/MacOS/AdobeAcrobat\n";
         NSDictionary *stats = ParseProcessStats(ps, 3, ^NSString *(pid_t pid) {
             return (pid == 101 || pid == 102) ? @"Google Chrome" : nil;
-        });
+        }, nil);
         NSArray *cpu = stats[@"cpu"], *mem = stats[@"memory"];
         check([cpu[0][@"name"] isEqual:@"Google Chrome"], @"CPU stats roll Chrome helpers up");
         check(fabs([cpu[0][@"cpu"] doubleValue] - 30.0) < 0.001, @"Chrome CPU is summed");
         check([cpu[0][@"commands"] containsObject:@"Google Chrome Helper"], @"CPU row preserves helper command");
         check([mem[0][@"name"] isEqual:@"AdobeAcrobat"], @"memory stats sort by RSS");
         check([mem[0][@"bytes"] unsignedLongLongValue] == 400000ULL * 1024ULL, @"RSS is converted to bytes");
+
+        // --- ParseProcessStats footprint override ---
+        NSDictionary *stats2 = ParseProcessStats(ps, 3,
+            ^NSString *(pid_t pid) { return nil; },
+            ^unsigned long long (pid_t pid) { return pid == 104 ? 999ULL * 1024 * 1024 : 0; });
+        check([stats2[@"memory"][0][@"name"] isEqual:@"AdobeAcrobat"], @"footprint keeps sort order");
+        check([stats2[@"memory"][0][@"bytes"] unsignedLongLongValue] == 999ULL * 1024 * 1024,
+              @"footprint block overrides RSS when it returns nonzero");
+        check([stats2[@"memory"][1][@"bytes"] unsignedLongLongValue] == 300000ULL * 1024ULL,
+              @"zero footprint falls back to RSS (grouped helpers summed)");
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");

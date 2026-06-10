@@ -158,9 +158,20 @@ static NSArray<NSDictionary *> *SampleHogs(int topN) {
     return ParseHogs(out ? out : @"", topN, ^NSString *(pid_t pid){ return AppGroupForPid(pid); });
 }
 
+// Physical footprint (what Activity Monitor shows) — unlike RSS it does not count
+// shared framework pages once per helper process.
+static unsigned long long FootprintForPid(pid_t pid) {
+    struct rusage_info_v4 ri;
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0)
+        return ri.ri_phys_footprint;
+    return 0;
+}
+
 static NSDictionary<NSString *, NSArray<NSDictionary *> *> *SampleProcessStats(int topN) {
     NSString *out = RunTaskOutput(@"/bin/ps", @[@"-axo", @"pid=,pcpu=,rss=,comm="]);
-    return ParseProcessStats(out ? out : @"", topN, ^NSString *(pid_t pid){ return AppGroupForPid(pid); });
+    return ParseProcessStats(out ? out : @"", topN,
+                             ^NSString *(pid_t pid){ return AppGroupForPid(pid); },
+                             ^unsigned long long (pid_t pid){ return FootprintForPid(pid); });
 }
 
 static NSArray<NSString *> *CommandsForHog(NSDictionary *h) {
