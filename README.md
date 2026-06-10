@@ -13,10 +13,11 @@
 ## Overview
 
 Glancebar shows your disk usage and battery charge in a single compact menu bar item
-(`💾 61%  🔋 76%`). Click it for one native popover with two sections: **Storage**
-(every mounted volume with a usage gauge) and **Battery** (time until 20%, battery
-pressure by app/process, current draw, and health). One item, one slot, **no dependencies, no
-background services, and no admin rights**.
+(`💾 61%  🔋 76%`). Click it for one native popover with **Storage**, **Battery**, and
+**System** summaries: volumes, time until 20%, battery pressure by app/process, CPU,
+memory pressure, swap, and the leading CPU/memory culprits. A **Details…** window keeps
+fuller battery and system process lists behind tabs without crowding the popover. One
+item, one slot, **no dependencies, no background services, and no admin rights**.
 
 It merges two earlier single-purpose apps — [Diskbar](https://github.com/todd866/diskbar)
 and Voltbar (battery) — into one, so they stop competing for space next to the notch.
@@ -29,6 +30,9 @@ and Voltbar (battery) — into one, so they stop competing for space next to the
 - **Battery** — "3:14 until 20%" (not a bare percentage), plus battery pressure grouped by
   app/process with raw process names and plain-English context, live draw in watts, and
   battery health / cycle count.
+- **System** — overall CPU, memory pressure, swap usage, and top CPU/memory apps grouped
+  with the same raw-process-plus-context treatment; the popover shows the lead signals
+  while Details keeps the longer lists.
 - **Self-contained** — one binary, native popover UI, no runtime, no installer, no `sudo`.
 
 ## Build & Install
@@ -44,7 +48,7 @@ Start at login: **System Settings → General → Login Items → +** and add Gl
 Requires the Xcode Command Line Tools (`xcode-select --install`).
 
 Headless readout: `Glancebar.app/Contents/MacOS/Glancebar --dump` prints disk, battery,
-and battery pressure to the terminal.
+battery pressure, and system pressure to the terminal.
 
 ## How It Works
 
@@ -59,15 +63,21 @@ and battery pressure to the terminal.
   grouped under the **outermost `.app` bundle in each executable path** where possible so
   helpers roll up under their parent app. Rows show the share of sampled app/process
   pressure, while preserving raw process names such as `syspolicyd`.
+- **System pressure** — CPU is calculated from Mach processor tick deltas; memory uses
+  Mach VM statistics plus `hw.memsize`; swap uses `vm.swapusage`. Top CPU and top memory
+  apps come from `ps -axo pid=,pcpu=,rss=,comm=` and are grouped under parent apps where
+  possible. If CPU and memory cannot be sampled, Glancebar reports the system state as
+  unknown rather than treating missing data as low pressure.
 
-The time estimator and battery-pressure grouping are pure functions with unit tests (`./tests.sh`);
-the IORegistry, disk, and `top` plumbing live in the app shell.
+The time estimator, battery-pressure grouping, and process-stat grouping are pure functions
+with unit tests (`./tests.sh`); the IORegistry, disk, `top`, and `ps` plumbing live in the
+app shell.
 
 ## Repository
 
 ```
 glancebar/
-├── Sources/pure.{h,m}   # pure, testable logic: time-to-20% + battery-pressure grouping
+├── Sources/pure.{h,m}   # pure, testable logic: time-to-20% + process grouping
 ├── Sources/main.m       # app shell: disk + battery readers, top sampling, popover UI
 ├── Tests/test_pure.m    # unit tests for the pure functions
 ├── tools/mockup.m       # renders docs/screenshot.png

@@ -39,6 +39,22 @@ int main(void) {
         double ws = 0; for (NSDictionary *h in hogs) if ([h[@"name"] isEqual:@"WindowServer"]) ws = [h[@"impact"] doubleValue];
         check(ws == 26.7, @"WindowServer = 26.7 (second frame only)");
 
+        // --- ParseProcessStats grouping ---
+        NSString *ps =
+            @"101 24.5 200000 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper\n"
+             "102  5.5 100000 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper\n"
+             "103 12.0  50000 /usr/libexec/syspolicyd\n"
+             "104  0.2 400000 /Applications/Adobe Acrobat.app/Contents/MacOS/AdobeAcrobat\n";
+        NSDictionary *stats = ParseProcessStats(ps, 3, ^NSString *(pid_t pid) {
+            return (pid == 101 || pid == 102) ? @"Google Chrome" : nil;
+        });
+        NSArray *cpu = stats[@"cpu"], *mem = stats[@"memory"];
+        check([cpu[0][@"name"] isEqual:@"Google Chrome"], @"CPU stats roll Chrome helpers up");
+        check(fabs([cpu[0][@"cpu"] doubleValue] - 30.0) < 0.001, @"Chrome CPU is summed");
+        check([cpu[0][@"commands"] containsObject:@"Google Chrome Helper"], @"CPU row preserves helper command");
+        check([mem[0][@"name"] isEqual:@"AdobeAcrobat"], @"memory stats sort by RSS");
+        check([mem[0][@"bytes"] unsignedLongLongValue] == 400000ULL * 1024ULL, @"RSS is converted to bytes");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

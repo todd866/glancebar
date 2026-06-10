@@ -30,18 +30,18 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
                                    NSString *(^groupForPid)(pid_t)) {
     if (topN <= 0) return @[];
     NSArray<NSString *> *lines = [topOutput componentsSeparatedByString:@"\n"];
-    NSInteger headerCount = 0, start = -1;
-    for (NSInteger i = 0; i < lines.count; i++) {
+    NSUInteger headerCount = 0, start = NSNotFound;
+    for (NSUInteger i = 0; i < lines.count; i++) {
         if ([lines[i] containsString:@"PID"] && [lines[i] containsString:@"POWER"]) {
             headerCount++;
             if (headerCount == 2) { start = i + 1; break; }
         }
     }
-    if (start < 0) return @[];
+    if (start == NSNotFound) return @[];
 
     NSMutableDictionary<NSString *, NSNumber *> *sum = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSMutableSet<NSString *> *> *commands = [NSMutableDictionary dictionary];
-    for (NSInteger i = start; i < lines.count; i++) {
+    for (NSUInteger i = start; i < lines.count; i++) {
         NSMutableArray<NSString *> *cols = [NSMutableArray array];
         for (NSString *s in [lines[i] componentsSeparatedByCharactersInSet:
                              NSCharacterSet.whitespaceCharacterSet])
@@ -67,11 +67,77 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
     for (NSString *k in keys) if (sum[k].doubleValue > 0) totalImpact += sum[k].doubleValue;
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     for (NSString *k in keys) {
-        if (out.count >= topN) break;
+        if (out.count >= (NSUInteger)topN) break;
         if (sum[k].doubleValue <= 0) continue;
         NSArray *commandList = [[commands[k] allObjects] sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
         [out addObject:@{@"name": k, @"impact": sum[k], @"totalImpact": @(totalImpact),
                          @"commands": commandList ? commandList : @[]}];
     }
     return out;
+}
+
+static NSString *Trimmed(NSString *s) {
+    return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+static NSString *FallbackProcessName(NSString *command) {
+    NSString *trimmed = Trimmed(command);
+    NSString *last = trimmed.lastPathComponent;
+    return last.length ? last : trimmed;
+}
+
+static NSArray<NSDictionary *> *RowsSortedBy(NSDictionary<NSString *, NSMutableDictionary *> *groups,
+                                             NSString *key, int topN) {
+    NSArray<NSString *> *names = [groups keysSortedByValueUsingComparator:
+        ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [b[key] compare:a[key]];
+        }];
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+    for (NSString *name in names) {
+        if (rows.count >= (NSUInteger)topN) break;
+        NSMutableDictionary *g = groups[name];
+        double cpu = [g[@"cpu"] doubleValue];
+        unsigned long long bytes = [g[@"bytes"] unsignedLongLongValue];
+        if (([key isEqualToString:@"cpu"] && cpu <= 0.05) ||
+            ([key isEqualToString:@"bytes"] && bytes == 0)) continue;
+        NSArray *commands = [[g[@"commands"] allObjects] sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+        [rows addObject:@{@"name": name, @"cpu": @(cpu), @"bytes": @(bytes),
+                          @"commands": commands ? commands : @[]}];
+    }
+    return rows;
+}
+
+NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString *psOutput, int topN,
+                                                                        NSString *(^groupForPid)(pid_t)) {
+    if (topN <= 0) return @{@"cpu": @[], @"memory": @[]};
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
+    for (NSString *line in [psOutput componentsSeparatedByString:@"\n"]) {
+        NSString *trimmed = Trimmed(line);
+        if (!trimmed.length) continue;
+        NSArray<NSString *> *cols = [trimmed componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (NSString *s in cols) if (s.length) [parts addObject:s];
+        if (parts.count < 4) continue;
+
+        pid_t pid = (pid_t)parts[0].intValue;
+        if (pid <= 0) continue;
+        double cpu = parts[1].doubleValue;
+        unsigned long long bytes = (unsigned long long)parts[2].longLongValue * 1024ULL;
+        NSString *command = [[parts subarrayWithRange:NSMakeRange(3, parts.count - 3)] componentsJoinedByString:@" "];
+
+        NSString *group = groupForPid(pid);
+        if (!group.length) group = FallbackProcessName(command);
+        if (!group.length) continue;
+
+        NSMutableDictionary *g = groups[group];
+        if (!g) {
+            g = [@{@"cpu": @0.0, @"bytes": @(0ULL), @"commands": [NSMutableSet set]} mutableCopy];
+            groups[group] = g;
+        }
+        g[@"cpu"] = @([g[@"cpu"] doubleValue] + cpu);
+        g[@"bytes"] = @([g[@"bytes"] unsignedLongLongValue] + bytes);
+        if (command.length) [g[@"commands"] addObject:FallbackProcessName(command)];
+    }
+    return @{@"cpu": RowsSortedBy(groups, @"cpu", topN),
+             @"memory": RowsSortedBy(groups, @"bytes", topN)};
 }

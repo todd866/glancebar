@@ -30,3 +30,10 @@ NSString *FmtDuration(int minutes);
 // @[@{@"name":…, @"impact":@(…), @"totalImpact":@(…), @"commands":@[…]}].
 NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
                                    NSString *(^groupForPid)(pid_t));
+
+// Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
+// RSS is returned as bytes. Shape:
+// @{@"cpu": @[@{@"name":…, @"cpu":@(…), @"bytes":@(…), @"commands":@[…]}],
+//   @"memory": @[…]}.
+NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString *psOutput, int topN,
+                                                                        NSString *(^groupForPid)(pid_t));
