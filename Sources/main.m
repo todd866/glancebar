@@ -252,6 +252,23 @@ static host_t HostPort(void) {
     return port;
 }
 
+static int CoreCount(void) {
+    static int cores;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        int v = 0; size_t sz = sizeof(v);
+        if (sysctlbyname("hw.logicalcpu", &v, &sz, NULL, 0) != 0 || v < 1) v = 1;
+        cores = v;
+    });
+    return cores;
+}
+
+// ps reports %cpu per core (a busy group can exceed 100%); normalize to the same
+// all-cores scale as the headline CPU% so the two are comparable.
+static double GroupCPUShare(NSDictionary *h) {
+    return [h[@"cpu"] doubleValue] / 100.0 / CoreCount();
+}
+
 static CPUCounters ReadCPUCounters(void) {
     CPUCounters c = {0};
     natural_t cpuCount = 0;
@@ -1278,12 +1295,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     } else {
         if (_topCPU.count) {
             NSDictionary *h = _topCPU.firstObject;
-            double cpu = [h[@"cpu"] doubleValue] / 100.0;
+            double share = GroupCPUShare(h);
             NSDictionary *info = ProcessDisplayInfo(h);
-            NSString *right = [NSString stringWithFormat:@"CPU %d%%", (int)lround([h[@"cpu"] doubleValue])];
-            [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:(cpu < 1.0 ? cpu : 1.0)
-                                              color:CPUColor(cpu) width:kW pad:kPad at:y]];
+            NSString *right = [NSString stringWithFormat:@"CPU %d%%", (int)lround(share * 100)];
+            [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:MIN(share, 1.0)
+                                              color:CPUColor(share) width:kW pad:kPad at:y]];
             y += 30;
+            // ps cannot see kernel_task, which dominates exactly when throttling.
+            double rowShare = 0;
+            for (NSDictionary *row in _topCPU) rowShare += GroupCPUShare(row);
+            if (_sys.cpuValid && _sys.cpu >= 0.5 && _sys.cpu > 2.0 * rowShare) {
+                [root addSubview:[self text:@"Mostly system-level work (kernel)"
+                                       font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                                         at:NSMakeRect(kPad, y, inner, 13) align:NSTextAlignmentLeft]];
+                y += 18;
+            }
         }
         if (_topMem.count) {
             uint64_t memTotal = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : [_topMem.firstObject[@"bytes"] unsignedLongLongValue];
@@ -1508,9 +1534,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         }
         if (_topCPU.count) {
             NSDictionary *h = _topCPU.firstObject;
-            double cpu = [h[@"cpu"] doubleValue] / 100.0;
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"CPU %d%%", (int)lround([h[@"cpu"] doubleValue])]
-                                           fraction:(cpu < 1.0 ? cpu : 1.0) color:CPUColor(cpu)
+            double share = GroupCPUShare(h);
+            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"CPU %d%%", (int)lround(share * 100)]
+                                           fraction:MIN(share, 1.0) color:CPUColor(share)
                                               width:kDetailW pad:kDetailPad at:y]];
             y += 42;
         }
@@ -1640,12 +1666,17 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self addDetailStatus:@"No sampled CPU activity" to:root y:&y width:kDetailW];
     } else {
         for (NSDictionary *h in _topCPU) {
-            double cpu = [h[@"cpu"] doubleValue] / 100.0;
-            NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround([h[@"cpu"] doubleValue])];
-            [root addSubview:[self processMetricRow:h right:right fraction:(cpu < 1.0 ? cpu : 1.0)
-                                              color:CPUColor(cpu) width:kDetailW pad:kDetailPad at:y]];
+            double share = GroupCPUShare(h);
+            NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround(share * 100)];
+            [root addSubview:[self processMetricRow:h right:right fraction:MIN(share, 1.0)
+                                              color:CPUColor(share) width:kDetailW pad:kDetailPad at:y]];
             y += 42;
         }
+        double rowShare = 0;
+        for (NSDictionary *row in _topCPU) rowShare += GroupCPUShare(row);
+        if (_sys.cpuValid && _sys.cpu >= 0.5 && _sys.cpu > 2.0 * rowShare)
+            [self addDetailStatus:@"Headline CPU is mostly system-level work (kernel), which per-app sampling can't see"
+                               to:root y:&y width:kDetailW];
     }
 
     [self addDetailHeading:@"Top Memory" to:root y:&y width:kDetailW];
@@ -1759,7 +1790,7 @@ static void Dump(void) {
         printf("top cpu:\n");
         for (NSDictionary *h in cpu) {
             NSDictionary *info = ProcessDisplayInfo(h);
-            printf("  %3.0f%%  %-18s %s\n", [h[@"cpu"] doubleValue],
+            printf("  %3.0f%%  %-18s %s\n", GroupCPUShare(h) * 100,
                    [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
         }
     }
