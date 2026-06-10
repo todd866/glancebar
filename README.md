@@ -89,7 +89,7 @@ battery pressure, system pressure, and AI status to the terminal.
   "Claude account via Keychain/API" toggle (off by default): it reads the OAuth token
   Claude Code already maintains in your Keychain (macOS asks for permission) and polls
   Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at most
-  every 5 minutes. The token is cached in memory only until expiry, never written by
+  every 15 minutes. The token is cached in memory only until expiry, never written by
   Glancebar, never refreshed by Glancebar, and never sent anywhere except
   `api.anthropic.com`. Or provide `~/.glancebar/ai-status.json`, which overrides either
   provider's gauge:

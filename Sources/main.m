@@ -741,12 +741,26 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block NSDictionary *json = nil;
     __block BOOL completed = NO;
+    __block NSInteger statusCode = 0;
+    __block NSTimeInterval retryAfter = 0;
+    __block NSString *errorMessage = nil;
     [[session dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             NSHTTPURLResponse *http = [resp isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)resp : nil;
+            statusCode = http.statusCode;
+            retryAfter = [http.allHeaderFields[@"Retry-After"] doubleValue];
             if (!err && http.statusCode == 200 && data.length) {
                 id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                 if ([obj isKindOfClass:NSDictionary.class]) json = obj;
+            } else {
+                if (data.length) {
+                    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    NSDictionary *dict = [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+                    NSDictionary *error = [dict[@"error"] isKindOfClass:NSDictionary.class] ? dict[@"error"] : nil;
+                    NSString *message = [error[@"message"] isKindOfClass:NSString.class] ? error[@"message"] : nil;
+                    if (message.length) errorMessage = message;
+                }
+                if (!errorMessage.length && err.localizedDescription.length) errorMessage = err.localizedDescription;
             }
             completed = YES;
             [session finishTasksAndInvalidate];
@@ -754,6 +768,16 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
         }] resume];
     dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
     if (!completed) [session invalidateAndCancel];
+    if (!json) {
+        NSString *message = errorMessage.length ? errorMessage
+            : statusCode > 0 ? [NSHTTPURLResponse localizedStringForStatusCode:statusCode]
+            : @"Claude usage API request timed out";
+        return @{@"_glancebarFetchError": @YES,
+                 @"statusCode": @(statusCode),
+                 @"rateLimited": @(statusCode == 429),
+                 @"retryAfter": @(retryAfter),
+                 @"message": message};
+    }
     return json;
 }
 
@@ -806,6 +830,7 @@ static NSDate *FileMTime(NSString *path) {
     NSString *_claudeAccessToken;               // memory-only; never persisted by Glancebar
     double _claudeAccessTokenExpiresAt;
     double _claudeKeychainNextTry;
+    NSString *_claudeAccountStatus;
 }
 
 - (instancetype)init {
@@ -963,7 +988,10 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
 - (NSString *)claudeAccessTokenForNow:(double)now {
     if (_claudeAccessToken.length && (_claudeAccessTokenExpiresAt <= 0 || _claudeAccessTokenExpiresAt > now + 60))
         return _claudeAccessToken;
-    if (now < _claudeKeychainNextTry) return nil;
+    if (now < _claudeKeychainNextTry) {
+        _claudeAccountStatus = @"Keychain access unavailable; retrying later";
+        return nil;
+    }
 
     NSDictionary *cred = ClaudeAccessTokenFromKeychain();
     NSString *token = [cred[@"token"] isKindOfClass:NSString.class] ? cred[@"token"] : nil;
@@ -972,6 +1000,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         _claudeAccessToken = nil;
         _claudeAccessTokenExpiresAt = 0;
         _claudeKeychainNextTry = now + 3600;   // denied/missing/expired: don't keep prompting
+        _claudeAccountStatus = @"Keychain token unavailable; retrying later";
         return nil;
     }
 
@@ -979,6 +1008,19 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     _claudeAccessTokenExpiresAt = expiresAt;
     _claudeKeychainNextTry = 0;
     return _claudeAccessToken;
+}
+
+- (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
+    BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
+    double retry = [fetch[@"retryAfter"] doubleValue];
+    NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
+    if (rateLimited) {
+        _claudeNextFetch = now + MAX(900.0, retry);   // retry-after is often 0 here; avoid hammering
+        _claudeAccountStatus = @"Usage API rate-limited; retrying later";
+    } else {
+        _claudeAccountStatus = message.length ? [@"Usage API: " stringByAppendingString:message]
+                                              : @"Usage API unavailable";
+    }
 }
 
 - (AIUsage *)claudeUsage {
@@ -1012,10 +1054,17 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     if (self.allowClaudeAccount) {
         double now = NSDate.date.timeIntervalSince1970;
         if (now >= _claudeNextFetch) {
-            _claudeNextFetch = now + 300;   // the endpoint rate-limits readily; 5 min cap
+            _claudeNextFetch = now + 900;   // the endpoint rate-limits readily; 15 min cap
             NSString *token = [self claudeAccessTokenForNow:now];
-            NSDictionary *json = token ? FetchClaudeUsageJSON(token) : nil;
-            if (json && !json[@"error"]) _claudeUsageJSON = json;
+            NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
+            if ([fetch[@"_glancebarFetchError"] boolValue]) {
+                [self rememberClaudeFetchError:fetch now:now];
+            } else if (fetch && !fetch[@"error"]) {
+                _claudeUsageJSON = fetch;
+                _claudeAccountStatus = nil;
+            } else if (token.length) {
+                _claudeAccountStatus = @"Usage API unavailable";
+            }
         }
         NSDictionary *pick = PickClaudeLimitWindow(_claudeUsageJSON, NSDate.date.timeIntervalSince1970);
         if (pick) {
@@ -1026,8 +1075,8 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             u.statusReason = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
             u.statusSource = @"Anthropic usage API (opt-in)";
         } else {
-            u.statusReason = _claudeUsageJSON ? @"Claude account response did not include a current limit window"
-                                              : @"Claude account status unavailable";
+            u.statusReason = _claudeAccountStatus ?: (_claudeUsageJSON ? @"Claude account response did not include a current limit window"
+                                                                       : @"Claude account status unavailable");
         }
         NSDictionary *extra = [_claudeUsageJSON[@"extra_usage"] isKindOfClass:NSDictionary.class]
             ? _claudeUsageJSON[@"extra_usage"] : nil;
@@ -1041,6 +1090,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         _claudeAccessToken = nil;
         _claudeAccessTokenExpiresAt = 0;
         _claudeUsageJSON = nil;
+        _claudeAccountStatus = nil;
     }
     return u;
 }
@@ -1464,9 +1514,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSArray<AIUsage *> *usage = [self->_aiReader read];
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%lld|%.4f|%@|%@;", u.name, u.available,
+            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@;", u.name, u.available,
              u.limitStatusAvailable, u.todayTokens, u.todayTokensAll, u.weekTokens, u.todaySessions,
-             u.remainingFraction, u.resetText, u.statusText];
+             u.remainingFraction, u.resetText, u.statusText, u.statusReason];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_aiLoading = NO;
             BOOL rerun = self->_aiRefreshPending;
@@ -1685,6 +1735,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
     if (u.limitStatusAvailable) return [self compactResetText:u];
     if (!u.available) return @"No local state";
+    if (u.statusReason.length) return u.statusReason;
     if (u.stale && u.statusText.length)   // e.g. Claude's cache computes through yesterday
         return [NSString stringWithFormat:@"No limit status · %@", u.statusText];
     return @"No limit status";
@@ -2464,12 +2515,15 @@ static void Dump(BOOL allowOnline) {
         NSString *week = FmtTokenCount(u.weekTokens);
         if (u.weekTokensAll > u.weekTokens)
             week = [week stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.weekTokensAll)];
-        printf("  %-7s %s · %s · today %s · 7d %s\n",
+        NSString *reason = (!u.limitStatusAvailable && u.statusReason.length)
+            ? [@" · " stringByAppendingString:u.statusReason] : @"";
+        printf("  %-7s %s · %s · today %s · 7d %s%s\n",
                u.name.UTF8String,
                remaining.UTF8String,
                reset.UTF8String,
                today.UTF8String,
-               week.UTF8String);
+               week.UTF8String,
+               reason.UTF8String);
     }
 }
 
