@@ -128,21 +128,23 @@ static NSTextField *L(NSString *s, NSFont *f, NSColor *c, NSRect fr, NSTextAlign
     hdr(@"AI Status"); y += 22;
     void (^ai)(NSString *, NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, NSString *detail, double frac, NSColor *color){
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 44)];
-        CGFloat titleW=74, rightW=54, barX=kPad+titleW+8, barW=inner-titleW-rightW-18;
+        CGFloat titleW=74, rightW=70, barX=kPad+titleW+8, barW=inner-titleW-rightW-18;
         [row addSubview:L(name, [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
                           NSMakeRect(kPad, 25, titleW, 15), NSTextAlignmentLeft)];
         [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold],
                           color, NSMakeRect(kW-kPad-rightW, 23, rightW, 17), NSTextAlignmentRight)];
-        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, barW, 7)]; g.fraction=frac; g.color=color;
-        [row addSubview:g];
+        if (frac >= 0) {
+            Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, barW, 7)]; g.fraction=frac; g.color=color;
+            [row addSubview:g];
+        }
         [row addSubview:L(detail, [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
                           NSMakeRect(kPad, 7, inner, 14), NSTextAlignmentLeft)];
         [card addSubview:row]; y += 44;
     };
     // Codex's gauge is read from its own session logs; Claude has no local quota
-    // source, so its gauge is empty unless ~/.glancebar/ai-status.json provides one.
-    ai(@"Claude", @"—", @"No limit status", 0.0, NSColor.tertiaryLabelColor);
-    ai(@"Codex", @"27%", @"Reset: 10:08 PM", 0.27, NSColor.systemOrangeColor);
+    // source, so its row carries no gauge unless ~/.glancebar/ai-status.json provides one.
+    ai(@"Claude", @"—", @"No limit status · Stats through Jun 9", -1, NSColor.tertiaryLabelColor);
+    ai(@"Codex", @"27% left", @"Reset: 10:08 PM", 0.27, NSColor.systemOrangeColor);
 
     y += 4;
     NSBox *d4=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d4.boxType=NSBoxSeparator; [card addSubview:d4]; y+=9;

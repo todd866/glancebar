@@ -412,6 +412,7 @@ static NSColor *CPUColor(double cpu) {
 @property BOOL available, stale, limitStatusAvailable;
 @property double remainingFraction;
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
+@property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
 @property (strong) NSDate *lastActivity;
 @property (copy) NSArray<NSDictionary *> *models;
 @end
@@ -725,7 +726,7 @@ static NSDate *FileMTime(NSString *path) {
 
 @implementation AIReader {
     NSMutableDictionary<NSString *, NSNumber *> *_offsets;   // rollout basename -> consumed bytes
-    NSMutableDictionary<NSString *, NSNumber *> *_days;      // local "yyyy-MM-dd" -> tokens
+    NSMutableDictionary<NSString *, NSDictionary *> *_days;  // local "yyyy-MM-dd" -> @{@"t":, @"f":}
     NSDictionary *_limits;          // newest rate_limits seen
     NSString *_limitsTs;
     NSDate *_dbStamp;               // change detection for the sqlite extras
@@ -867,10 +868,15 @@ static NSDate *FileMTime(NSString *path) {
     u.statusReason = @"Codex session logs do not carry limit status";
 
     NSString *today = LocalDateString(NSDate.date);
-    u.todayTokens = [_days[today] longLongValue];
-    long long week = 0;
-    for (NSNumber *tokens in _days.allValues) week += tokens.longLongValue;   // _days is pruned to 7 days
+    u.todayTokens = [_days[today][@"f"] longLongValue];       // fresh = the headline
+    u.todayTokensAll = [_days[today][@"t"] longLongValue];
+    long long week = 0, weekAll = 0;
+    for (NSDictionary *day in _days.allValues) {              // _days is pruned to 7 days
+        week += [day[@"f"] longLongValue];
+        weekAll += [day[@"t"] longLongValue];
+    }
     u.weekTokens = week;
+    u.weekTokensAll = weekAll;
     u.todaySessions = _sessionsToday;
     u.lastActivity = _lastActivity;
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
@@ -1128,8 +1134,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSArray<AIUsage *> *usage = [self->_aiReader read];
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%.4f|%@|%@;", u.name, u.available,
-             u.limitStatusAvailable, u.todayTokens, u.weekTokens, u.todaySessions,
+            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%lld|%.4f|%@|%@;", u.name, u.available,
+             u.limitStatusAvailable, u.todayTokens, u.todayTokensAll, u.weekTokens, u.todaySessions,
              u.remainingFraction, u.resetText, u.statusText];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_aiLoading = NO;
@@ -1344,6 +1350,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
     if (u.limitStatusAvailable) return [self compactResetText:u];
     if (!u.available) return @"No local state";
+    if (u.stale && u.statusText.length)   // e.g. Claude's cache computes through yesterday
+        return [NSString stringWithFormat:@"No limit status · %@", u.statusText];
     return @"No limit status";
 }
 
@@ -1357,19 +1365,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (NSView *)aiStatusRow:(AIUsage *)u width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 44)];
     CGFloat inner = width - 2*pad;
-    CGFloat rightW = 54;
+    CGFloat rightW = 70;
     CGFloat titleW = 74;
     CGFloat barX = pad + titleW + 8;
     CGFloat barW = inner - titleW - rightW - 18;
+    BOOL hasGauge = u.limitStatusAvailable && u.remainingFraction >= 0;
     NSString *title = u.name ?: @"AI";
     [row addSubview:[self text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
                           at:NSMakeRect(pad, 25, titleW, 15) align:NSTextAlignmentLeft]];
-    [row addSubview:[self text:[self aiPercentText:u] font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
+    // "left" makes the direction unambiguous — a bare "10%" reads as used just as
+    // easily as remaining.
+    NSString *rightText = hasGauge ? [[self aiPercentText:u] stringByAppendingString:@" left"] : @"—";
+    [row addSubview:[self text:rightText font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
                          color:[self aiStatusColor:u] at:NSMakeRect(width-pad-rightW, 23, rightW, 17) align:NSTextAlignmentRight]];
-    Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, MAX(20, barW), 7)];
-    g.fraction = u.limitStatusAvailable && u.remainingFraction >= 0 ? u.remainingFraction : 0;
-    g.color = [self aiStatusColor:u];
-    [row addSubview:g];
+    if (hasGauge) {   // no gauge at all beats an empty gauge that implies "0% used"
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, MAX(20, barW), 7)];
+        g.fraction = u.remainingFraction;
+        g.color = [self aiStatusColor:u];
+        [row addSubview:g];
+    }
     [row addSubview:[self text:[self aiStatusSubtext:u] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
                           at:NSMakeRect(pad, 7, inner, 14) align:NSTextAlignmentLeft]];
     return row;
@@ -1832,10 +1846,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
             continue;
         }
-        [self addDetailKey:@"Today" value:u.todayTokens > 0 ? FmtTokenCount(u.todayTokens) : @"No local usage today"
-                        to:root y:&y width:kDetailW];
-        [self addDetailKey:@"7 days" value:u.weekTokens > 0 ? FmtTokenCount(u.weekTokens) : @"No local usage"
-                        to:root y:&y width:kDetailW];
+        NSString *todayVal = u.todayTokens > 0 ? FmtTokenCount(u.todayTokens) : @"No local usage today";
+        if (u.todayTokensAll > u.todayTokens)
+            todayVal = [todayVal stringByAppendingFormat:@" · %@ incl. cached context", FmtCompact(u.todayTokensAll)];
+        [self addDetailKey:@"Today" value:todayVal to:root y:&y width:kDetailW];
+        NSString *weekVal = u.weekTokens > 0 ? FmtTokenCount(u.weekTokens) : @"No local usage";
+        if (u.weekTokensAll > u.weekTokens)
+            weekVal = [weekVal stringByAppendingFormat:@" · %@ incl. cached context", FmtCompact(u.weekTokensAll)];
+        [self addDetailKey:@"7 days" value:weekVal to:root y:&y width:kDetailW];
         if (u.todaySessions > 0 || u.weekSessions > 0) {
             NSString *sessions = [NSString stringWithFormat:@"%lld today · %lld in 7d", u.todaySessions, u.weekSessions];
             [self addDetailKey:@"Sessions" value:sessions to:root y:&y width:kDetailW];
@@ -2047,12 +2065,18 @@ static void Dump(void) {
             reset = (u.resetText.length && ![u.resetText isEqualToString:@"Not exposed locally"])
                 ? [NSString stringWithFormat:@"resets %@", u.resetText] : @"reset not provided";
         }
+        NSString *today = FmtTokenCount(u.todayTokens);
+        if (u.todayTokensAll > u.todayTokens)
+            today = [today stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.todayTokensAll)];
+        NSString *week = FmtTokenCount(u.weekTokens);
+        if (u.weekTokensAll > u.weekTokens)
+            week = [week stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.weekTokensAll)];
         printf("  %-7s %s · %s · today %s · 7d %s\n",
                u.name.UTF8String,
                remaining.UTF8String,
                reset.UTF8String,
-               FmtTokenCount(u.todayTokens).UTF8String,
-               FmtTokenCount(u.weekTokens).UTF8String);
+               today.UTF8String,
+               week.UTF8String);
     }
 }
 

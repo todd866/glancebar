@@ -39,13 +39,15 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
 // threads.tokens_used column is a lifetime counter and cannot be windowed.
 
 // Parses one rollout line. Returns nil unless it is a token_count event:
-// @{@"ts": ISO-8601 string, @"tokens": @(per-turn total), @"limits": rate_limits dict (optional)}
+// @{@"ts": ISO-8601 string, @"tokens": @(per-turn total incl. cached context re-reads),
+//   @"fresh": @(non-cached input + output — the humanly meaningful count),
+//   @"limits": rate_limits dict (optional)}
 NSDictionary *ParseTokenCountLine(NSString *line);
 
-// Buckets parsed events into per-local-day token totals, merged over existingDays.
-// Returns @{@"days": @{@"yyyy-MM-dd": @(tokens)}, and when any event carried limits,
-// @"latestLimits": rate_limits dict, @"latestTs": its ISO timestamp}.
-NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSNumber *> *existingDays,
+// Buckets parsed events into per-local-day totals, merged over existingDays.
+// Returns @{@"days": @{@"yyyy-MM-dd": @{@"t": total, @"f": fresh}}, and when any event
+// carried limits, @"latestLimits": rate_limits dict, @"latestTs": its ISO timestamp}.
+NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
                                     NSArray<NSDictionary *> *events, NSTimeZone *tz);
 
 // Picks the most constrained, still-current window from a Codex rate_limits dict

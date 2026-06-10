@@ -70,6 +70,7 @@ int main(void) {
         NSDictionary *ev = ParseTokenCountLine(tok);
         check(ev != nil, @"token_count line parses");
         check([ev[@"tokens"] longLongValue] == 74706, @"per-turn token delta extracted");
+        check([ev[@"fresh"] longLongValue] == 74038 - 63360 + 668, @"fresh excludes cached input");
         check([ev[@"ts"] isEqual:@"2026-06-10T09:04:20.778Z"], @"timestamp extracted");
         check([ev[@"limits"][@"plan_type"] isEqual:@"prolite"], @"rate limits captured");
         check(ParseTokenCountLine(@"{\"timestamp\":\"t\",\"payload\":{\"type\":\"user_message\"}}") == nil,
@@ -81,16 +82,19 @@ int main(void) {
         // --- AccumulateTokenEvents ---
         NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:10 * 3600];
         NSDictionary *acc = AccumulateTokenEvents(nil, @[
-            @{@"ts": @"2026-06-09T20:00:00Z", @"tokens": @100},
-            @{@"ts": @"2026-06-09T10:00:00Z", @"tokens": @50},
-            @{@"ts": @"2026-06-10T01:00:00.500Z", @"tokens": @7, @"limits": @{@"plan_type": @"prolite"}},
+            @{@"ts": @"2026-06-09T20:00:00Z", @"tokens": @100, @"fresh": @10},
+            @{@"ts": @"2026-06-09T10:00:00Z", @"tokens": @50, @"fresh": @5},
+            @{@"ts": @"2026-06-10T01:00:00.500Z", @"tokens": @7, @"fresh": @2,
+              @"limits": @{@"plan_type": @"prolite"}},
         ], tz);
-        check([acc[@"days"][@"2026-06-10"] longLongValue] == 107, @"UTC events bucket into local day");
-        check([acc[@"days"][@"2026-06-09"] longLongValue] == 50, @"earlier event stays previous local day");
+        check([acc[@"days"][@"2026-06-10"][@"t"] longLongValue] == 107, @"UTC events bucket into local day");
+        check([acc[@"days"][@"2026-06-10"][@"f"] longLongValue] == 12, @"fresh totals accumulate per day");
+        check([acc[@"days"][@"2026-06-09"][@"t"] longLongValue] == 50, @"earlier event stays previous local day");
         check([acc[@"latestLimits"][@"plan_type"] isEqual:@"prolite"], @"latest limits surfaced");
         NSDictionary *acc2 = AccumulateTokenEvents(acc[@"days"],
-            @[@{@"ts": @"2026-06-10T02:00:00Z", @"tokens": @3}], tz);
-        check([acc2[@"days"][@"2026-06-10"] longLongValue] == 110, @"accumulation merges into existing days");
+            @[@{@"ts": @"2026-06-10T02:00:00Z", @"tokens": @3, @"fresh": @1}], tz);
+        check([acc2[@"days"][@"2026-06-10"][@"t"] longLongValue] == 110, @"accumulation merges into existing days");
+        check([acc2[@"days"][@"2026-06-10"][@"f"] longLongValue] == 13, @"fresh merges too");
 
         // --- PickLimitWindow ---
         NSDictionary *limits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @2000},

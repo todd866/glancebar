@@ -96,6 +96,13 @@ NSDictionary *ParseTokenCountLine(NSString *line) {
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     out[@"ts"] = ts;
     out[@"tokens"] = total ?: @0;
+    // ~94% of total_tokens is cached context re-read every turn; fresh = what a human
+    // would call "tokens used".
+    long long input = [last[@"input_tokens"] longLongValue];
+    long long cachedInput = [last[@"cached_input_tokens"] longLongValue];
+    long long output = [last[@"output_tokens"] longLongValue];
+    long long fresh = (input > cachedInput ? input - cachedInput : 0) + output;
+    out[@"fresh"] = @(fresh);
     if (limits) out[@"limits"] = limits;
     return out;
 }
@@ -111,7 +118,7 @@ static NSDate *DateFromISO8601(NSString *s) {
     return [fractional dateFromString:s] ?: [plain dateFromString:s];
 }
 
-NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSNumber *> *existingDays,
+NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
                                     NSArray<NSDictionary *> *events, NSTimeZone *tz) {
     NSMutableDictionary *days = existingDays ? [existingDays mutableCopy] : [NSMutableDictionary dictionary];
     NSDictionary *latestLimits = nil;
@@ -125,9 +132,12 @@ NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSNumber *> *existi
         NSDate *date = ts ? DateFromISO8601(ts) : nil;
         if (!date) continue;
         long long tokens = [e[@"tokens"] longLongValue];
-        if (tokens > 0) {
+        long long fresh = [e[@"fresh"] longLongValue];
+        if (tokens > 0 || fresh > 0) {
             NSString *day = [dayFmt stringFromDate:date];
-            days[day] = @([days[day] longLongValue] + tokens);
+            NSDictionary *cur = days[day];
+            days[day] = @{@"t": @([cur[@"t"] longLongValue] + tokens),
+                          @"f": @([cur[@"f"] longLongValue] + fresh)};
         }
         if (e[@"limits"] && (!latestTs || [ts compare:latestTs] == NSOrderedDescending)) {
             latestTs = ts;

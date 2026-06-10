@@ -79,6 +79,8 @@ battery pressure, system pressure, and AI status to the terminal.
   the most constrained window that is still current. The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed (the sqlite thread
   store only keeps lifetime counters per thread, which can't be windowed honestly).
+  Headline counts are **fresh tokens** (non-cached input + output); the raw total is
+  ~16× larger because cached context is re-read every turn, and is shown alongside.
   Rollout files are append-only and read incrementally by byte offset on a background
   queue, so the steady-state cost is a handful of `stat` calls. Claude's local stats
   cache (`~/.claude/stats-cache.json`) has usage history but no quota data, so its gauge
