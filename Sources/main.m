@@ -894,6 +894,15 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     _topCPU = @[];
     _topMem = @[];
 
+    // LSUIElement apps have no visible menu bar, but key equivalents are still routed
+    // through the main menu — without this, Cmd+W is dead in the details window.
+    NSMenu *mainMenu = [NSMenu new];
+    NSMenuItem *fileItem = [mainMenu addItemWithTitle:@"File" action:nil keyEquivalent:@""];
+    NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
+    fileItem.submenu = fileMenu;
+    NSApp.mainMenu = mainMenu;
+
     _item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _item.button.target = self;
     _item.button.action = @selector(togglePopover:);
@@ -991,12 +1000,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                               @"color": frac >= 0.85 ? DiskColor(frac) : fg}];
     }
     if (_barShowBattery) {
-        NSString *symbol = _bat.acConnected ? @"battery.100percent.bolt"
-                         : _bat.percent <= 20 ? @"battery.25percent" : @"battery.100percent";
         NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
         NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
-        NSMutableDictionary *seg = [@{@"symbol": symbol, @"text": text, @"color": color} mutableCopy];
-        if (_bat.valid) seg[@"var"] = @(_bat.percent / 100.0);
+        NSMutableDictionary *seg = [@{@"text": text, @"color": color} mutableCopy];
+        if (_bat.valid) {   // no battery (desktop Mac): text-only, no misleading empty glyph
+            seg[@"symbol"] = _bat.acConnected ? @"battery.100percent.bolt"
+                           : _bat.percent <= 20 ? @"battery.25percent" : @"battery.100percent";
+            seg[@"var"] = @(_bat.percent / 100.0);
+        }
         [segments addObject:seg];
     }
     if (_barShowSystem) {
@@ -1374,13 +1385,19 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     root.frame = NSMakeRect(0, 0, kW, y);
     CGFloat maxPopoverH = 720;
     if (y > maxPopoverH) {
+        // Preserve the scroll position across the periodic rebuilds; togglePopover
+        // resets the content view on open so a fresh popover still starts at the top.
+        CGFloat offset = 0;
+        NSView *current = _popover.contentViewController.view;
+        if ([current isKindOfClass:NSScrollView.class])
+            offset = ((NSScrollView *)current).contentView.bounds.origin.y;
         NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, kW, maxPopoverH)];
         scroll.borderType = NSNoBorder;
         scroll.drawsBackground = NO;
         scroll.hasVerticalScroller = YES;
         scroll.autohidesScrollers = YES;
         scroll.documentView = root;
-        [scroll.contentView scrollToPoint:NSMakePoint(0, 0)];
+        [scroll.contentView scrollToPoint:NSMakePoint(0, MIN(offset, MAX(0, y - maxPopoverH)))];
         [scroll reflectScrolledClipView:scroll.contentView];
         _popover.contentSize = NSMakeSize(kW, maxPopoverH);
         _popover.contentViewController.view = scroll;
@@ -1709,41 +1726,57 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return [self detailScrollForRoot:root height:y];
 }
 
+- (NSScrollView *)detailViewForIdentifier:(NSString *)identifier {
+    if ([identifier isEqualToString:@"overview"]) return [self overviewDetailsView];
+    if ([identifier isEqualToString:@"battery"]) return [self batteryDetailsView];
+    if ([identifier isEqualToString:@"system"]) return [self systemDetailsView];
+    if ([identifier isEqualToString:@"ai"]) return [self aiDetailsView];
+    return nil;
+}
+
 - (void)rebuildDetails {
     if (!_detailsWindow) return;
 
-    id selected = nil;
+    NSTabView *tabs = nil;
     for (NSView *subview in _detailsWindow.contentView.subviews) {
-        if ([subview isKindOfClass:NSTabView.class]) {
-            selected = ((NSTabView *)subview).selectedTabViewItem.identifier;
-            break;
-        }
+        if ([subview isKindOfClass:NSTabView.class]) { tabs = (NSTabView *)subview; break; }
     }
 
-    NSRect bounds = _detailsWindow.contentView ? _detailsWindow.contentView.bounds : NSMakeRect(0, 0, 640, 520);
-    if (bounds.size.width < 100 || bounds.size.height < 100) bounds = NSMakeRect(0, 0, 640, 520);
-    NSView *content = [[NSView alloc] initWithFrame:bounds];
-    NSTabView *tabs = [[NSTabView alloc] initWithFrame:NSInsetRect(content.bounds, 12, 12)];
-    tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [tabs addTabViewItem:[self detailTabWithIdentifier:@"overview" title:@"Overview" view:[self overviewDetailsView]]];
-    [tabs addTabViewItem:[self detailTabWithIdentifier:@"battery" title:@"Battery" view:[self batteryDetailsView]]];
-    [tabs addTabViewItem:[self detailTabWithIdentifier:@"system" title:@"System" view:[self systemDetailsView]]];
-    [tabs addTabViewItem:[self detailTabWithIdentifier:@"ai" title:@"AI" view:[self aiDetailsView]]];
-    [content addSubview:tabs];
-    _detailsWindow.contentView = content;
+    if (!tabs) {   // first build: create the shell once
+        NSRect bounds = _detailsWindow.contentView ? _detailsWindow.contentView.bounds : NSMakeRect(0, 0, 660, 520);
+        if (bounds.size.width < 100 || bounds.size.height < 100) bounds = NSMakeRect(0, 0, 660, 520);
+        NSView *content = [[NSView alloc] initWithFrame:bounds];
+        tabs = [[NSTabView alloc] initWithFrame:NSInsetRect(content.bounds, 12, 12)];
+        tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [tabs addTabViewItem:[self detailTabWithIdentifier:@"overview" title:@"Overview" view:[self detailViewForIdentifier:@"overview"]]];
+        [tabs addTabViewItem:[self detailTabWithIdentifier:@"battery" title:@"Battery" view:[self detailViewForIdentifier:@"battery"]]];
+        [tabs addTabViewItem:[self detailTabWithIdentifier:@"system" title:@"System" view:[self detailViewForIdentifier:@"system"]]];
+        [tabs addTabViewItem:[self detailTabWithIdentifier:@"ai" title:@"AI" view:[self detailViewForIdentifier:@"ai"]]];
+        [content addSubview:tabs];
+        _detailsWindow.contentView = content;
+        return;
+    }
 
-    NSTabViewItem *selectedItem = nil;
+    // Periodic refresh: swap each tab's document in place — the tab view, selection,
+    // first responder, and per-tab scroll position all survive.
     for (NSTabViewItem *item in tabs.tabViewItems) {
-        if (selected && [item.identifier isEqual:selected]) { selectedItem = item; break; }
+        NSScrollView *fresh = [self detailViewForIdentifier:item.identifier];
+        if (!fresh) continue;
+        CGFloat offset = 0;
+        if ([item.view isKindOfClass:NSScrollView.class])
+            offset = ((NSScrollView *)item.view).contentView.bounds.origin.y;
+        item.view = fresh;
+        CGFloat maxOffset = MAX(0, fresh.documentView.frame.size.height - fresh.contentView.bounds.size.height);
+        [fresh.contentView scrollToPoint:NSMakePoint(0, MIN(offset, maxOffset))];
+        [fresh reflectScrolledClipView:fresh.contentView];
     }
-    [tabs selectTabViewItem:(selectedItem ?: tabs.tabViewItems.firstObject)];
 }
 
 - (void)showDetails:(id)sender {
     [self refresh];
     BOOL didCreateWindow = (_detailsWindow == nil);
     if (!_detailsWindow) {
-        _detailsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 640, 520)
+        _detailsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 520)
                                                      styleMask:(NSWindowStyleMaskTitled |
                                                                 NSWindowStyleMaskClosable |
                                                                 NSWindowStyleMaskMiniaturizable |
@@ -1752,7 +1785,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                                          defer:NO];
         _detailsWindow.title = @"Glancebar Details";
         _detailsWindow.releasedWhenClosed = NO;
-        _detailsWindow.minSize = NSMakeSize(540, 420);
+        // Tab content is laid out at a fixed 600pt; below ~648 the right column clips
+        // with no horizontal scroller, so don't allow narrower.
+        _detailsWindow.minSize = NSMakeSize(648, 420);
     }
     [self rebuildDetails];
     if (didCreateWindow) [_detailsWindow center];
