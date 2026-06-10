@@ -19,8 +19,7 @@ energy-using apps, current draw, and health). One item, one slot, **no dependenc
 background services, and no admin rights**.
 
 It merges two earlier single-purpose apps — [Diskbar](https://github.com/todd866/diskbar)
-and [Voltbar](https://github.com/todd866/voltbar) — into one, so they stop competing for
-space next to the notch.
+and Voltbar (battery) — into one, so they stop competing for space next to the notch.
 
 ## Key Results
 
