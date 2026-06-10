@@ -83,10 +83,8 @@ Glancebar being a single item — rather than two — makes this far less likely
 
 ## Related
 
-The single-purpose predecessors, now merged into Glancebar:
-
-- **[Diskbar](https://github.com/todd866/diskbar)** — disk usage only.
-- **[Voltbar](https://github.com/todd866/voltbar)** — battery only.
+- **[Diskbar](https://github.com/todd866/diskbar)** — the disk-only predecessor, merged
+  into Glancebar. (A battery-only predecessor, Voltbar, was also merged in.)
 
 ## Credits
 
