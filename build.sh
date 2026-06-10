@@ -7,7 +7,7 @@ APP=build/Glancebar.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-clang -fobjc-arc -O2 Sources/pure.m Sources/main.m \
+clang -fobjc-arc -O2 -mmacosx-version-min=13.0 Sources/pure.m Sources/main.m \
     -framework Cocoa -framework IOKit \
     -o "$APP/Contents/MacOS/Glancebar"
 cp Info.plist "$APP/Contents/Info.plist"

@@ -389,6 +389,7 @@ static NSString *MemoryStatusText(SystemState s) {
 
 static NSString *SwapStatusText(SystemState s) {
     if (!s.swapValid) return @"Swap unknown";
+    if (s.swapUsed == 0) return @"Swap none";   // NSByteCountFormatter renders 0 as "Zero KB"
     return [NSString stringWithFormat:@"Swap %@", FmtBytes(s.swapUsed)];
 }
 
