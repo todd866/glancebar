@@ -71,6 +71,16 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
 // nil when nothing is current, else the same shape as PickLimitWindow.
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
 
+// Reads Anthropic's extra_usage credit budget. Returns nil when absent/disabled, else
+// @{@"description": display string, @"statusReason": short status,
+//   @"overageActive": @(YES when usage is at/over the paid limit)}.
+NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage);
+
+// Claude account fetches are gated by visibility, but a newly visible UI with no
+// cached account state must fetch even if an older retry timer is in the future.
+BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,
+                              BOOL hasAccountStatus, double nowEpoch, double nextFetchEpoch);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

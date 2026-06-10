@@ -807,7 +807,8 @@ static NSDate *FileMTime(NSString *path) {
 // state a handful of stats per tick. Stateful and not reentrant: call from one serial
 // queue only (the --dump path makes its own throwaway instance).
 @interface AIReader : NSObject
-@property BOOL allowClaudeAccount;
+@property BOOL useClaudeAccount;
+@property BOOL allowClaudeAccountFetch;
 @property BOOL allowClaudeTranscripts;
 - (NSArray<AIUsage *> *)read;
 @end
@@ -1051,9 +1052,11 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             u.statusText = [u.statusText stringByAppendingString:@" · transcript totals off"];
     }
 
-    if (self.allowClaudeAccount) {
+    if (self.useClaudeAccount) {
         double now = NSDate.date.timeIntervalSince1970;
-        if (now >= _claudeNextFetch) {
+        if (ShouldFetchClaudeAccount(self.useClaudeAccount, self.allowClaudeAccountFetch,
+                                     _claudeUsageJSON != nil, _claudeAccountStatus.length > 0,
+                                     now, _claudeNextFetch)) {
             _claudeNextFetch = now + 900;   // the endpoint rate-limits readily; 15 min cap
             NSString *token = [self claudeAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
@@ -1066,6 +1069,9 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
                 _claudeAccountStatus = @"Usage API unavailable";
             }
         }
+        NSDictionary *extraStatus = ClaudeExtraUsageStatus(_claudeUsageJSON);
+        if (extraStatus[@"description"]) u.extraUsage = extraStatus[@"description"];
+
         NSDictionary *pick = PickClaudeLimitWindow(_claudeUsageJSON, NSDate.date.timeIntervalSince1970);
         if (pick) {
             u.limitStatusAvailable = YES;
@@ -1075,32 +1081,25 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             u.statusReason = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
             u.statusSource = @"Anthropic usage API (opt-in)";
         } else {
-            u.statusReason = _claudeAccountStatus ?: (_claudeUsageJSON ? @"Claude account response did not include a current limit window"
-                                                                       : @"Claude account status unavailable");
+            NSString *fallback = _claudeUsageJSON ? @"Claude account response did not include a current limit window"
+                : self.allowClaudeAccountFetch ? @"Claude account status unavailable"
+                : @"Claude account refresh paused until visible";
+            u.statusReason = _claudeAccountStatus ?: (extraStatus[@"statusReason"] ?: fallback);
         }
-        NSDictionary *extra = [_claudeUsageJSON[@"extra_usage"] isKindOfClass:NSDictionary.class]
-            ? _claudeUsageJSON[@"extra_usage"] : nil;
-        if ([extra[@"is_enabled"] boolValue] && [extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) {
-            double utilization = [extra[@"utilization"] doubleValue];
-            double usedCredits = [extra[@"used_credits"] doubleValue];
-            double monthlyLimit = [extra[@"monthly_limit"] doubleValue];
-            NSString *currency = [extra[@"currency"] isKindOfClass:NSString.class] ? extra[@"currency"] : @"";
-            u.extraUsage = [NSString stringWithFormat:@"%.0f of %@ %@ (%.0f%%)",
-                            usedCredits, extra[@"monthly_limit"], currency, utilization];
-            if (utilization >= 100.0 || (monthlyLimit > 0 && usedCredits >= monthlyLimit)) {
-                u.limitStatusAvailable = YES;
-                u.remainingFraction = 0;
-                u.overageActive = YES;
-                u.resetText = @"Not provided";
-                u.statusReason = @"Overage billing active";
-                u.statusSource = @"Anthropic usage API (opt-in)";
-            }
+        if ([extraStatus[@"overageActive"] boolValue]) {
+            u.limitStatusAvailable = YES;
+            u.remainingFraction = 0;
+            u.overageActive = YES;
+            u.resetText = @"Not provided";
+            u.statusReason = extraStatus[@"statusReason"];
+            u.statusSource = @"Anthropic usage API (opt-in)";
         }
     } else {
         _claudeAccessToken = nil;
         _claudeAccessTokenExpiresAt = 0;
         _claudeUsageJSON = nil;
         _claudeAccountStatus = nil;
+        _claudeNextFetch = 0;
     }
     return u;
 }
@@ -1516,10 +1515,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _aiLoading = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL showAI = _barShowAI || _popover.isShown || _detailsWindow.isVisible;
-    BOOL allowAccount = showAI && [ud boolForKey:@"useClaudeAccount"];
+    BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
+    BOOL allowAccountFetch = showAI && useAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     dispatch_async(_aiQueue, ^{
-        self->_aiReader.allowClaudeAccount = allowAccount;
+        self->_aiReader.useClaudeAccount = useAccount;
+        self->_aiReader.allowClaudeAccountFetch = allowAccountFetch;
         self->_aiReader.allowClaudeTranscripts = allowTranscripts;
         NSArray<AIUsage *> *usage = [self->_aiReader read];
         NSMutableString *sig = [NSMutableString string];
@@ -2509,7 +2510,8 @@ static void Dump(BOOL allowOnline) {
     printf("ai status:\n");
     AIReader *reader = [AIReader new];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    reader.allowClaudeAccount = allowOnline && [ud boolForKey:@"useClaudeAccount"];
+    reader.useClaudeAccount = allowOnline && [ud boolForKey:@"useClaudeAccount"];
+    reader.allowClaudeAccountFetch = reader.useClaudeAccount;
     reader.allowClaudeTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     for (AIUsage *u in [reader read]) {
         NSString *remaining = u.limitStatusAvailable ? [NSString stringWithFormat:@"%d%% remaining",

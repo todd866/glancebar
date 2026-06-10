@@ -237,6 +237,31 @@ NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch) {
     return best;
 }
 
+NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
+    if (![usage isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *extra = [usage[@"extra_usage"] isKindOfClass:NSDictionary.class] ? usage[@"extra_usage"] : nil;
+    if (!extra || ![extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) return nil;
+    id enabled = extra[@"is_enabled"];
+    if ([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) return nil;
+    double utilization = [extra[@"utilization"] doubleValue];
+    double usedCredits = [extra[@"used_credits"] doubleValue];
+    double monthlyLimit = [extra[@"monthly_limit"] doubleValue];
+    NSString *currency = [extra[@"currency"] isKindOfClass:NSString.class] ? extra[@"currency"] : @"";
+    BOOL overage = utilization >= 100.0 || (monthlyLimit > 0 && usedCredits >= monthlyLimit);
+    NSString *description = [NSString stringWithFormat:@"%.0f of %@ %@ (%.0f%%)",
+                             usedCredits, extra[@"monthly_limit"], currency, utilization];
+    return @{@"description": description,
+             @"statusReason": overage ? @"Overage billing active" : @"Extra usage active",
+             @"overageActive": @(overage)};
+}
+
+BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,
+                              BOOL hasAccountStatus, double nowEpoch, double nextFetchEpoch) {
+    if (!useAccount || !allowFetch) return NO;
+    if (nowEpoch >= nextFetchEpoch) return YES;
+    return !hasUsageJSON && !hasAccountStatus;
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }

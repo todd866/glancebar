@@ -144,6 +144,24 @@ int main(void) {
               @"extra_usage excluded; 5-hour window wins");
         check([rpick[@"window"] isEqual:@"5-hour"], @"5-hour window labeled");
         check([rpick[@"resetsAt"] doubleValue] > 1781000000.0, @"microsecond ISO reset parsed");
+        NSDictionary *extra = ClaudeExtraUsageStatus(real);
+        check(extra && [extra[@"statusReason"] isEqual:@"Extra usage active"], @"extra_usage below limit is account status");
+        check(![extra[@"overageActive"] boolValue], @"extra_usage below limit is not overage");
+        NSDictionary *overage = ClaudeExtraUsageStatus(@{@"extra_usage": @{@"is_enabled": @YES,
+                                                                           @"used_credits": @10500,
+                                                                           @"monthly_limit": @10000,
+                                                                           @"currency": @"AUD",
+                                                                           @"utilization": @105.0}});
+        check([overage[@"overageActive"] boolValue], @"extra_usage over limit is overage");
+        check([overage[@"statusReason"] isEqual:@"Overage billing active"], @"overage status is explicit");
+        check(!ShouldFetchClaudeAccount(YES, NO, NO, NO, 1000, 2000),
+              @"hidden Claude account UI does not fetch");
+        check(ShouldFetchClaudeAccount(YES, YES, NO, NO, 1000, 2000),
+              @"visible Claude account with no cached status fetches despite future retry");
+        check(!ShouldFetchClaudeAccount(YES, YES, NO, YES, 1000, 2000),
+              @"visible Claude account keeps cached error until retry");
+        check(ShouldFetchClaudeAccount(YES, YES, YES, YES, 2500, 2000),
+              @"visible Claude account fetches after retry interval");
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
