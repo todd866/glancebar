@@ -7,7 +7,7 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
+  <img src="docs/screenshot.png?v=7c524a2" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
 </p>
 
 ## Overview
