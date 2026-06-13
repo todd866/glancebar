@@ -11,7 +11,17 @@ clang -fobjc-arc -O2 -mmacosx-version-min=13.0 Sources/pure.m Sources/main.m \
     -framework Cocoa -framework IOKit -framework Security \
     -o "$APP/Contents/MacOS/Glancebar"
 cp Info.plist "$APP/Contents/Info.plist"
-codesign --force --sign "${GLANCEBAR_CODESIGN_IDENTITY:--}" "$APP"
+
+# Sign with a stable identity so the Keychain "Always Allow" grant for the Claude
+# Code-credentials item survives rebuilds (ad-hoc signing changes the code hash every
+# build, which re-triggers the prompt). Falls back to ad-hoc on machines that don't
+# have the cert. Create it once with: see docs or Keychain Access > Certificate
+# Assistant (Code Signing, self-signed).
+IDENTITY="${GLANCEBAR_CODESIGN_IDENTITY:-Glancebar Self-Signed}"
+if ! security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+    IDENTITY="-"
+fi
+codesign --force --sign "$IDENTITY" "$APP"
 
 echo "Built $APP"
 echo "Run:     open $APP"
