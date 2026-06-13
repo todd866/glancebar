@@ -412,6 +412,7 @@ static NSColor *CPUColor(double cpu) {
 @interface AIUsage : NSObject
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
 @property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
+@property (copy) NSString *diagnostics;   // --dump only: why the gauge is or isn't shown
 @property BOOL available, stale, limitStatusAvailable, overageActive;
 @property double remainingFraction;
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
@@ -430,6 +431,19 @@ static os_log_t GBAILog(void) {
     return log;
 }
 #define GBLog(fmt, ...) os_log(GBAILog(), fmt, ##__VA_ARGS__)
+
+static NSString *FmtEpochClock(double epoch) {   // "12:12:08", or "—" when unset
+    if (epoch <= 0) return @"—";
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"HH:mm:ss";
+    return [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:epoch]];
+}
+static NSString *FmtEpochDayClock(double epoch) {   // "12/6 04:08", or "—" when unset
+    if (epoch <= 0) return @"—";
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"d/M HH:mm";
+    return [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:epoch]];
+}
 
 static NSString *FmtCompact(long long n) {
     double v = (double)llabs(n);
@@ -1125,12 +1139,19 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             u.statusReason = extraStatus[@"statusReason"];
             u.statusSource = @"Anthropic usage API (opt-in)";
         }
+        u.diagnostics = [NSString stringWithFormat:@"usage JSON %@ · next fetch %@ · keychain %@",
+            _claudeUsageJSON ? @"cached" : @"none",
+            FmtEpochClock(_claudeNextFetch),
+            _claudeKeychainNextTry > now
+                ? [@"backoff until " stringByAppendingString:FmtEpochClock(_claudeKeychainNextTry)]
+                : _claudeAccessToken.length ? @"token cached" : @"not read"];
     } else {
         _claudeAccessToken = nil;
         _claudeAccessTokenExpiresAt = 0;
         _claudeUsageJSON = nil;
         _claudeAccountStatus = nil;
         _claudeNextFetch = 0;
+        u.diagnostics = @"account toggle off";
     }
     return u;
 }
@@ -1220,6 +1241,24 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         u.statusSource = @"~/.codex session logs";
     }
     else u.statusReason = CodexLimitStatusReason(_limits, _limitsTs, now);
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    [parts addObject:[NSString stringWithFormat:@"limits snapshot %@",
+                      _limitsTs.length ? _limitsTs : @"never seen"]];
+    BOOL anyCurrent = NO, anyUsable = NO;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        NSDictionary *w = [_limits[key] isKindOfClass:NSDictionary.class] ? _limits[key] : nil;
+        if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
+        anyUsable = YES;
+        double resets = [w[@"resets_at"] doubleValue];
+        BOOL expired = resets > 0 && resets <= now;
+        if (!expired) anyCurrent = YES;
+        long mins = [w[@"window_minutes"] longValue];
+        [parts addObject:[NSString stringWithFormat:@"%@ reset %@%@",
+            mins == 10080 ? @"weekly" : mins == 300 ? @"5h" : @"window",
+            FmtEpochDayClock(resets), expired ? @" (expired)" : @""]];
+    }
+    if (anyUsable && !anyCurrent) [parts addObject:@"all expired"];
+    u.diagnostics = [parts componentsJoinedByString:@" · "];
     return u;
 }
 
@@ -2554,9 +2593,13 @@ static void Dump(BOOL allowOnline) {
         }
     }
 
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    printf("ai toggles: barShowAI=%s · useClaudeAccount=%s · useClaudeTranscripts=%s\n",
+           [ud boolForKey:@"barShowAI"] ? "on" : "off",
+           [ud boolForKey:@"useClaudeAccount"] ? "on" : "off",
+           [ud boolForKey:@"useClaudeTranscripts"] ? "on" : "off");
     printf("ai status:\n");
     AIReader *reader = [AIReader new];
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     reader.useClaudeAccount = allowOnline && [ud boolForKey:@"useClaudeAccount"];
     reader.allowClaudeAccountFetch = reader.useClaudeAccount;
     reader.allowClaudeTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
@@ -2584,6 +2627,7 @@ static void Dump(BOOL allowOnline) {
                today.UTF8String,
                week.UTF8String,
                reason.UTF8String);
+        if (u.diagnostics.length) printf("          why: %s\n", u.diagnostics.UTF8String);
     }
 }
 
