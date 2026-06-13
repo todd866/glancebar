@@ -37,7 +37,9 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
     long long avail = [v[NSURLVolumeAvailableCapacityKey] longLongValue];
     NSNumber *important = [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
                                                error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
-    if (important.longLongValue > 0) avail = important.longLongValue;
+    // APFS reports purgeable space in the "important usage" figure, which can exceed
+    // total capacity; clamp so used/free/fraction stay self-consistent.
+    if (important.longLongValue > 0) avail = MIN(important.longLongValue, total.longLongValue);
 
     Volume *vol = [Volume new];
     vol.path = url.path.length ? url.path : @"/";
@@ -133,6 +135,7 @@ static NSString *AppGroupForPid(pid_t pid) {
     char path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
     NSString *p = [NSString stringWithUTF8String:path];
+    if (!p) return nil;   // executable path was not valid UTF-8
     NSRange app = [p rangeOfString:@".app/"];
     if (app.location == NSNotFound) return nil;
     NSString *bundle = [p substringToIndex:app.location + 4];
@@ -664,7 +667,7 @@ static AIUsage *ReadClaudeUsage(void) {
                  : u.stale ? [NSString stringWithFormat:@"Stats through %@", ShortDateText(lastComputed)]
                  : @"Local stats current";
 
-    NSDictionary *latestTokensByModel = nil;
+    NSDictionary *latestTokensByModel = nil, *displayTokens = nil;
     NSString *latestDate = nil;
     for (NSDictionary *row in ([root[@"dailyModelTokens"] isKindOfClass:NSArray.class] ? root[@"dailyModelTokens"] : @[])) {
         if (![row isKindOfClass:NSDictionary.class]) continue;
@@ -674,20 +677,16 @@ static AIUsage *ReadClaudeUsage(void) {
         if (!date || !tokensByModel) continue;
         if ([date compare:weekStart] != NSOrderedAscending && [date compare:now] != NSOrderedDescending)
             u.weekTokens += SumNumbersInDictionary(tokensByModel);
-        if ([dateString isEqualToString:today])
+        if ([dateString isEqualToString:today]) {
             u.todayTokens = SumNumbersInDictionary(tokensByModel);
+            if (u.todayTokens > 0) displayTokens = tokensByModel;
+        }
         if (!latestDate || [dateString compare:latestDate] == NSOrderedDescending) {
             latestDate = dateString;
             latestTokensByModel = tokensByModel;
         }
     }
 
-    NSDictionary *displayTokens = nil;
-    if (u.todayTokens > 0) {
-        for (NSDictionary *row in ([root[@"dailyModelTokens"] isKindOfClass:NSArray.class] ? root[@"dailyModelTokens"] : @[])) {
-            if ([row[@"date"] isEqualToString:today]) { displayTokens = row[@"tokensByModel"]; break; }
-        }
-    }
     if (!displayTokens) displayTokens = latestTokensByModel;
     u.models = ModelRowsFromTokenDictionary(displayTokens);
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
@@ -881,12 +880,16 @@ static NSDate *FileMTime(NSString *path) {
     unsigned long long offset = [offsets[key] unsignedLongLongValue];
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return nil;
-    unsigned long long size = [fh seekToEndOfFile];
+    // These files belong to other tools and can be rotated/truncated mid-read; use the
+    // error-returning APIs so an I/O failure skips the sample instead of raising.
+    unsigned long long size = 0;
+    NSError *err = nil;
+    if (![fh seekToEndReturningOffset:&size error:&err]) { [fh closeAndReturnError:nil]; return nil; }
     if (offset > size) offset = 0;   // file was truncated/recreated
-    [fh seekToFileOffset:offset];
-    NSData *data = [fh readDataOfLength:kMaxLogReadBytes];
-    [fh closeFile];
-    if (!data.length) return nil;
+    if (![fh seekToOffset:offset error:&err]) { [fh closeAndReturnError:nil]; return nil; }
+    NSData *data = [fh readDataUpToLength:kMaxLogReadBytes error:&err];
+    [fh closeAndReturnError:nil];
+    if (err || !data.length) return nil;
     const char *bytes = data.bytes;
     NSUInteger consume = 0;
     for (NSUInteger i = data.length; i > 0; i--) {
@@ -949,7 +952,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
             unsigned long long offset = [_offsets[key] unsignedLongLongValue];
             if (size <= offset) continue;   // nothing appended (append-only files)
-            [self consumeFile:[base stringByAppendingPathComponent:rel] key:key fromOffset:offset];
+            [self consumeFile:[base stringByAppendingPathComponent:rel] key:key];
         }
     }
     // Offsets for files that aged out of the window are dead weight.
@@ -957,7 +960,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     PruneDays(_days, WeekStartDayString());
 }
 
-- (void)consumeFile:(NSString *)path key:(NSString *)key fromOffset:(unsigned long long)offset {
+- (void)consumeFile:(NSString *)path key:(NSString *)key {
     NSData *chunk = [self newLineDataAtPath:path key:key offsets:_offsets];
     if (!chunk) return;
     NSMutableArray *events = [NSMutableArray array];
@@ -1579,8 +1582,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         while (_ampHistory.count > 6) [_ampHistory removeObjectAtIndex:0];
     }
     [self updateBar];
-    if (_popover.isShown) [self rebuildContent];
-    if (_detailsWindow.isVisible) [self rebuildDetails];
+    [self refreshVisibleSurfaces];
     // The details window stays open indefinitely; refresh its one-shot process samples
     // on a slow cadence so they don't masquerade as live data next to live numbers.
     if (_detailsWindow.isVisible && !_hogsLoading && !_procStatsLoading &&
@@ -1624,8 +1626,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             if (![sig isEqualToString:self->_aiSignature]) {
                 self->_aiSignature = sig;
                 [self updateBar];
-                if (self->_popover.isShown) [self rebuildContent];
-                if (self->_detailsWindow.isVisible) [self rebuildDetails];
+                [self refreshVisibleSurfaces];
             }
             if (rerun) [self refreshAIUsageAsync];
         });
@@ -1704,6 +1705,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
 }
 
+// Redraw whatever on-screen surfaces are currently visible.
+- (void)refreshVisibleSurfaces {
+    if (_popover.isShown) [self rebuildContent];
+    if (_detailsWindow.isVisible) [self rebuildDetails];
+}
+
 #pragma mark popover
 
 - (void)togglePopover:(id)sender {
@@ -1731,8 +1738,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _hogs = @[];
     _hogsLoading = YES;
     _hogsUnavailable = NO;
-    if (_popover.isShown) [self rebuildContent];
-    if (_detailsWindow.isVisible) [self rebuildDetails];
+    [self refreshVisibleSurfaces];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSArray *hogs = SampleHogs(5);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1740,8 +1746,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             self->_hogs = hogs ? hogs : @[];
             self->_hogsLoading = NO;
             self->_hogsUnavailable = self->_hogs.count == 0;
-            if (self->_popover.isShown) [self rebuildContent];
-            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+            [self refreshVisibleSurfaces];
         });
     });
 }
@@ -1752,8 +1757,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _topMem = @[];
     _procStatsLoading = YES;
     _procStatsUnavailable = NO;
-    if (_popover.isShown) [self rebuildContent];
-    if (_detailsWindow.isVisible) [self rebuildDetails];
+    [self refreshVisibleSurfaces];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSDictionary *stats = SampleProcessStats(5);
         NSArray *cpu = stats[@"cpu"] ? stats[@"cpu"] : @[];
@@ -1764,8 +1768,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             self->_topMem = memory;
             self->_procStatsLoading = NO;
             self->_procStatsUnavailable = cpu.count == 0 && memory.count == 0;
-            if (self->_popover.isShown) [self rebuildContent];
-            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+            [self refreshVisibleSurfaces];
         });
     });
 }
