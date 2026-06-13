@@ -89,6 +89,14 @@ double RateLimitRetryDelay(double retryAfterSeconds);
 // revoked it); drop it so the next attempt re-reads the Keychain.
 BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);
 
+// Classifies a Keychain credential read. Missing/denied/empty backs off an hour (each
+// retry may prompt the user); an expired token retries in 5 minutes (Claude Code
+// refreshes it quickly, and re-reading an item we already have ACL access to never
+// prompts). Returns @{@"ok": @YES, @"token":, @"expiresAt":} or
+// @{@"ok": @NO, @"status": display string, @"retryDelay": @(seconds)}.
+NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
+                                    double expiresAtEpoch, double nowEpoch);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

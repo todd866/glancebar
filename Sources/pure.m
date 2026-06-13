@@ -271,6 +271,17 @@ BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode) {
     return statusCode == 401 || statusCode == 403;
 }
 
+NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
+                                    double expiresAtEpoch, double nowEpoch) {
+    if (!itemFound || !token.length)
+        return @{@"ok": @NO, @"retryDelay": @3600.0,
+                 @"status": @"Keychain token unavailable; retrying later"};
+    if (expiresAtEpoch > 0 && expiresAtEpoch <= nowEpoch)
+        return @{@"ok": @NO, @"retryDelay": @300.0,
+                 @"status": @"Claude Code token expired; waiting for it to refresh"};
+    return @{@"ok": @YES, @"token": token, @"expiresAt": @(expiresAtEpoch)};
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }

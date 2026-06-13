@@ -701,9 +701,9 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
 // quota state on disk — its /usage panel fetches from the API — so the only true gauge
 // source is the same OAuth endpoint, authenticated with the token Claude Code already
 // maintains in the Keychain. Returns nil when the toggle is off conceptually (callers
-// gate), the item is missing, access is denied, or the token has expired (Claude Code
-// refreshes it while it runs; never refresh it ourselves — that could rotate the
-// refresh token out from under Claude Code).
+// gate), the item is missing, or access is denied.
+// Expiry is judged by the caller via ClaudeKeychainOutcome (never refresh the token
+// ourselves — that could rotate the refresh token out from under Claude Code).
 static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
     NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
                             (__bridge id)kSecAttrService: @"Claude Code-credentials",
@@ -714,10 +714,10 @@ static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
     NSData *data = CFBridgingRelease(result);
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     NSDictionary *oauth = [json[@"claudeAiOauth"] isKindOfClass:NSDictionary.class] ? json[@"claudeAiOauth"] : nil;
+    if (!oauth) return nil;
     NSString *token = [oauth[@"accessToken"] isKindOfClass:NSString.class] ? oauth[@"accessToken"] : nil;
     double expiresAt = [oauth[@"expiresAt"] doubleValue] / 1000.0;   // ms epoch
-    if (!token.length || (expiresAt > 0 && expiresAt <= NSDate.date.timeIntervalSince1970)) return nil;
-    return @{@"token": token, @"expiresAt": @(expiresAt)};
+    return @{@"token": token ?: @"", @"expiresAt": @(expiresAt)};    // expiry judged by the caller
 }
 
 // One GET to Anthropic's OAuth usage endpoint — the same data Claude Code's /usage
@@ -990,23 +990,23 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     if (_claudeAccessToken.length && (_claudeAccessTokenExpiresAt <= 0 || _claudeAccessTokenExpiresAt > now + 60))
         return _claudeAccessToken;
     if (now < _claudeKeychainNextTry) {
-        _claudeAccountStatus = @"Keychain access unavailable; retrying later";
+        if (!_claudeAccountStatus.length) _claudeAccountStatus = @"Keychain token unavailable; retrying later";
         return nil;
     }
 
     NSDictionary *cred = ClaudeAccessTokenFromKeychain();
-    NSString *token = [cred[@"token"] isKindOfClass:NSString.class] ? cred[@"token"] : nil;
-    double expiresAt = [cred[@"expiresAt"] doubleValue];
-    if (!token.length) {
+    NSDictionary *outcome = ClaudeKeychainOutcome(cred != nil, cred[@"token"],
+                                                  [cred[@"expiresAt"] doubleValue], now);
+    if (![outcome[@"ok"] boolValue]) {
         _claudeAccessToken = nil;
         _claudeAccessTokenExpiresAt = 0;
-        _claudeKeychainNextTry = now + 3600;   // denied/missing/expired: don't keep prompting
-        _claudeAccountStatus = @"Keychain token unavailable; retrying later";
+        _claudeKeychainNextTry = now + [outcome[@"retryDelay"] doubleValue];
+        _claudeAccountStatus = outcome[@"status"];
         return nil;
     }
 
-    _claudeAccessToken = token;
-    _claudeAccessTokenExpiresAt = expiresAt;
+    _claudeAccessToken = outcome[@"token"];
+    _claudeAccessTokenExpiresAt = [outcome[@"expiresAt"] doubleValue];
     _claudeKeychainNextTry = 0;
     return _claudeAccessToken;
 }

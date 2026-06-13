@@ -176,6 +176,25 @@ int main(void) {
         check(!ShouldDropCachedTokenForStatus(500), @"500 keeps the cached token");
         check(!ShouldDropCachedTokenForStatus(0), @"transport error keeps the cached token");
 
+        // --- ClaudeKeychainOutcome ---
+        NSDictionary *kcMissing = ClaudeKeychainOutcome(NO, nil, 0, 1000);
+        check(![kcMissing[@"ok"] boolValue], @"missing keychain item ⇒ not ok");
+        check([kcMissing[@"retryDelay"] doubleValue] == 3600, @"missing item backs off 1h (avoid prompt spam)");
+        check([kcMissing[@"status"] isEqual:@"Keychain token unavailable; retrying later"],
+              @"missing item keeps the existing message");
+        NSDictionary *kcEmpty = ClaudeKeychainOutcome(YES, @"", 2000, 1000);
+        check(![kcEmpty[@"ok"] boolValue] && [kcEmpty[@"retryDelay"] doubleValue] == 3600,
+              @"empty token is treated as missing");
+        NSDictionary *kcExpired = ClaudeKeychainOutcome(YES, @"tok", 999, 1000);
+        check(![kcExpired[@"ok"] boolValue], @"expired token ⇒ not ok");
+        check([kcExpired[@"retryDelay"] doubleValue] == 300, @"expired token retries in 5 min, not 1h");
+        check([kcExpired[@"status"] isEqual:@"Claude Code token expired; waiting for it to refresh"],
+              @"expired token names the real condition");
+        NSDictionary *kcOk = ClaudeKeychainOutcome(YES, @"tok", 5000, 1000);
+        check([kcOk[@"ok"] boolValue] && [kcOk[@"token"] isEqual:@"tok"], @"future expiry ⇒ usable token");
+        NSDictionary *kcNoExpiry = ClaudeKeychainOutcome(YES, @"tok", 0, 1000);
+        check([kcNoExpiry[@"ok"] boolValue], @"unknown expiry (0) is trusted");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;
