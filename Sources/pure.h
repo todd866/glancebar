@@ -97,6 +97,12 @@ BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);
 NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
                                     double expiresAtEpoch, double nowEpoch);
 
+// The user-facing reason when PickLimitWindow shows no Codex gauge: nil when a window
+// is current (caller shows the gauge), "do not carry" only when no usable rate_limits
+// were ever seen, and an explicit stale message when every usable window has already
+// reset (dated from the snapshot's ISO-8601 timestamp when parseable).
+NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, double nowEpoch);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

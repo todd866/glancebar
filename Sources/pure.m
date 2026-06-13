@@ -282,6 +282,24 @@ NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
     return @{@"ok": @YES, @"token": token, @"expiresAt": @(expiresAtEpoch)};
 }
 
+NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, double nowEpoch) {
+    BOOL sawUsable = NO;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
+        if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
+        sawUsable = YES;
+        double resets = [w[@"resets_at"] doubleValue];
+        if (!(resets > 0 && resets <= nowEpoch)) return nil;   // current window — gauge shows
+    }
+    if (!sawUsable) return @"Codex session logs do not carry limit status";
+    NSDate *snapshot = limitsTs.length ? DateFromISO8601(limitsTs) : nil;
+    if (!snapshot) return @"Limit windows reset since last Codex session";
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    [fmt setLocalizedDateFormatFromTemplate:@"d MMM"];
+    return [NSString stringWithFormat:@"Limit windows reset since last Codex session (%@)",
+            [fmt stringFromDate:snapshot]];
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }

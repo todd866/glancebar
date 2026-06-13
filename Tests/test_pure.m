@@ -195,6 +195,31 @@ int main(void) {
         NSDictionary *kcNoExpiry = ClaudeKeychainOutcome(YES, @"tok", 0, 1000);
         check([kcNoExpiry[@"ok"] boolValue], @"unknown expiry (0) is trusted");
 
+        // --- CodexLimitStatusReason ---
+        check([CodexLimitStatusReason(nil, nil, 1000)
+                  isEqual:@"Codex session logs do not carry limit status"],
+              @"no rate_limits ever seen ⇒ do-not-carry");
+        check([CodexLimitStatusReason(@{@"primary": @{@"window_minutes": @300}}, nil, 1000)
+                  isEqual:@"Codex session logs do not carry limit status"],
+              @"windows without used_percent are malformed ⇒ do-not-carry");
+        check(CodexLimitStatusReason(@{@"primary": @{@"used_percent": @83.0, @"resets_at": @2000}},
+                                     @"2026-06-10T09:25:32Z", 1000) == nil,
+              @"unexpired window ⇒ nil (gauge shows)");
+        check(CodexLimitStatusReason(@{@"primary": @{@"used_percent": @83.0, @"resets_at": @500},
+                                       @"secondary": @{@"used_percent": @91.0, @"resets_at": @2000}},
+                                     @"2026-06-10T09:25:32Z", 1000) == nil,
+              @"one expired but the other current ⇒ nil (gauge shows)");
+        NSString *expiredReason = CodexLimitStatusReason(
+            @{@"primary": @{@"used_percent": @83.0, @"resets_at": @500},
+              @"secondary": @{@"used_percent": @91.0, @"resets_at": @900}},
+            @"2026-06-10T09:25:32Z", 1000);
+        check([expiredReason hasPrefix:@"Limit windows reset since last Codex session ("],
+              @"all windows expired ⇒ dated stale message");
+        check([CodexLimitStatusReason(@{@"primary": @{@"used_percent": @83.0, @"resets_at": @500}},
+                                      nil, 1000)
+                  isEqual:@"Limit windows reset since last Codex session"],
+              @"expired with no snapshot timestamp ⇒ undated stale message");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

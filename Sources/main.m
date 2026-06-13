@@ -1165,8 +1165,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         return u;
     }
     u.statusText = @"Per-turn session logs";
-    u.statusReason = @"Codex session logs do not carry limit status";
-
+    double now = NSDate.date.timeIntervalSince1970;
     NSString *today = LocalDateString(NSDate.date);
     u.todayTokens = [_days[today][@"f"] longLongValue];       // fresh = the headline
     u.todayTokensAll = [_days[today][@"t"] longLongValue];
@@ -1181,7 +1180,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     u.lastActivity = _lastActivity;
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
 
-    NSDictionary *pick = PickLimitWindow(_limits, NSDate.date.timeIntervalSince1970);
+    NSDictionary *pick = PickLimitWindow(_limits, now);
     if (pick) {
         u.limitStatusAvailable = YES;
         u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
@@ -1193,6 +1192,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
         u.statusSource = @"~/.codex session logs";
     }
+    else u.statusReason = CodexLimitStatusReason(_limits, _limitsTs, now);
     return u;
 }
 
