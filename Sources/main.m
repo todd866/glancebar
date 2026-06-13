@@ -1272,7 +1272,9 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     for (AIUsage *u in usage) {
         NSString *prev = _lastStatusReasons[u.name];
         if (u.statusReason.length && ![u.statusReason isEqualToString:prev]) {
-            GBLog("%{public}@ status: %{public}@ -> %{public}@",
+            // Reason strings can carry server- or status-file-sourced text, so they stay
+            // private by os_log default; only the provider name is logged publicly.
+            GBLog("%{public}@ status changed: %@ -> %@",
                   u.name, prev ?: @"(none)", u.statusReason);
             _lastStatusReasons[u.name] = u.statusReason;
         }
