@@ -9,6 +9,7 @@
 #import <mach/mach.h>
 #import <sys/mount.h>
 #import <sys/sysctl.h>
+#import <os/log.h>
 #import "pure.h"
 
 #pragma mark - Disk
@@ -419,6 +420,16 @@ static NSColor *CPUColor(double cpu) {
 @property (copy) NSArray<NSDictionary *> *models;
 @end
 @implementation AIUsage @end
+
+// Unified logging for the AI pipeline: transitions only, metadata only (booleans,
+// HTTP codes, our own status strings — never tokens, counts, or credentials).
+// View: log show --predicate 'subsystem == "com.iantodd.glancebar"' --last 12h
+static os_log_t GBAILog(void) {
+    static os_log_t log; static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("com.iantodd.glancebar", "ai"); });
+    return log;
+}
+#define GBLog(fmt, ...) os_log(GBAILog(), fmt, ##__VA_ARGS__)
 
 static NSString *FmtCompact(long long n) {
     double v = (double)llabs(n);
@@ -832,6 +843,8 @@ static NSDate *FileMTime(NSString *path) {
     double _claudeAccessTokenExpiresAt;
     double _claudeKeychainNextTry;
     NSString *_claudeAccountStatus;
+    NSString *_lastFetchSkipReason;
+    NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
 }
 
 - (instancetype)init {
@@ -841,6 +854,7 @@ static NSDate *FileMTime(NSString *path) {
         _claudeOffsets = [NSMutableDictionary dictionary];
         _claudeDays = [NSMutableDictionary dictionary];
         _claudeSeenIds = [NSMutableSet set];
+        _lastStatusReasons = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -1002,12 +1016,14 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         _claudeAccessTokenExpiresAt = 0;
         _claudeKeychainNextTry = now + [outcome[@"retryDelay"] doubleValue];
         _claudeAccountStatus = outcome[@"status"];
+        GBLog("keychain read: %{public}@", outcome[@"status"]);
         return nil;
     }
 
     _claudeAccessToken = outcome[@"token"];
     _claudeAccessTokenExpiresAt = [outcome[@"expiresAt"] doubleValue];
     _claudeKeychainNextTry = 0;
+    GBLog("keychain read: ok");
     return _claudeAccessToken;
 }
 
@@ -1062,15 +1078,27 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
                                      _claudeUsageJSON != nil, _claudeAccountStatus.length > 0,
                                      now, _claudeNextFetch)) {
             _claudeNextFetch = now + 900;   // the endpoint rate-limits readily; 15 min cap
+            _lastFetchSkipReason = nil;
             NSString *token = [self claudeAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
             if ([fetch[@"_glancebarFetchError"] boolValue]) {
                 [self rememberClaudeFetchError:fetch now:now];
+                GBLog("claude fetch: failed http=%ld rateLimited=%d",
+                      (long)[fetch[@"statusCode"] integerValue], [fetch[@"rateLimited"] boolValue]);
             } else if (fetch && !fetch[@"error"]) {
                 _claudeUsageJSON = fetch;
                 _claudeAccountStatus = nil;
+                GBLog("claude fetch: ok");
             } else if (token.length) {
                 _claudeAccountStatus = @"Usage API unavailable";
+                GBLog("claude fetch: unusable response");
+            }
+        } else {
+            NSString *skip = !self.allowClaudeAccountFetch ? @"hidden"
+                : now < _claudeNextFetch ? @"throttled" : @"cached status";
+            if (![skip isEqualToString:_lastFetchSkipReason]) {
+                GBLog("claude fetch: skipped (%{public}@)", skip);
+                _lastFetchSkipReason = skip;
             }
         }
         NSDictionary *extraStatus = ClaudeExtraUsageStatus(_claudeUsageJSON);
@@ -1202,6 +1230,14 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     NSDictionary *status = JSONDictionaryAtPath(statusPath);
     if (status) {
         for (AIUsage *u in usage) ApplyAIStatusFile(u, status, @"~/.glancebar/ai-status.json");
+    }
+    for (AIUsage *u in usage) {
+        NSString *prev = _lastStatusReasons[u.name];
+        if (u.statusReason.length && ![u.statusReason isEqualToString:prev]) {
+            GBLog("%{public}@ status: %{public}@ -> %{public}@",
+                  u.name, prev ?: @"(none)", u.statusReason);
+            _lastStatusReasons[u.name] = u.statusReason;
+        }
     }
     return usage;
 }
@@ -1426,6 +1462,7 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
+    BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
 }
 
@@ -1522,6 +1559,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
     BOOL allowAccountFetch = showAI && useAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
+    if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
+        allowTranscripts != _lastAllowTranscripts) {
+        GBLog("gates: showAI=%d useClaudeAccount=%d transcripts=%d",
+              showAI, useAccount, allowTranscripts);
+        _aiGatesLogged = YES; _lastShowAI = showAI;
+        _lastUseAccount = useAccount; _lastAllowTranscripts = allowTranscripts;
+    }
     dispatch_async(_aiQueue, ^{
         self->_aiReader.useClaudeAccount = useAccount;
         self->_aiReader.allowClaudeAccountFetch = allowAccountFetch;
