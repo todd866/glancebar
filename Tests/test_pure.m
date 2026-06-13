@@ -163,6 +163,12 @@ int main(void) {
         check(ShouldFetchClaudeAccount(YES, YES, YES, YES, 2500, 2000),
               @"visible Claude account fetches after retry interval");
 
+        // --- RateLimitRetryDelay ---
+        check(RateLimitRetryDelay(0) == 900, @"no Retry-After ⇒ 900s floor");
+        check(RateLimitRetryDelay(600) == 900, @"short Retry-After ⇒ 900s floor");
+        check(RateLimitRetryDelay(2000) == 2000, @"reasonable Retry-After honored");
+        check(RateLimitRetryDelay(86400) == 3600, @"huge Retry-After capped at 3600s");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

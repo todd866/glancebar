@@ -1016,7 +1016,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     double retry = [fetch[@"retryAfter"] doubleValue];
     NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
     if (rateLimited) {
-        _claudeNextFetch = now + MAX(900.0, retry);   // retry-after is often 0 here; avoid hammering
+        _claudeNextFetch = now + RateLimitRetryDelay(retry);
         _claudeAccountStatus = @"Usage API rate-limited; retrying later";
     } else {
         _claudeAccountStatus = message.length ? [@"Usage API: " stringByAppendingString:message]

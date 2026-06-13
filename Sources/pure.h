@@ -81,6 +81,10 @@ NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage);
 BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,
                               BOOL hasAccountStatus, double nowEpoch, double nextFetchEpoch);
 
+// Seconds until the next account fetch after a 429: at least the standard 15-minute
+// throttle, but never trust a server-supplied Retry-After beyond an hour.
+double RateLimitRetryDelay(double retryAfterSeconds);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

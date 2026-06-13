@@ -262,6 +262,11 @@ BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSO
     return !hasUsageJSON && !hasAccountStatus;
 }
 
+double RateLimitRetryDelay(double retryAfterSeconds) {
+    double capped = retryAfterSeconds > 3600 ? 3600 : retryAfterSeconds;
+    return capped < 900 ? 900 : capped;
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
