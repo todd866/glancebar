@@ -169,6 +169,13 @@ int main(void) {
         check(RateLimitRetryDelay(2000) == 2000, @"reasonable Retry-After honored");
         check(RateLimitRetryDelay(86400) == 3600, @"huge Retry-After capped at 3600s");
 
+        // --- ShouldDropCachedTokenForStatus ---
+        check(ShouldDropCachedTokenForStatus(401), @"401 drops the cached token");
+        check(ShouldDropCachedTokenForStatus(403), @"403 drops the cached token");
+        check(!ShouldDropCachedTokenForStatus(429), @"429 keeps the cached token");
+        check(!ShouldDropCachedTokenForStatus(500), @"500 keeps the cached token");
+        check(!ShouldDropCachedTokenForStatus(0), @"transport error keeps the cached token");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

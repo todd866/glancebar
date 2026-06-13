@@ -1015,6 +1015,10 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
     double retry = [fetch[@"retryAfter"] doubleValue];
     NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
+    if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue])) {
+        _claudeAccessToken = nil;        // revoked; re-read the Keychain next attempt
+        _claudeAccessTokenExpiresAt = 0;
+    }
     if (rateLimited) {
         _claudeNextFetch = now + RateLimitRetryDelay(retry);
         _claudeAccountStatus = @"Usage API rate-limited; retrying later";

@@ -85,6 +85,10 @@ BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSO
 // throttle, but never trust a server-supplied Retry-After beyond an hour.
 double RateLimitRetryDelay(double retryAfterSeconds);
 
+// An auth failure means the cached access token is dead (e.g. Claude Code re-login
+// revoked it); drop it so the next attempt re-reads the Keychain.
+BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:

@@ -267,6 +267,10 @@ double RateLimitRetryDelay(double retryAfterSeconds) {
     return capped < 900 ? 900 : capped;
 }
 
+BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode) {
+    return statusCode == 401 || statusCode == 403;
+}
+
 static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
