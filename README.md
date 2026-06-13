@@ -51,6 +51,11 @@ open /Applications/Glancebar.app            # run
 Start at login: **System Settings → General → Login Items → +** and add Glancebar.
 Requires the Xcode Command Line Tools (`xcode-select --install`).
 
+There are no prebuilt or notarized downloads — build locally with `./build.sh`. A
+locally built app carries no quarantine flag, so it opens without a Gatekeeper prompt.
+If you copy a built `.app` from another machine, clear the quarantine flag first:
+`xattr -dr com.apple.quarantine /Applications/Glancebar.app`.
+
 Headless readout: `Glancebar.app/Contents/MacOS/Glancebar --dump` prints disk, battery,
 battery pressure, system pressure, and AI status to the terminal.
 
@@ -111,9 +116,12 @@ battery pressure, system pressure, and AI status to the terminal.
 
   Local development builds are ad-hoc signed by default. macOS Keychain "Always Allow"
   grants are tied to the app's signing requirement; ad-hoc rebuilt binaries can prompt
-  again after each rebuild. Set `GLANCEBAR_CODESIGN_IDENTITY` to a stable local or
-  Developer ID signing identity before running `./build.sh` to make that prompt stick
-  across updates.
+  again after each rebuild. To make the grant stick across rebuilds, sign with a stable
+  identity: create one once in **Keychain Access → Certificate Assistant → Create a
+  Certificate** (Name: `Glancebar Self-Signed`, Identity Type: Self Signed Root,
+  Certificate Type: Code Signing). `./build.sh` picks up that identity automatically when
+  present — override with `GLANCEBAR_CODESIGN_IDENTITY` (e.g. a Developer ID), or it falls
+  back to ad-hoc without it.
 
 The time estimator, battery-pressure grouping, process-stat grouping, and log parsing
 are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`,
