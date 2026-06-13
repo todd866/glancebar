@@ -1094,8 +1094,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
                 GBLog("claude fetch: unusable response");
             }
         } else {
-            NSString *skip = !self.allowClaudeAccountFetch ? @"hidden"
-                : now < _claudeNextFetch ? @"throttled" : @"cached status";
+            NSString *skip = !self.allowClaudeAccountFetch ? @"hidden" : @"throttled";
             if (![skip isEqualToString:_lastFetchSkipReason]) {
                 GBLog("claude fetch: skipped (%{public}@)", skip);
                 _lastFetchSkipReason = skip;
