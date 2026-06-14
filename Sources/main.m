@@ -1474,6 +1474,9 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
 
 static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
 
+// Identifies our observation of the status button's effectiveAppearance.
+static void *kBarAppearanceContext = &kBarAppearanceContext;
+
 @interface Controller : NSObject <NSApplicationDelegate>
 @end
 
@@ -1541,6 +1544,11 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
     _item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _item.button.target = self;
     _item.button.action = @selector(togglePopover:);
+    // Re-render immediately when the menu bar flips light/dark (Light/Dark toggle, or a
+    // wallpaper change that re-tints the bar). Never removed: _item lives for the whole
+    // process, same as this controller.
+    [_item.button addObserver:self forKeyPath:@"effectiveAppearance"
+                      options:0 context:kBarAppearanceContext];
 
     _popover = [NSPopover new];
     _popover.behavior = NSPopoverBehaviorTransient;
@@ -1702,7 +1710,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)updateBar {
-    _item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
+    // The bar is drawn into a detached, non-template NSImage, so dynamic colors like
+    // controlTextColor resolve against whatever drawing appearance is current. Left to
+    // default that's the *app's* appearance, which can be Light while the menu bar is
+    // dark (e.g. a dark wallpaper in Light mode) — baking black text onto a dark bar.
+    // Draw under the button's own menu-bar appearance instead so the neutral fg and the
+    // alert colors all resolve to the shade the menu bar actually uses. barSegments
+    // builds the meter icons eagerly (each lockFocuses), so it must run inside the block.
+    [_item.button.effectiveAppearance performAsCurrentDrawingAppearance:^{
+        self->_item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
+    }];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context == kBarAppearanceContext) {
+        [self updateBar];   // redraw in the new menu-bar appearance
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
 }
 
 // Redraw whatever on-screen surfaces are currently visible.
