@@ -42,7 +42,7 @@ the one app you can quit — and no admin rights**.
 ## Build & Install
 
 ```bash
-./build.sh                                  # → build/Glancebar.app (clang, ad-hoc signed)
+./build.sh                                  # → build/Glancebar.app (clang; stable identity if present, else ad-hoc)
 ./tests.sh                                  # run the pure-logic unit tests
 cp -R build/Glancebar.app /Applications/    # install
 open /Applications/Glancebar.app            # run
@@ -79,7 +79,8 @@ battery pressure, system pressure, and AI status to the terminal.
   and measured by physical footprint (what Activity Monitor shows), grouped under parent
   apps where possible.
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
-  turn in `~/.codex/sessions/**.jsonl` records OpenAI's official rate-limit state
+  turn in `~/.codex/sessions/**.jsonl` (and rotated
+  `~/.codex/archived_sessions/**.jsonl`) records OpenAI's official rate-limit state
   (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
   the most constrained window that is still current. The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed. Headline counts are
@@ -114,9 +115,10 @@ battery pressure, system pressure, and AI status to the terminal.
   `--dump` is local-only by default. To allow account-backed Claude status in a dump,
   pass `--online` or set `GLANCEBAR_ALLOW_ACCOUNT=1`.
 
-  Local development builds are ad-hoc signed by default. macOS Keychain "Always Allow"
-  grants are tied to the app's signing requirement; ad-hoc rebuilt binaries can prompt
-  again after each rebuild. To make the grant stick across rebuilds, sign with a stable
+  Until you create the signing identity described below, `./build.sh` ad-hoc signs the
+  app. macOS Keychain "Always Allow" grants are tied to the app's signing requirement;
+  ad-hoc rebuilt binaries can prompt again after each rebuild. To make the grant stick
+  across rebuilds, sign with a stable
   identity: create one once in **Keychain Access → Certificate Assistant → Create a
   Certificate** (Name: `Glancebar Self-Signed`, Identity Type: Self Signed Root,
   Certificate Type: Code Signing). `./build.sh` picks up that identity automatically when
