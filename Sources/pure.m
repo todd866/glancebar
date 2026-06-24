@@ -237,6 +237,59 @@ NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch) {
     return best;
 }
 
+NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch) {
+    if (![rateLimits isKindOfClass:NSDictionary.class]) return @[];
+    NSString *plan = [rateLimits[@"plan_type"] isKindOfClass:NSString.class] ? rateLimits[@"plan_type"] : nil;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *key in @[@"primary", @"secondary"]) {   // 5h then weekly, as the source presents them
+        NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
+        if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
+        double resets = [w[@"resets_at"] doubleValue];
+        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
+        double remaining = 1.0 - [w[@"used_percent"] doubleValue] / 100.0;
+        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+        long mins = [w[@"window_minutes"] longValue];
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"window"] = mins == 10080 ? @"weekly" : mins == 300 ? @"5-hour"
+                     : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
+        d[@"remainingFraction"] = @(remaining);
+        if (resets > 0) d[@"resetsAt"] = @(resets);
+        if (plan) d[@"plan"] = plan;
+        [out addObject:d];
+    }
+    return out;
+}
+
+NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch) {
+    if (![usage isKindOfClass:NSDictionary.class]) return @[];
+    // Fixed reading order so the dual meter always renders 5-hour before weekly,
+    // independent of dictionary iteration order. Only known windows are surfaced
+    // (extra_usage is a credit budget, not a rate window, and is never included).
+    NSArray *order = @[@"five_hour", @"seven_day", @"seven_day_opus", @"seven_day_sonnet"];
+    NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
+                             @"seven_day_opus": @"weekly Opus", @"seven_day_sonnet": @"weekly Sonnet"};
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *key in order) {
+        NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
+        if (![w[@"utilization"] isKindOfClass:NSNumber.class]) continue;
+        double used = [w[@"utilization"] doubleValue];
+        if (used > 1.0) used /= 100.0;          // tolerate percent or fraction
+        double resets = 0;
+        id resetsAt = w[@"resets_at"];
+        if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
+        else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
+        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
+        double remaining = 1.0 - used;
+        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"window"] = labels[key];
+        d[@"remainingFraction"] = @(remaining);
+        if (resets > 0) d[@"resetsAt"] = @(resets);
+        [out addObject:d];
+    }
+    return out;
+}
+
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
     if (![usage isKindOfClass:NSDictionary.class]) return nil;
     NSDictionary *extra = [usage[@"extra_usage"] isKindOfClass:NSDictionary.class] ? usage[@"extra_usage"] : nil;

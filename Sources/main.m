@@ -422,6 +422,7 @@ static NSColor *CPUColor(double cpu) {
 @property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
 @property (strong) NSDate *lastActivity;
 @property (copy) NSArray<NSDictionary *> *models;
+@property (copy) NSArray<NSDictionary *> *limitWindows;   // all current limit windows (dual meter); bar still uses remainingFraction
 @end
 @implementation AIUsage @end
 
@@ -1120,6 +1121,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         NSDictionary *extraStatus = ClaudeExtraUsageStatus(_claudeUsageJSON);
         if (extraStatus[@"description"]) u.extraUsage = extraStatus[@"description"];
 
+        u.limitWindows = ClaudeLimitWindows(_claudeUsageJSON, NSDate.date.timeIntervalSince1970);
         NSDictionary *pick = PickClaudeLimitWindow(_claudeUsageJSON, NSDate.date.timeIntervalSince1970);
         if (pick) {
             u.limitStatusAvailable = YES;
@@ -1231,6 +1233,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     u.lastActivity = _lastActivity;
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
 
+    u.limitWindows = CodexLimitWindows(_limits, now);
     NSDictionary *pick = PickLimitWindow(_limits, now);
     if (pick) {
         u.limitStatusAvailable = YES;
@@ -1666,12 +1669,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return [NSString stringWithFormat:@"%d%%", (int)lround(u.remainingFraction * 100)];
 }
 
+- (NSColor *)windowColor:(double)frac {
+    if (frac <= 0.15) return NSColor.systemRedColor;
+    if (frac <= 0.35) return NSColor.systemOrangeColor;
+    if (frac <= 0.60) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
+    return NSColor.systemGreenColor;
+}
+
 - (NSColor *)aiStatusColor:(AIUsage *)u {
     if (!u.limitStatusAvailable || u.remainingFraction < 0) return NSColor.tertiaryLabelColor;
-    if (u.remainingFraction <= 0.15) return NSColor.systemRedColor;
-    if (u.remainingFraction <= 0.35) return NSColor.systemOrangeColor;
-    if (u.remainingFraction <= 0.60) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
-    return NSColor.systemGreenColor;
+    return [self windowColor:u.remainingFraction];
 }
 
 - (NSArray<NSDictionary *> *)barSegments {
@@ -1904,6 +1911,47 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return row;
 }
 
+// "Resets — 5-hour 3:10pm · weekly Mon 9am" from a window list (skips windows with no reset).
+- (NSString *)windowsResetSummary:(NSArray<NSDictionary *> *)windows {
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSDictionary *w in windows) {
+        NSNumber *resets = w[@"resetsAt"];
+        if (![resets isKindOfClass:NSNumber.class]) continue;
+        NSString *t = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+        if (t.length) [parts addObject:[NSString stringWithFormat:@"%@ %@", w[@"window"], t]];
+    }
+    return parts.count ? [@"Resets — " stringByAppendingString:[parts componentsJoinedByString:@" · "]] : @"";
+}
+
+// One popover AI card. With two or more current limit windows it draws the dual meter
+// (a labeled gauge per window + a combined resets line); otherwise the compact
+// single-line row, which also carries the overage / no-status fallbacks. Returns new y.
+- (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
+    NSArray<NSDictionary *> *windows = u.limitWindows;
+    if (u.overageActive || windows.count < 2) {
+        [root addSubview:[self aiStatusRow:u width:width pad:pad at:y]];
+        return y + 44;
+    }
+    CGFloat inner = width - 2*pad;
+    [root addSubview:[self text:(u.name ?: @"AI") font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+                          color:nil at:NSMakeRect(pad, y, inner, 15) align:NSTextAlignmentLeft]];
+    y += 19;
+    for (NSDictionary *w in windows) {
+        double frac = [w[@"remainingFraction"] doubleValue];
+        NSString *right = [NSString stringWithFormat:@"%d%% left", (int)lround(frac * 100)];
+        [root addSubview:[self compactSignalRow:(w[@"window"] ?: @"window") right:right fraction:frac
+                                          color:[self windowColor:frac] width:width pad:pad at:y]];
+        y += 28;
+    }
+    NSString *resets = [self windowsResetSummary:windows];
+    if (resets.length) {
+        [root addSubview:[self text:resets font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                              at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
+        y += 16;
+    }
+    return y + 6;
+}
+
 - (NSString *)aiOverviewText {
     AIUsage *lowest = [self lowestAIStatus];
     if (lowest) return [NSString stringWithFormat:@"%@ %@ remaining · %@",
@@ -2078,8 +2126,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         y += 22;
     } else {
         for (AIUsage *u in _aiUsage) {
-            [root addSubview:[self aiStatusRow:u width:kW pad:kPad at:y]];
-            y += 44;
+            y = [self addAICard:u toView:root width:kW pad:kPad at:y];
         }
     }
 
@@ -2382,6 +2429,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self addDetailHeading:u.name ?: @"AI" to:root y:&y width:kDetailW];
         [self addDetailKey:@"Remaining" value:[self aiPercentText:u] to:root y:&y width:kDetailW];
         [self addDetailKey:@"Reset" value:[self aiResetDetailText:u] to:root y:&y width:kDetailW];
+        if (u.limitWindows.count >= 2)
+            for (NSDictionary *w in u.limitWindows) {
+                NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
+                NSString *reset = resets ? ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]) : nil;
+                int pct = (int)lround([w[@"remainingFraction"] doubleValue] * 100);
+                NSString *val = reset.length ? [NSString stringWithFormat:@"%d%% left · resets %@", pct, reset]
+                                             : [NSString stringWithFormat:@"%d%% left", pct];
+                [self addDetailKey:w[@"window"] value:val to:root y:&y width:kDetailW];
+            }
         [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
                                                                    : (u.statusReason ?: @"No limit status source")
                         to:root y:&y width:kDetailW];
@@ -2658,6 +2714,13 @@ static void Dump(BOOL allowOnline) {
                today.UTF8String,
                week.UTF8String,
                reason.UTF8String);
+        for (NSDictionary *w in u.limitWindows) {
+            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
+            NSString *r = resets ? [@"resets " stringByAppendingString:ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue])]
+                                 : @"reset not provided";
+            printf("          %-8s %d%% left · %s\n", [w[@"window"] UTF8String],
+                   (int)lround([w[@"remainingFraction"] doubleValue] * 100), r.UTF8String);
+        }
         if (u.diagnostics.length) printf("          why: %s\n", u.diagnostics.UTF8String);
     }
 }

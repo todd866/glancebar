@@ -163,6 +163,43 @@ int main(void) {
         check(ShouldFetchClaudeAccount(YES, YES, YES, YES, 2500, 2000),
               @"visible Claude account fetches after retry interval");
 
+        // --- ClaudeLimitWindows (all current windows for the dual meter) ---
+        NSDictionary *cwAll = @{@"five_hour": @{@"utilization": @76.0, @"resets_at": @4000},
+                                @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
+                                @"seven_day_opus": NSNull.null,
+                                @"extra_usage": @{@"utilization": @91.0, @"monthly_limit": @10000}};
+        NSArray *cwins = ClaudeLimitWindows(cwAll, 1000);
+        check(cwins.count == 2, @"claude returns both current windows (extra_usage excluded)");
+        check([cwins[0][@"window"] isEqual:@"5-hour"], @"claude 5-hour ordered first");
+        check([cwins[1][@"window"] isEqual:@"weekly"], @"claude weekly ordered second");
+        check(fabs([cwins[0][@"remainingFraction"] doubleValue] - 0.24) < 0.001, @"claude 5-hour remaining = 1-0.76");
+        check(fabs([cwins[1][@"remainingFraction"] doubleValue] - 0.45) < 0.001, @"claude weekly remaining = 1-0.55");
+        check([cwins[0][@"resetsAt"] doubleValue] == 4000, @"claude 5-hour reset surfaced");
+        NSArray *cwins2 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @20.0, @"resets_at": @500},
+                                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000}}, 1000);
+        check(cwins2.count == 1 && [cwins2[0][@"window"] isEqual:@"weekly"], @"claude drops reset-elapsed window");
+        check(ClaudeLimitWindows(nil, 1000).count == 0, @"claude nil usage ⇒ empty");
+        check(ClaudeLimitWindows(@{@"error": @{@"type": @"rate_limit_error"}}, 1000).count == 0, @"claude error ⇒ empty");
+        NSArray *cwins3 = ClaudeLimitWindows(@{@"seven_day": @{@"utilization": @10.0, @"resets_at": @9000},
+                                               @"five_hour": @{@"utilization": @10.0, @"resets_at": @9000}}, 1000);
+        check([cwins3[0][@"window"] isEqual:@"5-hour"], @"claude order is fixed (5-hour first) regardless of dict order");
+
+        // --- CodexLimitWindows (all current windows for the dual meter) ---
+        NSDictionary *xlimits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @4000},
+                                  @"secondary": @{@"used_percent": @90.0, @"window_minutes": @10080, @"resets_at": @9000},
+                                  @"plan_type": @"prolite"};
+        NSArray *xwins = CodexLimitWindows(xlimits, 1000);
+        check(xwins.count == 2, @"codex returns both current windows");
+        check([xwins[0][@"window"] isEqual:@"5-hour"], @"codex 5-hour (primary) first");
+        check([xwins[1][@"window"] isEqual:@"weekly"], @"codex weekly (secondary) second");
+        check(fabs([xwins[0][@"remainingFraction"] doubleValue] - 0.17) < 0.001, @"codex 5-hour remaining = 1-0.83");
+        check(fabs([xwins[1][@"remainingFraction"] doubleValue] - 0.10) < 0.001, @"codex weekly remaining = 1-0.90");
+        check([xwins[1][@"plan"] isEqual:@"prolite"], @"codex plan surfaced on windows");
+        NSArray *xwins2 = CodexLimitWindows(@{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @500},
+                                              @"secondary": @{@"used_percent": @90.0, @"window_minutes": @10080, @"resets_at": @9000}}, 1000);
+        check(xwins2.count == 1 && [xwins2[0][@"window"] isEqual:@"weekly"], @"codex drops reset-elapsed window");
+        check(CodexLimitWindows(nil, 1000).count == 0, @"codex nil ⇒ empty");
+
         // --- RateLimitRetryDelay ---
         check(RateLimitRetryDelay(0) == 900, @"no Retry-After ⇒ 900s floor");
         check(RateLimitRetryDelay(600) == 900, @"short Retry-After ⇒ 900s floor");
