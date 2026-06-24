@@ -183,6 +183,10 @@ int main(void) {
         NSArray *cwins3 = ClaudeLimitWindows(@{@"seven_day": @{@"utilization": @10.0, @"resets_at": @9000},
                                                @"five_hour": @{@"utilization": @10.0, @"resets_at": @9000}}, 1000);
         check([cwins3[0][@"window"] isEqual:@"5-hour"], @"claude order is fixed (5-hour first) regardless of dict order");
+        NSArray *cwins5 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @76.0, @"resets_at": @4000},
+                                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
+                                               @"seven_day_sonnet": @{@"utilization": @0.0}}, 1000);
+        check(cwins5.count == 2, @"claude excludes a reset-less placeholder window (e.g. unused weekly Sonnet)");
 
         // --- CodexLimitWindows (all current windows for the dual meter) ---
         NSDictionary *xlimits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @4000},

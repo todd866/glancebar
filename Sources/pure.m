@@ -278,7 +278,10 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
         id resetsAt = w[@"resets_at"];
         if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
         else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
-        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
+        // Require a real, still-future reset: this drops both elapsed windows and the
+        // reset-less placeholder buckets the API returns for models you aren't using
+        // (e.g. an always-100% "weekly Sonnet" with no resets_at), which are not live limits.
+        if (resets <= 0 || resets <= nowEpoch) continue;
         double remaining = 1.0 - used;
         remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
