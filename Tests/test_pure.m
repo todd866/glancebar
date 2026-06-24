@@ -143,6 +143,10 @@ int main(void) {
         check(fabs([rpick[@"remainingFraction"] doubleValue] - 0.24) < 0.001,
               @"extra_usage excluded; 5-hour window wins");
         check([rpick[@"window"] isEqual:@"5-hour"], @"5-hour window labeled");
+        // weekly Sonnet must never drive the bar, even when it is the most-constrained window.
+        NSDictionary *spick = PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @20.0, @"resets_at": @9000},
+                                                      @"seven_day_sonnet": @{@"utilization": @99.0, @"resets_at": @9000}}, 1000);
+        check([spick[@"window"] isEqual:@"5-hour"], @"weekly Sonnet never picked even when most constrained");
         check([rpick[@"resetsAt"] doubleValue] > 1781000000.0, @"microsecond ISO reset parsed");
         NSDictionary *extra = ClaudeExtraUsageStatus(real);
         check(extra && [extra[@"statusReason"] isEqual:@"Extra usage active"], @"extra_usage below limit is account status");
@@ -183,10 +187,17 @@ int main(void) {
         NSArray *cwins3 = ClaudeLimitWindows(@{@"seven_day": @{@"utilization": @10.0, @"resets_at": @9000},
                                                @"five_hour": @{@"utilization": @10.0, @"resets_at": @9000}}, 1000);
         check([cwins3[0][@"window"] isEqual:@"5-hour"], @"claude order is fixed (5-hour first) regardless of dict order");
+        // weekly Sonnet is never surfaced, even with a real future reset and live utilization.
         NSArray *cwins5 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @76.0, @"resets_at": @4000},
                                                @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
-                                               @"seven_day_sonnet": @{@"utilization": @0.0}}, 1000);
-        check(cwins5.count == 2, @"claude excludes a reset-less placeholder window (e.g. unused weekly Sonnet)");
+                                               @"seven_day_sonnet": @{@"utilization": @30.0, @"resets_at": @9000}}, 1000);
+        check(cwins5.count == 2, @"claude never surfaces weekly Sonnet");
+        check([cwins5[1][@"window"] isEqual:@"weekly"], @"weekly Sonnet dropped; overall weekly kept");
+        // A reset-less placeholder window (e.g. an unused weekly Opus) is still excluded.
+        NSArray *cwins6 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @76.0, @"resets_at": @4000},
+                                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
+                                               @"seven_day_opus": @{@"utilization": @0.0}}, 1000);
+        check(cwins6.count == 2, @"claude excludes a reset-less placeholder window (e.g. unused weekly Opus)");
 
         // --- CodexLimitWindows (all current windows for the dual meter) ---
         NSDictionary *xlimits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @4000},

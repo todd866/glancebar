@@ -73,10 +73,11 @@ NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
 
 // ALL still-current limit windows (for the dual-meter breakdown), in fixed reading
 // order rather than most-constrained-first: Codex primary→secondary, Claude
-// 5-hour→weekly→weekly Opus→weekly Sonnet. Obsolete (reset-elapsed) windows and the
-// Claude extra_usage credit budget are excluded. Each element has the same shape as
-// PickLimitWindow. Empty array when none apply. (The bar's single gauge still uses the
-// Pick*LimitWindow pickers above; these feed the popover/details breakdown.)
+// 5-hour→weekly→weekly Opus (weekly Sonnet is intentionally not surfaced). Obsolete
+// (reset-elapsed) windows and the Claude extra_usage credit budget are excluded. Each
+// element has the same shape as PickLimitWindow. Empty array when none apply. (The bar's
+// single gauge still uses the Pick*LimitWindow pickers above; these feed the
+// popover/details breakdown.)
 NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch);
 

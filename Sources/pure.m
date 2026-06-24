@@ -209,11 +209,12 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch) {
     if (![usage isKindOfClass:NSDictionary.class]) return nil;
     NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
-                             @"seven_day_opus": @"weekly Opus", @"seven_day_sonnet": @"weekly Sonnet"};
+                             @"seven_day_opus": @"weekly Opus"};
     NSDictionary *best = nil;
     double bestRemaining = 2;
     for (NSString *key in usage) {
-        if ([key isEqualToString:@"extra_usage"]) continue;   // a credit budget, not a rate window
+        if ([key isEqualToString:@"extra_usage"]) continue;       // a credit budget, not a rate window
+        if ([key isEqualToString:@"seven_day_sonnet"]) continue;  // weekly Sonnet intentionally not surfaced
         NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
         id util = w[@"utilization"];
         if (![util isKindOfClass:NSNumber.class]) continue;
@@ -265,9 +266,11 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
     // Fixed reading order so the dual meter always renders 5-hour before weekly,
     // independent of dictionary iteration order. Only known windows are surfaced
     // (extra_usage is a credit budget, not a rate window, and is never included).
-    NSArray *order = @[@"five_hour", @"seven_day", @"seven_day_opus", @"seven_day_sonnet"];
+    // weekly Sonnet (seven_day_sonnet) is intentionally absent from this order, so it is
+    // never surfaced in the dual meter regardless of what the API reports for it.
+    NSArray *order = @[@"five_hour", @"seven_day", @"seven_day_opus"];
     NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
-                             @"seven_day_opus": @"weekly Opus", @"seven_day_sonnet": @"weekly Sonnet"};
+                             @"seven_day_opus": @"weekly Opus"};
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *key in order) {
         NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
@@ -280,7 +283,7 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
         else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
         // Require a real, still-future reset: this drops both elapsed windows and the
         // reset-less placeholder buckets the API returns for models you aren't using
-        // (e.g. an always-100% "weekly Sonnet" with no resets_at), which are not live limits.
+        // (e.g. an always-100% "weekly Opus" with no resets_at), which are not live limits.
         if (resets <= 0 || resets <= nowEpoch) continue;
         double remaining = 1.0 - used;
         remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
