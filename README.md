@@ -115,15 +115,25 @@ battery pressure, system pressure, and AI status to the terminal.
   `--dump` is local-only by default. To allow account-backed Claude status in a dump,
   pass `--online` or set `GLANCEBAR_ALLOW_ACCOUNT=1`.
 
-  Until you create the signing identity described below, `./build.sh` ad-hoc signs the
-  app. macOS Keychain "Always Allow" grants are tied to the app's signing requirement;
-  ad-hoc rebuilt binaries can prompt again after each rebuild. To make the grant stick
-  across rebuilds, sign with a stable
-  identity: create one once in **Keychain Access → Certificate Assistant → Create a
-  Certificate** (Name: `Glancebar Self-Signed`, Identity Type: Self Signed Root,
-  Certificate Type: Code Signing). `./build.sh` picks up that identity automatically when
-  present — override with `GLANCEBAR_CODESIGN_IDENTITY` (e.g. a Developer ID), or it falls
-  back to ad-hoc without it.
+  **Signing & the password prompt.** macOS Keychain grants are tied to the app's
+  *signing requirement* and, on the modern login keychain, to a per-item *partition
+  list*. `./build.sh` signs with a stable identity so the requirement doesn't change
+  between rebuilds: it prefers `$GLANCEBAR_CODESIGN_IDENTITY` (e.g. a Developer ID), else
+  the `Glancebar Self-Signed` cert matched by **SHA-1** (create one in **Keychain Access →
+  Certificate Assistant → Create a Certificate**: Name `Glancebar Self-Signed`, Self
+  Signed Root, Code Signing — then pass its hash via `GLANCEBAR_CODESIGN_SHA1` on other
+  machines), else ad-hoc with a loud warning (ad-hoc changes the code hash every build, so
+  the grant re-prompts).
+
+  A stable signature is necessary but **not sufficient** for the Claude account toggle.
+  The `Claude Code-credentials` item's partition list only admits Apple's own tools and
+  apps with a matching **Team ID**. A *self-signed, no-Team-ID* Glancebar is already a
+  trusted application on the item yet still gets the password prompt on every read because
+  it can't satisfy the partition — and "Allow all applications" / "Always Allow" do **not**
+  durably clear it. The durable fix is to sign with a **Developer ID** (which carries a
+  Team ID): `GLANCEBAR_CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAMID>)" ./build.sh`,
+  then grant access once. Otherwise leave the toggle off — the prompt only fires while the
+  toggle is on and an AI surface (popover/Details) is open.
 
 The time estimator, battery-pressure grouping, process-stat grouping, and log parsing
 are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`,
