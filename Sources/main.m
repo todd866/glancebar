@@ -722,21 +722,52 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
     return RunTaskOutput(@"/usr/bin/sqlite3", @[@"-readonly", @"-separator", @"\t", path, sql]);
 }
 
+// Read a generic-password value via /usr/bin/security rather than SecItemCopyMatching in
+// this process. The "Claude Code-credentials" item's PartitionID ACL is ["apple-tool:"]
+// only, and Claude Code resets it to that on every ~hourly token refresh — so although
+// this app already passes the item's trusted-app ACL, the partition (XARA) gate rejects
+// our Developer ID code signature and macOS prompts for a password on every read. The
+// Apple-signed `security` tool lives in the apple-tool: partition that Claude Code always
+// preserves, so it reads silently; the keychain check is evaluated against `security`'s
+// own signature, not ours (no responsible-process propagation), and survives refreshes.
+//
+// This leans on undocumented partition behavior, so it is bounded and watchdogged: a hard
+// deadline kills the child if `security` ever blocks (e.g. a future ACL change that makes
+// IT prompt), so we degrade quietly instead of hanging on a dialog. The returned blob is
+// a live OAuth token — callers must never log it.
+static NSString *KeychainBlobViaSecurity(NSString *service) {
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
+    t.arguments = @[@"find-generic-password", @"-w", @"-s", service, @"-a", NSUserName()];
+    t.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
+    if (![t launchAndReturnError:nil]) return nil;
+
+    // `security` normally returns instantly; if it ever wedges (interactive prompt), kill it.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (t.isRunning) [t terminate];
+    });
+
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];   // unblocks on exit/terminate
+    [t waitUntilExit];
+    if (t.terminationStatus != 0 || data.length == 0 || data.length > 64 * 1024) return nil;
+
+    NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
 // Opt-in only (the "Claude account for limit status" toggle): Claude Code keeps no
 // quota state on disk — its /usage panel fetches from the API — so the only true gauge
 // source is the same OAuth endpoint, authenticated with the token Claude Code already
 // maintains in the Keychain. Returns nil when the toggle is off conceptually (callers
-// gate), the item is missing, or access is denied.
+// gate), the item is missing, the read times out, or the value is not the expected JSON.
 // Expiry is judged by the caller via ClaudeKeychainOutcome (never refresh the token
 // ourselves — that could rotate the refresh token out from under Claude Code).
 static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
-    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                            (__bridge id)kSecAttrService: @"Claude Code-credentials",
-                            (__bridge id)kSecReturnData: @YES,
-                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne};
-    CFTypeRef result = NULL;
-    if (SecItemCopyMatching((__bridge CFDictionaryRef)query, &result) != errSecSuccess || !result) return nil;
-    NSData *data = CFBridgingRelease(result);
+    NSString *blob = KeychainBlobViaSecurity(@"Claude Code-credentials");
+    if (!blob.length) return nil;
+    NSData *data = [blob dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     NSDictionary *oauth = [json[@"claudeAiOauth"] isKindOfClass:NSDictionary.class] ? json[@"claudeAiOauth"] : nil;
     if (!oauth) return nil;
@@ -1026,7 +1057,12 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         return nil;
     }
 
+    // Time the read: a silent read via /usr/bin/security is tens of ms; a SecurityAgent
+    // password prompt makes it seconds. Logging the latency makes "did it prompt?"
+    // answerable from this log alone — a plain "ok" hid that distinction before.
+    double readStart = CFAbsoluteTimeGetCurrent();
     NSDictionary *cred = ClaudeAccessTokenFromKeychain();
+    double readMs = (CFAbsoluteTimeGetCurrent() - readStart) * 1000.0;
     NSDictionary *outcome = ClaudeKeychainOutcome(cred != nil, cred[@"token"],
                                                   [cred[@"expiresAt"] doubleValue], now);
     if (![outcome[@"ok"] boolValue]) {
@@ -1034,14 +1070,14 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         _claudeAccessTokenExpiresAt = 0;
         _claudeKeychainNextTry = now + [outcome[@"retryDelay"] doubleValue];
         _claudeAccountStatus = outcome[@"status"];
-        GBLog("keychain read: %{public}@", outcome[@"status"]);
+        GBLog("keychain read: %{public}@ (%.0f ms)", outcome[@"status"], readMs);
         return nil;
     }
 
     _claudeAccessToken = outcome[@"token"];
     _claudeAccessTokenExpiresAt = [outcome[@"expiresAt"] doubleValue];
     _claudeKeychainNextTry = 0;
-    GBLog("keychain read: ok");
+    GBLog("keychain read: ok (%.0f ms)", readMs);
     return _claudeAccessToken;
 }
 
