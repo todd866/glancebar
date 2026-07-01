@@ -1352,6 +1352,20 @@ static NSColor *BattBarColor(int pct) {
 @interface FlippedView : NSView @end
 @implementation FlippedView - (BOOL)isFlipped { return YES; } @end
 
+// Opaque, appearance-adaptive backing for the popover. The default NSPopover material is
+// translucent (behind-window vibrancy), so a dark or saturated window behind the menu bar
+// bleeds through and washes out the fixed semantic text colors toward the bottom of the
+// panel. Fill an opaque background so contrast holds regardless of the backdrop. Drawn in
+// drawRect: — not a CALayer background color — so windowBackgroundColor re-resolves under
+// the current Light/Dark appearance on every redraw instead of being frozen at assignment.
+@interface PopoverRootView : FlippedView @end
+@implementation PopoverRootView
+- (void)drawRect:(NSRect)dirty {
+    [NSColor.windowBackgroundColor set];
+    NSRectFill(dirty);
+}
+@end
+
 #pragma mark - bar image
 
 static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColor *color) {
@@ -1516,7 +1530,7 @@ static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
 // Identifies our observation of the status button's effectiveAppearance.
 static void *kBarAppearanceContext = &kBarAppearanceContext;
 
-@interface Controller : NSObject <NSApplicationDelegate>
+@interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate>
 @end
 
 @interface Controller ()
@@ -1549,6 +1563,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
+    CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -1592,6 +1607,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     _popover = [NSPopover new];
     _popover.behavior = NSPopoverBehaviorTransient;
     _popover.animates = YES;
+    _popover.delegate = self;   // popoverWillClose: timestamps the dismiss for the toggle guard
     _popover.contentViewController = [NSViewController new];
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
 
@@ -1784,6 +1800,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (void)togglePopover:(id)sender {
     if (_popover.isShown) { [_popover close]; return; }
+    // A transient popover dismisses on the mouse-DOWN of an outside click — and a click on
+    // our own status-item button counts as "outside". The button's action then fires on
+    // mouse-UP; without this guard it sees isShown==NO and reopens, so a second icon click
+    // never closes the panel the way a menu would. Suppress the reopen for a frame or two
+    // after any close so the icon toggles cleanly. (sender is nil for programmatic opens.)
+    if (sender && CFAbsoluteTimeGetCurrent() - _popoverClosedAt < 0.20) return;
     // Reset the content view so the rebuild starts at the top on a fresh open.
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
     [self refresh];
@@ -1791,6 +1813,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
     [self refreshAIUsageAsync];
     [self beginSampling];
+}
+
+// Records when the popover last closed so togglePopover: can tell a real "open me" click
+// apart from the mouse-UP that trails a transient dismiss. Fires on every close path —
+// outside click, second icon click, or Escape — which is exactly the set we want to guard.
+- (void)popoverWillClose:(NSNotification *)note {
+    _popoverClosedAt = CFAbsoluteTimeGetCurrent();
 }
 
 // Starts both process samplers, invalidating any still-in-flight results: top takes
@@ -1996,7 +2025,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)rebuildContent {
-    FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
+    FlippedView *root = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
     CGFloat y = kPad;
 
     // ---------- STORAGE ----------
@@ -2197,7 +2226,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             offset = ((NSScrollView *)current).contentView.bounds.origin.y;
         NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, kW, maxPopoverH)];
         scroll.borderType = NSNoBorder;
-        scroll.drawsBackground = NO;
+        // Opaque backing on the scroll path too: the document view covers the clip, but the
+        // clip/overscroll and scroller gutter would otherwise show the translucent backdrop.
+        scroll.drawsBackground = YES;
+        scroll.backgroundColor = NSColor.windowBackgroundColor;
         scroll.hasVerticalScroller = YES;
         scroll.autohidesScrollers = YES;
         scroll.documentView = root;
