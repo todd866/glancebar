@@ -163,10 +163,6 @@ Glancebar being a single item makes this far less likely.
 Built by Claude (Anthropic) and Codex (OpenAI), working from Ian Todd's brief and
 direction — design, implementation, tests, the rendered screenshot, and this README.
 
-## Related
-
-This project is part of an experiment in agent-to-agent capability sharing. See the [Trustlist protocol](https://github.com/todd866/trustlist): a web of trust where trust is a prior and your own verification is the truth.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
