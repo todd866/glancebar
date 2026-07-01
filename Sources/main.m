@@ -1811,6 +1811,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self refresh];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    // Accessory (LSUIElement) apps don't activate on their own, so the popover's window
+    // never becomes key — and a transient popover with no key window to resign is never
+    // dismissed when the user clicks another app. Activate on open so a click elsewhere
+    // (and the key-window resign it triggers) closes the panel like a normal menu.
+    [NSApp activateIgnoringOtherApps:YES];
     [self refreshAIUsageAsync];
     [self beginSampling];
 }
