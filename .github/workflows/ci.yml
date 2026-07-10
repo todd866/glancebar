@@ -50,9 +50,22 @@ jobs:
             GLANCEBAR_ALLOW_ACCOUNT=0 \
             build/Glancebar.app/Contents/MacOS/Glancebar --dump --json \
             > "$RUNNER_TEMP/glancebar.json"
-          plutil -lint "$RUNNER_TEMP/glancebar.json"
-          ruby -rjson -e 'j=JSON.parse(File.read(ARGV[0])); abort "bad schema" unless j["schemaVersion"] == 1 && j.dig("ai", "onlineAllowed") == false' \
-            "$RUNNER_TEMP/glancebar.json"
+          # `plutil -lint` parses property lists, not JSON, and rejects a leading '{'.
+          # JSON.parse is the real syntax check, so assert the schema off the parsed value.
+          ruby -rjson -e '
+            j = JSON.parse(File.read(ARGV[0]))
+            fail "schemaVersion"   unless j["schemaVersion"] == 1
+            fail "status"          unless j["status"].is_a?(String)
+            fail "partialSources"  unless j["partialSources"].is_a?(Array)
+            # Real JSON booleans, not 0/1 or "false".
+            fail "onlineAllowed"   unless j.dig("ai", "onlineAllowed") == false
+            fail "accountEnabled"  unless [true, false].include?(j.dig("ai", "accountEnabled"))
+          ' "$RUNNER_TEMP/glancebar.json"
+          # An unreadable source must degrade the schema, not collapse it, and --strict must say so.
+          GLANCEBAR_HOME="$RUNNER_TEMP/glancebar-home" GLANCEBAR_ALLOW_ACCOUNT=0 \
+            build/Glancebar.app/Contents/MacOS/Glancebar --dump --json --strict \
+            > /dev/null && strict_rc=0 || strict_rc=$?
+          test "$strict_rc" = 2 || { echo "expected --strict exit 2 on a partial dump, got $strict_rc"; exit 1; }
 
       - name: Verify bundle
         run: |
