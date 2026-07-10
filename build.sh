@@ -78,8 +78,10 @@ install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns
 #      regenerated same-named cert cannot silently change the signature.
 #   5. Ad-hoc "-", with a loud warning.
 SELF_SIGNED_SHA1="${GLANCEBAR_CODESIGN_SHA1:-A14E62A164EEEC5A633BFF74C2CA5409A1C4F9E7}"
+# `|| true`: under `set -o pipefail` the grep exits 1 when no Developer ID is installed, which
+# would abort the build before it could fall back to ad-hoc. That is the CI path.
 DEVELOPER_ID=$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -m1 "Developer ID Application" | sed -E 's/^[^"]*"([^"]+)".*/\1/')
+    | grep -m1 "Developer ID Application" | sed -E 's/^[^"]*"([^"]+)".*/\1/' || true)
 if [[ -n "${GLANCEBAR_CODESIGN_IDENTITY:-}" ]]; then
     IDENTITY="$GLANCEBAR_CODESIGN_IDENTITY"
     if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
