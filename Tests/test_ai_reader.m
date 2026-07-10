@@ -23,6 +23,40 @@ static AIUsage *UsageNamed(NSArray<AIUsage *> *usage, NSString *name) {
     return nil;
 }
 
+// The bounded reader is private to main.m; the harness already imports that shell.
+@interface AIReader (BoundedReaderTestAccess)
+- (NSData *)newLineDataAtPath:(NSString *)path record:(NSMutableDictionary *)record
+                     maxBytes:(NSUInteger)maxBytes lineCap:(NSUInteger)lineCap
+                    bytesRead:(NSUInteger *)bytesRead readFailed:(BOOL *)readFailed;
+- (void)consumeCodexData:(NSData *)chunk record:(NSMutableDictionary *)record;
+@end
+
+// A rollout line padded to an arbitrary length, so the fixture cannot accidentally align
+// its newlines to a power-of-two read boundary the way fixed 4096-byte filler does.
+static NSData *PaddedRolloutLine(long long tokens, NSUInteger pad) {
+    NSMutableString *filler = [NSMutableString stringWithCapacity:pad];
+    for (NSUInteger i = 0; i < pad; i++) [filler appendString:@"x"];
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    iso.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    NSString *line = [NSString stringWithFormat:
+        @"{\"timestamp\":\"%@\",\"pad\":\"%@\",\"payload\":{\"type\":\"token_count\","
+         "\"info\":{\"last_token_usage\":{\"total_tokens\":%lld,\"input_tokens\":0,"
+         "\"cached_input_tokens\":0,\"output_tokens\":%lld}}}}\n",
+        [iso stringFromDate:NSDate.date], filler, tokens, tokens];
+    return [line dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static long long TotalTokensInRecord(NSDictionary *record) {
+    long long total = 0;
+    NSDictionary *days = record[@"days"];
+    for (NSString *day in days) {
+        NSDictionary *counts = days[day];
+        if ([counts isKindOfClass:NSDictionary.class] && [counts[@"t"] isKindOfClass:NSNumber.class])
+            total += [counts[@"t"] longLongValue];
+    }
+    return total;
+}
+
 static NSData *RolloutData(NSUInteger fillerBytes, long long tokens) {
     NSMutableData *data = [NSMutableData dataWithCapacity:fillerBytes + 1024];
     char filler[4096];
@@ -165,6 +199,42 @@ int main(void) {
                                        applicationSupportDirectory:support];
         codex = UsageNamed([regrown readUntilCaughtUpWithTimeLimit:5.0], @"Codex");
         check(codex.todayTokens == 9, @"same-inode truncate/regrow discards the old aggregate");
+
+        // A pass budget that runs out mid-line must not consume that line. Previously the
+        // budget and the per-line cap were the same argument, so a residual budget smaller
+        // than the next line advanced the offset into it and dropped its tokens for good.
+        NSString *straddleDir = [home stringByAppendingPathComponent:@".codex/sessions/2026/07/11"];
+        [fm createDirectoryAtPath:straddleDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *straddle = [straddleDir stringByAppendingPathComponent:@"rollout-straddle.jsonl"];
+        NSMutableData *straddleData = [NSMutableData data];
+        [straddleData appendData:PaddedRolloutLine(100, 1800)];   // ~2 KB line
+        [straddleData appendData:PaddedRolloutLine(7, 0)];
+        [straddleData writeToFile:straddle atomically:NO];
+
+        AIReader *bounded = [[AIReader alloc] initWithHomeDirectory:home
+                                        applicationSupportDirectory:support];
+        NSMutableDictionary *rec = [NSMutableDictionary dictionaryWithObject:@0 forKey:@"offset"];
+        NSUInteger boundedBytes = 0;
+        BOOL boundedFailed = NO;
+        [bounded newLineDataAtPath:straddle record:rec maxBytes:500 lineCap:kAIMaxLineBytes
+                         bytesRead:&boundedBytes readFailed:&boundedFailed];
+        check([rec[@"offset"] unsignedLongLongValue] == 0,
+              @"a budget-truncated read leaves the offset before the unterminated line");
+        check(boundedBytes == 500, @"a budget-truncated read still charges the pass budget");
+        NSData *boundedChunk = [bounded newLineDataAtPath:straddle record:rec
+                                                 maxBytes:16 * 1024 * 1024 lineCap:kAIMaxLineBytes
+                                                bytesRead:&boundedBytes readFailed:&boundedFailed];
+        [bounded consumeCodexData:boundedChunk record:rec];
+        check(TotalTokensInRecord(rec) == 107,
+              @"the straddled line's tokens are counted in full on the next pass");
+
+        // A line genuinely longer than the cap is still abandoned, or one pathological row
+        // would wedge the scan forever.
+        NSMutableDictionary *cappedRec = [NSMutableDictionary dictionaryWithObject:@0 forKey:@"offset"];
+        [bounded newLineDataAtPath:straddle record:cappedRec maxBytes:16 * 1024 * 1024 lineCap:64
+                         bytesRead:&boundedBytes readFailed:&boundedFailed];
+        check([cappedRec[@"offset"] unsignedLongLongValue] == 64,
+              @"a line longer than the cap is abandoned so the scan makes progress");
 
         // Claude amendments may be far apart. Retain compact hashes for the full file
         // lifetime, and keep both project paths and provider IDs out of persisted state.

@@ -905,6 +905,10 @@ static NSDate *FileMTime(NSString *path) {
 // history to "today"). Rollouts are append-only; per-file byte offsets make the steady
 // state a handful of stats per tick. Stateful and not reentrant: call from one serial
 // queue only (the --dump path makes its own throwaway instance).
+// A single log line longer than this is abandoned rather than buffered. Distinct from the
+// per-pass byte budget, which bounds work but must never abandon a line.
+static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
+
 @interface AIReader : NSObject
 @property BOOL useClaudeAccount;
 @property BOOL allowClaudeAccountFetch;
@@ -921,6 +925,10 @@ static NSDate *FileMTime(NSString *path) {
            applicationSupportDirectory:(NSString *)applicationSupportDirectory;
 - (NSArray<AIUsage *> *)read;
 - (NSArray<AIUsage *> *)readUntilCaughtUpWithTimeLimit:(NSTimeInterval)timeLimit;
+// Drops the cached credential immediately. read/claudeUsage also clears it when the
+// account is off, but no read runs while every AI surface is hidden, so withdrawing
+// consent from the menu must not wait for one. Call on _aiQueue.
+- (void)forgetClaudeAccountCredentials;
 @end
 
 @implementation AIReader {
@@ -1064,9 +1072,16 @@ static void StoreOffsetAnchor(NSMutableDictionary *record, NSData *data,
 
 // Reads complete appended lines within the caller's GLOBAL pass budget. A partial
 // trailing line stays at the old offset and is retried only after the file grows.
+//
+// The two caps are not interchangeable. `lineCap` is a hard per-line ceiling: a line
+// longer than it is abandoned so a pathological row cannot wedge the scan. `maxBytes` is
+// the soft remaining pass budget, and a read it truncates says nothing about the line —
+// the newline may sit one byte past it. Conflating them consumes an ordinary line
+// whenever the budget happens to run out inside one, losing its tokens permanently.
 - (NSData *)newLineDataAtPath:(NSString *)path
                        record:(NSMutableDictionary *)record
                      maxBytes:(NSUInteger)maxBytes
+                      lineCap:(NSUInteger)lineCap
                     bytesRead:(NSUInteger *)bytesRead
                    readFailed:(BOOL *)readFailed {
     if (bytesRead) *bytesRead = 0;
@@ -1125,7 +1140,11 @@ static void StoreOffsetAnchor(NSMutableDictionary *record, NSData *data,
     if (![fh seekToOffset:offset error:&err]) {
         [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
     }
-    NSUInteger wanted = (NSUInteger)MIN((unsigned long long)maxBytes, size - offset);
+    NSUInteger readCap = lineCap > 0 ? MIN(maxBytes, lineCap) : maxBytes;
+    // True when the pass budget — not the line cap — is what ends this read short of EOF.
+    BOOL budgetTruncated = lineCap > 0 && maxBytes < lineCap &&
+                           (unsigned long long)maxBytes < size - offset;
+    NSUInteger wanted = (NSUInteger)MIN((unsigned long long)readCap, size - offset);
     NSData *data = [fh readDataUpToLength:wanted error:&err];
     [fh closeAndReturnError:nil];
     if (bytesRead) *bytesRead = data.length;
@@ -1137,6 +1156,13 @@ static void StoreOffsetAnchor(NSMutableDictionary *record, NSData *data,
         if (bytes[i - 1] == '\n') { consume = i; break; }
     }
     BOOL reachedEOF = offset + data.length >= size;
+    if (!consume && !reachedEOF && budgetTruncated) {
+        // The budget, not the line cap, stopped this read, so the line is probably ordinary
+        // and its newline sits just past the cut. Leave the offset where it is and re-read
+        // the line whole on the next pass. The budget is still charged with the bytes read,
+        // so the current pass still terminates.
+        return nil;
+    }
     if (!consume && !reachedEOF) {
         // Token-count lines are small. Skipping an overlong non-matching line bounds
         // memory and guarantees forward progress through pathological transcript rows.
@@ -1494,7 +1520,7 @@ static NSString *HashedMessageID(NSString *messageID) {
         // the freshly peeked limit is not then discarded by the historical read.
         BOOL validationFailed = NO;
         NSUInteger validationBytes = 0;
-        [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:0
+        [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:0 lineCap:0
                      bytesRead:&validationBytes readFailed:&validationFailed];
         if (validationFailed) { _codexBlocked = YES; continue; }
         NSUInteger bytesRead = 0;
@@ -1567,9 +1593,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             NSUInteger bytesRead = 0;
             BOOL failed = NO;
             unsigned long long before = offset;
-            NSUInteger wanted = MIN((NSUInteger)(4 * 1024 * 1024), _scanBytesRemaining);
-            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:wanted
-                                         bytesRead:&bytesRead readFailed:&failed];
+            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record
+                                           maxBytes:_scanBytesRemaining lineCap:kAIMaxLineBytes
+                                          bytesRead:&bytesRead readFailed:&failed];
             _scanBytesRemaining -= MIN(_scanBytesRemaining, bytesRead);
             if (failed) { [failedKeys addObject:key]; _codexBlocked = YES; continue; }
             [self consumeCodexData:chunk record:record];
@@ -1606,9 +1632,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             NSUInteger bytesRead = 0;
             BOOL failed = NO;
             unsigned long long before = offset;
-            NSUInteger wanted = MIN((NSUInteger)(4 * 1024 * 1024), _scanBytesRemaining);
-            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:wanted
-                                         bytesRead:&bytesRead readFailed:&failed];
+            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record
+                                           maxBytes:_scanBytesRemaining lineCap:kAIMaxLineBytes
+                                          bytesRead:&bytesRead readFailed:&failed];
             _scanBytesRemaining -= MIN(_scanBytesRemaining, bytesRead);
             if (failed) { [failedKeys addObject:key]; _claudeBlocked = YES; continue; }
             [self consumeClaudeData:chunk record:record];
@@ -1790,15 +1816,22 @@ static NSString *HashedMessageID(NSString *messageID) {
                 ? [@"backoff until " stringByAppendingString:FmtEpochClock(_claudeKeychainNextTry)]
                 : _claudeAccessToken.length ? @"token cached" : @"not read"];
     } else {
-        _claudeAccessToken = nil;
-        _claudeAccessTokenExpiresAt = 0;
-        _claudeUsageJSON = nil;
-        _claudeAccountStatus = nil;
-        _claudeLastSuccessAt = 0;
-        _claudeNextFetch = 0;
-        u.diagnostics = @"account toggle off";
+        [self forgetClaudeAccountCredentials];
+        // The account can be unrequested because the user's toggle is off or because online
+        // access was never granted (`--dump` without `--online`). Naming only the toggle
+        // contradicts the accountEnabled=true this same run reports.
+        u.diagnostics = @"account status not requested";
     }
     return u;
+}
+
+- (void)forgetClaudeAccountCredentials {
+    _claudeAccessToken = nil;
+    _claudeAccessTokenExpiresAt = 0;
+    _claudeUsageJSON = nil;
+    _claudeAccountStatus = nil;
+    _claudeLastSuccessAt = 0;
+    _claudeNextFetch = 0;
 }
 
 // Session counts, per-model split, and last activity still come from the sqlite thread
@@ -3276,9 +3309,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
     const CGFloat footerH = 54;
-    FlippedView *footer = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
-    footer.wantsLayer = YES;
-    footer.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+    // Draws windowBackgroundColor in drawRect: rather than freezing it into a CALayer
+    // CGColor, so the footer follows a live Light/Dark switch like the panel behind it.
+    PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
     NSTextField *freshnessField = [self text:freshness font:[NSFont systemFontOfSize:9.5]
                                            color:NSColor.tertiaryLabelColor
                                               at:NSMakeRect(kPad, 3, kW-2*kPad, 13)
@@ -3422,6 +3455,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeAccount"];
+    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleClaudeTranscripts:(id)s {

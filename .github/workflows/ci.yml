@@ -20,7 +20,9 @@ jobs:
       - name: Validate metadata and scripts
         run: |
           plutil -lint Info.plist
-          zsh -n build.sh tests.sh
+          # `zsh -n a b` syntax-checks only `a`; `b` becomes a positional parameter.
+          zsh -n build.sh
+          zsh -n tests.sh
 
       - name: Run tests with sanitizers
         env:
@@ -31,7 +33,9 @@ jobs:
         run: |
           SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           for source in Sources/pure.m Sources/main.m; do
-            xcrun clang --analyze -fobjc-arc -Wall -Wextra -Werror \
+            # -Werror does not promote analyzer diagnostics; without -analyzer-werror this
+            # step prints its findings and still exits 0, so the gate never fails a build.
+            xcrun clang --analyze -Xclang -analyzer-werror -fobjc-arc -Wall -Wextra -Werror \
               -isysroot "$SDKROOT" -mmacosx-version-min=13.0 \
               "$source" -o /dev/null
           done
