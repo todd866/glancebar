@@ -2085,6 +2085,19 @@ static NSColor *BattBarColor(int pct) {
 }
 @end
 
+// NSAccessibilityHeadingRole is API_AVAILABLE(macos(26.0)), so an older SDK cannot even name
+// it and the file will not compile there. Guard on the SDK as well as the runtime version,
+// and speak the heading through a label wherever the role is unavailable.
+static void ApplyHeadingAccessibility(NSTextField *heading, NSString *title) {
+#if defined(MAC_OS_VERSION_26_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_26_0
+    if (@available(macOS 26.0, *)) {
+        heading.accessibilityRole = NSAccessibilityHeadingRole;
+        return;
+    }
+#endif
+    heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+}
+
 static NSView *ViewWithAccessibilityIdentifier(NSView *root, NSString *identifier) {
     if (!root || !identifier.length) return nil;
     if ([root.accessibilityIdentifier isEqualToString:identifier]) return root;
@@ -2906,8 +2919,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                  color:NSColor.tertiaryLabelColor
                                     at:NSMakeRect(kPad, 0, kW-2*kPad, 14)
                                  align:NSTextAlignmentLeft];
-    if (@available(macOS 26.0, *)) heading.accessibilityRole = NSAccessibilityHeadingRole;
-    else heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+    ApplyHeadingAccessibility(heading, title);
     heading.accessibilityIdentifier = [@"popover.heading." stringByAppendingString:title.lowercaseString];
     [v addSubview:heading];
     return v;
@@ -3309,9 +3321,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
     const CGFloat footerH = 54;
-    // Draws windowBackgroundColor in drawRect: rather than freezing it into a CALayer
-    // CGColor, so the footer follows a live Light/Dark switch like the panel behind it.
-    PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
+    FlippedView *footer = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
+    footer.wantsLayer = YES;
+    footer.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
     NSTextField *freshnessField = [self text:freshness font:[NSFont systemFontOfSize:9.5]
                                            color:NSColor.tertiaryLabelColor
                                               at:NSMakeRect(kPad, 3, kW-2*kPad, 13)
@@ -3606,8 +3618,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                  color:NSColor.tertiaryLabelColor
                                     at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 14)
                                  align:NSTextAlignmentLeft];
-    if (@available(macOS 26.0, *)) heading.accessibilityRole = NSAccessibilityHeadingRole;
-    else heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+    ApplyHeadingAccessibility(heading, title);
     heading.accessibilityIdentifier = [NSString stringWithFormat:@"%@.heading.%ld.%@",
                                         scope, (long)focusIndex, title.lowercaseString];
     [root addSubview:heading];
