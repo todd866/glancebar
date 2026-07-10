@@ -784,10 +784,17 @@ static NSString *KeychainBlobViaSecurity(NSString *service) {
     NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
     if (![t launchAndReturnError:nil]) return nil;
 
-    // `security` normally returns instantly; if it ever wedges, terminate it.
+    // `security` normally returns instantly; if it ever wedges, terminate at 5s and
+    // force-kill at 6s. Without the kill, a child that ignores SIGTERM leaves the read
+    // below blocked forever and wedges the serial AI queue with it.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (t.isRunning) [t terminate];
+        if (!t.isRunning) return;
+        [t terminate];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (t.isRunning) kill(t.processIdentifier, SIGKILL);
+        });
     });
 
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];   // unblocks on exit/terminate
@@ -929,6 +936,8 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 // account is off, but no read runs while every AI surface is hidden, so withdrawing
 // consent from the menu must not wait for one. Call on _aiQueue.
 - (void)forgetClaudeAccountCredentials;
+// Writes out any state a catch-up pass left coalesced. Call on _aiQueue before quitting.
+- (void)flushPersistentState;
 @end
 
 @implementation AIReader {
@@ -968,6 +977,12 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     BOOL _codexBlocked, _claudeBlocked;
     BOOL _needsImmediateRescan;
     BOOL _stateDirty;
+    // Set when the pending change REMOVES something (a consent withdrawal purging the
+    // transcript index). Scan progress may wait for the next pass; a purge may not, because
+    // there may be no next pass — hiding every AI surface stops read() entirely.
+    BOOL _stateMustPersist;
+    double _lastStateWrite;
+    NSUInteger _stateWrites;   // diagnostic: how many times the state file was rewritten
 }
 
 - (instancetype)init {
@@ -1024,8 +1039,25 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     if (limits && limitsTs.length) { _limits = limits; _limitsTs = limitsTs; }
 }
 
+// Indexing a large backlog drives read() in a tight catch-up loop, and each pass rewrote the
+// whole (growing) state file. Coalesce those writes: during catch-up a lost write only costs
+// a re-read of the last couple of seconds' bytes, since offsets and totals move together.
+// The pass that finishes the backlog always writes, so a settled index is never stale.
+static const double kAIStateWriteInterval = 2.0;
+
 - (void)savePersistentStateIfNeeded {
+    [self savePersistentStateForcingWrite:YES];
+}
+
+- (void)savePersistentStateCoalesced {
+    [self savePersistentStateForcingWrite:NO];
+}
+
+- (void)savePersistentStateForcingWrite:(BOOL)force {
     if (!_stateDirty) return;
+    if (_stateMustPersist) force = YES;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (!force && _lastStateWrite > 0 && now - _lastStateWrite < kAIStateWriteInterval) return;
     NSMutableDictionary *root = [@{
         @"version": @2,
         @"timeZone": NSTimeZone.localTimeZone.name ?: @"",
@@ -1051,7 +1083,14 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     }
     [fm setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:_statePath error:nil];
     _stateDirty = NO;
+    _stateMustPersist = NO;
+    _lastStateWrite = now;
+    _stateWrites++;
 }
+
+- (void)flushPersistentState { [self savePersistentStateForcingWrite:YES]; }
+
+- (NSUInteger)stateWriteCount { return _stateWrites; }
 
 static NSString *FNVHashBytes(const void *rawBytes, NSUInteger length) {
     const unsigned char *bytes = rawBytes;
@@ -1722,7 +1761,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.source = @"~/.claude transcripts + stats cache";
         }
     } else {
-        if (_claudeFiles.count || _claudeDays.count) _stateDirty = YES;
+        // Withdrawn consent: the transcript index (message-ID hashes, per-day totals) must
+        // leave the disk on this pass, not whenever a later one happens to run.
+        if (_claudeFiles.count || _claudeDays.count) _stateDirty = _stateMustPersist = YES;
         [_claudeFiles removeAllObjects];
         [_claudeDays removeAllObjects];
         _claudeInventory = nil;
@@ -1986,7 +2027,10 @@ static NSString *HashedMessageID(NSString *messageID) {
             _lastStatusReasons[u.name] = u.statusReason;
         }
     }
-    [self savePersistentStateIfNeeded];
+    // Mid-catch-up another pass follows immediately, so coalesce. The pass that lands the
+    // backlog (and every steady-state pass) flushes.
+    if (_needsImmediateRescan) [self savePersistentStateCoalesced];
+    else [self savePersistentStateIfNeeded];
     return usage;
 }
 
@@ -2067,7 +2111,11 @@ static NSColor *BattBarColor(int pct) {
 @end
 
 @interface FlippedView : NSView
-@property (nonatomic) NSInteger accessibilitySequence;
+// The section heading the next row belongs under, and the per-identifier occurrence counts
+// used to disambiguate genuine duplicates. Together these give a row a stable identity that
+// does not move when another row is inserted above it.
+@property (nonatomic, copy) NSString *accessibilitySection;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *accessibilityIdentifierCounts;
 @end
 @implementation FlippedView - (BOOL)isFlipped { return YES; } @end
 
@@ -2077,11 +2125,22 @@ static NSColor *BattBarColor(int pct) {
 // panel. Fill an opaque background so contrast holds regardless of the backdrop. Drawn in
 // drawRect: — not a CALayer background color — so windowBackgroundColor re-resolves under
 // the current Light/Dark appearance on every redraw instead of being frozen at assignment.
+//
+// AppKit does not clip drawRect: to a view's bounds unless the view is layer-backed
+// (clipsToBounds itself is macOS 14+, and the deployment target is 13.0). As the full-size
+// root that is harmless, but any SHORT instance of this view must set wantsLayer, or its
+// fill will paint over whatever sits above it. See the popover footer.
 @interface PopoverRootView : FlippedView @end
 @implementation PopoverRootView
 - (void)drawRect:(NSRect)dirty {
     [NSColor.windowBackgroundColor set];
-    NSRectFill(dirty);
+    NSRectFill(NSIntersectionRect(dirty, self.bounds));
+}
+// A dynamic system color only re-resolves when something redraws. Nothing else marks this
+// view dirty on a live Light/Dark switch.
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    self.needsDisplay = YES;
 }
 @end
 
@@ -2096,6 +2155,33 @@ static void ApplyHeadingAccessibility(NSTextField *heading, NSString *title) {
     }
 #endif
     heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+}
+
+// Returns `base`, or base#2, base#3 … for repeat uses within one detail root. `namespace`
+// keeps the section counter from colliding with the identifier counter.
+static NSString *DisambiguatedDetailKey(FlippedView *root, NSString *ns, NSString *base) {
+    if (!root) return base;
+    if (!root.accessibilityIdentifierCounts) root.accessibilityIdentifierCounts = [NSMutableDictionary dictionary];
+    NSString *counterKey = [NSString stringWithFormat:@"%@|%@", ns, base];
+    NSInteger n = root.accessibilityIdentifierCounts[counterKey].integerValue + 1;
+    root.accessibilityIdentifierCounts[counterKey] = @(n);
+    return n > 1 ? [base stringByAppendingFormat:@"#%ld", (long)n] : base;
+}
+
+// An accessibility identifier must name the field, not its position. These were built from a
+// running build-order counter, so inserting one row renamed every row below it and focus
+// restoration — which matches identifiers exactly — landed on the wrong field. Key off the
+// enclosing section instead, whose key the caller supplies as a stable semantic path
+// ("local-history.codex.models"). Nothing here may depend on how many siblings were built
+// first, or a conditional section appearing elsewhere would rename these rows again.
+static NSString *DetailIdentifier(NSView *root, NSString *kind, NSString *label) {
+    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
+    NSString *scope = root.accessibilityIdentifier ?: @"details";
+    NSString *section = detailRoot.accessibilitySection;
+    NSString *base = section.length
+        ? [NSString stringWithFormat:@"%@.%@.%@.%@", scope, kind, section, label.lowercaseString]
+        : [NSString stringWithFormat:@"%@.%@.%@", scope, kind, label.lowercaseString];
+    return DisambiguatedDetailKey(detailRoot, @"id", base);
 }
 
 static NSView *ViewWithAccessibilityIdentifier(NSView *root, NSString *identifier) {
@@ -2149,6 +2235,14 @@ static NSView *ViewAtSubviewPath(NSView *root, NSArray<NSNumber *> *path) {
 // the identifier-based restoration path below.
 static BOOL ViewTreesCompatible(NSView *existing, NSView *fresh) {
     if (!existing || !fresh || existing.class != fresh.class) return NO;
+    // Matching class and subview counts do not make two rows the same row. If one section
+    // gains a row while another loses one, the flat counts still line up and an in-place
+    // update would silently repoint a focused field at different data — the identifier
+    // moves with it, so nothing downstream can notice. Compare identity as well as shape.
+    NSString *existingIdentifier = existing.accessibilityIdentifier;
+    NSString *freshIdentifier = fresh.accessibilityIdentifier;
+    if (existingIdentifier != freshIdentifier && ![existingIdentifier isEqualToString:freshIdentifier])
+        return NO;
     if ([existing isKindOfClass:NSScrollView.class]) {
         NSView *existingDocument = ((NSScrollView *)existing).documentView;
         NSView *freshDocument = ((NSScrollView *)fresh).documentView;
@@ -2451,6 +2545,25 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
+}
+
+// A catch-up pass may hold a coalesced state write. Land it before the process goes away,
+// or the next launch re-reads bytes it already indexed.
+//
+// Never block quit on it. The AI queue is serial and a pass in flight can be parked in
+// /usr/bin/security or a 15s HTTP timeout; a plain dispatch_sync would freeze the main
+// thread until then. The flush is worth at most a couple of seconds of re-read, so wait
+// briefly and abandon it.
+- (void)applicationWillTerminate:(NSNotification *)n {
+    (void)n;
+    if (!_aiQueue || !_aiReader) return;
+    dispatch_semaphore_t flushed = dispatch_semaphore_create(0);
+    dispatch_async(_aiQueue, ^{
+        [self->_aiReader flushPersistentState];
+        dispatch_semaphore_signal(flushed);
+    });
+    if (dispatch_semaphore_wait(flushed, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC))))
+        GBLog("terminate: AI state flush timed out; indexing resumes from the last write");
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -3321,9 +3434,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
     const CGFloat footerH = 54;
-    FlippedView *footer = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
-    footer.wantsLayer = YES;
-    footer.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+    // Fills windowBackgroundColor in drawRect: instead of freezing it into a CALayer CGColor,
+    // so the footer follows a live Light/Dark switch like the panel above it.
+    PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
     NSTextField *freshnessField = [self text:freshness font:[NSFont systemFontOfSize:9.5]
                                            color:NSColor.tertiaryLabelColor
                                               at:NSMakeRect(kPad, 3, kW-2*kPad, 13)
@@ -3608,27 +3721,37 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             _bat.amperage_mA < 0 ? @"Drawing" : @"Charging at", watts];
 }
 
-- (void)addDetailHeading:(NSString *)title to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
+// `sectionKey` is a stable semantic path for the section this heading OPENS — never the
+// section it follows, and never a build-order index. Rows added after it inherit it.
+- (void)addDetailHeading:(NSString *)title key:(NSString *)sectionKey
+                      to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
     if (*y > kDetailPad) *y += 8;
     FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
-    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
-    NSString *scope = root.accessibilityIdentifier ?: @"details";
     NSTextField *heading = [self text:title.uppercaseString
                                   font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
                                  color:NSColor.tertiaryLabelColor
                                     at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 14)
                                  align:NSTextAlignmentLeft];
     ApplyHeadingAccessibility(heading, title);
-    heading.accessibilityIdentifier = [NSString stringWithFormat:@"%@.heading.%ld.%@",
-                                        scope, (long)focusIndex, title.lowercaseString];
+    NSString *key = sectionKey.length ? sectionKey.lowercaseString : title.lowercaseString;
+    NSString *scope = root.accessibilityIdentifier ?: @"details";
+    heading.accessibilityIdentifier = DisambiguatedDetailKey(detailRoot, @"id",
+        [NSString stringWithFormat:@"%@.heading.%@", scope, key]);
+    if (detailRoot) detailRoot.accessibilitySection = key;
     [root addSubview:heading];
     *y += 24;
 }
 
 - (void)addDetailKey:(NSString *)key value:(NSString *)value to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
-    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
-    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
-    NSString *scope = root.accessibilityIdentifier ?: @"details";
+    [self addDetailKey:key value:value identifierKey:key to:root y:y width:width];
+}
+
+// `identifierKey` names the row for focus restoration and defaults to the displayed key.
+// Pass a distinct one wherever the display text is lossy — ShortModelName maps both
+// "claude-opus-4-8" and "opus-4-8" onto "opus-4-8", and the rows are ordered by usage, so
+// a key built from the display name would swap identifiers as token counts cross.
+- (void)addDetailKey:(NSString *)key value:(NSString *)value identifierKey:(NSString *)identifierKey
+                  to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
     CGFloat keyW = 126;
     CGFloat valueW = width - 2*kDetailPad - keyW;
     NSFont *valueFont = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
@@ -3645,16 +3768,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     field.lineBreakMode = NSLineBreakByWordWrapping;
     field.maximumNumberOfLines = 0;
     field.selectable = YES;
-    field.accessibilityIdentifier = [NSString stringWithFormat:@"%@.value.%ld.%@",
-                                      scope, (long)focusIndex, key];
+    field.accessibilityIdentifier = DetailIdentifier(root, @"value", identifierKey.length ? identifierKey : key);
     [root addSubview:field];
     *y += MAX(24, rowH + 8);
 }
 
 - (void)addDetailStatus:(NSString *)status to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
-    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
-    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
-    NSString *scope = root.accessibilityIdentifier ?: @"details";
     CGFloat fieldW = width - 2*kDetailPad;
     NSFont *font = [NSFont systemFontOfSize:12];
     NSString *safeStatus = status ?: @"";
@@ -3667,7 +3786,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     field.lineBreakMode = NSLineBreakByWordWrapping;
     field.maximumNumberOfLines = 0;
     field.selectable = YES;
-    field.accessibilityIdentifier = [NSString stringWithFormat:@"%@.status.%ld", scope, (long)focusIndex];
+    field.accessibilityIdentifier = DetailIdentifier(root, @"status", @"status");
     [root addSubview:field];
     *y += MAX(24, rowH + 8);
 }
@@ -3695,7 +3814,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 360)];
     root.accessibilityIdentifier = @"details.overview";
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"Overview" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Overview" key:@"overview" to:root y:&y width:kDetailW];
 
     Volume *primary = [self primaryVolume];
     NSString *storage = primary
@@ -3709,7 +3828,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                     to:root y:&y width:kDetailW];
     [self addDetailKey:@"AI status" value:[self aiOverviewText] to:root y:&y width:kDetailW];
 
-    [self addDetailHeading:@"Top Signals" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Top Signals" key:@"top-signals" to:root y:&y width:kDetailW];
     if (_hogsLoading || _procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
     } else if (_hogsUnavailable || _procStatsUnavailable) {
@@ -3759,7 +3878,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 420)];
     root.accessibilityIdentifier = @"details.storage";
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"Storage" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Storage" key:@"storage" to:root y:&y width:kDetailW];
     if (_volumesUnavailable && _vols.count)
         [self addDetailStatus:@"Volume scan unavailable; showing the last successful reading"
                            to:root y:&y width:kDetailW];
@@ -3768,7 +3887,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                            to:root y:&y width:kDetailW];
     }
     for (Volume *volume in _vols) {
-        [self addDetailHeading:volume.name to:root y:&y width:kDetailW];
+        [self addDetailHeading:volume.name key:[@"volume." stringByAppendingString:volume.path ?: volume.name] to:root y:&y width:kDetailW];
         [root addSubview:[self compactSignalRow:@"Used"
                                           right:[NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)]
                                        fraction:volume.fraction color:DiskColor(volume.fraction)
@@ -3794,7 +3913,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 520)];
     root.accessibilityIdentifier = @"details.battery";
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"Battery" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Battery" key:@"battery" to:root y:&y width:kDetailW];
     if (!_bat.valid) {
         [self addDetailStatus:@"Battery unavailable" to:root y:&y width:kDetailW];
     } else {
@@ -3816,7 +3935,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         }
     }
 
-    [self addDetailHeading:@"Sampled Energy Impact" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Sampled Energy Impact" key:@"energy" to:root y:&y width:kDetailW];
     if (_hogsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
     } else if (_hogsUnavailable) {
@@ -3841,10 +3960,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
     root.accessibilityIdentifier = @"details.ai";
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"AI Status" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"AI Status" key:@"ai-status" to:root y:&y width:kDetailW];
 
     for (AIUsage *u in _aiUsage) {
-        [self addDetailHeading:u.name ?: @"AI" to:root y:&y width:kDetailW];
+        NSString *providerKey = (u.name ?: @"ai").lowercaseString;
+        [self addDetailHeading:u.name ?: @"AI" key:[@"ai-status." stringByAppendingString:providerKey]
+                            to:root y:&y width:kDetailW];
         [self addDetailKey:@"Remaining" value:[self aiPercentText:u] to:root y:&y width:kDetailW];
         [self addDetailKey:@"Reset" value:[self aiResetDetailText:u] to:root y:&y width:kDetailW];
         if (u.limitWindows.count >= 2)
@@ -3867,7 +3988,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             [self addDetailKey:@"Status source" value:u.statusSource to:root y:&y width:kDetailW];
     }
 
-    [self addDetailHeading:@"Privacy & Sources" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Privacy & Sources" key:@"privacy" to:root y:&y width:kDetailW];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [self addDetailKey:@"Claude account"
                  value:[ud boolForKey:@"useClaudeAccount"] ? @"On · Keychain token + api.anthropic.com" : @"Off · no Keychain/API access"
@@ -3882,9 +4003,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         ? @"Present · overrides provider gauges" : @"Not found";
     [self addDetailKey:@"Status file" value:statusState to:root y:&y width:kDetailW];
 
-    [self addDetailHeading:@"Local History" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Local History" key:@"local-history" to:root y:&y width:kDetailW];
     for (AIUsage *u in _aiUsage) {
-        [self addDetailHeading:u.name ?: @"AI" to:root y:&y width:kDetailW];
+        NSString *providerKey = (u.name ?: @"ai").lowercaseString;
+        [self addDetailHeading:u.name ?: @"AI" key:[@"local-history." stringByAppendingString:providerKey]
+                            to:root y:&y width:kDetailW];
         if (!u.available) {
             [self addDetailStatus:u.statusText ?: @"Local state not found" to:root y:&y width:kDetailW];
             [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
@@ -3913,15 +4036,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
 
         if (u.models.count) {
-            [self addDetailHeading:@"Models" to:root y:&y width:kDetailW];
+            // Keyed by provider: Claude gaining a Models section must not rename Codex's rows.
+            [self addDetailHeading:@"Models"
+                               key:[NSString stringWithFormat:@"local-history.%@.models", providerKey]
+                                to:root y:&y width:kDetailW];
             for (NSDictionary *model in u.models) {
-                NSString *name = ShortModelName(model[@"name"]);
+                NSString *rawName = [model[@"name"] isKindOfClass:NSString.class] ? model[@"name"] : nil;
+                NSString *name = ShortModelName(rawName);
                 long long tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? [model[@"tokens"] longLongValue] : 0;
                 NSNumber *sessions = [model[@"sessions"] isKindOfClass:NSNumber.class] ? model[@"sessions"] : nil;
                 NSString *right = tokens > 0 && sessions ? [NSString stringWithFormat:@"%@ · %@ sessions", FmtTokenCount(tokens), sessions]
                                 : sessions ? [NSString stringWithFormat:@"%@ sessions", sessions]
                                 : FmtTokenCount(tokens);
-                [self addDetailKey:name value:right to:root y:&y width:kDetailW];
+                // The raw model id, not the shortened display name: rows are ordered by usage.
+                [self addDetailKey:name value:right identifierKey:rawName ?: name
+                                to:root y:&y width:kDetailW];
             }
         }
     }
@@ -3932,13 +4061,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
     root.accessibilityIdentifier = @"details.system";
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"System" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"System" key:@"system" to:root y:&y width:kDetailW];
     [self addDetailKey:@"Pressure" value:SystemPressureLevel(_sys) to:root y:&y width:kDetailW];
     [self addDetailKey:@"CPU" value:CPUStatusText(_sys) to:root y:&y width:kDetailW];
     [self addDetailKey:@"Memory" value:MemoryStatusText(_sys) to:root y:&y width:kDetailW];
     [self addDetailKey:@"Swap" value:SwapStatusText(_sys) to:root y:&y width:kDetailW];
 
-    [self addDetailHeading:@"Top CPU" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Top CPU" key:@"top-cpu" to:root y:&y width:kDetailW];
     if (_procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
     } else if (_procStatsUnavailable) {
@@ -3960,7 +4089,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                to:root y:&y width:kDetailW];
     }
 
-    [self addDetailHeading:@"Top Memory" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Top Memory" key:@"top-memory" to:root y:&y width:kDetailW];
     if (_procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
     } else if (_procStatsUnavailable) {
