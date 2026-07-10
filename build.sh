@@ -63,17 +63,20 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 
-# Sign with a stable identity. Ad-hoc signing changes the code hash on every build, which
-# invalidates the Keychain grant for the Claude Code credential and leaves SMAppService
-# without the durable code identity Launch at Login registers against.
+# Sign with a stable identity. Ad-hoc signing pins the designated requirement to the code
+# hash, so every rebuild is a different program as far as macOS is concerned. Launch at Login
+# registers against that identity (Background Task Management re-registers the item on each
+# change), and a Developer ID is what a distributable build needs anyway.
+#
+# It is NOT about the Keychain: the Claude Code credential is read through Apple's
+# /usr/bin/security, so that read is judged against *that* tool's signature, not Glancebar's.
+# Signing this app does not change whether it prompts. See Sources/main.m.
 #
 # Resolution order:
 #   1. $GLANCEBAR_CODESIGN_IDENTITY — explicit override; fails loudly if not installed.
 #   2. GLANCEBAR_ADHOC=1 — deliberate ad-hoc, for CI and reproducible builds.
-#   3. An installed "Developer ID Application" identity. It carries a Team ID, which lets the
-#      Keychain grant occupy a durable "teamid:" partition — the only thing that makes the
-#      Claude account read prompt-free. Preferred automatically so a plain ./build.sh stays
-#      prompt-free once you have one. Set GLANCEBAR_ADHOC=1 on a shared machine.
+#   3. An installed "Developer ID Application" identity, preferred automatically so a plain
+#      ./build.sh is stable. Set GLANCEBAR_ADHOC=1 on a shared machine.
 #   4. The "Glancebar Self-Signed" cert, matched by SHA-1 rather than display name so a
 #      regenerated same-named cert cannot silently change the signature.
 #   5. Ad-hoc "-", with a loud warning.
@@ -99,8 +102,8 @@ else
     IDENTITY="-"
     echo "build.sh: WARNING — no stable signing identity found (no Developer ID, no cert" >&2
     echo "  SHA-1 $SELF_SIGNED_SHA1, no \$GLANCEBAR_CODESIGN_IDENTITY). Falling back to AD-HOC" >&2
-    echo "  signing: the Keychain grant for the Claude Code credential re-prompts on every" >&2
-    echo "  rebuild, and Launch at Login may need re-approval. See docs/RELEASING.md." >&2
+    echo "  signing: every rebuild changes the app's code identity, so Launch at Login is" >&2
+    echo "  re-registered each time. See docs/RELEASING.md." >&2
 fi
 
 CODESIGN_ARGS=(--force --sign "$IDENTITY")

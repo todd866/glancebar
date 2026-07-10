@@ -55,10 +55,11 @@ cross-compile. Requires the Xcode Command Line Tools (`xcode-select --install`).
 
 Signing prefers, in order: `GLANCEBAR_CODESIGN_IDENTITY`, then an installed
 `Developer ID Application` identity, then the `Glancebar Self-Signed` cert, then ad-hoc.
-Prefer a stable identity: ad-hoc signing pins the designated requirement to the code
-hash, so every rebuild invalidates the Keychain grant for the Claude Code credential and
-the Launch at Login registration. Pass `GLANCEBAR_ADHOC=1` to force ad-hoc on a shared
-machine or in CI.
+Prefer a stable identity: ad-hoc signing pins the designated requirement to the code hash,
+so every rebuild looks like a new program and Launch at Login is re-registered. It does not
+affect the Keychain prompt — the Claude Code credential is read through Apple's
+`/usr/bin/security`, which is judged against that tool's signature rather than Glancebar's.
+Pass `GLANCEBAR_ADHOC=1` to force ad-hoc on a shared machine or in CI.
 
 This repository does not currently advertise a prebuilt or notarized download; build
 locally with `./build.sh`. Do not remove quarantine from an app obtained from someone
