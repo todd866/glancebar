@@ -57,7 +57,7 @@ int main(void) {
 
         // --- ParseProcessStats footprint override ---
         NSDictionary *stats2 = ParseProcessStats(ps, 3,
-            ^NSString *(pid_t pid) { return nil; },
+            ^NSString *(pid_t __unused pid) { return nil; },
             ^unsigned long long (pid_t pid) { return pid == 104 ? 999ULL * 1024 * 1024 : 0; });
         check([stats2[@"memory"][0][@"name"] isEqual:@"AdobeAcrobat"], @"footprint keeps sort order");
         check([stats2[@"memory"][0][@"bytes"] unsignedLongLongValue] == 999ULL * 1024 * 1024,
@@ -127,10 +127,38 @@ int main(void) {
         NSDictionary *cpick = PickClaudeLimitWindow(cu, 1000);
         check(fabs([cpick[@"remainingFraction"] doubleValue] - 0.19) < 0.001, @"claude most constrained window wins");
         check([cpick[@"window"] isEqual:@"weekly"], @"claude weekly labeled");
-        NSDictionary *cpick2 = PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @0.4, @"resets_at": @9000}}, 1000);
-        check(fabs([cpick2[@"remainingFraction"] doubleValue] - 0.6) < 0.001, @"fraction utilization tolerated");
+        NSDictionary *cpickOne = PickClaudeLimitWindow(
+            @{@"five_hour": @{@"utilization": @1.0, @"resets_at": @9000}}, 1000);
+        check(fabs([cpickOne[@"remainingFraction"] doubleValue] - 0.99) < 0.001,
+              @"claude utilization 1.0 means 1 percent used, not a full fraction");
+        NSDictionary *cpickFractionalPercent = PickClaudeLimitWindow(
+            @{@"five_hour": @{@"utilization": @0.4, @"resets_at": @9000}}, 1000);
+        check(fabs([cpickFractionalPercent[@"remainingFraction"] doubleValue] - 0.996) < 0.001,
+              @"claude sub-1 utilization remains a fractional percentage");
+        NSDictionary *cpickFull = PickClaudeLimitWindow(
+            @{@"five_hour": @{@"utilization": @100.0, @"resets_at": @9000}}, 1000);
+        check(fabs([cpickFull[@"remainingFraction"] doubleValue]) < 0.001,
+              @"claude utilization 100 means no quota remaining");
         check(PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @37, @"resets_at": @500}}, 1000) == nil,
               @"claude obsolete window skipped");
+        check(PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @37, @"resets_at": @1000}}, 1000) == nil,
+              @"claude window resetting exactly now is elapsed");
+        check(PickClaudeLimitWindow(@{@"five_hour": @{@"utilization": @100}}, 1000) == nil,
+              @"claude reset-less placeholder cannot drive headline");
+        NSDictionary *placeholderPick = PickClaudeLimitWindow(
+            @{@"five_hour": @{@"utilization": @20, @"resets_at": @9000},
+              @"seven_day_opus": @{@"utilization": @100}}, 1000);
+        check([placeholderPick[@"window"] isEqual:@"5-hour"] &&
+              fabs([placeholderPick[@"remainingFraction"] doubleValue] - 0.80) < 0.001,
+              @"claude reset-less weekly Opus placeholder cannot override live headline");
+        check(PickClaudeLimitWindow(@{@"future_window": @{@"utilization": @99, @"resets_at": @9000}}, 1000) == nil,
+              @"claude unknown window cannot drive headline");
+        NSDictionary *knownPick = PickClaudeLimitWindow(
+            @{@"future_window": @{@"utilization": @99, @"resets_at": @9000},
+              @"five_hour": @{@"utilization": @20, @"resets_at": @9000}}, 1000);
+        check([knownPick[@"window"] isEqual:@"5-hour"] &&
+              fabs([knownPick[@"remainingFraction"] doubleValue] - 0.80) < 0.001,
+              @"claude known current window wins over unknown bucket");
         check(PickClaudeLimitWindow(@{@"error": @{@"type": @"rate_limit_error"}}, 1000) == nil,
               @"error response yields nil");
         // Real response shape: percent utilization, microsecond ISO resets, null windows,
@@ -179,6 +207,13 @@ int main(void) {
         check(fabs([cwins[0][@"remainingFraction"] doubleValue] - 0.24) < 0.001, @"claude 5-hour remaining = 1-0.76");
         check(fabs([cwins[1][@"remainingFraction"] doubleValue] - 0.45) < 0.001, @"claude weekly remaining = 1-0.55");
         check([cwins[0][@"resetsAt"] doubleValue] == 4000, @"claude 5-hour reset surfaced");
+        NSArray *cwinsPercent = ClaudeLimitWindows(
+            @{@"five_hour": @{@"utilization": @1.0, @"resets_at": @4000},
+              @"seven_day": @{@"utilization": @100.0, @"resets_at": @9000}}, 1000);
+        check(fabs([cwinsPercent[0][@"remainingFraction"] doubleValue] - 0.99) < 0.001,
+              @"claude dual meter treats 1.0 as 1 percent used");
+        check(fabs([cwinsPercent[1][@"remainingFraction"] doubleValue]) < 0.001,
+              @"claude dual meter treats 100 as fully used");
         NSArray *cwins2 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @20.0, @"resets_at": @500},
                                                @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000}}, 1000);
         check(cwins2.count == 1 && [cwins2[0][@"window"] isEqual:@"weekly"], @"claude drops reset-elapsed window");
@@ -198,6 +233,15 @@ int main(void) {
                                                @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
                                                @"seven_day_opus": @{@"utilization": @0.0}}, 1000);
         check(cwins6.count == 2, @"claude excludes a reset-less placeholder window (e.g. unused weekly Opus)");
+        NSArray *cwins7 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @76.0},
+                                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @9000},
+                                               @"future_window": @{@"utilization": @99.0, @"resets_at": @9000}}, 1000);
+        check(cwins7.count == 1 && [cwins7[0][@"window"] isEqual:@"weekly"],
+              @"claude dual meter drops reset-less known and current unknown windows");
+        NSArray *cwins8 = ClaudeLimitWindows(@{@"five_hour": @{@"utilization": @76.0, @"resets_at": @1000},
+                                               @"seven_day": @{@"utilization": @55.0, @"resets_at": @1001}}, 1000);
+        check(cwins8.count == 1 && [cwins8[0][@"window"] isEqual:@"weekly"],
+              @"claude dual meter drops a window whose reset is exactly elapsed");
 
         // --- CodexLimitWindows (all current windows for the dual meter) ---
         NSDictionary *xlimits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @4000},

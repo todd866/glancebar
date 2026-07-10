@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate metadata and scripts
+        run: |
+          plutil -lint Info.plist
+          zsh -n build.sh tests.sh
+
+      - name: Run tests with sanitizers
+        env:
+          GLANCEBAR_TEST_SANITIZERS: "1"
+        run: ./tests.sh
+
+      - name: Run static analyzer
+        run: |
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          for source in Sources/pure.m Sources/main.m; do
+            xcrun clang --analyze -fobjc-arc -Wall -Wextra -Werror \
+              -isysroot "$SDKROOT" -mmacosx-version-min=13.0 \
+              "$source" -o /dev/null
+          done
+
+      - name: Build Universal 2 app
+        run: ./build.sh
+
+      - name: Verify CLI JSON contract
+        run: |
+          mkdir -p "$RUNNER_TEMP/glancebar-home"
+          GLANCEBAR_HOME="$RUNNER_TEMP/glancebar-home" \
+            GLANCEBAR_ALLOW_ACCOUNT=0 \
+            build/Glancebar.app/Contents/MacOS/Glancebar --dump --json \
+            > "$RUNNER_TEMP/glancebar.json"
+          plutil -lint "$RUNNER_TEMP/glancebar.json"
+          ruby -rjson -e 'j=JSON.parse(File.read(ARGV[0])); abort "bad schema" unless j["schemaVersion"] == 1 && j.dig("ai", "onlineAllowed") == false' \
+            "$RUNNER_TEMP/glancebar.json"
+
+      - name: Verify bundle
+        run: |
+          codesign --verify --strict --verbose=2 build/Glancebar.app
+          test "$(plutil -extract CFBundleShortVersionString raw -o - build/Glancebar.app/Contents/Info.plist)" = "1.1.0"
+          test "$(plutil -extract CFBundleVersion raw -o - build/Glancebar.app/Contents/Info.plist)" = "2"
+          test "$(build/Glancebar.app/Contents/MacOS/Glancebar --version)" = "Glancebar 1.1.0"
+          test -f build/Glancebar.app/Contents/Resources/Glancebar.icns
+          lipo -verify_arch arm64 x86_64 build/Glancebar.app/Contents/MacOS/Glancebar

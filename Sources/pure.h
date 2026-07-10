@@ -67,17 +67,18 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
 
 // Picks the most constrained, still-current window from Anthropic's OAuth usage
 // response (window dicts like five_hour/seven_day carrying utilization + resets_at).
-// Tolerates fraction or percent utilization and ISO-8601 or epoch resets_at. Returns
-// nil when nothing is current, else the same shape as PickLimitWindow.
+// Anthropic defines utilization as a percentage (so 1.0 means 1%, not 100%); resets_at
+// may be ISO-8601 or epoch. Unknown and reset-less placeholder windows are excluded.
+// Returns nil when nothing is current, else the same shape as PickLimitWindow.
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
 
 // ALL still-current limit windows (for the dual-meter breakdown), in fixed reading
 // order rather than most-constrained-first: Codex primary→secondary, Claude
 // 5-hour→weekly→weekly Opus (weekly Sonnet is intentionally not surfaced). Obsolete
-// (reset-elapsed) windows and the Claude extra_usage credit budget are excluded. Each
-// element has the same shape as PickLimitWindow. Empty array when none apply. (The bar's
-// single gauge still uses the Pick*LimitWindow pickers above; these feed the
-// popover/details breakdown.)
+// (reset-elapsed) windows, reset-less Claude placeholders, and Claude's extra_usage
+// credit budget are excluded. Each element has the same shape as PickLimitWindow. Empty
+// array when none apply. (The bar's single gauge still uses the Pick*LimitWindow pickers
+// above; these feed the popover/details breakdown.)
 NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch);
 

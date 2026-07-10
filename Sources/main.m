@@ -4,13 +4,27 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
-#import <Security/Security.h>
+#import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
 #import <mach/mach.h>
+#import <signal.h>
 #import <sys/mount.h>
 #import <sys/sysctl.h>
 #import <os/log.h>
 #import "pure.h"
+
+static NSString * const GBVersion = @"1.1.0";
+
+// Tests and diagnostics can point Glancebar at an isolated fixture home without touching
+// a real Codex/Claude installation. Normal app runs always fall back to the login home.
+static NSString *GBHomeDirectory(void) {
+    const char *override = getenv("GLANCEBAR_HOME");
+    if (override && override[0]) {
+        NSString *path = [NSString stringWithUTF8String:override];
+        if (path.length) return path.stringByStandardizingPath;
+    }
+    return NSHomeDirectory();
+}
 
 #pragma mark - Disk
 
@@ -39,7 +53,10 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
                                                error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
     // APFS reports purgeable space in the "important usage" figure, which can exceed
     // total capacity; clamp so used/free/fraction stay self-consistent.
-    if (important.longLongValue > 0) avail = MIN(important.longLongValue, total.longLongValue);
+    if (important.longLongValue > 0) avail = important.longLongValue;
+    // Network and transient volumes can briefly report -1 or a free-space figure larger
+    // than their capacity. Clamp every source, not just the APFS "important" value.
+    avail = MAX(0LL, MIN(avail, total.longLongValue));
 
     Volume *vol = [Volume new];
     vol.path = url.path.length ? url.path : @"/";
@@ -108,8 +125,9 @@ static BatteryState ReadBattery(void) {
     CFMutableDictionaryRef props = NULL;
     if (IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS) {
         NSDictionary *d = CFBridgingRelease(props);
-        b.valid = YES;
-        b.percent = (int)NumFor(d, @"CurrentCapacity");
+        long percent = NumFor(d, @"CurrentCapacity");
+        b.valid = percent >= 0 && percent <= 100;
+        b.percent = b.valid ? (int)percent : 0;
         b.isCharging = [d[@"IsCharging"] boolValue];
         b.acConnected = [d[@"ExternalConnected"] boolValue];
         b.fullyCharged = [d[@"FullyCharged"] boolValue];
@@ -151,9 +169,25 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
     t.environment = @{@"LC_ALL": @"C"};   // ps/top honor LC_NUMERIC; force '.' decimals
     NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
     t.standardError = NSFileHandle.fileHandleWithNullDevice;
-    if (![t launchAndReturnError:nil]) return nil;
+    NSError *launchError = nil;
+    if (![t launchAndReturnError:&launchError]) return nil;
+
+    // `top`, `ps`, and sqlite normally complete quickly. Never let a wedged child pin the
+    // sampling queue or the serial AI reader forever; terminate at 8s and force-kill at 9s.
+    __block BOOL timedOut = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (!t.isRunning) return;
+        timedOut = YES;
+        [t terminate];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (t.isRunning) kill(t.processIdentifier, SIGKILL);
+        });
+    });
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
     [t waitUntilExit];
+    if (timedOut || t.terminationStatus != 0) return nil;
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
@@ -233,10 +267,6 @@ static NSDictionary *ProcessDisplayInfo(NSDictionary *h) {
     if (commands.count == 1 && [commands.firstObject isEqualToString:name])
         detail = [name hasSuffix:@"d"] ? @"background service" : @"process";
     return @{@"title": name, @"detail": detail};
-}
-
-static NSString *PressureLevel(double share) {
-    return share >= 0.35 ? @"High" : share >= 0.15 ? @"Medium" : @"Low";
 }
 
 static NSColor *PressureColor(double share) {
@@ -389,7 +419,8 @@ static NSString *CPUStatusText(SystemState s) {
 
 static NSString *MemoryStatusText(SystemState s) {
     if (!s.memValid) return @"Memory unknown";
-    return [NSString stringWithFormat:@"Memory %@ · %@ available", MemoryPressureLevel(s), FmtBytes(s.memAvailable)];
+    return [NSString stringWithFormat:@"Memory pressure %@ · %@ available",
+            MemoryPressureLevel(s), FmtBytes(s.memAvailable)];
 }
 
 static NSString *SwapStatusText(SystemState s) {
@@ -415,12 +446,14 @@ static NSColor *CPUColor(double cpu) {
 @interface AIUsage : NSObject
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
 @property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
+@property (copy) NSString *limitRefreshError;
 @property (copy) NSString *diagnostics;   // --dump only: why the gauge is or isn't shown
-@property BOOL available, stale, limitStatusAvailable, overageActive;
+@property BOOL available, stale, limitStatusAvailable, limitStale, overageActive;
 @property double remainingFraction;
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
 @property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
 @property (strong) NSDate *lastActivity;
+@property (strong) NSDate *limitUpdatedAt;
 @property (copy) NSArray<NSDictionary *> *models;
 @property (copy) NSArray<NSDictionary *> *limitWindows;   // all current limit windows (dual meter); bar still uses remainingFraction
 @end
@@ -623,7 +656,8 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSNumber *fraction = StatusNumberForKeys(entry, @[@"remainingFraction", @"fractionRemaining"]);
     NSNumber *percent = StatusNumberForKeys(entry, @[@"remainingPercent", @"percentRemaining", @"percentageRemaining"]);
     double v = fraction ? fraction.doubleValue : (percent ? percent.doubleValue / 100.0 : -1);
-    if (v >= 0) {
+    BOOL replacedGauge = v >= 0;
+    if (replacedGauge) {
         u.remainingFraction = MIN(1.0, MAX(0.0, v));
         u.limitStatusAvailable = YES;
     }
@@ -632,9 +666,19 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSString *resetAt = StatusStringForKeys(entry, @[@"resetAt", @"resetTime", @"resetsAt"]);
     NSDate *resetDate = DateFromStatusString(resetAt);
     if (resetDate) reset = ResetTextFromDate(resetDate);
-    if (reset.length) {
+    if (reset.length && (replacedGauge || (u.limitStatusAvailable && u.remainingFraction >= 0))) {
         u.resetText = reset;
-        u.limitStatusAvailable = YES;
+        replacedGauge = YES;
+    }
+
+    if (replacedGauge) {
+        // A status-file entry is a true override, not a third opinion layered over the
+        // provider. Clear provider-specific dual meters/overage so every surface agrees.
+        u.limitWindows = @[];
+        u.overageActive = NO;
+        u.extraUsage = nil;
+        u.limitStale = NO;
+        u.limitUpdatedAt = nil;
     }
 
     NSString *reason = StatusStringForKeys(entry, @[@"status", @"detail", @"reason"]);
@@ -642,8 +686,9 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     u.statusReason = reason.length ? reason : @"Limit status from local status file";
 }
 
-static AIUsage *ReadClaudeUsage(void) {
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@".claude/stats-cache.json"];
+static AIUsage *ReadClaudeUsage(NSString *homeDirectory) {
+    NSString *home = homeDirectory.length ? homeDirectory : GBHomeDirectory();
+    NSString *path = [home stringByAppendingPathComponent:@".claude/stats-cache.json"];
     NSDictionary *root = JSONDictionaryAtPath(path);
     if (!root) return UnavailableAIUsage(@"Claude", @"~/.claude/stats-cache.json");
 
@@ -722,18 +767,14 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
     return RunTaskOutput(@"/usr/bin/sqlite3", @[@"-readonly", @"-separator", @"\t", path, sql]);
 }
 
-// Read a generic-password value via /usr/bin/security rather than SecItemCopyMatching in
-// this process. The "Claude Code-credentials" item's PartitionID ACL is ["apple-tool:"]
-// only, and Claude Code resets it to that on every ~hourly token refresh — so although
-// this app already passes the item's trusted-app ACL, the partition (XARA) gate rejects
-// our Developer ID code signature and macOS prompts for a password on every read. The
-// Apple-signed `security` tool lives in the apple-tool: partition that Claude Code always
-// preserves, so it reads silently; the keychain check is evaluated against `security`'s
-// own signature, not ours (no responsible-process propagation), and survives refreshes.
+// Claude Code's credential item authorizes Apple's `apple-tool:` partition. Glancebar
+// therefore asks the Apple-signed /usr/bin/security tool to read it; Keychain evaluates
+// that tool's signature rather than Glancebar's, so the read is normally silent. This is
+// an undocumented trust-boundary behavior, disclosed in-app before the opt-in is stored.
 //
 // This leans on undocumented partition behavior, so it is bounded and watchdogged: a hard
-// deadline kills the child if `security` ever blocks (e.g. a future ACL change that makes
-// IT prompt), so we degrade quietly instead of hanging on a dialog. The returned blob is
+// deadline kills the child if `security` ever blocks (for example after an ACL change),
+// so we degrade quietly instead of hanging on a dialog. The returned blob is
 // a live OAuth token — callers must never log it.
 static NSString *KeychainBlobViaSecurity(NSString *service) {
     NSTask *t = [NSTask new];
@@ -743,7 +784,7 @@ static NSString *KeychainBlobViaSecurity(NSString *service) {
     NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
     if (![t launchAndReturnError:nil]) return nil;
 
-    // `security` normally returns instantly; if it ever wedges (interactive prompt), kill it.
+    // `security` normally returns instantly; if it ever wedges, terminate it.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (t.isRunning) [t terminate];
@@ -776,6 +817,22 @@ static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
     return @{@"token": token ?: @"", @"expiresAt": @(expiresAt)};    // expiry judged by the caller
 }
 
+@interface GBAnthropicSessionDelegate : NSObject <NSURLSessionTaskDelegate>
+@end
+@implementation GBAnthropicSessionDelegate
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+                         newRequest:(NSURLRequest *)request
+                  completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
+    // Authorization headers must never follow a provider-controlled redirect. A future
+    // same-host HTTPS redirect is acceptable; every other destination is refused.
+    NSURL *url = request.URL;
+    BOOL sameTrustedHost = [url.scheme.lowercaseString isEqualToString:@"https"] &&
+                           [url.host.lowercaseString isEqualToString:@"api.anthropic.com"];
+    completionHandler(sameTrustedHost ? request : nil);
+}
+@end
+
 // One GET to Anthropic's OAuth usage endpoint — the same data Claude Code's /usage
 // shows. Synchronous by design: callers run on the AI queue, never the main thread.
 static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
@@ -792,7 +849,8 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
     cfg.HTTPCookieStorage = nil;
     cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     cfg.HTTPShouldSetCookies = NO;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    GBAnthropicSessionDelegate *delegate = [GBAnthropicSessionDelegate new];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:delegate delegateQueue:nil];
 
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block NSDictionary *json = nil;
@@ -837,21 +895,6 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
     return json;
 }
 
-// Codex's sqlite schema versions its filename (state_5.sqlite today); pick the
-// highest-versioned one so a Codex update doesn't silently blank the panel.
-static NSString *CodexStatePath(void) {
-    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@".codex"];
-    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
-    NSString *best = nil;
-    long bestVersion = -1;
-    for (NSString *name in names) {
-        if (![name hasPrefix:@"state_"] || ![name hasSuffix:@".sqlite"] || name.length <= 13) continue;
-        long v = [name substringWithRange:NSMakeRange(6, name.length - 13)].integerValue;
-        if (v > bestVersion) { bestVersion = v; best = name; }
-    }
-    return best ? [dir stringByAppendingPathComponent:best] : nil;
-}
-
 static NSDate *FileMTime(NSString *path) {
     return [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
 }
@@ -866,11 +909,31 @@ static NSDate *FileMTime(NSString *path) {
 @property BOOL useClaudeAccount;
 @property BOOL allowClaudeAccountFetch;
 @property BOOL allowClaudeTranscripts;
+// A bounded pass intentionally leaves large histories unfinished. UI callers can
+// immediately schedule another pass while needsImmediateRescan is true; diagnostics
+// can drive catch-up without waiting for the normal 15-second refresh.
+@property (readonly) BOOL needsImmediateRescan;
+@property (readonly) BOOL totalsIncomplete;
+@property (readonly) double catchUpProgress;
+@property (readonly, copy) NSString *catchUpStatus;
+- (instancetype)initWithHomeDirectory:(NSString *)homeDirectory;
+- (instancetype)initWithHomeDirectory:(NSString *)homeDirectory
+           applicationSupportDirectory:(NSString *)applicationSupportDirectory;
 - (NSArray<AIUsage *> *)read;
+- (NSArray<AIUsage *> *)readUntilCaughtUpWithTimeLimit:(NSTimeInterval)timeLimit;
 @end
 
 @implementation AIReader {
-    NSMutableDictionary<NSString *, NSNumber *> *_offsets;   // rollout basename -> consumed bytes
+    NSString *_homeDirectory;
+    NSString *_applicationSupportDirectory;
+    NSString *_statePath;
+    // Contributions live with their source file so truncation/replacement can remove
+    // precisely the stale totals before the replacement is indexed.
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *_codexFiles;
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *_claudeFiles;
+    NSArray<NSDictionary *> *_codexInventory;
+    NSArray<NSDictionary *> *_claudeInventory;
+    double _codexInventoryValidUntil, _claudeInventoryValidUntil;
     NSMutableDictionary<NSString *, NSDictionary *> *_days;  // local "yyyy-MM-dd" -> @{@"t":, @"f":}
     NSDictionary *_limits;          // newest rate_limits seen
     NSString *_limitsTs;
@@ -879,60 +942,222 @@ static NSDate *FileMTime(NSString *path) {
     long long _sessionsToday;
     NSArray<NSDictionary *> *_models;
     NSDate *_lastActivity;
-    NSMutableDictionary<NSString *, NSNumber *> *_claudeOffsets;  // transcript rel path -> consumed bytes
     NSMutableDictionary<NSString *, NSDictionary *> *_claudeDays;
-    NSMutableSet<NSString *> *_claudeSeenIds;   // duplicate transcript lines share a message id
     NSDictionary *_claudeUsageJSON;             // last good OAuth usage response
     double _claudeNextFetch;                    // epoch; throttles the usage endpoint
     NSString *_claudeAccessToken;               // memory-only; never persisted by Glancebar
     double _claudeAccessTokenExpiresAt;
     double _claudeKeychainNextTry;
     NSString *_claudeAccountStatus;
+    double _claudeLastSuccessAt;
     NSString *_lastFetchSkipReason;
     NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
+    NSUInteger _scanBytesRemaining;
+    double _scanDeadline;
+    unsigned long long _codexTotalBytes, _codexDoneBytes;
+    unsigned long long _claudeTotalBytes, _claudeDoneBytes;
+    BOOL _codexTotalsIncomplete, _claudeTotalsIncomplete;
+    BOOL _codexBlocked, _claudeBlocked;
+    BOOL _needsImmediateRescan;
+    BOOL _stateDirty;
 }
 
 - (instancetype)init {
+    NSString *base = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                                          NSUserDomainMask, YES).firstObject;
+    NSString *fallback = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
+    NSString *support = [(base ?: fallback) stringByAppendingPathComponent:@"Glancebar"];
+    return [self initWithHomeDirectory:NSHomeDirectory() applicationSupportDirectory:support];
+}
+
+- (instancetype)initWithHomeDirectory:(NSString *)homeDirectory {
+    NSString *home = (homeDirectory.length ? homeDirectory : NSHomeDirectory()).stringByStandardizingPath;
+    NSString *support = [home stringByAppendingPathComponent:@"Library/Application Support/Glancebar"];
+    return [self initWithHomeDirectory:home applicationSupportDirectory:support];
+}
+
+- (instancetype)initWithHomeDirectory:(NSString *)homeDirectory
+           applicationSupportDirectory:(NSString *)applicationSupportDirectory {
     if ((self = [super init])) {
-        _offsets = [NSMutableDictionary dictionary];
+        _homeDirectory = (homeDirectory.length ? homeDirectory : NSHomeDirectory()).stringByStandardizingPath;
+        _applicationSupportDirectory = (applicationSupportDirectory.length
+            ? applicationSupportDirectory
+            : [_homeDirectory stringByAppendingPathComponent:@"Library/Application Support/Glancebar"])
+            .stringByStandardizingPath;
+        _statePath = [_applicationSupportDirectory stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
+        _codexFiles = [NSMutableDictionary dictionary];
+        _claudeFiles = [NSMutableDictionary dictionary];
         _days = [NSMutableDictionary dictionary];
-        _claudeOffsets = [NSMutableDictionary dictionary];
         _claudeDays = [NSMutableDictionary dictionary];
-        _claudeSeenIds = [NSMutableSet set];
         _lastStatusReasons = [NSMutableDictionary dictionary];
+        [self loadPersistentState];
     }
     return self;
 }
 
-// Reads the complete lines appended to an append-only file since the recorded offset
-// and advances it; a partially-written trailing line is re-read next pass.
-- (NSData *)newLineDataAtPath:(NSString *)path key:(NSString *)key
-                      offsets:(NSMutableDictionary<NSString *, NSNumber *> *)offsets {
-    static const NSUInteger kMaxLogReadBytes = 1024 * 1024;
-    unsigned long long offset = [offsets[key] unsignedLongLongValue];
+- (void)loadPersistentState {
+    NSData *data = [NSData dataWithContentsOfFile:_statePath options:0 error:nil];
+    NSDictionary *root = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![root isKindOfClass:NSDictionary.class] || [root[@"version"] integerValue] != 2) return;
+    NSString *timeZone = [root[@"timeZone"] isKindOfClass:NSString.class] ? root[@"timeZone"] : nil;
+    if (timeZone.length && ![timeZone isEqualToString:NSTimeZone.localTimeZone.name]) return;
+    NSDictionary *codex = [root[@"codexFiles"] isKindOfClass:NSDictionary.class] ? root[@"codexFiles"] : nil;
+    NSDictionary *claude = [root[@"claudeFiles"] isKindOfClass:NSDictionary.class] ? root[@"claudeFiles"] : nil;
+    for (NSString *key in codex) {
+        NSDictionary *record = [codex[key] isKindOfClass:NSDictionary.class] ? codex[key] : nil;
+        if (key.length && record) _codexFiles[key] = [record mutableCopy];
+    }
+    for (NSString *key in claude) {
+        NSDictionary *record = [claude[key] isKindOfClass:NSDictionary.class] ? claude[key] : nil;
+        if (key.length && record) _claudeFiles[key] = [record mutableCopy];
+    }
+    NSDictionary *limits = [root[@"codexLimits"] isKindOfClass:NSDictionary.class] ? root[@"codexLimits"] : nil;
+    NSString *limitsTs = [root[@"codexLimitsTs"] isKindOfClass:NSString.class] ? root[@"codexLimitsTs"] : nil;
+    if (limits && limitsTs.length) { _limits = limits; _limitsTs = limitsTs; }
+}
+
+- (void)savePersistentStateIfNeeded {
+    if (!_stateDirty) return;
+    NSMutableDictionary *root = [@{
+        @"version": @2,
+        @"timeZone": NSTimeZone.localTimeZone.name ?: @"",
+        @"codexFiles": _codexFiles,
+        @"claudeFiles": _claudeFiles
+    } mutableCopy];
+    if (_limits && _limitsTs.length) {
+        root[@"codexLimits"] = _limits;
+        root[@"codexLimitsTs"] = _limitsTs;
+    }
+    NSError *err = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:&err];
+    if (!data || err) { GBLog("AI state encode failed"); return; }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm createDirectoryAtPath:_applicationSupportDirectory withIntermediateDirectories:YES
+                        attributes:@{NSFilePosixPermissions: @0700} error:&err]) {
+        GBLog("AI state directory unavailable");
+        return;
+    }
+    if (![data writeToFile:_statePath options:NSDataWritingAtomic error:&err]) {
+        GBLog("AI state write failed");
+        return;
+    }
+    [fm setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:_statePath error:nil];
+    _stateDirty = NO;
+}
+
+static NSString *FNVHashBytes(const void *rawBytes, NSUInteger length) {
+    const unsigned char *bytes = rawBytes;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (NSUInteger i = 0; i < length; i++) { hash ^= bytes[i]; hash *= UINT64_C(1099511628211); }
+    return [NSString stringWithFormat:@"%016llx", (unsigned long long)hash];
+}
+
+static void StoreOffsetAnchor(NSMutableDictionary *record, NSData *data,
+                              unsigned long long newOffset, NSUInteger consumed) {
+    NSUInteger length = MIN((NSUInteger)64, consumed);
+    if (!length) { [record removeObjectForKey:@"anchor"]; return; }
+    NSRange range = NSMakeRange(consumed - length, length);
+    record[@"anchor"] = FNVHashBytes((const char *)data.bytes + range.location, range.length);
+    record[@"anchorOffset"] = @(newOffset);
+    record[@"anchorLength"] = @(length);
+}
+
+// Reads complete appended lines within the caller's GLOBAL pass budget. A partial
+// trailing line stays at the old offset and is retried only after the file grows.
+- (NSData *)newLineDataAtPath:(NSString *)path
+                       record:(NSMutableDictionary *)record
+                     maxBytes:(NSUInteger)maxBytes
+                    bytesRead:(NSUInteger *)bytesRead
+                   readFailed:(BOOL *)readFailed {
+    if (bytesRead) *bytesRead = 0;
+    if (readFailed) *readFailed = NO;
+    unsigned long long offset = [record[@"offset"] unsignedLongLongValue];
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
-    if (!fh) return nil;
+    if (!fh) { if (readFailed) *readFailed = YES; return nil; }
     // These files belong to other tools and can be rotated/truncated mid-read; use the
     // error-returning APIs so an I/O failure skips the sample instead of raising.
     unsigned long long size = 0;
     NSError *err = nil;
-    if (![fh seekToEndReturningOffset:&size error:&err]) { [fh closeAndReturnError:nil]; return nil; }
-    if (offset > size) offset = 0;   // file was truncated/recreated
-    if (![fh seekToOffset:offset error:&err]) { [fh closeAndReturnError:nil]; return nil; }
-    NSData *data = [fh readDataUpToLength:kMaxLogReadBytes error:&err];
+    if (![fh seekToEndReturningOffset:&size error:&err]) {
+        [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+    }
+    unsigned long long priorSize = [record[@"size"] unsignedLongLongValue];
+    if (offset > size || (priorSize > 0 && size < priorSize)) {
+        // Truncation after inventory refresh: throw away this file's old contribution,
+        // not merely its offset, or the replacement would be counted on top of it.
+        NSNumber *dev = record[@"dev"], *ino = record[@"ino"];
+        [record removeAllObjects];
+        if (dev) record[@"dev"] = dev;
+        if (ino) record[@"ino"] = ino;
+        record[@"offset"] = @0;
+        record[@"size"] = @(size);
+        record[@"inventoryMismatch"] = @YES;
+        _codexInventoryValidUntil = 0;
+        _claudeInventoryValidUntil = 0;
+        offset = 0;
+        _stateDirty = YES;
+    }
+    if (!record[@"size"]) record[@"size"] = @(size);
+    NSString *anchor = [record[@"anchor"] isKindOfClass:NSString.class] ? record[@"anchor"] : nil;
+    NSUInteger anchorLength = [record[@"anchorLength"] unsignedIntegerValue];
+    if (offset > 0 && anchor.length && anchorLength > 0 && anchorLength <= offset &&
+        [record[@"anchorOffset"] unsignedLongLongValue] == offset) {
+        if (![fh seekToOffset:offset - anchorLength error:&err]) {
+            [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+        }
+        NSData *anchorData = [fh readDataUpToLength:anchorLength error:&err];
+        if (err || anchorData.length != anchorLength) {
+            [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+        }
+        if (![FNVHashBytes(anchorData.bytes, anchorData.length) isEqualToString:anchor]) {
+            // Same inode and a regrown size can otherwise conceal truncate-and-rewrite.
+            NSNumber *dev = record[@"dev"], *ino = record[@"ino"];
+            [record removeAllObjects];
+            if (dev) record[@"dev"] = dev;
+            if (ino) record[@"ino"] = ino;
+            record[@"offset"] = @0;
+            record[@"size"] = @(size);
+            offset = 0;
+            _stateDirty = YES;
+        }
+    }
+    if (offset >= size || maxBytes == 0) { [fh closeAndReturnError:nil]; return nil; }
+    if (![fh seekToOffset:offset error:&err]) {
+        [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+    }
+    NSUInteger wanted = (NSUInteger)MIN((unsigned long long)maxBytes, size - offset);
+    NSData *data = [fh readDataUpToLength:wanted error:&err];
     [fh closeAndReturnError:nil];
-    if (err || !data.length) return nil;
+    if (bytesRead) *bytesRead = data.length;
+    if (err) { if (readFailed) *readFailed = YES; return nil; }
+    if (!data.length) return nil;
     const char *bytes = data.bytes;
     NSUInteger consume = 0;
     for (NSUInteger i = data.length; i > 0; i--) {
         if (bytes[i - 1] == '\n') { consume = i; break; }
     }
-    if (!consume && data.length >= kMaxLogReadBytes) {
-        offsets[key] = @(offset + data.length);   // drop a pathological overlong line
+    BOOL reachedEOF = offset + data.length >= size;
+    if (!consume && !reachedEOF) {
+        // Token-count lines are small. Skipping an overlong non-matching line bounds
+        // memory and guarantees forward progress through pathological transcript rows.
+        unsigned long long newOffset = offset + data.length;
+        record[@"offset"] = @(newOffset);
+        StoreOffsetAnchor(record, data, newOffset, data.length);
+        [record removeObjectForKey:@"partialSize"];
+        _stateDirty = YES;
         return nil;
     }
-    if (!consume) return nil;
-    offsets[key] = @(offset + consume);
+    if (!consume) {
+        record[@"partialSize"] = @(size);
+        _stateDirty = YES;
+        return nil;
+    }
+    unsigned long long newOffset = offset + consume;
+    record[@"offset"] = @(newOffset);
+    StoreOffsetAnchor(record, data, newOffset, consume);
+    if (reachedEOF && consume < data.length) record[@"partialSize"] = @(size);
+    else [record removeObjectForKey:@"partialSize"];
+    _stateDirty = YES;
     return [data subdataWithRange:NSMakeRange(0, consume)];
 }
 
@@ -965,88 +1190,437 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         if ([day compare:weekStartDay] == NSOrderedAscending) [days removeObjectForKey:day];
 }
 
-// Rollout files keep their unique basename when they move from sessions/ to
-// archived_sessions/, so offsets keyed by basename survive archiving without
-// double-counting.
-- (void)scanRollouts {
-    NSString *home = NSHomeDirectory();
+static NSComparisonResult NewestCandidateFirst(NSDictionary *a, NSDictionary *b) {
+    NSComparisonResult byTime = [b[@"mtime"] compare:a[@"mtime"]];
+    if (byTime != NSOrderedSame) return byTime;
+    return [b[@"size"] compare:a[@"size"]];
+}
+
+- (NSMutableDictionary *)recordForCandidate:(NSDictionary *)candidate
+                                       files:(NSMutableDictionary<NSString *, NSMutableDictionary *> *)files {
+    NSString *key = candidate[@"key"];
+    NSMutableDictionary *record = files[key];
+    NSNumber *oldDev = record[@"dev"], *oldIno = record[@"ino"];
+    NSNumber *newDev = candidate[@"dev"], *newIno = candidate[@"ino"];
+    BOOL identityChanged = record && oldDev && oldIno && newDev && newIno &&
+        (![oldDev isEqual:newDev] || ![oldIno isEqual:newIno]);
+    if (!record || identityChanged) {
+        record = [NSMutableDictionary dictionaryWithObject:@0 forKey:@"offset"];
+        files[key] = record;
+        _stateDirty = YES;
+    }
+    for (NSString *field in @[@"dev", @"ino", @"size", @"mtime"]) {
+        if ([field isEqualToString:@"size"] && [record[@"inventoryMismatch"] boolValue]) continue;
+        id value = candidate[field];
+        if (value && ![record[field] isEqual:value]) { record[field] = value; _stateDirty = YES; }
+    }
+    if (!record[@"offset"]) record[@"offset"] = @0;
+    return record;
+}
+
+- (NSArray<NSDictionary *> *)refreshRecentInventory:(NSArray<NSDictionary *> *)inventory
+                                               files:(NSMutableDictionary<NSString *, NSMutableDictionary *> *)files {
+    NSMutableArray *updated = [inventory mutableCopy];
+    NSUInteger count = MIN((NSUInteger)8, updated.count);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSMutableDictionary *candidate = [updated[i] mutableCopy];
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:candidate[@"path"] error:nil];
+        if (!attrs) {
+            // A rollout may have moved to archived_sessions; force the next pass to
+            // rebuild paths, while still avoiding another recursive walk in this pass.
+            _codexInventoryValidUntil = 0;
+            _claudeInventoryValidUntil = 0;
+            continue;
+        }
+        NSDate *mtime = [attrs[NSFileModificationDate] isKindOfClass:NSDate.class]
+            ? attrs[NSFileModificationDate] : nil;
+        candidate[@"size"] = @([attrs[NSFileSize] unsignedLongLongValue]);
+        candidate[@"mtime"] = @(mtime ? mtime.timeIntervalSince1970 : 0);
+        if (attrs[NSFileSystemNumber]) candidate[@"dev"] = attrs[NSFileSystemNumber];
+        if (attrs[NSFileSystemFileNumber]) candidate[@"ino"] = attrs[NSFileSystemFileNumber];
+        NSString *key = candidate[@"key"];
+        NSMutableDictionary *record = files[key];
+        [record removeObjectForKey:@"inventoryMismatch"];
+        if (record && [record[@"size"] unsignedLongLongValue] > [candidate[@"size"] unsignedLongLongValue]) {
+            [files removeObjectForKey:key];
+            _stateDirty = YES;
+        }
+        [self recordForCandidate:candidate files:files];
+        updated[i] = candidate;
+    }
+    [updated sortUsingComparator:
+        ^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return NewestCandidateFirst(a, b); }];
+    return updated;
+}
+
+- (NSArray<NSDictionary *> *)codexInventory {
+    double now = CFAbsoluteTimeGetCurrent();
+    if (_codexInventory && now < _codexInventoryValidUntil) {
+        _codexInventory = [self refreshRecentInventory:_codexInventory files:_codexFiles];
+        return _codexInventory;
+    }
     NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-8 * 24 * 3600];
-    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSMutableDictionary<NSString *, NSDictionary *> *byKey = [NSMutableDictionary dictionary];
     for (NSString *dir in @[@".codex/sessions", @".codex/archived_sessions"]) {
-        NSString *base = [home stringByAppendingPathComponent:dir];
+        NSString *base = [_homeDirectory stringByAppendingPathComponent:dir];
         NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtPath:base];
         for (NSString *rel in en) {
             if (![rel.pathExtension isEqualToString:@"jsonl"]) continue;
             NSDictionary *attrs = en.fileAttributes;
-            if ([attrs[NSFileModificationDate] compare:cutoff] == NSOrderedAscending) continue;
+            NSDate *mtime = [attrs[NSFileModificationDate] isKindOfClass:NSDate.class]
+                ? attrs[NSFileModificationDate] : nil;
+            if (mtime && [mtime compare:cutoff] == NSOrderedAscending) continue;
             NSString *key = rel.lastPathComponent;
-            [seen addObject:key];
-            unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
-            unsigned long long offset = [_offsets[key] unsignedLongLongValue];
-            if (size <= offset) continue;   // nothing appended (append-only files)
-            [self consumeFile:[base stringByAppendingPathComponent:rel] key:key];
+            if (!key.length) continue;
+            NSMutableDictionary *candidate = [@{
+                @"key": key,
+                @"path": [base stringByAppendingPathComponent:rel],
+                @"size": @([attrs[NSFileSize] unsignedLongLongValue]),
+                @"mtime": @(mtime ? mtime.timeIntervalSince1970 : 0)
+            } mutableCopy];
+            if (attrs[NSFileSystemNumber]) candidate[@"dev"] = attrs[NSFileSystemNumber];
+            if (attrs[NSFileSystemFileNumber]) candidate[@"ino"] = attrs[NSFileSystemFileNumber];
+            NSDictionary *prior = byKey[key];
+            if (!prior || NewestCandidateFirst(candidate, prior) == NSOrderedAscending) byKey[key] = candidate;
         }
     }
-    // Offsets for files that aged out of the window are dead weight.
-    for (NSString *key in _offsets.allKeys) if (![seen containsObject:key]) [_offsets removeObjectForKey:key];
-    PruneDays(_days, WeekStartDayString());
-}
-
-- (void)consumeFile:(NSString *)path key:(NSString *)key {
-    NSData *chunk = [self newLineDataAtPath:path key:key offsets:_offsets];
-    if (!chunk) return;
-    NSMutableArray *events = [NSMutableArray array];
-    ForEachMatchingLine(chunk, "\"token_count\"", ^(NSString *line) {
-        NSDictionary *e = ParseTokenCountLine(line);
-        if (e) [events addObject:e];
-    });
-    if (!events.count) return;
-    NSDictionary *acc = AccumulateTokenEvents(_days, events, nil);
-    _days = [acc[@"days"] mutableCopy];
-    NSString *ts = acc[@"latestTs"];
-    if (ts && (!_limitsTs || [ts compare:_limitsTs] == NSOrderedDescending)) {
-        _limits = acc[@"latestLimits"];
-        _limitsTs = ts;
+    NSArray *inventory = [byKey.allValues sortedArrayUsingComparator:
+        ^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return NewestCandidateFirst(a, b); }];
+    NSMutableSet *seen = [NSMutableSet setWithArray:byKey.allKeys];
+    for (NSDictionary *candidate in inventory) {
+        NSString *key = candidate[@"key"];
+        NSMutableDictionary *record = _codexFiles[key];
+        [record removeObjectForKey:@"inventoryMismatch"];
+        if (record && [record[@"size"] unsignedLongLongValue] > [candidate[@"size"] unsignedLongLongValue]) {
+            [_codexFiles removeObjectForKey:key];
+            _stateDirty = YES;
+        }
+        [self recordForCandidate:candidate files:_codexFiles];
     }
+    for (NSString *key in _codexFiles.allKeys.copy) {
+        if (![seen containsObject:key]) { [_codexFiles removeObjectForKey:key]; _stateDirty = YES; }
+    }
+    _codexInventory = inventory;
+    _codexInventoryValidUntil = now + 30.0;   // normal ticks alternate full inventory / cheap active-file stats
+    return inventory;
 }
 
-// Claude Code's per-session transcripts carry per-message usage — the only live source
-// for today's Claude tokens (~/.claude/stats-cache.json computes through yesterday and
-// its aggregation isn't reproducible). Same incremental pattern as the Codex rollouts.
-- (void)scanClaudeTranscripts {
-    NSString *base = [NSHomeDirectory() stringByAppendingPathComponent:@".claude/projects"];
+- (NSArray<NSDictionary *> *)claudeInventory {
+    double now = CFAbsoluteTimeGetCurrent();
+    if (_claudeInventory && now < _claudeInventoryValidUntil) {
+        _claudeInventory = [self refreshRecentInventory:_claudeInventory files:_claudeFiles];
+        return _claudeInventory;
+    }
+    NSString *base = [_homeDirectory stringByAppendingPathComponent:@".claude/projects"];
     NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-8 * 24 * 3600];
-    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSMutableArray<NSDictionary *> *inventory = [NSMutableArray array];
     NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtPath:base];
     for (NSString *rel in en) {
         if (![rel.pathExtension isEqualToString:@"jsonl"]) continue;
         NSDictionary *attrs = en.fileAttributes;
-        if ([attrs[NSFileModificationDate] compare:cutoff] == NSOrderedAscending) continue;
-        [seen addObject:rel];
-        unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
-        if (size <= [_claudeOffsets[rel] unsignedLongLongValue]) continue;
-        NSData *chunk = [self newLineDataAtPath:[base stringByAppendingPathComponent:rel]
-                                            key:rel offsets:_claudeOffsets];
-        if (!chunk) continue;
-        NSMutableArray *events = [NSMutableArray array];
-        NSMutableSet *seenIds = _claudeSeenIds;
-        ForEachMatchingLine(chunk, "\"usage\"", ^(NSString *line) {
-            NSDictionary *e = ParseClaudeUsageLine(line);
-            if (!e) return;
-            NSString *messageId = e[@"id"];
-            if (messageId) {   // a message amended across lines must only count once
-                if ([seenIds containsObject:messageId]) return;
-                [seenIds addObject:messageId];
-            }
-            [events addObject:e];
-        });
-        if (events.count)
-            _claudeDays = [AccumulateTokenEvents(_claudeDays, events, nil)[@"days"] mutableCopy];
+        NSDate *mtime = [attrs[NSFileModificationDate] isKindOfClass:NSDate.class]
+            ? attrs[NSFileModificationDate] : nil;
+        if (mtime && [mtime compare:cutoff] == NSOrderedAscending) continue;
+        NSNumber *dev = attrs[NSFileSystemNumber], *ino = attrs[NSFileSystemFileNumber];
+        const char *relBytes = rel.UTF8String;
+        NSString *opaqueKey = dev && ino
+            ? [NSString stringWithFormat:@"%llx-%llx", dev.unsignedLongLongValue, ino.unsignedLongLongValue]
+            : [@"path-" stringByAppendingString:FNVHashBytes(relBytes ?: "", relBytes ? strlen(relBytes) : 0)];
+        NSMutableDictionary *candidate = [@{
+            // Persisted keys are opaque filesystem identities/hashes, never project paths.
+            @"key": opaqueKey,
+            @"path": [base stringByAppendingPathComponent:rel],
+            @"size": @([attrs[NSFileSize] unsignedLongLongValue]),
+            @"mtime": @(mtime ? mtime.timeIntervalSince1970 : 0)
+        } mutableCopy];
+        if (dev) candidate[@"dev"] = dev;
+        if (ino) candidate[@"ino"] = ino;
+        [inventory addObject:candidate];
     }
-    for (NSString *key in _claudeOffsets.allKeys)
-        if (![seen containsObject:key]) [_claudeOffsets removeObjectForKey:key];
-    PruneDays(_claudeDays, WeekStartDayString());
-    if (_claudeSeenIds.count > 100000) [_claudeSeenIds removeAllObjects];   // bounded; dupes are rare
+    [inventory sortUsingComparator:
+        ^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return NewestCandidateFirst(a, b); }];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSDictionary *candidate in inventory) {
+        NSString *key = candidate[@"key"];
+        [seen addObject:key];
+        NSMutableDictionary *record = _claudeFiles[key];
+        [record removeObjectForKey:@"inventoryMismatch"];
+        if (record && [record[@"size"] unsignedLongLongValue] > [candidate[@"size"] unsignedLongLongValue]) {
+            [_claudeFiles removeObjectForKey:key];
+            _stateDirty = YES;
+        }
+        [self recordForCandidate:candidate files:_claudeFiles];
+    }
+    for (NSString *key in _claudeFiles.allKeys.copy) {
+        if (![seen containsObject:key]) { [_claudeFiles removeObjectForKey:key]; _stateDirty = YES; }
+    }
+    _claudeInventory = inventory;
+    _claudeInventoryValidUntil = now + 30.0;
+    return inventory;
+}
+
+static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDictionary *days) {
+    for (NSString *day in days) {
+        NSDictionary *old = sum[day], *add = [days[day] isKindOfClass:NSDictionary.class] ? days[day] : nil;
+        if (!add) continue;
+        sum[day] = @{@"t": @([old[@"t"] longLongValue] + [add[@"t"] longLongValue]),
+                     @"f": @([old[@"f"] longLongValue] + [add[@"f"] longLongValue])};
+    }
+}
+
+- (void)rebuildCodexDerivedState {
+    NSString *weekStart = WeekStartDayString();
+    NSMutableDictionary *sum = [NSMutableDictionary dictionary];
+    NSDictionary *bestLimits = nil;
+    NSString *bestTs = nil;
+    for (NSMutableDictionary *record in _codexFiles.allValues) {
+        NSMutableDictionary *recordDays = [([record[@"days"] isKindOfClass:NSDictionary.class]
+                                             ? record[@"days"] : @{}) mutableCopy];
+        NSUInteger before = recordDays.count;
+        PruneDays(recordDays, weekStart);
+        if (recordDays.count != before) { record[@"days"] = recordDays; _stateDirty = YES; }
+        AddDays(sum, recordDays);
+        for (NSString *prefix in @[@"latest", @"peek"]) {
+            NSString *tsKey = [prefix stringByAppendingString:@"Ts"];
+            NSString *limitsKey = [prefix stringByAppendingString:@"Limits"];
+            NSString *ts = [record[tsKey] isKindOfClass:NSString.class] ? record[tsKey] : nil;
+            NSDictionary *limits = [record[limitsKey] isKindOfClass:NSDictionary.class] ? record[limitsKey] : nil;
+            if (limits && ts.length && (!bestTs || [ts compare:bestTs] == NSOrderedDescending)) {
+                bestTs = ts; bestLimits = limits;
+            }
+        }
+    }
+    _days = sum;
+    _limits = bestLimits;
+    _limitsTs = bestTs;
+}
+
+- (void)rebuildClaudeDerivedState {
+    NSString *weekStart = WeekStartDayString();
+    NSMutableDictionary *sum = [NSMutableDictionary dictionary];
+    for (NSMutableDictionary *record in _claudeFiles.allValues) {
+        NSMutableDictionary *recordDays = [([record[@"days"] isKindOfClass:NSDictionary.class]
+                                             ? record[@"days"] : @{}) mutableCopy];
+        NSUInteger before = recordDays.count;
+        PruneDays(recordDays, weekStart);
+        if (recordDays.count != before) { record[@"days"] = recordDays; _stateDirty = YES; }
+        AddDays(sum, recordDays);
+    }
+    _claudeDays = sum;
+}
+
+- (void)consumeCodexData:(NSData *)chunk record:(NSMutableDictionary *)record {
+    if (!chunk.length) return;
+    NSMutableArray *events = [NSMutableArray array];
+    ForEachMatchingLine(chunk, "\"token_count\"", ^(NSString *line) {
+        NSDictionary *event = ParseTokenCountLine(line);
+        if (event) [events addObject:event];
+    });
+    if (!events.count) return;
+    NSDictionary *acc = AccumulateTokenEvents(record[@"days"], events, nil);
+    record[@"days"] = acc[@"days"] ?: @{};
+    NSString *ts = acc[@"latestTs"];
+    if (ts.length && (![record[@"latestTs"] isKindOfClass:NSString.class] ||
+                      [ts compare:record[@"latestTs"]] == NSOrderedDescending)) {
+        record[@"latestLimits"] = acc[@"latestLimits"];
+        record[@"latestTs"] = ts;
+    }
+    _stateDirty = YES;
+}
+
+static NSString *HashedMessageID(NSString *messageID) {
+    const unsigned char *bytes = (const unsigned char *)messageID.UTF8String;
+    static const unsigned char empty[] = "";
+    return FNVHashBytes(bytes ?: empty, bytes ? strlen((const char *)bytes) : 0);
+}
+
+- (void)consumeClaudeData:(NSData *)chunk record:(NSMutableDictionary *)record {
+    if (!chunk.length) return;
+    NSMutableArray *ids = [([record[@"ids"] isKindOfClass:NSArray.class] ? record[@"ids"] : @[]) mutableCopy];
+    NSMutableSet *seen = [NSMutableSet setWithArray:ids];
+    NSMutableArray *events = [NSMutableArray array];
+    ForEachMatchingLine(chunk, "\"usage\"", ^(NSString *line) {
+        NSDictionary *event = ParseClaudeUsageLine(line);
+        if (!event) return;
+        NSString *messageID = [event[@"id"] isKindOfClass:NSString.class] ? event[@"id"] : nil;
+        if (messageID.length) {
+            NSString *hashed = HashedMessageID(messageID);
+            if ([seen containsObject:hashed]) return;
+            [seen addObject:hashed];
+            [ids addObject:hashed];
+        }
+        [events addObject:event];
+    });
+    // Keep hashes for the record's whole seven-day lifetime. A small rolling window can
+    // double-count an older message amended much later; hashes are compact and contain
+    // neither message content nor the original provider identifier.
+    record[@"ids"] = ids;
+    if (events.count) record[@"days"] = AccumulateTokenEvents(record[@"days"], events, nil)[@"days"] ?: @{};
+    _stateDirty = YES;
+}
+
+- (NSData *)tailDataAtPath:(NSString *)path maxBytes:(NSUInteger)maxBytes
+                 bytesRead:(NSUInteger *)bytesRead readFailed:(BOOL *)readFailed {
+    if (bytesRead) *bytesRead = 0;
+    if (readFailed) *readFailed = NO;
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) { if (readFailed) *readFailed = YES; return nil; }
+    NSError *err = nil;
+    unsigned long long size = 0;
+    if (![fh seekToEndReturningOffset:&size error:&err]) {
+        [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+    }
+    NSUInteger wanted = (NSUInteger)MIN((unsigned long long)maxBytes, size);
+    if (![fh seekToOffset:size - wanted error:&err]) {
+        [fh closeAndReturnError:nil]; if (readFailed) *readFailed = YES; return nil;
+    }
+    NSData *data = [fh readDataUpToLength:wanted error:&err];
+    [fh closeAndReturnError:nil];
+    if (bytesRead) *bytesRead = data.length;
+    if (err && readFailed) *readFailed = YES;
+    return err ? nil : data;
+}
+
+- (void)scanNewestCodexLimitFromInventory:(NSArray<NSDictionary *> *)inventory {
+    NSUInteger attempts = 0;
+    for (NSDictionary *candidate in inventory) {
+        if (attempts >= 4 || _scanBytesRemaining == 0 || CFAbsoluteTimeGetCurrent() >= _scanDeadline) break;
+        NSMutableDictionary *record = [self recordForCandidate:candidate files:_codexFiles];
+        unsigned long long size = [candidate[@"size"] unsignedLongLongValue];
+        if ([record[@"tailSize"] unsignedLongLongValue] == size) continue;
+        attempts++;
+        // Validate the persisted offset anchor before attaching a tail snapshot to the
+        // record. If the same inode was rewritten, this clears its old totals first so
+        // the freshly peeked limit is not then discarded by the historical read.
+        BOOL validationFailed = NO;
+        NSUInteger validationBytes = 0;
+        [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:0
+                     bytesRead:&validationBytes readFailed:&validationFailed];
+        if (validationFailed) { _codexBlocked = YES; continue; }
+        NSUInteger bytesRead = 0;
+        BOOL failed = NO;
+        NSUInteger wanted = MIN((NSUInteger)(512 * 1024), _scanBytesRemaining);
+        NSData *tail = [self tailDataAtPath:candidate[@"path"] maxBytes:wanted
+                                 bytesRead:&bytesRead readFailed:&failed];
+        _scanBytesRemaining -= MIN(_scanBytesRemaining, bytesRead);
+        if (failed) { _codexBlocked = YES; continue; }
+        record[@"tailSize"] = @(size);
+        _stateDirty = YES;
+        __block NSDictionary *bestLimits = nil;
+        __block NSString *bestTs = nil;
+        ForEachMatchingLine(tail, "\"token_count\"", ^(NSString *line) {
+            NSDictionary *event = ParseTokenCountLine(line);
+            NSString *ts = [event[@"ts"] isKindOfClass:NSString.class] ? event[@"ts"] : nil;
+            NSDictionary *limits = [event[@"limits"] isKindOfClass:NSDictionary.class] ? event[@"limits"] : nil;
+            if (limits && ts.length && (!bestTs || [ts compare:bestTs] == NSOrderedDescending)) {
+                bestTs = ts; bestLimits = limits;
+            }
+        });
+        if (bestLimits) {
+            record[@"peekLimits"] = bestLimits;
+            record[@"peekTs"] = bestTs;
+            break;   // newest modified file with a snapshot wins in normal Codex logs
+        }
+    }
+}
+
+- (void)progressForInventory:(NSArray<NSDictionary *> *)inventory
+                       files:(NSDictionary<NSString *, NSMutableDictionary *> *)files
+                       total:(unsigned long long *)total done:(unsigned long long *)done
+                  incomplete:(BOOL *)incomplete {
+    unsigned long long totalBytes = 0, doneBytes = 0;
+    for (NSDictionary *candidate in inventory) {
+        NSMutableDictionary *record = files[candidate[@"key"]];
+        unsigned long long size = MAX([candidate[@"size"] unsignedLongLongValue],
+                                      [record[@"size"] unsignedLongLongValue]);
+        unsigned long long offset = MIN(size, [record[@"offset"] unsignedLongLongValue]);
+        if (offset < size && [record[@"partialSize"] unsignedLongLongValue] == size) offset = size;
+        totalBytes += size;
+        doneBytes += offset;
+    }
+    if (total) *total = totalBytes;
+    if (done) *done = doneBytes;
+    if (incomplete) *incomplete = doneBytes < totalBytes;
+}
+
+// Rollout files keep their unique basename when they move to archived_sessions, so
+// records survive the move. Inventory is cached during immediate catch-up passes;
+// historical reads share one global byte/time budget and always start newest-first.
+- (void)scanRollouts {
+    NSArray *inventory = [self codexInventory];
+    _codexBlocked = NO;
+    [self scanNewestCodexLimitFromInventory:inventory];
+    NSMutableSet *failedKeys = [NSMutableSet set];
+    BOOL madeProgress = NO, stopped = NO;
+    do {
+        BOOL roundProgress = NO, foundWork = NO;
+        for (NSDictionary *candidate in inventory) {
+            if (_scanBytesRemaining == 0 || CFAbsoluteTimeGetCurrent() >= _scanDeadline) { stopped = YES; break; }
+            NSString *key = candidate[@"key"];
+            if ([failedKeys containsObject:key]) continue;
+            NSMutableDictionary *record = [self recordForCandidate:candidate files:_codexFiles];
+            unsigned long long size = MAX([candidate[@"size"] unsignedLongLongValue],
+                                          [record[@"size"] unsignedLongLongValue]);
+            unsigned long long offset = [record[@"offset"] unsignedLongLongValue];
+            if (offset >= size || (offset < size && [record[@"partialSize"] unsignedLongLongValue] == size)) continue;
+            foundWork = YES;
+            NSUInteger bytesRead = 0;
+            BOOL failed = NO;
+            unsigned long long before = offset;
+            NSUInteger wanted = MIN((NSUInteger)(4 * 1024 * 1024), _scanBytesRemaining);
+            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:wanted
+                                         bytesRead:&bytesRead readFailed:&failed];
+            _scanBytesRemaining -= MIN(_scanBytesRemaining, bytesRead);
+            if (failed) { [failedKeys addObject:key]; _codexBlocked = YES; continue; }
+            [self consumeCodexData:chunk record:record];
+            if ([record[@"offset"] unsignedLongLongValue] > before) roundProgress = madeProgress = YES;
+        }
+        if (stopped || !foundWork || !roundProgress) break;
+    } while (_scanBytesRemaining > 0 && CFAbsoluteTimeGetCurrent() < _scanDeadline);
+    [self rebuildCodexDerivedState];
+    [self progressForInventory:inventory files:_codexFiles total:&_codexTotalBytes
+                          done:&_codexDoneBytes incomplete:&_codexTotalsIncomplete];
+    if (_codexTotalsIncomplete && (_scanBytesRemaining == 0 || CFAbsoluteTimeGetCurrent() >= _scanDeadline)) stopped = YES;
+    _needsImmediateRescan |= _codexTotalsIncomplete && (madeProgress || stopped);
+}
+
+// Claude transcripts use the same bounded scanner. Only short hashes of recent message
+// IDs are retained for amended-line de-duplication; no transcript content is persisted.
+- (void)scanClaudeTranscripts {
+    NSArray *inventory = [self claudeInventory];
+    _claudeBlocked = NO;
+    NSMutableSet *failedKeys = [NSMutableSet set];
+    BOOL madeProgress = NO, stopped = NO;
+    do {
+        BOOL roundProgress = NO, foundWork = NO;
+        for (NSDictionary *candidate in inventory) {
+            if (_scanBytesRemaining == 0 || CFAbsoluteTimeGetCurrent() >= _scanDeadline) { stopped = YES; break; }
+            NSString *key = candidate[@"key"];
+            if ([failedKeys containsObject:key]) continue;
+            NSMutableDictionary *record = [self recordForCandidate:candidate files:_claudeFiles];
+            unsigned long long size = MAX([candidate[@"size"] unsignedLongLongValue],
+                                          [record[@"size"] unsignedLongLongValue]);
+            unsigned long long offset = [record[@"offset"] unsignedLongLongValue];
+            if (offset >= size || (offset < size && [record[@"partialSize"] unsignedLongLongValue] == size)) continue;
+            foundWork = YES;
+            NSUInteger bytesRead = 0;
+            BOOL failed = NO;
+            unsigned long long before = offset;
+            NSUInteger wanted = MIN((NSUInteger)(4 * 1024 * 1024), _scanBytesRemaining);
+            NSData *chunk = [self newLineDataAtPath:candidate[@"path"] record:record maxBytes:wanted
+                                         bytesRead:&bytesRead readFailed:&failed];
+            _scanBytesRemaining -= MIN(_scanBytesRemaining, bytesRead);
+            if (failed) { [failedKeys addObject:key]; _claudeBlocked = YES; continue; }
+            [self consumeClaudeData:chunk record:record];
+            if ([record[@"offset"] unsignedLongLongValue] > before) roundProgress = madeProgress = YES;
+        }
+        if (stopped || !foundWork || !roundProgress) break;
+    } while (_scanBytesRemaining > 0 && CFAbsoluteTimeGetCurrent() < _scanDeadline);
+    [self rebuildClaudeDerivedState];
+    [self progressForInventory:inventory files:_claudeFiles total:&_claudeTotalBytes
+                          done:&_claudeDoneBytes incomplete:&_claudeTotalsIncomplete];
+    if (_claudeTotalsIncomplete && (_scanBytesRemaining == 0 || CFAbsoluteTimeGetCurrent() >= _scanDeadline)) stopped = YES;
+    _needsImmediateRescan |= _claudeTotalsIncomplete && (madeProgress || stopped);
 }
 
 - (NSString *)claudeAccessTokenForNow:(double)now {
@@ -1057,9 +1631,8 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         return nil;
     }
 
-    // Time the read: a silent read via /usr/bin/security is tens of ms; a SecurityAgent
-    // password prompt makes it seconds. Logging the latency makes "did it prompt?"
-    // answerable from this log alone — a plain "ok" hid that distinction before.
+    // Track latency so a future Keychain/ACL behavior change is diagnosable without ever
+    // logging the credential or its contents.
     double readStart = CFAbsoluteTimeGetCurrent();
     NSDictionary *cred = ClaudeAccessTokenFromKeychain();
     double readMs = (CFAbsoluteTimeGetCurrent() - readStart) * 1000.0;
@@ -1099,10 +1672,9 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
 }
 
 - (AIUsage *)claudeUsage {
-    AIUsage *u = ReadClaudeUsage();   // stats-cache: sessions/messages/models (day-stale)
+    AIUsage *u = ReadClaudeUsage(_homeDirectory);   // stats-cache: sessions/messages/models (day-stale)
     if (self.allowClaudeTranscripts) {
-        [self scanClaudeTranscripts];
-        if (_claudeOffsets.count) {
+        if (_claudeFiles.count) {
             NSString *today = LocalDateString(NSDate.date);
             u.todayTokens = [_claudeDays[today][@"f"] longLongValue];
             u.todayTokensAll = [_claudeDays[today][@"t"] longLongValue];
@@ -1115,13 +1687,22 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             u.weekTokensAll = weekAll;
             u.available = YES;
             u.stale = NO;   // token counts are live now; only the activity counts lag a day
-            u.statusText = @"Tokens live from local transcripts";
+            if (_claudeTotalsIncomplete)
+                u.statusText = _claudeBlocked && !_needsImmediateRescan
+                    ? @"Transcript totals incomplete · some logs unreadable"
+                    : [NSString stringWithFormat:@"Indexing transcripts %.0f%% · totals incomplete",
+                       _claudeTotalBytes ? 100.0 * _claudeDoneBytes / _claudeTotalBytes : 0.0];
+            else u.statusText = @"Tokens live from local transcripts";
             u.source = @"~/.claude transcripts + stats cache";
         }
     } else {
-        [_claudeOffsets removeAllObjects];
+        if (_claudeFiles.count || _claudeDays.count) _stateDirty = YES;
+        [_claudeFiles removeAllObjects];
         [_claudeDays removeAllObjects];
-        [_claudeSeenIds removeAllObjects];
+        _claudeInventory = nil;
+        _claudeInventoryValidUntil = 0;
+        _claudeTotalBytes = _claudeDoneBytes = 0;
+        _claudeTotalsIncomplete = _claudeBlocked = NO;
         if (u.statusText.length)
             u.statusText = [u.statusText stringByAppendingString:@" · transcript totals off"];
     }
@@ -1142,6 +1723,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             } else if (fetch && !fetch[@"error"]) {
                 _claudeUsageJSON = fetch;
                 _claudeAccountStatus = nil;
+                _claudeLastSuccessAt = now;
                 GBLog("claude fetch: ok");
             } else if (token.length) {
                 _claudeAccountStatus = @"Usage API unavailable";
@@ -1162,24 +1744,45 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         if (pick) {
             u.limitStatusAvailable = YES;
             u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
+            u.limitUpdatedAt = _claudeLastSuccessAt > 0
+                ? [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt] : nil;
             NSNumber *resets = pick[@"resetsAt"];
             if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
-            u.statusReason = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
-            u.statusSource = @"Anthropic usage API (opt-in)";
+            NSString *window = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
+            if (_claudeAccountStatus.length) {
+                u.limitStale = YES;
+                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
+                                  _claudeAccountStatus, window];
+                u.statusSource = @"Cached Anthropic usage API response (opt-in)";
+            } else {
+                u.statusReason = window;
+                u.statusSource = @"Anthropic usage API (opt-in)";
+            }
         } else {
             NSString *fallback = _claudeUsageJSON ? @"Claude account response did not include a current limit window"
                 : self.allowClaudeAccountFetch ? @"Claude account status unavailable"
                 : @"Claude account refresh paused until visible";
             u.statusReason = _claudeAccountStatus ?: (extraStatus[@"statusReason"] ?: fallback);
+            if (self.allowClaudeAccountFetch) u.limitRefreshError = _claudeAccountStatus ?: fallback;
         }
         if ([extraStatus[@"overageActive"] boolValue]) {
             u.limitStatusAvailable = YES;
             u.remainingFraction = 0;
             u.overageActive = YES;
             u.resetText = @"Not provided";
-            u.statusReason = extraStatus[@"statusReason"];
-            u.statusSource = @"Anthropic usage API (opt-in)";
+            if (_claudeAccountStatus.length) {
+                u.limitStale = YES;
+                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
+                                  _claudeAccountStatus, extraStatus[@"statusReason"]];
+                u.statusSource = @"Cached Anthropic usage API response (opt-in)";
+            } else {
+                u.statusReason = extraStatus[@"statusReason"];
+                u.statusSource = @"Anthropic usage API (opt-in)";
+            }
         }
+        if (u.limitStatusAvailable && !u.limitUpdatedAt && _claudeLastSuccessAt > 0)
+            u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt];
+        if (_claudeAccountStatus.length) u.limitRefreshError = _claudeAccountStatus;
         u.diagnostics = [NSString stringWithFormat:@"usage JSON %@ · next fetch %@ · keychain %@",
             _claudeUsageJSON ? @"cached" : @"none",
             FmtEpochClock(_claudeNextFetch),
@@ -1191,6 +1794,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
         _claudeAccessTokenExpiresAt = 0;
         _claudeUsageJSON = nil;
         _claudeAccountStatus = nil;
+        _claudeLastSuccessAt = 0;
         _claudeNextFetch = 0;
         u.diagnostics = @"account toggle off";
     }
@@ -1199,8 +1803,21 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
 
 // Session counts, per-model split, and last activity still come from the sqlite thread
 // store (the rollouts don't carry the model); re-queried only when the db changes.
+- (NSString *)codexStatePath {
+    NSString *dir = [_homeDirectory stringByAppendingPathComponent:@".codex"];
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+    NSString *best = nil;
+    long bestVersion = -1;
+    for (NSString *name in names) {
+        if (![name hasPrefix:@"state_"] || ![name hasSuffix:@".sqlite"] || name.length <= 13) continue;
+        long version = [name substringWithRange:NSMakeRange(6, name.length - 13)].integerValue;
+        if (version > bestVersion) { bestVersion = version; best = name; }
+    }
+    return best ? [dir stringByAppendingPathComponent:best] : nil;
+}
+
 - (void)refreshDBExtras {
-    NSString *path = CodexStatePath();
+    NSString *path = [self codexStatePath];
     if (!path) { _sessionsToday = 0; _models = @[]; _lastActivity = nil; return; }
     NSDate *m1 = FileMTime(path), *m2 = FileMTime([path stringByAppendingString:@"-wal"]);
     NSDate *stamp = (m2 && (!m1 || [m2 compare:m1] == NSOrderedDescending)) ? m2 : m1;
@@ -1238,7 +1855,6 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
 }
 
 - (AIUsage *)codexUsage {
-    [self scanRollouts];
     [self refreshDBExtras];
 
     AIUsage *u = [AIUsage new];
@@ -1247,13 +1863,18 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
     u.remainingFraction = -1;
     u.resetText = @"Not exposed locally";
     u.models = _models ?: @[];
-    u.available = _offsets.count > 0;
+    u.available = _codexFiles.count > 0;
     if (!u.available) {
         u.statusText = @"Local state not found";
         u.statusReason = @"No Codex session logs under ~/.codex";
         return u;
     }
-    u.statusText = @"Per-turn session logs";
+    if (_codexTotalsIncomplete)
+        u.statusText = _codexBlocked && !_needsImmediateRescan
+            ? @"Totals incomplete · some session logs unreadable"
+            : [NSString stringWithFormat:@"Indexing %.0f%% · totals incomplete",
+               _codexTotalBytes ? 100.0 * _codexDoneBytes / _codexTotalBytes : 0.0];
+    else u.statusText = @"Per-turn session logs";
     double now = NSDate.date.timeIntervalSince1970;
     NSString *today = LocalDateString(NSDate.date);
     u.todayTokens = [_days[today][@"f"] longLongValue];       // fresh = the headline
@@ -1281,6 +1902,7 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             ? [NSString stringWithFormat:@"%@ window · %@ plan", pick[@"window"], plan]
             : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
         u.statusSource = @"~/.codex session logs";
+        u.limitUpdatedAt = DateFromStatusString(_limitsTs);
     }
     else u.statusReason = CodexLimitStatusReason(_limits, _limitsTs, now);
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
@@ -1300,13 +1922,23 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             FmtEpochDayClock(resets), expired ? @" (expired)" : @""]];
     }
     if (anyUsable && !anyCurrent) [parts addObject:@"all expired"];
+    if (_codexTotalsIncomplete) [parts addObject:[NSString stringWithFormat:@"indexing %.1f%%",
+        _codexTotalBytes ? 100.0 * _codexDoneBytes / _codexTotalBytes : 0.0]];
     u.diagnostics = [parts componentsJoinedByString:@" · "];
     return u;
 }
 
 - (NSArray<AIUsage *> *)read {
+    // One budget covers Codex and the opt-in Claude transcript reader together. Codex
+    // goes first so the tail snapshot makes the live limit gauge available even while
+    // historical totals are still catching up.
+    _scanBytesRemaining = 16 * 1024 * 1024;
+    _scanDeadline = CFAbsoluteTimeGetCurrent() + 0.35;
+    _needsImmediateRescan = NO;
+    [self scanRollouts];
+    if (self.allowClaudeTranscripts) [self scanClaudeTranscripts];
     NSArray<AIUsage *> *usage = @[[self claudeUsage], [self codexUsage]];
-    NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
+    NSString *statusPath = [_homeDirectory stringByAppendingPathComponent:@".glancebar/ai-status.json"];
     NSDictionary *status = JSONDictionaryAtPath(statusPath);
     if (status) {
         for (AIUsage *u in usage) ApplyAIStatusFile(u, status, @"~/.glancebar/ai-status.json");
@@ -1321,7 +1953,35 @@ static void PruneDays(NSMutableDictionary *days, NSString *weekStartDay) {
             _lastStatusReasons[u.name] = u.statusReason;
         }
     }
+    [self savePersistentStateIfNeeded];
     return usage;
+}
+
+- (BOOL)needsImmediateRescan { return _needsImmediateRescan; }
+- (BOOL)totalsIncomplete { return _codexTotalsIncomplete ||
+    (self.allowClaudeTranscripts && _claudeTotalsIncomplete); }
+
+- (double)catchUpProgress {
+    unsigned long long total = _codexTotalBytes;
+    unsigned long long done = _codexDoneBytes;
+    if (self.allowClaudeTranscripts) { total += _claudeTotalBytes; done += _claudeDoneBytes; }
+    return total ? MIN(1.0, (double)done / (double)total) : 1.0;
+}
+
+- (NSString *)catchUpStatus {
+    if (!self.totalsIncomplete) return @"Local AI totals current";
+    if (!_needsImmediateRescan && (_codexBlocked || (self.allowClaudeTranscripts && _claudeBlocked)))
+        return @"AI totals incomplete · some logs unreadable";
+    return [NSString stringWithFormat:@"Indexing %.0f%% · totals incomplete", self.catchUpProgress * 100.0];
+}
+
+- (NSArray<AIUsage *> *)readUntilCaughtUpWithTimeLimit:(NSTimeInterval)timeLimit {
+    NSArray<AIUsage *> *usage = nil;
+    double deadline = CFAbsoluteTimeGetCurrent() + MAX(0.0, timeLimit);
+    do {
+        usage = [self read];
+    } while (self.needsImmediateRescan && CFAbsoluteTimeGetCurrent() < deadline);
+    return usage ?: @[];
 }
 
 @end
@@ -1336,20 +1996,46 @@ static NSColor *BattBarColor(int pct) {
 }
 
 @interface Gauge : NSView
-@property double fraction; @property (strong) NSColor *color;
+@property (nonatomic) double fraction;
+@property (nonatomic, strong) NSColor *color;
+@property (nonatomic, copy) NSString *metricLabel;
 @end
 @implementation Gauge
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setAccessibilityElement:YES];
+        [self setAccessibilityRole:NSAccessibilityProgressIndicatorRole];
+        [self setAccessibilityMinValue:@0.0];
+        [self setAccessibilityMaxValue:@1.0];
+        [self setAccessibilityLabel:@"Progress"];
+    }
+    return self;
+}
+- (void)setFraction:(double)fraction {
+    _fraction = MIN(1.0, MAX(0.0, fraction));
+    [self setAccessibilityValue:@(_fraction)];
+    self.needsDisplay = YES;
+}
+- (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
+- (void)setMetricLabel:(NSString *)metricLabel {
+    _metricLabel = [metricLabel copy];
+    [self setAccessibilityLabel:_metricLabel.length ? _metricLabel : @"Progress"];
+    [self setAccessibilityIdentifier:_metricLabel.length
+        ? [@"gauge." stringByAppendingString:_metricLabel] : @"gauge.progress"];
+}
 - (void)drawRect:(NSRect)d {
     NSRect r = self.bounds; CGFloat rad = r.size.height/2;
     [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill];
     [[NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad] fill];
-    NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*MIN(1.0,MAX(0,self.fraction)));
+    NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*self.fraction);
     [(self.color ?: NSColor.controlAccentColor) setFill];
     [[NSBezierPath bezierPathWithRoundedRect:f xRadius:rad yRadius:rad] fill];
 }
 @end
 
-@interface FlippedView : NSView @end
+@interface FlippedView : NSView
+@property (nonatomic) NSInteger accessibilitySequence;
+@end
 @implementation FlippedView - (BOOL)isFlipped { return YES; } @end
 
 // Opaque, appearance-adaptive backing for the popover. The default NSPopover material is
@@ -1365,6 +2051,142 @@ static NSColor *BattBarColor(int pct) {
     NSRectFill(dirty);
 }
 @end
+
+static NSView *ViewWithAccessibilityIdentifier(NSView *root, NSString *identifier) {
+    if (!root || !identifier.length) return nil;
+    if ([root.accessibilityIdentifier isEqualToString:identifier]) return root;
+    for (NSView *child in root.subviews) {
+        NSView *match = ViewWithAccessibilityIdentifier(child, identifier);
+        if (match) return match;
+    }
+    return nil;
+}
+
+static NSView *ViewOwningAccessibilityElement(NSView *root, id element) {
+    if (!root || !element) return nil;
+    if (root == element) return root;
+    if ([root isKindOfClass:NSControl.class] && ((NSControl *)root).cell == element) return root;
+    for (NSView *child in root.subviews) {
+        NSView *owner = ViewOwningAccessibilityElement(child, element);
+        if (owner) return owner;
+    }
+    return nil;
+}
+
+static NSArray<NSNumber *> *SubviewPathToView(NSView *root, NSView *target) {
+    if (!root || !target) return nil;
+    if (root == target) return @[];
+    for (NSUInteger i = 0; i < root.subviews.count; i++) {
+        NSArray<NSNumber *> *tail = SubviewPathToView(root.subviews[i], target);
+        if (!tail) continue;
+        NSMutableArray<NSNumber *> *path = [NSMutableArray arrayWithObject:@(i)];
+        [path addObjectsFromArray:tail];
+        return path;
+    }
+    return nil;
+}
+
+static NSView *ViewAtSubviewPath(NSView *root, NSArray<NSNumber *> *path) {
+    NSView *view = root;
+    for (NSNumber *indexValue in path) {
+        NSUInteger index = indexValue.unsignedIntegerValue;
+        if (index >= view.subviews.count) return nil;
+        view = view.subviews[index];
+    }
+    return view;
+}
+
+// Most refreshes change values, not structure. Updating a compatible hierarchy in
+// place keeps the same AppKit/accessibility objects alive, so VoiceOver focus, keyboard
+// focus, selections, and scroll state survive the 15-second live refresh. Structural
+// changes (a volume/window/row appearing or disappearing) fall back to replacement plus
+// the identifier-based restoration path below.
+static BOOL ViewTreesCompatible(NSView *existing, NSView *fresh) {
+    if (!existing || !fresh || existing.class != fresh.class) return NO;
+    if ([existing isKindOfClass:NSScrollView.class]) {
+        NSView *existingDocument = ((NSScrollView *)existing).documentView;
+        NSView *freshDocument = ((NSScrollView *)fresh).documentView;
+        return ViewTreesCompatible(existingDocument, freshDocument);
+    }
+    NSArray<NSView *> *existingSubviews = existing.subviews;
+    NSArray<NSView *> *freshSubviews = fresh.subviews;
+    if (existingSubviews.count != freshSubviews.count) return NO;
+    for (NSUInteger i = 0; i < existingSubviews.count; i++)
+        if (!ViewTreesCompatible(existingSubviews[i], freshSubviews[i])) return NO;
+    return YES;
+}
+
+static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
+    existing.frame = fresh.frame;
+    existing.autoresizingMask = fresh.autoresizingMask;
+    existing.hidden = fresh.hidden;
+    existing.alphaValue = fresh.alphaValue;
+    existing.toolTip = fresh.toolTip;
+    existing.identifier = fresh.identifier;
+    existing.accessibilityIdentifier = fresh.accessibilityIdentifier;
+    existing.accessibilityLabel = fresh.accessibilityLabel;
+    existing.accessibilityHelp = fresh.accessibilityHelp;
+    existing.accessibilityRole = fresh.accessibilityRole;
+
+    if ([existing isKindOfClass:NSTextField.class]) {
+        NSTextField *old = (NSTextField *)existing, *new = (NSTextField *)fresh;
+        if (![old.stringValue isEqualToString:new.stringValue]) old.stringValue = new.stringValue;
+        old.font = new.font;
+        old.textColor = new.textColor;
+        old.alignment = new.alignment;
+        old.lineBreakMode = new.lineBreakMode;
+        old.maximumNumberOfLines = new.maximumNumberOfLines;
+        if (old.selectable != new.selectable) old.selectable = new.selectable;
+    } else if ([existing isKindOfClass:NSButton.class]) {
+        NSButton *old = (NSButton *)existing, *new = (NSButton *)fresh;
+        old.title = new.title;
+        old.enabled = new.enabled;
+        old.state = new.state;
+        old.contentTintColor = new.contentTintColor;
+    } else if ([existing isKindOfClass:NSImageView.class]) {
+        NSImageView *old = (NSImageView *)existing, *new = (NSImageView *)fresh;
+        old.image = new.image;
+        old.contentTintColor = new.contentTintColor;
+    } else if ([existing isKindOfClass:Gauge.class]) {
+        Gauge *old = (Gauge *)existing, *new = (Gauge *)fresh;
+        old.fraction = new.fraction;
+        old.color = new.color;
+        old.metricLabel = new.metricLabel;
+        old.accessibilityIdentifier = new.accessibilityIdentifier;
+        [old setAccessibilityElement:new.isAccessibilityElement];
+    } else if ([existing isKindOfClass:NSBox.class]) {
+        ((NSBox *)existing).boxType = ((NSBox *)fresh).boxType;
+    }
+
+    if ([existing isKindOfClass:NSScrollView.class]) {
+        NSScrollView *old = (NSScrollView *)existing, *new = (NSScrollView *)fresh;
+        old.hasVerticalScroller = new.hasVerticalScroller;
+        old.autohidesScrollers = new.autohidesScrollers;
+        old.drawsBackground = new.drawsBackground;
+        old.backgroundColor = new.backgroundColor;
+        ApplyFreshViewState(old.documentView, new.documentView);
+        return;
+    }
+    NSArray<NSView *> *existingSubviews = existing.subviews;
+    NSArray<NSView *> *freshSubviews = fresh.subviews;
+    for (NSUInteger i = 0; i < existingSubviews.count; i++)
+        ApplyFreshViewState(existingSubviews[i], freshSubviews[i]);
+}
+
+static BOOL ReconcileViewTree(NSView *existing, NSView *fresh) {
+    if (!ViewTreesCompatible(existing, fresh)) return NO;
+    ApplyFreshViewState(existing, fresh);
+    return YES;
+}
+
+static NSScrollView *FirstScrollView(NSView *root) {
+    if ([root isKindOfClass:NSScrollView.class]) return (NSScrollView *)root;
+    for (NSView *child in root.subviews) {
+        NSScrollView *scroll = FirstScrollView(child);
+        if (scroll) return scroll;
+    }
+    return nil;
+}
 
 #pragma mark - bar image
 
@@ -1525,17 +2347,29 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
 
 #pragma mark - Controller
 
-static const CGFloat kW = 320, kPad = 16, kDetailW = 600, kDetailPad = 24;
+static const CGFloat kW = 320, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
+// The details document follows the resizable window. It is only touched on the
+// main thread; keeping the active width here avoids threading a layout argument
+// through every detail-section builder.
+static CGFloat kDetailW = 600;
 
 // Identifies our observation of the status button's effectiveAppearance.
 static void *kBarAppearanceContext = &kBarAppearanceContext;
 
-@interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate>
+@interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate>
 @end
 
 @interface Controller ()
 - (void)rebuildContent;
 - (void)rebuildDetails;
+- (void)showWelcomeIfNeeded;
+- (void)refreshVolumesAsync;
+- (void)refreshAIUsageAsync;
+- (void)updateBar;
+- (void)refreshVisibleSurfaces;
+- (NSDictionary *)focusSnapshotForWindow:(NSWindow *)window rootView:(NSView *)root;
+- (void)restoreFocus:(NSDictionary *)snapshot
+             inView:(NSView *)root window:(NSWindow *)window;
 @end
 
 @implementation Controller {
@@ -1552,8 +2386,12 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSArray<AIUsage *> *_aiUsage;
     AIReader *_aiReader;            // touched only on _aiQueue
     dispatch_queue_t _aiQueue;
+    dispatch_queue_t _volumeQueue;
     BOOL _aiLoading, _aiRefreshPending;
+    BOOL _volumesLoading, _volumesUnavailable;
     NSString *_aiSignature;
+    NSString *_aiCatchUpStatus;
+    BOOL _aiTotalsIncomplete;
     NSArray<NSDictionary *> *_hogs;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
     NSMutableArray<NSNumber *> *_ampHistory;
@@ -1564,6 +2402,9 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
+    NSDate *_lastMachineRefresh, *_lastAIRefresh;
+    NSDate *_lastVolumeSuccess;
+    NSScrollView *_popoverScroll;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -1572,16 +2413,22 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"barShowAI": @NO,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO}];
+    _bat = ReadBattery();
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
     _barShowBattery = [ud boolForKey:@"barShowBattery"];
     _barShowSystem = [ud boolForKey:@"barShowSystem"];
     _barShowAI = [ud boolForKey:@"barShowAI"];
+    NSString *defaultsDomain = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
+    NSDictionary *persisted = [ud persistentDomainForName:defaultsDomain];
+    if (!persisted[@"barShowBattery"] && !_bat.valid) _barShowBattery = NO;
     _ampHistory = [NSMutableArray array];
+    _vols = @[];
     _aiUsage = @[];
-    _aiReader = [AIReader new];
+    _aiReader = [[AIReader alloc] initWithHomeDirectory:GBHomeDirectory()];
     _aiQueue = dispatch_queue_create("com.iantodd.glancebar.ai", DISPATCH_QUEUE_SERIAL);
+    _volumeQueue = dispatch_queue_create("com.iantodd.glancebar.volumes", DISPATCH_QUEUE_SERIAL);
     _hogs = @[];
     _topCPU = @[];
     _topMem = @[];
@@ -1616,6 +2463,9 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     if (getenv("GLANCEBAR_AUTOOPEN"))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self togglePopover:nil]; });
+    else if (!getenv("GLANCEBAR_SKIP_WELCOME"))
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
     if (src) {
@@ -1626,8 +2476,27 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
+- (void)refreshVolumesAsync {
+    if (_volumesLoading) return;
+    _volumesLoading = YES;
+    dispatch_async(_volumeQueue, ^{
+        NSArray<Volume *> *volumes = ScanVolumes();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_volumesLoading = NO;
+            // Keep last-good data if an offline mount makes a scan fail wholesale.
+            if (volumes.count) {
+                self->_vols = volumes;
+                self->_volumesUnavailable = NO;
+                self->_lastVolumeSuccess = NSDate.date;
+            } else self->_volumesUnavailable = YES;
+            [self updateBar];
+            [self refreshVisibleSurfaces];
+        });
+    });
+}
+
 - (void)refresh {
-    _vols = ScanVolumes();
+    [self refreshVolumesAsync];
     _bat = ReadBattery();
     // refresh fires from three uncoordinated sources (15s timer, IOPS notification
     // bursts, popover open); only advance the CPU tick baseline when the window is
@@ -1639,6 +2508,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (s.cpuValid) { _lastCPU = s.cpu; _lastCPUValid = YES; }
     else if (_lastCPUValid) { s.cpu = _lastCPU; s.cpuValid = YES; }
     _sys = s;
+    _lastMachineRefresh = NSDate.date;
     [self refreshAIUsageAsync];
     if (_bat.valid) {
         [_ampHistory addObject:@(_bat.amperage_mA)];
@@ -1657,10 +2527,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 // main thread (refresh fires every 15s and on IOPS bursts). Single-flight: a tick
 // that arrives mid-read is skipped; the next one catches up.
 - (void)refreshAIUsageAsync {
+    BOOL showAI = _barShowAI || _popover.isShown || _detailsWindow.isVisible;
+    // Codex histories can be large. Do no transcript/database work while every AI surface
+    // is hidden; opening the popover or enabling the bar segment starts/resumes indexing.
+    if (!showAI) return;
     if (_aiLoading) { _aiRefreshPending = YES; return; }
     _aiLoading = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    BOOL showAI = _barShowAI || _popover.isShown || _detailsWindow.isVisible;
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
     BOOL allowAccountFetch = showAI && useAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
@@ -1676,22 +2549,39 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         self->_aiReader.allowClaudeAccountFetch = allowAccountFetch;
         self->_aiReader.allowClaudeTranscripts = allowTranscripts;
         NSArray<AIUsage *> *usage = [self->_aiReader read];
+        BOOL needsImmediateRescan = self->_aiReader.needsImmediateRescan;
+        BOOL totalsIncomplete = self->_aiReader.totalsIncomplete;
+        NSString *catchUpStatus = self->_aiReader.catchUpStatus;
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@;", u.name, u.available,
-             u.limitStatusAvailable, u.todayTokens, u.todayTokensAll, u.weekTokens, u.todaySessions,
-             u.remainingFraction, u.resetText, u.statusText, u.statusReason];
+            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
+             u.name, u.available, u.limitStatusAvailable, u.limitStale,
+             u.todayTokens, u.todayTokensAll, u.weekTokens, u.weekTokensAll,
+             u.todaySessions, u.weekSessions, u.todayMessages, u.todayToolCalls,
+             u.remainingFraction, u.resetText, u.statusText, u.statusReason,
+             u.statusSource, u.extraUsage, u.limitWindows, u.models, u.lastActivity,
+             u.limitUpdatedAt, u.limitRefreshError];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_aiLoading = NO;
             BOOL rerun = self->_aiRefreshPending;
             self->_aiRefreshPending = NO;
             self->_aiUsage = usage;
+            self->_lastAIRefresh = NSDate.date;
+            self->_aiTotalsIncomplete = totalsIncomplete;
+            self->_aiCatchUpStatus = catchUpStatus;
             if (![sig isEqualToString:self->_aiSignature]) {
                 self->_aiSignature = sig;
                 [self updateBar];
                 [self refreshVisibleSurfaces];
             }
             if (rerun) [self refreshAIUsageAsync];
+            else if (needsImmediateRescan) {
+                // Drain the bounded reader promptly while an AI surface is visible instead
+                // of waiting 15 seconds per chunk. The visibility gate above stops this
+                // loop as soon as the user hides AI.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [self refreshAIUsageAsync]; });
+            }
         });
     });
 }
@@ -1704,7 +2594,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (int)rootDiskPct {
     for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return (int)lround(v.fraction*100);
-    return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : 0;
+    return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : -1;
 }
 
 - (AIUsage *)lowestAIStatus {
@@ -1738,10 +2628,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     NSColor *fg = NSColor.controlTextColor;
     if (_barShowDisk) {
         int pct = [self rootDiskPct];
-        double frac = pct / 100.0;
-        NSColor *driveTextColor = frac >= 0.85 ? DiskColor(frac) : fg;
+        double frac = pct >= 0 ? pct / 100.0 : 0;
+        NSColor *driveTextColor = pct >= 0 && frac >= 0.85 ? DiskColor(frac) : fg;
         [segments addObject:@{@"image": DriveMeterIcon(frac, fg, fg),
-                              @"text": [NSString stringWithFormat:@"%d%%", pct],
+                              @"text": pct >= 0 ? [NSString stringWithFormat:@"%d%%", pct] : @"—",
                               @"color": driveTextColor}];
     }
     if (_barShowBattery) {
@@ -1768,6 +2658,32 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return segments;
 }
 
+- (NSString *)barAccessibilityText {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (_barShowDisk) {
+        int pct = [self rootDiskPct];
+        [parts addObject:pct >= 0 ? [NSString stringWithFormat:@"Storage %d percent used", pct]
+                                  : @"Storage scanning"];
+    }
+    if (_barShowBattery) {
+        [parts addObject:_bat.valid ? [NSString stringWithFormat:@"Battery %d percent%@", _bat.percent,
+                                        _bat.acConnected ? @", on AC" : @""]
+                                    : @"No battery detected"];
+    }
+    if (_barShowSystem) {
+        NSString *cpu = _sys.cpuValid ? [NSString stringWithFormat:@", CPU %d percent", (int)lround(_sys.cpu * 100)] : @"";
+        [parts addObject:[NSString stringWithFormat:@"System pressure %@%@", SystemPressureLevel(_sys), cpu]];
+    }
+    if (_barShowAI) {
+        AIUsage *lowest = [self lowestAIStatus];
+        [parts addObject:lowest ? [NSString stringWithFormat:@"AI, %@ %d percent remaining%@", lowest.name,
+                                    (int)lround(lowest.remainingFraction * 100),
+                                    lowest.limitStale ? @", cached; refresh failed" : @""]
+                                : @"AI limit status unavailable"];
+    }
+    return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
+}
+
 - (void)updateBar {
     // The bar is drawn into a detached, non-template NSImage, so dynamic colors like
     // controlTextColor resolve against whatever drawing appearance is current. Left to
@@ -1779,6 +2695,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [_item.button.effectiveAppearance performAsCurrentDrawingAppearance:^{
         self->_item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
     }];
+    NSString *summary = [self barAccessibilityText];
+    _item.button.toolTip = [@"Glancebar — " stringByAppendingString:summary];
+    [_item.button setAccessibilityLabel:@"Glancebar"];
+    [_item.button setAccessibilityValue:summary];
+    [_item.button setAccessibilityHelp:@"Open Glancebar status and details"];
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
@@ -1796,6 +2717,67 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     if (_detailsWindow.isVisible) [self rebuildDetails];
 }
 
+- (NSDictionary *)focusSnapshotForWindow:(NSWindow *)window rootView:(NSView *)root {
+    if (!window || !root) return @{};
+    NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
+    id focused = window.accessibilityFocusedUIElement;
+    NSView *focusedView = ViewOwningAccessibilityElement(root, focused);
+    if (!focusedView && [focused respondsToSelector:@selector(accessibilityIdentifier)]) {
+        NSString *identifier = [focused accessibilityIdentifier];
+        if (identifier.length) snapshot[@"accessibility"] = identifier;
+    }
+    if (focusedView) {
+        if (focusedView.accessibilityIdentifier.length)
+            snapshot[@"accessibility"] = focusedView.accessibilityIdentifier;
+        NSArray<NSNumber *> *path = SubviewPathToView(root, focusedView);
+        if (path) snapshot[@"accessibilityPath"] = path;
+    }
+    NSResponder *responder = window.firstResponder;
+    NSView *keyboardView = nil;
+    BOOL hasFieldEditor = [responder isKindOfClass:NSTextView.class] && ((NSTextView *)responder).isFieldEditor;
+    if (hasFieldEditor) {
+        id delegate = ((NSTextView *)responder).delegate;
+        if ([delegate isKindOfClass:NSView.class]) keyboardView = delegate;
+        else keyboardView = ViewOwningAccessibilityElement(root, delegate);
+        snapshot[@"selection"] = [NSValue valueWithRange:((NSTextView *)responder).selectedRange];
+    }
+    for (NSUInteger depth = 0; responder && depth < 8; depth++, responder = responder.nextResponder) {
+        if (!keyboardView && [responder isKindOfClass:NSView.class] &&
+            !(hasFieldEditor && depth == 0)) keyboardView = (NSView *)responder;
+        if (keyboardView) break;
+    }
+    if (keyboardView) {
+        if (keyboardView.accessibilityIdentifier.length)
+            snapshot[@"keyboard"] = keyboardView.accessibilityIdentifier;
+        NSArray<NSNumber *> *path = SubviewPathToView(root, keyboardView);
+        if (path) snapshot[@"keyboardPath"] = path;
+    }
+    return snapshot;
+}
+
+- (void)restoreFocus:(NSDictionary *)snapshot
+             inView:(NSView *)root window:(NSWindow *)window {
+    if (!snapshot.count || !root || !window) return;
+    NSView *accessibilityView = ViewWithAccessibilityIdentifier(root, snapshot[@"accessibility"]);
+    if (!accessibilityView && [snapshot[@"accessibilityPath"] isKindOfClass:NSArray.class])
+        accessibilityView = ViewAtSubviewPath(root, snapshot[@"accessibilityPath"]);
+    if (accessibilityView) accessibilityView.accessibilityFocused = YES;
+    NSView *keyboardView = ViewWithAccessibilityIdentifier(root, snapshot[@"keyboard"]);
+    if (!keyboardView && [snapshot[@"keyboardPath"] isKindOfClass:NSArray.class])
+        keyboardView = ViewAtSubviewPath(root, snapshot[@"keyboardPath"]);
+    if (keyboardView) {
+        [window makeFirstResponder:keyboardView];
+        NSValue *selection = [snapshot[@"selection"] isKindOfClass:NSValue.class] ? snapshot[@"selection"] : nil;
+        NSText *editor = selection ? [window fieldEditor:NO forObject:keyboardView] : nil;
+        if ([editor isKindOfClass:NSTextView.class]) {
+            NSRange range = selection.rangeValue;
+            range.location = MIN(range.location, ((NSTextView *)editor).string.length);
+            range.length = MIN(range.length, ((NSTextView *)editor).string.length - range.location);
+            ((NSTextView *)editor).selectedRange = range;
+        }
+    }
+}
+
 #pragma mark popover
 
 - (void)togglePopover:(id)sender {
@@ -1807,6 +2789,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     // after any close so the icon toggles cleanly. (sender is nil for programmatic opens.)
     if (sender && CFAbsoluteTimeGetCurrent() - _popoverClosedAt < 0.20) return;
     // Reset the content view so the rebuild starts at the top on a fresh open.
+    _popoverScroll = nil;
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
     [self refresh];
     [self rebuildContent];
@@ -1885,8 +2868,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 - (NSView *)sectionHeader:(NSString *)title at:(CGFloat)y {
     NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 16)];
-    [v addSubview:[self text:title.uppercaseString font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
-                       color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, 0, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
+    NSTextField *heading = [self text:title.uppercaseString
+                                  font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
+                                 color:NSColor.tertiaryLabelColor
+                                    at:NSMakeRect(kPad, 0, kW-2*kPad, 14)
+                                 align:NSTextAlignmentLeft];
+    if (@available(macOS 26.0, *)) heading.accessibilityRole = NSAccessibilityHeadingRole;
+    else heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+    heading.accessibilityIdentifier = [@"popover.heading." stringByAppendingString:title.lowercaseString];
+    [v addSubview:heading];
     return v;
 }
 - (NSBox *)dividerAt:(CGFloat)y {
@@ -1907,6 +2897,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                           at:NSMakeRect(pad, 6, inner, 13) align:NSTextAlignmentLeft]];
     Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(pad, 2, inner, 3.5)];
     g.fraction = fraction; g.color = color;
+    g.metricLabel = [NSString stringWithFormat:@"%@ — %@", info[@"title"], right ?: @""];
     [row addSubview:g];
     return row;
 }
@@ -1927,6 +2918,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(pad, 3, inner, 4)];
     g.fraction = MIN(1.0, MAX(0.0, fraction));
     g.color = color ?: NSColor.controlAccentColor;
+    g.metricLabel = right.length ? [NSString stringWithFormat:@"%@ — %@", title, right] : title;
     [row addSubview:g];
     return row;
 }
@@ -1939,9 +2931,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
     if (u.overageActive && u.statusReason.length) return u.statusReason;
+    if (u.limitStale && u.statusReason.length) return u.statusReason;
     if (u.limitStatusAvailable) return [self compactResetText:u];
-    if (!u.available) return @"No local state";
     if (u.statusReason.length) return u.statusReason;
+    if (!u.available) return @"No local state";
     if (u.stale && u.statusText.length)   // e.g. Claude's cache computes through yesterday
         return [NSString stringWithFormat:@"No limit status · %@", u.statusText];
     return @"No limit status";
@@ -1974,6 +2967,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, MAX(20, barW), 7)];
         g.fraction = u.remainingFraction;
         g.color = [self aiStatusColor:u];
+        g.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", title];
         [row addSubview:g];
     }
     [row addSubview:[self text:[self aiStatusSubtext:u] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
@@ -2019,6 +3013,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                               at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
         y += 16;
     }
+    if (u.limitStale && u.statusReason.length) {
+        [root addSubview:[self text:u.statusReason font:[NSFont systemFontOfSize:10.5]
+                              color:NSColor.systemOrangeColor
+                                 at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
+        y += 16;
+    }
     return y + 6;
 }
 
@@ -2029,12 +3029,34 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return @"Limit status unavailable";
 }
 
+- (NSString *)shortAgeForDate:(NSDate *)date {
+    if (!date) return @"pending";
+    NSTimeInterval age = MAX(0, -date.timeIntervalSinceNow);
+    if (age < 10) return @"now";
+    if (age < 60) return [NSString stringWithFormat:@"%.0fs ago", age];
+    if (age < 3600) return [NSString stringWithFormat:@"%.0fm ago", age / 60.0];
+    return [NSString stringWithFormat:@"%.0fh ago", age / 3600.0];
+}
+
 - (void)rebuildContent {
+    NSView *previousView = _popover.contentViewController.view;
+    NSWindow *popoverWindow = previousView.window;
+    NSDictionary *focusSnapshot = [self focusSnapshotForWindow:popoverWindow rootView:previousView];
     FlippedView *root = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
     CGFloat y = kPad;
 
     // ---------- STORAGE ----------
     [root addSubview:[self sectionHeader:@"Storage" at:y]]; y += 22;
+    if (!_vols.count) {
+        NSString *status = _volumesLoading ? @"Scanning mounted volumes…" : @"Storage information unavailable";
+        NSTextField *statusField = [self text:status font:[NSFont systemFontOfSize:12]
+                                          color:NSColor.secondaryLabelColor
+                                             at:NSMakeRect(kPad, y, kW-2*kPad, 16)
+                                          align:NSTextAlignmentLeft];
+        statusField.accessibilityIdentifier = @"popover.storage.status";
+        [root addSubview:statusField];
+        y += 24;
+    }
     for (Volume *v in _vols) {
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
         CGFloat inner = kW - 2*kPad;
@@ -2043,19 +3065,43 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSImageView *iv = [NSImageView imageViewWithImage:ic];
         iv.contentTintColor = NSColor.secondaryLabelColor; iv.frame = NSMakeRect(kPad, 31, 17, 15);
         [row addSubview:iv];
-        [row addSubview:[self text:v.name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:nil
-                              at:NSMakeRect(kPad+23, 31, inner-23-46, 16) align:NSTextAlignmentLeft]];
-        [row addSubview:[self text:[NSString stringWithFormat:@"%d%%", (int)lround(v.fraction*100)]
-                              font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular]
-                             color:NSColor.secondaryLabelColor at:NSMakeRect(kW-kPad-46, 31, 46, 16) align:NSTextAlignmentRight]];
+        NSString *volumeID = [@"popover.storage" stringByAppendingString:v.path ?: v.name];
+        NSTextField *nameField = [self text:v.name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                          color:nil at:NSMakeRect(kPad+23, 31, inner-23-46, 16)
+                                          align:NSTextAlignmentLeft];
+        nameField.accessibilityIdentifier = [volumeID stringByAppendingString:@".name"];
+        [row addSubview:nameField];
+        NSTextField *percentField = [self text:[NSString stringWithFormat:@"%d%%", (int)lround(v.fraction*100)]
+                                             font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular]
+                                            color:NSColor.secondaryLabelColor
+                                               at:NSMakeRect(kW-kPad-46, 31, 46, 16)
+                                            align:NSTextAlignmentRight];
+        percentField.accessibilityIdentifier = [volumeID stringByAppendingString:@".percent"];
+        [row addSubview:percentField];
         Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 22, inner, 5)];
         g.fraction = v.fraction; g.color = DiskColor(v.fraction);
+        g.metricLabel = [NSString stringWithFormat:@"%@ storage used", v.name];
+        g.accessibilityIdentifier = [volumeID stringByAppendingString:@".gauge"];
         [row addSubview:g];
-        [row addSubview:[self text:[NSString stringWithFormat:@"%@ of %@ used · %@ free",
-                                    FmtBytes(v.used), FmtBytes(v.total), FmtBytes(v.available)]
-                              font:[NSFont systemFontOfSize:11] color:NSColor.secondaryLabelColor
-                                at:NSMakeRect(kPad, 4, inner, 14) align:NSTextAlignmentLeft]];
+        NSTextField *capacityField = [self text:[NSString stringWithFormat:@"%@ of %@ used · %@ free",
+                                                FmtBytes(v.used), FmtBytes(v.total), FmtBytes(v.available)]
+                                             font:[NSFont systemFontOfSize:11]
+                                            color:NSColor.secondaryLabelColor
+                                               at:NSMakeRect(kPad, 4, inner, 14)
+                                            align:NSTextAlignmentLeft];
+        capacityField.accessibilityIdentifier = [volumeID stringByAppendingString:@".capacity"];
+        [row addSubview:capacityField];
         [root addSubview:row]; y += 54;
+    }
+    if (_volumesUnavailable && _vols.count) {
+        NSString *age = _lastVolumeSuccess
+            ? [NSString stringWithFormat:@"Using last storage reading (%@) · scan unavailable",
+               [self shortAgeForDate:_lastVolumeSuccess]]
+            : @"Using last storage reading · scan unavailable";
+        [root addSubview:[self text:age font:[NSFont systemFontOfSize:10.5]
+                              color:NSColor.systemOrangeColor at:NSMakeRect(kPad, y, kW-2*kPad, 14)
+                              align:NSTextAlignmentLeft]];
+        y += 18;
     }
     y += 2;
     [root addSubview:[self dividerAt:y]]; y += 13;
@@ -2069,8 +3115,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             else if (_bat.isCharging) { big = @"Charging"; sub = [NSString stringWithFormat:@"%d%% — plugged in", _bat.percent]; }
             else { big = [NSString stringWithFormat:@"Held at %d%%", _bat.percent]; sub = @"On AC, not charging"; }
         } else {
-            big = [NSString stringWithFormat:@"%@ until 20%%", FmtDuration(MinutesTo20(_bat, [self avgAmp]))];
-            sub = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
+            if (_bat.percent <= 20) {
+                big = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
+                sub = @"At or below the 20% reserve";
+            } else {
+                int minutes = MinutesTo20(_bat, [self avgAmp]);
+                big = minutes >= 0 ? [NSString stringWithFormat:@"%@ until 20%%", FmtDuration(minutes)]
+                                   : @"Estimating time until 20%";
+                sub = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
+            }
         }
         NSView *hl = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
         CGFloat inner = kW - 2*kPad;
@@ -2081,12 +3134,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         Gauge *chargeGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 4, inner, 5)];
         chargeGauge.fraction = _bat.percent / 100.0;
         chargeGauge.color = BattBarColor(_bat.percent);
+        chargeGauge.metricLabel = @"Battery charge";
         [hl addSubview:chargeGauge];
         [root addSubview:hl]; y += 54;
+    } else {
+        [root addSubview:[self text:@"No battery detected" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                              color:nil at:NSMakeRect(kPad, y, kW-2*kPad, 17) align:NSTextAlignmentLeft]];
+        [root addSubview:[self text:@"Energy-impact sampling remains available on desktop Macs"
+                              font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                                at:NSMakeRect(kPad, y+18, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
+        y += 38;
     }
 
-    // battery pressure
-    [root addSubview:[self text:@"Battery pressure" font:[NSFont systemFontOfSize:11]
+    // The POWER column is a relative one-sample signal, not a percentage of battery drain.
+    [root addSubview:[self text:@"Sampled energy impact" font:[NSFont systemFontOfSize:11]
                           color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
     y += 18;
     if (_hogs.count == 0) {
@@ -2099,7 +3160,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSDictionary *h = _hogs.firstObject;
         double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
         NSDictionary *info = ProcessDisplayInfo(h);
-        NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround(share * 100)];
+        NSString *right = [NSString stringWithFormat:@"%d%% sample", (int)lround(share * 100)];
         [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:share color:PressureColor(share)
                                           width:kW pad:kPad at:y]];
         y += 30;
@@ -2131,19 +3192,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [root addSubview:[self dividerAt:y]]; y += 13;
     [root addSubview:[self sectionHeader:@"System" at:y]]; y += 22;
     NSString *sysLevel = SystemPressureLevel(_sys);
-    NSView *sys = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
+    NSView *sys = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 64)];
     CGFloat inner = kW - 2*kPad;
     [sys addSubview:[self text:[NSString stringWithFormat:@"%@ system pressure", sysLevel]
                           font:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold]
                          color:SystemPressureColor(sysLevel)
-                            at:NSMakeRect(kPad, 29, inner, 18) align:NSTextAlignmentLeft]];
-    [sys addSubview:[self text:SystemSummaryText(_sys) font:[NSFont systemFontOfSize:11]
-                         color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 13, inner, 14) align:NSTextAlignmentLeft]];
+                            at:NSMakeRect(kPad, 43, inner, 18) align:NSTextAlignmentLeft]];
+    NSTextField *systemSummary = [self text:SystemSummaryText(_sys) font:[NSFont systemFontOfSize:10.5]
+                                      color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 15, inner, 27)
+                                      align:NSTextAlignmentLeft];
+    systemSummary.lineBreakMode = NSLineBreakByWordWrapping;
+    systemSummary.maximumNumberOfLines = 2;
+    [sys addSubview:systemSummary];
     Gauge *cpuGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 5, inner, 4)];
     cpuGauge.fraction = _sys.cpuValid ? _sys.cpu : 0;
     cpuGauge.color = _sys.cpuValid ? CPUColor(_sys.cpu) : NSColor.tertiaryLabelColor;
+    cpuGauge.metricLabel = @"Overall CPU utilization";
+    if (!_sys.cpuValid) [cpuGauge setAccessibilityElement:NO];
     [sys addSubview:cpuGauge];
-    [root addSubview:sys]; y += 54;
+    [root addSubview:sys]; y += 68;
 
     if (_procStatsLoading) {
         [root addSubview:[self text:@"measuring top apps…" font:[NSFont systemFontOfSize:12]
@@ -2200,51 +3267,85 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         }
     }
 
-    // ---------- footer ----------
-    y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 9;
-    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 24)];
-    NSButton *opts = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"slider.horizontal.3" accessibilityDescription:@"Options"]
-                                        target:self action:@selector(showOptions:)];
-    opts.bordered = NO; opts.frame = NSMakeRect(kPad-4, 0, 26, 22);
+    // ---------- fixed footer ----------
+    // Keep navigation and freshness visible even when the metric document is
+    // taller than the current display and needs to scroll.
+    y += 8;
+    NSString *freshness = _aiTotalsIncomplete && _aiCatchUpStatus.length
+        ? _aiCatchUpStatus
+        : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
+           [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
+    const CGFloat footerH = 54;
+    FlippedView *footer = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
+    footer.wantsLayer = YES;
+    footer.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+    NSTextField *freshnessField = [self text:freshness font:[NSFont systemFontOfSize:9.5]
+                                           color:NSColor.tertiaryLabelColor
+                                              at:NSMakeRect(kPad, 3, kW-2*kPad, 13)
+                                           align:NSTextAlignmentLeft];
+    freshnessField.accessibilityIdentifier = @"popover.freshness";
+    [footer addSubview:freshnessField];
+    [footer addSubview:[self dividerAt:20]];
+    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 27, kW, 24)];
+    NSButton *opts = [NSButton buttonWithTitle:@"Options" target:self action:@selector(showOptions:)];
+    opts.bordered = NO; opts.font = [NSFont systemFontOfSize:12]; opts.contentTintColor = NSColor.secondaryLabelColor;
+    opts.frame = NSMakeRect(kPad-4, 0, 66, 22); opts.toolTip = @"Configure Glancebar";
+    opts.accessibilityIdentifier = @"popover.options";
+    [opts setAccessibilityHelp:@"Configure metrics, privacy, and startup behavior"];
     [foot addSubview:opts];
     NSButton *details = [NSButton buttonWithTitle:@"Details…" target:self action:@selector(showDetails:)];
     details.bordered = NO; details.font = [NSFont systemFontOfSize:12];
     details.contentTintColor = NSColor.secondaryLabelColor;
-    details.frame = NSMakeRect(kPad+28, 0, 76, 22);
+    details.frame = NSMakeRect(kPad+70, 0, 76, 22); details.toolTip = @"Open the detailed status window";
+    details.accessibilityIdentifier = @"popover.details";
     [foot addSubview:details];
     NSButton *quit = [NSButton buttonWithTitle:@"Quit" target:NSApp action:@selector(terminate:)];
     quit.bordered = NO; quit.font = [NSFont systemFontOfSize:12]; quit.contentTintColor = NSColor.secondaryLabelColor;
     quit.frame = NSMakeRect(kW-kPad-50, 0, 50, 22); quit.alignment = NSTextAlignmentRight;
+    quit.accessibilityIdentifier = @"popover.quit";
     [foot addSubview:quit];
-    [root addSubview:foot]; y += 26;
+    [footer addSubview:foot];
 
-    y += kPad - 6;
-    root.frame = NSMakeRect(0, 0, kW, y);
+    root.frame = NSMakeRect(0, 0, kW, MAX(y, 1));
+    NSScreen *screen = _item.button.window.screen ?: NSScreen.mainScreen;
     CGFloat maxPopoverH = 720;
-    if (y > maxPopoverH) {
-        // Preserve the scroll position across the periodic rebuilds; togglePopover
-        // resets the content view on open so a fresh popover still starts at the top.
-        CGFloat offset = 0;
-        NSView *current = _popover.contentViewController.view;
-        if ([current isKindOfClass:NSScrollView.class])
-            offset = ((NSScrollView *)current).contentView.bounds.origin.y;
-        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, kW, maxPopoverH)];
+    if (screen) maxPopoverH = MIN(maxPopoverH, MAX(360.0, screen.visibleFrame.size.height - 72.0));
+    NSView *freshView = nil;
+    NSScrollView *freshScroll = nil;
+    if (y + footerH > maxPopoverH) {
+        // Preserve position across periodic rebuilds; togglePopover: clears the
+        // stored scroll view so every newly opened popover starts at the top.
+        CGFloat offset = _popoverScroll ? _popoverScroll.contentView.bounds.origin.y : 0;
+        CGFloat scrollH = maxPopoverH - footerH;
+        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, kW, scrollH)];
         scroll.borderType = NSNoBorder;
-        // Opaque backing on the scroll path too: the document view covers the clip, but the
-        // clip/overscroll and scroller gutter would otherwise show the translucent backdrop.
         scroll.drawsBackground = YES;
         scroll.backgroundColor = NSColor.windowBackgroundColor;
         scroll.hasVerticalScroller = YES;
         scroll.autohidesScrollers = YES;
         scroll.documentView = root;
-        [scroll.contentView scrollToPoint:NSMakePoint(0, MIN(offset, MAX(0, y - maxPopoverH)))];
+        [scroll.contentView scrollToPoint:NSMakePoint(0, MIN(offset, MAX(0, y - scrollH)))];
         [scroll reflectScrolledClipView:scroll.contentView];
+        FlippedView *container = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, maxPopoverH)];
+        footer.frame = NSMakeRect(0, scrollH, kW, footerH);
+        [container addSubview:scroll];
+        [container addSubview:footer];
+        freshView = container;
+        freshScroll = scroll;
         _popover.contentSize = NSMakeSize(kW, maxPopoverH);
-        _popover.contentViewController.view = scroll;
     } else {
-        _popover.contentSize = NSMakeSize(kW, y);
-        _popover.contentViewController.view = root;
+        footer.frame = NSMakeRect(0, y, kW, footerH);
+        [root addSubview:footer];
+        root.frame = NSMakeRect(0, 0, kW, y + footerH);
+        freshView = root;
+        _popover.contentSize = NSMakeSize(kW, y + footerH);
+    }
+    if (ReconcileViewTree(previousView, freshView)) {
+        _popoverScroll = FirstScrollView(previousView);
+    } else {
+        _popover.contentViewController.view = freshView;
+        _popoverScroll = freshScroll;
+        [self restoreFocus:focusSnapshot inView:freshView window:popoverWindow];
     }
 }
 
@@ -2264,43 +3365,153 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
     NSMenuItem *w = [m addItemWithTitle:@"Show current draw" action:@selector(toggleWatts:) keyEquivalent:@""];
     w.target = self; w.state = _showWatts ? NSControlStateValueOn : NSControlStateValueOff;
+    w.enabled = _bat.valid;
     NSMenuItem *h = [m addItemWithTitle:@"Show battery health" action:@selector(toggleHealth:) keyEquivalent:@""];
     h.target = self; h.state = _showHealth ? NSControlStateValueOn : NSControlStateValueOff;
+    h.enabled = _bat.valid;
     [m addItem:NSMenuItem.separatorItem];
+
+    NSMenuItem *privacyTitle = [m addItemWithTitle:@"AI & privacy" action:nil keyEquivalent:@""];
+    privacyTitle.enabled = NO;
     NSMenuItem *transcripts = [m addItemWithTitle:@"Claude transcript token totals"
                                            action:@selector(toggleClaudeTranscripts:) keyEquivalent:@""];
     transcripts.target = self;
     transcripts.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeTranscripts"]
         ? NSControlStateValueOn : NSControlStateValueOff;
-    NSMenuItem *acct = [m addItemWithTitle:@"Claude account via Keychain/API"
+    NSMenuItem *acct = [m addItemWithTitle:@"Claude account status via Keychain/API"
                                     action:@selector(toggleClaudeAccount:) keyEquivalent:@""];
     acct.target = self;
     acct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]
         ? NSControlStateValueOn : NSControlStateValueOff;
+    [m addItem:NSMenuItem.separatorItem];
+
+    SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
+    NSMenuItem *login = [m addItemWithTitle:loginStatus == SMAppServiceStatusRequiresApproval
+                                            ? @"Launch at Login (approve in System Settings)"
+                                            : @"Launch at Login"
+                                      action:@selector(toggleLaunchAtLogin:) keyEquivalent:@""];
+    login.target = self;
+    login.state = loginStatus == SMAppServiceStatusEnabled ? NSControlStateValueOn
+                : loginStatus == SMAppServiceStatusRequiresApproval ? NSControlStateValueMixed
+                : NSControlStateValueOff;
+    NSMenuItem *refresh = [m addItemWithTitle:@"Refresh Now" action:@selector(refreshNow:) keyEquivalent:@"r"];
+    refresh.target = self;
+    [m addItem:NSMenuItem.separatorItem];
+    NSMenuItem *activity = [m addItemWithTitle:@"Open Activity Monitor…" action:@selector(openActivityMonitor:) keyEquivalent:@""];
+    activity.target = self;
+    NSMenuItem *diskUtility = [m addItemWithTitle:@"Open Disk Utility…" action:@selector(openDiskUtility:) keyEquivalent:@""];
+    diskUtility.target = self;
+    NSMenuItem *about = [m addItemWithTitle:@"About Glancebar…" action:@selector(showAbout:) keyEquivalent:@""];
+    about.target = self;
     [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
 }
 
-// Opt-in: reads the Claude Code OAuth token from the Keychain (macOS will ask once)
-// and polls Anthropic's usage endpoint for the real limit gauge. Off by default.
+// Explicit opt-in: `/usr/bin/security` performs an Apple-tool-authorized, normally silent
+// read of Claude Code's credential, so the app itself—not a system prompt—must explain and
+// obtain consent before the token is read or sent to Anthropic's usage endpoint.
 - (void)toggleClaudeAccount:(id)s {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [ud setBool:![ud boolForKey:@"useClaudeAccount"] forKey:@"useClaudeAccount"];
+    BOOL enabling = ![ud boolForKey:@"useClaudeAccount"];
+    if (enabling) {
+        NSAlert *alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleInformational;
+        alert.messageText = @"Enable Claude account status?";
+        alert.informativeText = @"Glancebar will ask Apple’s /usr/bin/security tool to read the Claude Code OAuth credential from your Keychain. That read is normally silent—macOS may not show its own permission dialog. Glancebar keeps the token only in memory and sends it only to api.anthropic.com to request your usage limits, at most every 15 minutes. This relies on Claude Code’s private Keychain layout and an undocumented account endpoint, so it may stop working after an update.";
+        [alert addButtonWithTitle:@"Enable"];
+        [alert addButtonWithTitle:@"Cancel"];
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    }
+    [ud setBool:enabling forKey:@"useClaudeAccount"];
     [self refresh];
 }
 - (void)toggleClaudeTranscripts:(id)s {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [ud setBool:![ud boolForKey:@"useClaudeTranscripts"] forKey:@"useClaudeTranscripts"];
+    BOOL enabling = ![ud boolForKey:@"useClaudeTranscripts"];
+    if (enabling) {
+        NSAlert *alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleInformational;
+        alert.messageText = @"Read Claude transcript usage counters?";
+        alert.informativeText = @"Claude transcript files contain conversation records. Glancebar scans them locally and never sends transcript contents over the network. Its mode-0600 local index stores only file offsets/identity, daily token totals, timestamps, and opaque message hashes—not prompts or responses.";
+        [alert addButtonWithTitle:@"Enable Local Scan"];
+        [alert addButtonWithTitle:@"Cancel"];
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    }
+    [ud setBool:enabling forKey:@"useClaudeTranscripts"];
     [self refresh];
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
 
-- (NSUInteger)enabledBarMetricCount {
-    return (_barShowDisk ? 1 : 0) + (_barShowBattery ? 1 : 0) + (_barShowSystem ? 1 : 0) + (_barShowAI ? 1 : 0);
+- (void)showError:(NSError *)error title:(NSString *)title {
+    NSAlert *alert = error ? [NSAlert alertWithError:error] : [NSAlert new];
+    if (title.length) alert.messageText = title;
+    [alert runModal];
 }
 
-- (BOOL)canDisableBarMetric:(BOOL)current {
-    return !current || [self enabledBarMetricCount] > 1;
+- (BOOL)setLaunchAtLoginEnabled:(BOOL)enabled showErrors:(BOOL)showErrors {
+    NSError *error = nil;
+    BOOL ok = enabled ? [SMAppService.mainAppService registerAndReturnError:&error]
+                      : [SMAppService.mainAppService unregisterAndReturnError:&error];
+    if (!ok && showErrors) [self showError:error title:@"Couldn’t update Launch at Login"];
+    if (ok && enabled && SMAppService.mainAppService.status == SMAppServiceStatusRequiresApproval && showErrors) {
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Approval required";
+        alert.informativeText = @"macOS requires approval in System Settings → General → Login Items. Glancebar has submitted the request.";
+        [alert runModal];
+    }
+    return ok;
+}
+
+- (void)toggleLaunchAtLogin:(id)sender {
+    BOOL enabled = SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
+    [self setLaunchAtLoginEnabled:!enabled showErrors:YES];
+}
+
+- (void)showWelcomeIfNeeded {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if ([ud boolForKey:@"hasShownWelcome"]) return;
+    [ud setBool:YES forKey:@"hasShownWelcome"];
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [NSAlert new];
+    alert.alertStyle = NSAlertStyleInformational;
+    alert.messageText = @"Glancebar is ready";
+    alert.informativeText = @"Glancebar now lives in your menu bar. Click its meters for storage, battery, system, and AI status. Options controls what appears and keeps Claude access off until you explicitly enable it. If the item is hidden by a MacBook notch, free one menu-bar slot in Control Center.";
+    [alert addButtonWithTitle:@"Got It"];
+    [alert addButtonWithTitle:@"Launch at Login"];
+    if ([alert runModal] == NSAlertSecondButtonReturn)
+        [self setLaunchAtLoginEnabled:YES showErrors:YES];
+}
+
+- (void)refreshNow:(id)sender {
+    [self refresh];
+    if (_popover.isShown || _detailsWindow.isVisible) [self beginSampling];
+}
+
+- (void)openApplicationAtPath:(NSString *)path title:(NSString *)title {
+    NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+    NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+    [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:configuration
+                                     completionHandler:^(NSRunningApplication *__unused app, NSError *error) {
+        if (error) dispatch_async(dispatch_get_main_queue(), ^{ [self showError:error title:title]; });
+    }];
+}
+
+- (void)openActivityMonitor:(id)sender {
+    [self openApplicationAtPath:@"/System/Applications/Utilities/Activity Monitor.app"
+                          title:@"Couldn’t open Activity Monitor"];
+}
+
+- (void)openDiskUtility:(id)sender {
+    [self openApplicationAtPath:@"/System/Applications/Utilities/Disk Utility.app"
+                          title:@"Couldn’t open Disk Utility"];
+}
+
+- (void)showAbout:(id)sender {
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = [NSString stringWithFormat:@"Glancebar %@", GBVersion];
+    alert.informativeText = @"One native menu-bar item for machine and AI status. No third-party dependencies; no network access unless Claude account status is explicitly enabled.";
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
 }
 
 - (void)saveBarOption:(NSString *)key value:(BOOL)value {
@@ -2311,19 +3522,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)toggleBarDisk:(id)s {
-    if (![self canDisableBarMetric:_barShowDisk]) return;
     _barShowDisk = !_barShowDisk; [self saveBarOption:@"barShowDisk" value:_barShowDisk];
 }
 - (void)toggleBarBattery:(id)s {
-    if (![self canDisableBarMetric:_barShowBattery]) return;
     _barShowBattery = !_barShowBattery; [self saveBarOption:@"barShowBattery" value:_barShowBattery];
 }
 - (void)toggleBarSystem:(id)s {
-    if (![self canDisableBarMetric:_barShowSystem]) return;
     _barShowSystem = !_barShowSystem; [self saveBarOption:@"barShowSystem" value:_barShowSystem];
 }
 - (void)toggleBarAI:(id)s {
-    if (![self canDisableBarMetric:_barShowAI]) return;
     _barShowAI = !_barShowAI; [self saveBarOption:@"barShowAI" value:_barShowAI];
 }
 
@@ -2333,14 +3540,18 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (NSString *)batteryStatusText {
-    if (!_bat.valid) return @"Unavailable";
+    if (!_bat.valid) return @"No battery detected";
     if (_bat.acConnected) {
         if (_bat.fullyCharged || _bat.percent >= 100) return @"Fully charged · on AC";
         if (_bat.isCharging) return [NSString stringWithFormat:@"%d%% · charging", _bat.percent];
         return [NSString stringWithFormat:@"%d%% · on AC, not charging", _bat.percent];
     }
-    return [NSString stringWithFormat:@"%d%% · %@ until 20%%",
-            _bat.percent, FmtDuration(MinutesTo20(_bat, [self avgAmp]))];
+    if (_bat.percent <= 20)
+        return [NSString stringWithFormat:@"%d%% · at or below the 20%% reserve", _bat.percent];
+    int minutes = MinutesTo20(_bat, [self avgAmp]);
+    return minutes >= 0 ? [NSString stringWithFormat:@"%d%% · %@ until 20%%",
+                           _bat.percent, FmtDuration(minutes)]
+                        : [NSString stringWithFormat:@"%d%% · estimating time until 20%%", _bat.percent];
 }
 
 - (NSString *)batteryPowerText {
@@ -2353,26 +3564,67 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (void)addDetailHeading:(NSString *)title to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
     if (*y > kDetailPad) *y += 8;
-    [root addSubview:[self text:title.uppercaseString font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
-                         color:NSColor.tertiaryLabelColor at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 14)
-                         align:NSTextAlignmentLeft]];
+    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
+    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
+    NSString *scope = root.accessibilityIdentifier ?: @"details";
+    NSTextField *heading = [self text:title.uppercaseString
+                                  font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
+                                 color:NSColor.tertiaryLabelColor
+                                    at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 14)
+                                 align:NSTextAlignmentLeft];
+    if (@available(macOS 26.0, *)) heading.accessibilityRole = NSAccessibilityHeadingRole;
+    else heading.accessibilityLabel = [NSString stringWithFormat:@"%@ section heading", title];
+    heading.accessibilityIdentifier = [NSString stringWithFormat:@"%@.heading.%ld.%@",
+                                        scope, (long)focusIndex, title.lowercaseString];
+    [root addSubview:heading];
     *y += 24;
 }
 
 - (void)addDetailKey:(NSString *)key value:(NSString *)value to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
+    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
+    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
+    NSString *scope = root.accessibilityIdentifier ?: @"details";
     CGFloat keyW = 126;
+    CGFloat valueW = width - 2*kDetailPad - keyW;
+    NSFont *valueFont = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    NSString *safeValue = value ?: @"";
+    NSRect measured = [safeValue boundingRectWithSize:NSMakeSize(valueW, CGFLOAT_MAX)
+                                               options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+                                            attributes:@{NSFontAttributeName: valueFont}];
+    CGFloat rowH = MAX(16, ceil(measured.size.height));
     [root addSubview:[self text:key font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
                             at:NSMakeRect(kDetailPad, *y, keyW, 16) align:NSTextAlignmentLeft]];
-    [root addSubview:[self text:value font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium] color:nil
-                            at:NSMakeRect(kDetailPad+keyW, *y, width-2*kDetailPad-keyW, 16)
-                         align:NSTextAlignmentLeft]];
-    *y += 24;
+    NSTextField *field = [self text:safeValue font:valueFont color:nil
+                                at:NSMakeRect(kDetailPad+keyW, *y, valueW, rowH)
+                             align:NSTextAlignmentLeft];
+    field.lineBreakMode = NSLineBreakByWordWrapping;
+    field.maximumNumberOfLines = 0;
+    field.selectable = YES;
+    field.accessibilityIdentifier = [NSString stringWithFormat:@"%@.value.%ld.%@",
+                                      scope, (long)focusIndex, key];
+    [root addSubview:field];
+    *y += MAX(24, rowH + 8);
 }
 
 - (void)addDetailStatus:(NSString *)status to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
-    [root addSubview:[self text:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
-                            at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 16) align:NSTextAlignmentLeft]];
-    *y += 24;
+    FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
+    NSInteger focusIndex = detailRoot ? detailRoot.accessibilitySequence++ : (NSInteger)root.subviews.count;
+    NSString *scope = root.accessibilityIdentifier ?: @"details";
+    CGFloat fieldW = width - 2*kDetailPad;
+    NSFont *font = [NSFont systemFontOfSize:12];
+    NSString *safeStatus = status ?: @"";
+    NSRect measured = [safeStatus boundingRectWithSize:NSMakeSize(fieldW, CGFLOAT_MAX)
+                                                options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+                                             attributes:@{NSFontAttributeName: font}];
+    CGFloat rowH = MAX(16, ceil(measured.size.height));
+    NSTextField *field = [self text:safeStatus font:font color:NSColor.secondaryLabelColor
+                                at:NSMakeRect(kDetailPad, *y, fieldW, rowH) align:NSTextAlignmentLeft];
+    field.lineBreakMode = NSLineBreakByWordWrapping;
+    field.maximumNumberOfLines = 0;
+    field.selectable = YES;
+    field.accessibilityIdentifier = [NSString stringWithFormat:@"%@.status.%ld", scope, (long)focusIndex];
+    [root addSubview:field];
+    *y += MAX(24, rowH + 8);
 }
 
 - (NSScrollView *)detailScrollForRoot:(NSView *)root height:(CGFloat)height {
@@ -2396,6 +3648,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSScrollView *)overviewDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 360)];
+    root.accessibilityIdentifier = @"details.overview";
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"Overview" to:root y:&y width:kDetailW];
 
@@ -2414,6 +3667,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self addDetailHeading:@"Top Signals" to:root y:&y width:kDetailW];
     if (_hogsLoading || _procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
+    } else if (_hogsUnavailable || _procStatsUnavailable) {
+        [self addDetailStatus:@"One or more app samplers are unavailable" to:root y:&y width:kDetailW];
     } else if (!_hogs.count && !_topCPU.count && !_topMem.count) {
         [self addDetailStatus:@"No sampled app activity" to:root y:&y width:kDetailW];
     } else {
@@ -2422,7 +3677,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
             if (total <= 0) for (NSDictionary *row in _hogs) total += [row[@"impact"] doubleValue];
             double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Battery %d%%", (int)lround(share * 100)]
+            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Sample %d%%", (int)lround(share * 100)]
                                            fraction:share color:PressureColor(share) width:kDetailW pad:kDetailPad at:y]];
             y += 42;
         }
@@ -2449,8 +3704,50 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return [self detailScrollForRoot:root height:y];
 }
 
+- (void)revealVolume:(NSButton *)sender {
+    NSString *path = sender.identifier;
+    if (!path.length) return;
+    [NSWorkspace.sharedWorkspace selectFile:nil inFileViewerRootedAtPath:path];
+}
+
+- (NSScrollView *)storageDetailsView {
+    FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 420)];
+    root.accessibilityIdentifier = @"details.storage";
+    CGFloat y = kDetailPad;
+    [self addDetailHeading:@"Storage" to:root y:&y width:kDetailW];
+    if (_volumesUnavailable && _vols.count)
+        [self addDetailStatus:@"Volume scan unavailable; showing the last successful reading"
+                           to:root y:&y width:kDetailW];
+    if (!_vols.count) {
+        [self addDetailStatus:_volumesLoading ? @"Scanning mounted volumes…" : @"Storage information unavailable"
+                           to:root y:&y width:kDetailW];
+    }
+    for (Volume *volume in _vols) {
+        [self addDetailHeading:volume.name to:root y:&y width:kDetailW];
+        [root addSubview:[self compactSignalRow:@"Used"
+                                          right:[NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)]
+                                       fraction:volume.fraction color:DiskColor(volume.fraction)
+                                          width:kDetailW pad:kDetailPad at:y]];
+        y += 34;
+        [self addDetailKey:@"Used" value:FmtBytes(volume.used) to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Available" value:FmtBytes(volume.available) to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Capacity" value:FmtBytes(volume.total) to:root y:&y width:kDetailW];
+        [self addDetailKey:@"Mount point" value:volume.path to:root y:&y width:kDetailW];
+        NSButton *reveal = [NSButton buttonWithTitle:@"Reveal in Finder" target:self action:@selector(revealVolume:)];
+        reveal.identifier = volume.path;
+        reveal.bezelStyle = NSBezelStyleRounded;
+        reveal.frame = NSMakeRect(kDetailPad, y, 126, 28);
+        reveal.accessibilityIdentifier = [@"details.reveal." stringByAppendingString:volume.path];
+        reveal.toolTip = [NSString stringWithFormat:@"Reveal %@ in Finder", volume.name];
+        [root addSubview:reveal];
+        y += 36;
+    }
+    return [self detailScrollForRoot:root height:y];
+}
+
 - (NSScrollView *)batteryDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 520)];
+    root.accessibilityIdentifier = @"details.battery";
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"Battery" to:root y:&y width:kDetailW];
     if (!_bat.valid) {
@@ -2464,7 +3761,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         y += 34;
         [self addDetailKey:@"Charge" value:[self batteryStatusText] to:root y:&y width:kDetailW];
         [self addDetailKey:@"Power" value:[self batteryPowerText] to:root y:&y width:kDetailW];
-        if (!_bat.acConnected)
+        if (!_bat.acConnected && _bat.percent > 20)
             [self addDetailKey:@"Until 20%" value:FmtDuration(MinutesTo20(_bat, [self avgAmp])) to:root y:&y width:kDetailW];
         if (_bat.designCap_mAh > 0) {
             NSString *health = [NSString stringWithFormat:@"%d%% · %ld/%ld mAh · %ld cycles",
@@ -2474,17 +3771,19 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         }
     }
 
-    [self addDetailHeading:@"Battery Pressure" to:root y:&y width:kDetailW];
+    [self addDetailHeading:@"Sampled Energy Impact" to:root y:&y width:kDetailW];
     if (_hogsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
-    } else if (_hogsUnavailable || !_hogs.count) {
-        [self addDetailStatus:@"No sampled battery pressure" to:root y:&y width:kDetailW];
+    } else if (_hogsUnavailable) {
+        [self addDetailStatus:@"Energy-impact sampler unavailable" to:root y:&y width:kDetailW];
+    } else if (!_hogs.count) {
+        [self addDetailStatus:@"No active sampled apps" to:root y:&y width:kDetailW];
     } else {
         double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
         if (total <= 0) for (NSDictionary *h in _hogs) total += [h[@"impact"] doubleValue];
         for (NSDictionary *h in _hogs) {
             double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-            NSString *right = [NSString stringWithFormat:@"%@  %d%%", PressureLevel(share), (int)lround(share * 100)];
+            NSString *right = [NSString stringWithFormat:@"Sample %d%%", (int)lround(share * 100)];
             [root addSubview:[self processMetricRow:h right:right fraction:share color:PressureColor(share)
                                               width:kDetailW pad:kDetailPad at:y]];
             y += 42;
@@ -2495,6 +3794,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSScrollView *)aiDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
+    root.accessibilityIdentifier = @"details.ai";
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"AI Status" to:root y:&y width:kDetailW];
 
@@ -2514,6 +3814,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
                                                                    : (u.statusReason ?: @"No limit status source")
                         to:root y:&y width:kDetailW];
+        if (u.limitUpdatedAt)
+            [self addDetailKey:@"Limit checked" value:ClockText(u.limitUpdatedAt) to:root y:&y width:kDetailW];
         if (u.extraUsage)
             [self addDetailKey:@"Extra usage" value:u.extraUsage to:root y:&y width:kDetailW];
         if (u.statusSource)
@@ -2530,7 +3832,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                     to:root y:&y width:kDetailW];
     [self addDetailKey:@"Codex logs" value:@"On · local ~/.codex session JSONL"
                     to:root y:&y width:kDetailW];
-    NSString *statusPath = [NSHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
+    NSString *statusPath = [GBHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
     NSString *statusState = [NSFileManager.defaultManager fileExistsAtPath:statusPath]
         ? @"Present · overrides provider gauges" : @"Not found";
     [self addDetailKey:@"Status file" value:statusState to:root y:&y width:kDetailW];
@@ -2583,6 +3885,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSScrollView *)systemDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
+    root.accessibilityIdentifier = @"details.system";
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"System" to:root y:&y width:kDetailW];
     [self addDetailKey:@"Pressure" value:SystemPressureLevel(_sys) to:root y:&y width:kDetailW];
@@ -2593,6 +3896,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self addDetailHeading:@"Top CPU" to:root y:&y width:kDetailW];
     if (_procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
+    } else if (_procStatsUnavailable) {
+        [self addDetailStatus:@"Process sampler unavailable" to:root y:&y width:kDetailW];
     } else if (!_topCPU.count) {
         [self addDetailStatus:@"No sampled CPU activity" to:root y:&y width:kDetailW];
     } else {
@@ -2613,6 +3918,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self addDetailHeading:@"Top Memory" to:root y:&y width:kDetailW];
     if (_procStatsLoading) {
         [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
+    } else if (_procStatsUnavailable) {
+        [self addDetailStatus:@"Process sampler unavailable" to:root y:&y width:kDetailW];
     } else if (!_topMem.count) {
         [self addDetailStatus:@"No sampled memory activity" to:root y:&y width:kDetailW];
     } else {
@@ -2631,6 +3938,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSScrollView *)detailViewForIdentifier:(NSString *)identifier {
     if ([identifier isEqualToString:@"overview"]) return [self overviewDetailsView];
+    if ([identifier isEqualToString:@"storage"]) return [self storageDetailsView];
     if ([identifier isEqualToString:@"battery"]) return [self batteryDetailsView];
     if ([identifier isEqualToString:@"system"]) return [self systemDetailsView];
     if ([identifier isEqualToString:@"ai"]) return [self aiDetailsView];
@@ -2639,6 +3947,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (void)rebuildDetails {
     if (!_detailsWindow) return;
+    NSDictionary *focusSnapshot = [self focusSnapshotForWindow:_detailsWindow
+                                                       rootView:_detailsWindow.contentView];
+
+    // The tab chrome consumes roughly 60pt at the initial 660pt window width.
+    // Grow the document with the window while retaining the original readable
+    // minimum, then rebuild rows so wrapping and right-aligned gauges stay exact.
+    kDetailW = MAX(kDetailMinW, _detailsWindow.contentView.bounds.size.width - 60.0);
 
     NSTabView *tabs = nil;
     for (NSView *subview in _detailsWindow.contentView.subviews) {
@@ -2650,13 +3965,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         if (bounds.size.width < 100 || bounds.size.height < 100) bounds = NSMakeRect(0, 0, 660, 520);
         NSView *content = [[NSView alloc] initWithFrame:bounds];
         tabs = [[NSTabView alloc] initWithFrame:NSInsetRect(content.bounds, 12, 12)];
+        tabs.accessibilityIdentifier = @"details.tabs";
         tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         [tabs addTabViewItem:[self detailTabWithIdentifier:@"overview" title:@"Overview" view:[self detailViewForIdentifier:@"overview"]]];
+        [tabs addTabViewItem:[self detailTabWithIdentifier:@"storage" title:@"Storage" view:[self detailViewForIdentifier:@"storage"]]];
         [tabs addTabViewItem:[self detailTabWithIdentifier:@"battery" title:@"Battery" view:[self detailViewForIdentifier:@"battery"]]];
         [tabs addTabViewItem:[self detailTabWithIdentifier:@"system" title:@"System" view:[self detailViewForIdentifier:@"system"]]];
         [tabs addTabViewItem:[self detailTabWithIdentifier:@"ai" title:@"AI" view:[self detailViewForIdentifier:@"ai"]]];
         [content addSubview:tabs];
         _detailsWindow.contentView = content;
+        [self restoreFocus:focusSnapshot inView:content window:_detailsWindow];
         return;
     }
 
@@ -2665,6 +3983,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     for (NSTabViewItem *item in tabs.tabViewItems) {
         NSScrollView *fresh = [self detailViewForIdentifier:item.identifier];
         if (!fresh) continue;
+        NSRect existingFrame = item.view.frame;
+        if (ReconcileViewTree(item.view, fresh)) {
+            item.view.frame = existingFrame;  // NSTabView owns the viewport geometry
+            continue;
+        }
         CGFloat offset = 0;
         if ([item.view isKindOfClass:NSScrollView.class])
             offset = ((NSScrollView *)item.view).contentView.bounds.origin.y;
@@ -2673,6 +3996,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [fresh.contentView scrollToPoint:NSMakePoint(0, MIN(offset, maxOffset))];
         [fresh reflectScrolledClipView:fresh.contentView];
     }
+    [self restoreFocus:focusSnapshot inView:_detailsWindow.contentView window:_detailsWindow];
 }
 
 - (void)showDetails:(id)sender {
@@ -2688,8 +4012,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                                          defer:NO];
         _detailsWindow.title = @"Glancebar Details";
         _detailsWindow.releasedWhenClosed = NO;
-        // Tab content is laid out at a fixed 600pt; below ~648 the right column clips
-        // with no horizontal scroller, so don't allow narrower.
+        _detailsWindow.delegate = self;
         _detailsWindow.minSize = NSMakeSize(648, 420);
     }
     [self rebuildDetails];
@@ -2701,115 +4024,400 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self beginSampling];
 }
 
+- (void)windowDidResize:(NSNotification *)notification {
+    if (notification.object != _detailsWindow || !_detailsWindow.isVisible) return;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(rebuildDetails) object:nil];
+    [self performSelector:@selector(rebuildDetails) withObject:nil afterDelay:0.04];
+}
+
 @end
 
 #pragma mark - main
 
-static void Dump(BOOL allowOnline) {
-    for (Volume *v in ScanVolumes())
-        printf("disk  %-16s %3d%%  %s free\n",
-               v.name.UTF8String, (int)lround(v.fraction*100), FmtBytes(v.available).UTF8String);
-    BatteryState b = ReadBattery();
-    if (b.valid) {
-        printf("batt  %d%% (%s)\n", b.percent, b.acConnected ? "on AC" : "on battery");
-        if (!b.acConnected) printf("      %s until 20%%\n", FmtDuration(MinutesTo20(b, b.amperage_mA)).UTF8String);
-        if (b.designCap_mAh > 0)
-            printf("      health %d%% · %ld cycles\n", (int)lround(100.0*b.rawMax_mAh/b.designCap_mAh), b.cycleCount);
+static id JSONValue(id value) { return value ?: NSNull.null; }
+static NSNumber *JSONBool(BOOL value) { return value ? @YES : @NO; }
+
+static BOOL IsJSONBoolean(id value) {
+    return value && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID();
+}
+
+static NSString *ISODateString(NSDate *date) {
+    if (!date) return nil;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    iso.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    return [iso stringFromDate:date];
+}
+
+static NSArray<NSDictionary *> *DumpProcessRows(NSArray<NSDictionary *> *rows, BOOL cpuRows) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        NSDictionary *info = ProcessDisplayInfo(row);
+        NSMutableDictionary *item = [@{
+            @"name": JSONValue(row[@"name"]),
+            @"title": JSONValue(info[@"title"]),
+            @"detail": JSONValue(info[@"detail"]),
+            @"commands": [row[@"commands"] isKindOfClass:NSArray.class] ? row[@"commands"] : @[],
+            @"bytes": @([row[@"bytes"] unsignedLongLongValue])
+        } mutableCopy];
+        if (cpuRows) item[@"cpuPercent"] = @(GroupCPUShare(row) * 100.0);
+        [out addObject:item];
     }
-    printf("battery pressure:\n");
+    return out;
+}
+
+static NSString *RequestedAIAccountError(NSArray<AIUsage *> *usage, BOOL accountRequested) {
+    if (!accountRequested) return nil;
+    for (AIUsage *item in usage)
+        if ([item.name isEqualToString:@"Claude"] && item.limitRefreshError.length)
+            return item.limitRefreshError;
+    return nil;
+}
+
+static NSDictionary *DumpSnapshot(BOOL allowOnline) {
+    NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
+    snapshot[@"schemaVersion"] = @1;
+    snapshot[@"glancebarVersion"] = GBVersion;
+    snapshot[@"generatedAt"] = ISODateString(NSDate.date);
+
+    NSArray<Volume *> *volumes = ScanVolumes();
+    NSMutableArray *volumeRows = [NSMutableArray array];
+    for (Volume *volume in volumes) {
+        [volumeRows addObject:@{
+            @"name": volume.name ?: @"",
+            @"path": volume.path ?: @"",
+            @"internal": JSONBool(volume.isInternal),
+            @"totalBytes": @(volume.total),
+            @"usedBytes": @(volume.used),
+            @"availableBytes": @(volume.available),
+            @"usedPercent": @(volume.fraction * 100.0)
+        }];
+    }
+    snapshot[@"storage"] = @{
+        @"available": JSONBool(volumeRows.count > 0),
+        @"error": volumeRows.count ? NSNull.null : @"No mounted volume data",
+        @"volumes": volumeRows
+    };
+
+    BatteryState battery = ReadBattery();
+    int minutesTo20 = battery.valid && !battery.acConnected && battery.percent > 20
+        ? MinutesTo20(battery, battery.amperage_mA) : -1;
+    NSNumber *watts = battery.valid && battery.voltage_mV > 0 && battery.amperage_mA != 0
+        ? @(fabs((double)battery.amperage_mA) * battery.voltage_mV / 1e6) : nil;
+    NSNumber *health = battery.valid && battery.designCap_mAh > 0 && battery.rawMax_mAh >= 0
+        ? @(100.0 * battery.rawMax_mAh / battery.designCap_mAh) : nil;
+    snapshot[@"battery"] = @{
+        @"available": JSONBool(battery.valid),
+        @"error": battery.valid ? NSNull.null : @"No battery detected",
+        @"percent": battery.valid ? @(battery.percent) : NSNull.null,
+        @"acConnected": JSONBool(battery.valid && battery.acConnected),
+        @"charging": JSONBool(battery.valid && battery.isCharging),
+        @"fullyCharged": JSONBool(battery.valid && battery.fullyCharged),
+        @"atOrBelowReserve": JSONBool(battery.valid && !battery.acConnected && battery.percent <= 20),
+        @"minutesUntil20Percent": minutesTo20 >= 0 ? @(minutesTo20) : NSNull.null,
+        @"powerWatts": JSONValue(watts),
+        @"healthPercent": JSONValue(health),
+        @"cycleCount": battery.valid && battery.cycleCount >= 0 ? @(battery.cycleCount) : NSNull.null
+    };
+
     NSArray *hogs = SampleHogs(5);
-    if (!hogs.count) printf("  unavailable\n");
-    double total = [hogs.firstObject[@"totalImpact"] doubleValue];
-    if (total <= 0) for (NSDictionary *h in hogs) total += [h[@"impact"] doubleValue];
-    for (NSDictionary *h in hogs) {
-        double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-        NSDictionary *info = ProcessDisplayInfo(h);
-        printf("  %3d%%  %-18s %s\n", (int)lround(share * 100),
-               [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
+    double impactTotal = [hogs.firstObject[@"totalImpact"] doubleValue];
+    if (impactTotal <= 0) for (NSDictionary *row in hogs) impactTotal += [row[@"impact"] doubleValue];
+    NSMutableArray *impactRows = [NSMutableArray array];
+    for (NSDictionary *row in hogs) {
+        NSDictionary *info = ProcessDisplayInfo(row);
+        double share = impactTotal > 0 ? [row[@"impact"] doubleValue] / impactTotal : 0;
+        [impactRows addObject:@{
+            @"name": JSONValue(row[@"name"]),
+            @"title": JSONValue(info[@"title"]),
+            @"detail": JSONValue(info[@"detail"]),
+            @"commands": [row[@"commands"] isKindOfClass:NSArray.class] ? row[@"commands"] : @[],
+            @"sampleSharePercent": @(share * 100.0)
+        }];
     }
+    snapshot[@"sampledEnergyImpact"] = @{
+        @"available": JSONBool(impactRows.count > 0),
+        @"error": impactRows.count ? NSNull.null : @"Energy-impact sample unavailable",
+        @"rows": impactRows
+    };
 
-    CPUCounters prev = ReadCPUCounters();
+    CPUCounters previous = ReadCPUCounters();
     [NSThread sleepForTimeInterval:0.25];
-    SystemState sys = ReadSystemState(&prev);
-    printf("system %s\n", [SystemSummaryText(sys) UTF8String]);
-    NSDictionary *stats = SampleProcessStats(3);
-    NSArray *cpu = stats[@"cpu"] ? stats[@"cpu"] : @[];
-    NSArray *memory = stats[@"memory"] ? stats[@"memory"] : @[];
-    if (!cpu.count && !memory.count) printf("top apps unavailable\n");
-    if (cpu.count) {
-        printf("top cpu:\n");
-        for (NSDictionary *h in cpu) {
-            NSDictionary *info = ProcessDisplayInfo(h);
-            printf("  %3.0f%%  %-18s %s\n", GroupCPUShare(h) * 100,
-                   [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
-        }
+    SystemState system = ReadSystemState(&previous);
+    NSDictionary *stats = SampleProcessStats(5);
+    NSArray *cpuRows = [stats[@"cpu"] isKindOfClass:NSArray.class] ? stats[@"cpu"] : @[];
+    NSArray *memoryRows = [stats[@"memory"] isKindOfClass:NSArray.class] ? stats[@"memory"] : @[];
+    NSMutableArray<NSString *> *systemErrors = [NSMutableArray array];
+    if (!system.cpuValid) [systemErrors addObject:@"CPU sample unavailable"];
+    if (!system.memValid) [systemErrors addObject:@"Memory sample unavailable"];
+    if (!system.swapValid) [systemErrors addObject:@"Swap sample unavailable"];
+    if (!cpuRows.count && !memoryRows.count) [systemErrors addObject:@"Process sample unavailable"];
+    snapshot[@"system"] = @{
+        @"available": JSONBool(systemErrors.count == 0),
+        @"error": systemErrors.count ? [systemErrors componentsJoinedByString:@"; "] : NSNull.null,
+        @"pressure": SystemPressureLevel(system),
+        @"cpuPercent": system.cpuValid ? @(system.cpu * 100.0) : NSNull.null,
+        @"memoryPressure": MemoryPressureLevel(system),
+        @"memoryTotalBytes": system.memValid ? @(system.memTotal) : NSNull.null,
+        @"memoryUsedBytes": system.memValid ? @(system.memUsed) : NSNull.null,
+        @"memoryAvailableBytes": system.memValid ? @(system.memAvailable) : NSNull.null,
+        @"swapUsedBytes": system.swapValid ? @(system.swapUsed) : NSNull.null,
+        @"topCPU": DumpProcessRows(cpuRows, YES),
+        @"topMemory": DumpProcessRows(memoryRows, NO),
+        @"processSampleAvailable": JSONBool(cpuRows.count > 0 || memoryRows.count > 0)
+    };
+
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults registerDefaults:@{@"barShowAI": @NO, @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO}];
+    BOOL accountEnabled = [defaults boolForKey:@"useClaudeAccount"];
+    BOOL accountRequested = allowOnline && accountEnabled;
+    AIReader *reader = [[AIReader alloc] initWithHomeDirectory:GBHomeDirectory()];
+    reader.useClaudeAccount = accountRequested;
+    reader.allowClaudeAccountFetch = reader.useClaudeAccount;
+    reader.allowClaudeTranscripts = [defaults boolForKey:@"useClaudeTranscripts"];
+    NSArray<AIUsage *> *usage = [reader readUntilCaughtUpWithTimeLimit:30.0];
+    NSMutableArray *providers = [NSMutableArray array];
+    BOOL anyAIAvailable = NO;
+    for (AIUsage *item in usage) {
+        anyAIAvailable |= item.available || item.limitStatusAvailable;
+        [providers addObject:@{
+            @"name": item.name ?: @"AI",
+            @"available": JSONBool(item.available),
+            @"limitStatusAvailable": JSONBool(item.limitStatusAvailable && item.remainingFraction >= 0),
+            @"limitStale": JSONBool(item.limitStale),
+            @"remainingPercent": item.limitStatusAvailable && item.remainingFraction >= 0
+                ? @(item.remainingFraction * 100.0) : NSNull.null,
+            @"limitUpdatedAt": JSONValue(ISODateString(item.limitUpdatedAt)),
+            @"limitRefreshError": JSONValue(item.limitRefreshError),
+            @"reset": JSONValue(item.resetText),
+            @"status": JSONValue(item.statusText),
+            @"statusReason": JSONValue(item.statusReason),
+            @"statusSource": JSONValue(item.statusSource),
+            @"source": JSONValue(item.source),
+            @"overageActive": JSONBool(item.overageActive),
+            @"todayFreshTokens": @(item.todayTokens),
+            @"todayAllTokens": @(item.todayTokensAll),
+            @"sevenDayFreshTokens": @(item.weekTokens),
+            @"sevenDayAllTokens": @(item.weekTokensAll),
+            @"todaySessions": @(item.todaySessions),
+            @"windows": item.limitWindows ?: @[],
+            @"models": item.models ?: @[],
+            @"lastActivity": JSONValue(ISODateString(item.lastActivity)),
+            @"diagnostics": JSONValue(item.diagnostics)
+        }];
     }
-    if (memory.count) {
-        printf("top memory:\n");
-        for (NSDictionary *h in memory) {
-            NSDictionary *info = ProcessDisplayInfo(h);
-            printf("  %6s  %-18s %s\n", [FmtBytes([h[@"bytes"] unsignedLongLongValue]) UTF8String],
-                   [info[@"title"] UTF8String], [info[@"detail"] UTF8String]);
+    NSString *accountError = RequestedAIAccountError(usage, accountRequested);
+    NSMutableArray<NSString *> *aiErrors = [NSMutableArray array];
+    if (!anyAIAvailable) [aiErrors addObject:@"No local AI status available"];
+    if (reader.totalsIncomplete) [aiErrors addObject:@"AI history indexing incomplete"];
+    if (accountError.length) [aiErrors addObject:[@"Claude account: " stringByAppendingString:accountError]];
+    snapshot[@"ai"] = @{
+        @"available": JSONBool(anyAIAvailable),
+        @"error": aiErrors.count ? [aiErrors componentsJoinedByString:@"; "] : NSNull.null,
+        @"onlineAllowed": JSONBool(allowOnline),
+        @"accountEnabled": JSONBool(accountEnabled),
+        @"accountRequested": JSONBool(accountRequested),
+        @"transcriptsEnabled": JSONBool([defaults boolForKey:@"useClaudeTranscripts"]),
+        @"totalsIncomplete": JSONBool(reader.totalsIncomplete),
+        @"catchUpProgress": @(reader.catchUpProgress),
+        @"catchUpStatus": reader.catchUpStatus,
+        @"providers": providers
+    };
+
+    NSMutableArray<NSString *> *partialSources = [NSMutableArray array];
+    if (!volumes.count) [partialSources addObject:@"storage"];
+    if (!battery.valid) [partialSources addObject:@"battery"];
+    if (!impactRows.count) [partialSources addObject:@"sampledEnergyImpact"];
+    if (!system.cpuValid || !system.memValid) [partialSources addObject:@"system"];
+    if (!system.swapValid) [partialSources addObject:@"system.swap"];
+    if (!cpuRows.count && !memoryRows.count) [partialSources addObject:@"system.processes"];
+    if (reader.totalsIncomplete) [partialSources addObject:@"ai.history"];
+    if (!anyAIAvailable) [partialSources addObject:@"ai"];
+    if (accountError.length) [partialSources addObject:@"ai.account"];
+    snapshot[@"partialSources"] = partialSources;
+    snapshot[@"status"] = partialSources.count ? @"partial" : @"complete";
+    return snapshot;
+}
+
+static const char *UTF8(NSString *string) { return string.UTF8String ?: ""; }
+
+static NSString *DumpBooleanTypeError(NSDictionary *snapshot) {
+    NSArray<NSDictionary *> *groups = @[
+        @{ @"name": @"storage", @"value": snapshot[@"storage"] ?: @{},
+           @"keys": @[@"available"] },
+        @{ @"name": @"battery", @"value": snapshot[@"battery"] ?: @{},
+           @"keys": @[@"available", @"acConnected", @"charging", @"fullyCharged", @"atOrBelowReserve"] },
+        @{ @"name": @"sampledEnergyImpact", @"value": snapshot[@"sampledEnergyImpact"] ?: @{},
+           @"keys": @[@"available"] },
+        @{ @"name": @"system", @"value": snapshot[@"system"] ?: @{},
+           @"keys": @[@"available", @"processSampleAvailable"] },
+        @{ @"name": @"ai", @"value": snapshot[@"ai"] ?: @{},
+           @"keys": @[@"available", @"onlineAllowed", @"accountEnabled", @"accountRequested",
+                       @"transcriptsEnabled", @"totalsIncomplete"] }
+    ];
+    for (NSDictionary *group in groups) {
+        NSDictionary *value = group[@"value"];
+        for (NSString *key in group[@"keys"])
+            if (!IsJSONBoolean(value[key]))
+                return [NSString stringWithFormat:@"%@.%@ must be a JSON boolean", group[@"name"], key];
+    }
+    for (NSDictionary *volume in snapshot[@"storage"][@"volumes"] ?: @[])
+        if (!IsJSONBoolean(volume[@"internal"])) return @"storage.volumes[].internal must be a JSON boolean";
+    for (NSDictionary *provider in snapshot[@"ai"][@"providers"] ?: @[])
+        for (NSString *key in @[@"available", @"limitStatusAvailable", @"limitStale", @"overageActive"])
+            if (!IsJSONBoolean(provider[key]))
+                return [NSString stringWithFormat:@"ai.providers[].%@ must be a JSON boolean", key];
+    return nil;
+}
+
+static void PrintHumanDump(NSDictionary *snapshot) {
+    NSDictionary *storage = snapshot[@"storage"];
+    NSArray *volumes = storage[@"volumes"];
+    if (!volumes.count) printf("disk  unavailable\n");
+    for (NSDictionary *volume in volumes)
+        printf("disk  %-16s %3d%%  %s free\n", UTF8(volume[@"name"]),
+               (int)lround([volume[@"usedPercent"] doubleValue]),
+               UTF8(FmtBytes([volume[@"availableBytes"] longLongValue])));
+
+    NSDictionary *battery = snapshot[@"battery"];
+    if (![battery[@"available"] boolValue]) printf("batt  no battery detected\n");
+    else {
+        printf("batt  %d%% (%s)\n", [battery[@"percent"] intValue],
+               [battery[@"acConnected"] boolValue] ? "on AC" : "on battery");
+        if ([battery[@"atOrBelowReserve"] boolValue]) printf("      at or below the 20%% reserve\n");
+        else if (battery[@"minutesUntil20Percent"] != NSNull.null)
+            printf("      %s until 20%%\n", UTF8(FmtDuration([battery[@"minutesUntil20Percent"] intValue])));
+        if (battery[@"healthPercent"] != NSNull.null) {
+            if (battery[@"cycleCount"] != NSNull.null)
+                printf("      health %d%% · %ld cycles\n",
+                       (int)lround([battery[@"healthPercent"] doubleValue]),
+                       [battery[@"cycleCount"] longValue]);
+            else printf("      health %d%%\n", (int)lround([battery[@"healthPercent"] doubleValue]));
         }
     }
 
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    printf("ai toggles: barShowAI=%s · useClaudeAccount=%s · useClaudeTranscripts=%s\n",
-           [ud boolForKey:@"barShowAI"] ? "on" : "off",
-           [ud boolForKey:@"useClaudeAccount"] ? "on" : "off",
-           [ud boolForKey:@"useClaudeTranscripts"] ? "on" : "off");
-    printf("ai status:\n");
-    AIReader *reader = [AIReader new];
-    reader.useClaudeAccount = allowOnline && [ud boolForKey:@"useClaudeAccount"];
-    reader.allowClaudeAccountFetch = reader.useClaudeAccount;
-    reader.allowClaudeTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
-    for (AIUsage *u in [reader read]) {
-        NSString *remaining = u.limitStatusAvailable ? [NSString stringWithFormat:@"%d%% remaining",
-                                                         (int)lround(u.remainingFraction * 100)]
-                                                      : @"remaining unavailable";
-        NSString *reset = @"reset unavailable";
-        if (u.limitStatusAvailable) {
-            reset = (u.resetText.length && ![u.resetText isEqualToString:@"Not exposed locally"])
-                ? [NSString stringWithFormat:@"resets %@", u.resetText] : @"reset not provided";
-        }
-        NSString *today = FmtTokenCount(u.todayTokens);
-        if (u.todayTokensAll > u.todayTokens)
-            today = [today stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.todayTokensAll)];
-        NSString *week = FmtTokenCount(u.weekTokens);
-        if (u.weekTokensAll > u.weekTokens)
-            week = [week stringByAppendingFormat:@" (%@ incl. cached)", FmtCompact(u.weekTokensAll)];
-        NSString *reason = ((!u.limitStatusAvailable || u.overageActive) && u.statusReason.length)
-            ? [@" · " stringByAppendingString:u.statusReason] : @"";
-        printf("  %-7s %s · %s · today %s · 7d %s%s\n",
-               u.name.UTF8String,
-               remaining.UTF8String,
-               reset.UTF8String,
-               today.UTF8String,
-               week.UTF8String,
-               reason.UTF8String);
-        for (NSDictionary *w in u.limitWindows) {
-            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
-            NSString *r = resets ? [@"resets " stringByAppendingString:ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue])]
-                                 : @"reset not provided";
-            printf("          %-8s %d%% left · %s\n", [w[@"window"] UTF8String],
-                   (int)lround([w[@"remainingFraction"] doubleValue] * 100), r.UTF8String);
-        }
-        if (u.diagnostics.length) printf("          why: %s\n", u.diagnostics.UTF8String);
+    printf("sampled energy impact:\n");
+    NSArray *impact = snapshot[@"sampledEnergyImpact"][@"rows"];
+    if (!impact.count) printf("  unavailable\n");
+    for (NSDictionary *row in impact)
+        printf("  %3d%%  %-18s %s\n", (int)lround([row[@"sampleSharePercent"] doubleValue]),
+               UTF8(row[@"title"]), UTF8(row[@"detail"]));
+
+    NSDictionary *system = snapshot[@"system"];
+    NSString *cpu = system[@"cpuPercent"] == NSNull.null ? @"CPU unknown"
+        : [NSString stringWithFormat:@"CPU %d%%", (int)lround([system[@"cpuPercent"] doubleValue])];
+    NSString *memory = system[@"memoryAvailableBytes"] == NSNull.null ? @"Memory unknown"
+        : [NSString stringWithFormat:@"Memory pressure %@ · %@ available", system[@"memoryPressure"],
+           FmtBytes([system[@"memoryAvailableBytes"] longLongValue])];
+    NSString *swap = system[@"swapUsedBytes"] == NSNull.null ? @"Swap unknown"
+        : [system[@"swapUsedBytes"] unsignedLongLongValue] == 0 ? @"Swap none"
+        : [NSString stringWithFormat:@"Swap %@", FmtBytes([system[@"swapUsedBytes"] longLongValue])];
+    printf("system %s · %s · %s\n", UTF8(cpu), UTF8(memory), UTF8(swap));
+    NSArray *topCPU = system[@"topCPU"], *topMemory = system[@"topMemory"];
+    if (!topCPU.count && !topMemory.count) printf("top apps unavailable\n");
+    if (topCPU.count) {
+        printf("top cpu:\n");
+        for (NSDictionary *row in topCPU)
+            printf("  %3.0f%%  %-18s %s\n", [row[@"cpuPercent"] doubleValue], UTF8(row[@"title"]), UTF8(row[@"detail"]));
     }
+    if (topMemory.count) {
+        printf("top memory:\n");
+        for (NSDictionary *row in topMemory)
+            printf("  %6s  %-18s %s\n", UTF8(FmtBytes([row[@"bytes"] longLongValue])),
+                   UTF8(row[@"title"]), UTF8(row[@"detail"]));
+    }
+
+    NSDictionary *ai = snapshot[@"ai"];
+    printf("ai toggles: useClaudeAccount=%s · useClaudeTranscripts=%s · onlinePermission=%s · accountRequest=%s\n",
+           [ai[@"accountEnabled"] boolValue] ? "on" : "off",
+           [ai[@"transcriptsEnabled"] boolValue] ? "on" : "off",
+           [ai[@"onlineAllowed"] boolValue] ? "allowed" : "off",
+           [ai[@"accountRequested"] boolValue] ? "enabled" : "off");
+    printf("ai status: %s\n", UTF8(ai[@"catchUpStatus"]));
+    for (NSDictionary *provider in ai[@"providers"]) {
+        NSString *remaining = provider[@"remainingPercent"] == NSNull.null ? @"remaining unavailable"
+            : [NSString stringWithFormat:@"%d%% remaining", (int)lround([provider[@"remainingPercent"] doubleValue])];
+        NSString *reset = provider[@"reset"] == NSNull.null ? @"reset unavailable"
+            : [NSString stringWithFormat:@"resets %@", provider[@"reset"]];
+        NSString *reason = provider[@"statusReason"] == NSNull.null ? @"" : provider[@"statusReason"];
+        printf("  %-7s %s · %s · today %s · 7d %s%s%s\n", UTF8(provider[@"name"]), UTF8(remaining), UTF8(reset),
+               UTF8(FmtTokenCount([provider[@"todayFreshTokens"] longLongValue])),
+               UTF8(FmtTokenCount([provider[@"sevenDayFreshTokens"] longLongValue])),
+               reason.length ? " · " : "", UTF8(reason));
+        for (NSDictionary *window in provider[@"windows"]) {
+            NSString *windowReset = window[@"resetsAt"] ? ResetTextFromDate(
+                [NSDate dateWithTimeIntervalSince1970:[window[@"resetsAt"] doubleValue]]) : @"not provided";
+            printf("          %-8s %d%% left · resets %s\n", UTF8(window[@"window"]),
+                   (int)lround([window[@"remainingFraction"] doubleValue] * 100), UTF8(windowReset));
+        }
+        if (provider[@"diagnostics"] != NSNull.null)
+            printf("          why: %s\n", UTF8(provider[@"diagnostics"]));
+    }
+    NSArray *partialSources = snapshot[@"partialSources"];
+    if (partialSources.count)
+        printf("status partial (%s)\n", UTF8([partialSources componentsJoinedByString:@", "]));
+    else printf("status complete\n");
+}
+
+static BOOL PrintJSONDump(NSDictionary *snapshot) {
+    NSString *schemaError = DumpBooleanTypeError(snapshot);
+    if (schemaError) {
+        fprintf(stderr, "Glancebar: JSON schema validation failed: %s\n", UTF8(schemaError));
+        return NO;
+    }
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot
+                                                   options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
+                                                     error:&error];
+    if (!data) {
+        fprintf(stderr, "Glancebar: JSON encoding failed: %s\n", UTF8(error.localizedDescription));
+        return NO;
+    }
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    return YES;
+}
+
+static void PrintUsage(FILE *stream) {
+    fprintf(stream,
+        "Glancebar %s\n"
+        "Usage: Glancebar [--dump [--json] [--strict] [--online]]\n"
+        "       Glancebar --version\n"
+        "       Glancebar --help\n\n"
+        "  --dump     Print a local machine and AI status snapshot.\n"
+        "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
+        "  --strict   Exit 2 when any sampled source is partial/unavailable.\n"
+        "  --online   Permit the already-opted-in Claude account request.\n",
+        UTF8(GBVersion));
 }
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
-            BOOL allowOnline = getenv("GLANCEBAR_ALLOW_ACCOUNT") != NULL;
-            for (int i = 2; i < argc; i++)
-                if (strcmp(argv[i], "--online") == 0) allowOnline = YES;
-            Dump(allowOnline);
-            return 0;
+        BOOL dump = NO, json = NO, strict = NO;
+        const char *onlineEnvironment = getenv("GLANCEBAR_ALLOW_ACCOUNT");
+        BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--dump") == 0) dump = YES;
+            else if (strcmp(argv[i], "--json") == 0) json = YES;
+            else if (strcmp(argv[i], "--strict") == 0) strict = YES;
+            else if (strcmp(argv[i], "--online") == 0) allowOnline = YES;
+            else if (strcmp(argv[i], "--version") == 0) { printf("Glancebar %s\n", UTF8(GBVersion)); return 0; }
+            else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { PrintUsage(stdout); return 0; }
+            else { fprintf(stderr, "Glancebar: unknown option '%s'\n", argv[i]); PrintUsage(stderr); return 64; }
+        }
+        if ((json || strict || allowOnline) && !dump && argc > 1) {
+            fprintf(stderr, "Glancebar: --json, --strict, and --online require --dump\n");
+            return 64;
+        }
+        if (dump) {
+            NSDictionary *snapshot = DumpSnapshot(allowOnline);
+            if (json) {
+                if (!PrintJSONDump(snapshot)) return 70;
+            } else PrintHumanDump(snapshot);
+            return strict && [snapshot[@"status"] isEqualToString:@"partial"] ? 2 : 0;
         }
         NSApplication *app = NSApplication.sharedApplication;
-        Controller *c = [Controller new];
-        app.delegate = c;
+        Controller *controller = [Controller new];
+        app.delegate = controller;
         [app run];
     }
     return 0;

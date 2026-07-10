@@ -7,7 +7,7 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 <p align="center">
-  <img src="docs/screenshot.png?v=7c524a2" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
+  <img src="docs/screenshot.png?v=24ce5cff" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
 </p>
 
 ## Overview
@@ -18,16 +18,17 @@ Glancebar puts the numbers that ruin your day in one compact menu bar item
 the leading battery/system culprits in plain English, and Claude/Codex limit gauges.
 A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
-One item, one slot, **no dependencies, no daemons or helpers — everything runs inside
-the one app you can quit — and no admin rights**.
+One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
+executables—and no admin rights**. Glancebar does invoke standard macOS tools such as
+`top`, `ps`, `sqlite3`, and (only after the Claude account opt-in) `/usr/bin/security`.
 
 ## Features
 
 - **Storage** — every volume (internal + external/NTFS) with Finder-accurate free space
   (purgeable counts as free); gauges turn orange past 85%, red past 95%.
-- **Battery** — "3:14 until 20%" (not a bare percentage), battery pressure grouped by
-  app/process with raw process names and plain-English context, live draw in watts, and
-  battery health / cycle count.
+- **Battery** — "3:14 until 20%" (not a bare percentage), sampled energy impact grouped
+  by app/process with raw process names and plain-English context, live draw in watts,
+  and battery health / cycle count.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
   popover shows the lead signals, Details keeps the longer lists.
@@ -42,22 +43,42 @@ the one app you can quit — and no admin rights**.
 ## Build & Install
 
 ```bash
-./build.sh                                  # → build/Glancebar.app (clang; stable identity if present, else ad-hoc)
-./tests.sh                                  # run the pure-logic unit tests
+./tests.sh                                  # run unit/regression + reader integration tests
+./build.sh                                  # test, build Universal 2, then ad-hoc sign
 cp -R build/Glancebar.app /Applications/    # install
 open /Applications/Glancebar.app            # run
 ```
 
-Start at login: **System Settings → General → Login Items → +** and add Glancebar.
-Requires the Xcode Command Line Tools (`xcode-select --install`).
+The build uses `-Wall -Wextra -Werror`, the macOS hardened runtime, and both `arm64`
+and `x86_64` by default. Set `GLANCEBAR_ARCHS=native` if the local toolchain cannot
+cross-compile. It never chooses a certificate on your behalf: local builds are ad-hoc
+signed unless `GLANCEBAR_CODESIGN_IDENTITY` names an installed identity. Requires the
+Xcode Command Line Tools (`xcode-select --install`).
 
-There are no prebuilt or notarized downloads — build locally with `./build.sh`. A
-locally built app carries no quarantine flag, so it opens without a Gatekeeper prompt.
-If you copy a built `.app` from another machine, clear the quarantine flag first:
-`xattr -dr com.apple.quarantine /Applications/Glancebar.app`.
+This repository does not currently advertise a prebuilt or notarized download; build
+locally with `./build.sh`. Do not remove quarantine from an app obtained from someone
+else unless you have independently verified it. Maintainers can follow
+[`docs/RELEASING.md`](docs/RELEASING.md) to create a signed, notarized candidate.
 
-Headless readout: `Glancebar.app/Contents/MacOS/Glancebar --dump` prints disk, battery,
-battery pressure, system pressure, and AI status to the terminal.
+Launch at Login can be enabled during first run or from Glancebar's options. You can
+also manage it in **System Settings → General → Login Items**.
+
+The bundled executable also has a stable headless interface:
+
+```bash
+build/Glancebar.app/Contents/MacOS/Glancebar --dump                 # human-readable, local only
+build/Glancebar.app/Contents/MacOS/Glancebar --dump --json          # schemaVersion 1 JSON
+build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json # exit 2 if any source is partial
+```
+
+`--help` and `--version` are available for scripts. JSON is written by itself to
+stdout; unknown options are usage errors. `--online` permits the account request only
+when the Claude account integration has already been enabled in Glancebar. In schema
+v1, each top-level source (`storage`, `battery`, `sampledEnergyImpact`, `system`, and
+`ai`) exposes `available` and `error`; `partialSources` names every unavailable or
+incomplete source that makes `--strict` exit 2. An unconfigured Claude account source
+is optional; after `--online` explicitly requests an enabled integration, a failed or
+stale account refresh is reported as `ai.account` and is strict-partial.
 
 ## How It Works
 
@@ -68,11 +89,12 @@ battery pressure, system pressure, and AI status to the terminal.
   instantly on plug/unplug via an `IOPSNotification`, otherwise every 15s.
 - **Time until 20%** — macOS's smoothed minutes-to-empty scaled by `(charge − 20)/charge`,
   with an amperage-based fallback.
-- **Battery pressure** — `top -l 2 -stats pid,command,power`, reading the second sample,
+- **Sampled energy impact** — `top -l 2 -stats pid,command,power`, reading the second sample,
   grouped under the **outermost `.app` bundle in each executable path** where possible so
-  helpers roll up under their parent app. Rows show the share of sampled app/process
-  pressure, while preserving raw process names such as `syspolicyd`. Process sampling
-  runs only while the popover or Details window is open.
+  helpers roll up under their parent app. Rows show each app/process's relative share of
+  the sampled energy-impact values—not a percentage of battery consumed—while preserving
+  raw process names such as `syspolicyd`. Sampling runs only while the popover or Details
+  window is open.
 - **System pressure** — CPU from Mach processor tick deltas; memory pressure from
   `kern.memorystatus_vm_pressure_level` (the kernel's own verdict); swap from
   `vm.swapusage`. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
@@ -84,22 +106,36 @@ battery pressure, system pressure, and AI status to the terminal.
   (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
   the most constrained window that is still current. The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed. Headline counts are
-  **fresh tokens** (non-cached input + output); the raw total is ~16× larger because
-  cached context is re-read every turn, and is shown alongside. If enabled, Claude's
-  token counts come the same way — live from the per-message usage records in
-  `~/.claude/projects/**.jsonl` transcripts. JSONL files are append-only and read
-  incrementally by byte offset on a background queue, with per-tick read limits.
+  **fresh tokens** (non-cached input + output); cached-context re-reads are shown
+  separately. If enabled, Claude's token counts come the same way — live from the
+  per-message usage records in `~/.claude/projects/**.jsonl` transcripts.
+
+  Glancebar keeps a persistent incremental index at
+  `~/Library/Application Support/Glancebar/ai-reader-state-v2.json`. The cache stores
+  file identity/offset metadata, day totals, opaque hashes, and the last Codex limits —
+  never transcript text, prompts, responses, or OAuth credentials. It is written
+  atomically with mode `0600`. Each catch-up pass has one global 16 MiB / 350 ms budget,
+  visits newest activity first, and exposes explicit indexing progress instead of
+  presenting partial history as complete. It detects appends, rotations, inode
+  replacement, truncation/regrowth, and time-zone changes safely.
 
   Claude's *quota* gauge has no on-disk source (Claude Code fetches it from the API at
   display time), so it fills in one of two ways. The options menu has an **opt-in**
-  "Claude account via Keychain/API" toggle (off by default): it reads the OAuth token
-  Claude Code already maintains in your Keychain (macOS asks for permission) and polls
-  Anthropic's usage endpoint — the same data Claude Code's `/usage` shows — at most
-  every 15 minutes. The token is cached in memory only until expiry, never written by
-  Glancebar, never refreshed by Glancebar, and never sent anywhere except
-  `api.anthropic.com`. If the account response reports paid overage usage at or above
-  100%, Glancebar shows that as an explicit red 0% status instead of a missing gauge.
-  Or provide `~/.glancebar/ai-status.json`, which overrides either provider's gauge:
+  "Claude account status via Keychain/API" toggle, off by default. Enabling it first presents
+  an in-app confirmation that explains the trust boundary. If confirmed, Glancebar
+  invokes Apple's signed `/usr/bin/security` tool to read the OAuth token Claude Code
+  maintains in the `Claude Code-credentials` Keychain item. Because Keychain evaluates
+  the Apple-signed tool performing the read rather than Glancebar itself, the read is
+  normally silent: **macOS does not present a Keychain permission prompt for Glancebar**.
+
+  Glancebar then polls the Anthropic usage endpoint at most every 15 minutes. The token
+  is kept in process memory only until expiry, never written or refreshed by Glancebar,
+  and sent only to `api.anthropic.com`. This integration depends on Claude Code's private
+  Keychain layout and an undocumented account endpoint; it is not a stable public API
+  contract and may stop working when Claude Code or Anthropic changes. If the response
+  reports paid overage usage at or above 100%, Glancebar shows an explicit red 0% status
+  instead of a missing gauge. Alternatively, provide `~/.glancebar/ai-status.json`,
+  which overrides either provider's gauge:
 
   ```json
   {
@@ -108,47 +144,41 @@ battery pressure, system pressure, and AI status to the terminal.
   ```
 
   Claude transcript token totals are a separate **opt-in** toggle because transcript
-  JSONL files contain conversation records even though Glancebar only extracts usage
-  counters. With both Claude toggles off, Glancebar reads local aggregate state only —
-  never Claude auth files or transcripts — and sends no network requests.
+  JSONL files contain conversation records. Glancebar extracts usage counters and
+  timestamps, then persists only file identity/offset metadata, daily totals, and
+  opaque message hashes in its protected local index—not prompts or responses. With
+  both Claude toggles off, Glancebar reads local Codex state only—never Claude auth
+  files or transcripts—and sends no network requests.
 
-  `--dump` is local-only by default. To allow account-backed Claude status in a dump,
-  pass `--online` or set `GLANCEBAR_ALLOW_ACCOUNT=1`.
+  `--dump` is local-only by default. Passing `--online` or setting
+  `GLANCEBAR_ALLOW_ACCOUNT=1` permits the account request only after the integration
+  has already been enabled in the GUI; neither switch enables credential access by
+  itself. Other environment values, including `0`, do not grant online access.
 
-  **Signing & the password prompt.** macOS Keychain grants are tied to the app's
-  *signing requirement* and, on the modern login keychain, to a per-item *partition
-  list*. `./build.sh` signs with a stable identity so the requirement doesn't change
-  between rebuilds: it prefers `$GLANCEBAR_CODESIGN_IDENTITY` (e.g. a Developer ID), else
-  the `Glancebar Self-Signed` cert matched by **SHA-1** (create one in **Keychain Access →
-  Certificate Assistant → Create a Certificate**: Name `Glancebar Self-Signed`, Self
-  Signed Root, Code Signing — then pass its hash via `GLANCEBAR_CODESIGN_SHA1` on other
-  machines), else ad-hoc with a loud warning (ad-hoc changes the code hash every build, so
-  the grant re-prompts).
+  App signing does not change this credential-access behavior: `/usr/bin/security` is
+  the process Keychain evaluates. Signing is still required for normal macOS distribution,
+  but Glancebar never auto-selects an installed identity. See
+  [`docs/RELEASING.md`](docs/RELEASING.md) for the explicit signing and notarization flow.
 
-  A stable signature is necessary but **not sufficient** for the Claude account toggle.
-  The `Claude Code-credentials` item's partition list only admits Apple's own tools and
-  apps with a matching **Team ID**. A *self-signed, no-Team-ID* Glancebar is already a
-  trusted application on the item yet still gets the password prompt on every read because
-  it can't satisfy the partition — and "Allow all applications" / "Always Allow" do **not**
-  durably clear it. The durable fix is to sign with a **Developer ID** (which carries a
-  Team ID): `GLANCEBAR_CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAMID>)" ./build.sh`,
-  then grant access once. Otherwise leave the toggle off — the prompt only fires while the
-  toggle is on and an AI surface (popover/Details) is open.
-
-The time estimator, battery-pressure grouping, process-stat grouping, and log parsing
-are pure functions with unit tests (`./tests.sh`); the IORegistry, disk, `top`, `ps`,
-and local AI state plumbing live in the app shell.
+The time estimator, sampled-energy-impact grouping, process-stat grouping, rate-limit
+selection, and log parsing have unit/regression tests. `./tests.sh` also runs an isolated
+AIReader integration suite covering persistence, catch-up, append, replacement,
+truncate/regrow, and privacy-safe deduplication. The IORegistry,
+disk, `top`, `ps`, and AppKit plumbing live in the app shell. CI repeats the sanitizer,
+static-analysis, Universal 2 build, bundle-version, architecture, and signing checks.
 
 ## Repository
 
 ```
 glancebar/
-├── Sources/pure.{h,m}   # pure, testable logic: estimators, grouping, log parsing
-├── Sources/main.m       # app shell: readers, sampling, popover + details UI
-├── Tests/test_pure.m    # unit tests for the pure functions
-├── tools/mockup.m       # renders docs/screenshot.png
-├── build.sh  ·  tests.sh  ·  Info.plist
-└── docs/screenshot.png
+├── Sources/pure.{h,m}    # pure logic: estimators, grouping, rate limits, parsing
+├── Sources/main.m        # readers, sampling, CLI, popover + details UI
+├── Tests/                # unit/regression and incremental-reader integration tests
+├── Resources/            # source PNG and packaged macOS app icon
+├── tools/mockup.m        # renders the example-data docs screenshot
+├── .github/workflows/    # macOS sanitizer, analyzer, build, and bundle gate
+├── build.sh · tests.sh · Info.plist
+└── docs/                 # screenshot and maintainer release checklist
 ```
 
 ### A note on notched Macs

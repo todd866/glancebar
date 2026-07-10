@@ -77,7 +77,7 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
 @interface App : NSObject <NSApplicationDelegate> @end
 @implementation App
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
-    Flip *card = [[Flip alloc] initWithFrame:NSMakeRect(0,0,kW,820)];
+    Flip *card = [[Flip alloc] initWithFrame:NSMakeRect(0,0,kW,900)];
     card.wantsLayer = YES;
     card.layer.backgroundColor = [NSColor colorWithWhite:0.98 alpha:1].CGColor;
     card.layer.cornerRadius = 12; card.layer.borderWidth = 0.5;
@@ -120,12 +120,12 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     Gauge *bg=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, y+38, inner, 5)];
     bg.fraction=0.76; bg.color=NSColor.systemGreenColor; [card addSubview:bg];
     y += 54;
-    [card addSubview:L(@"Battery pressure", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
+    [card addSubview:L(@"Sampled energy impact", [NSFont systemFontOfSize:11], NSColor.tertiaryLabelColor,
                        NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)]; y += 20;
     NSView *pressureRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
     [pressureRow addSubview:L(@"Google Chrome", [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
                               NSMakeRect(kPad, 11, inner-82, 15), NSTextAlignmentLeft)];
-    [pressureRow addSubview:L(@"48%", [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
+    [pressureRow addSubview:L(@"48% sample", [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
                               NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 11, 82, 15), NSTextAlignmentRight)];
     Gauge *pg=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 4)]; pg.fraction=0.48; pg.color=Pressure(0.48);
     [pressureRow addSubview:pg]; [card addSubview:pressureRow]; y += 32;
@@ -137,12 +137,13 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     hdr(@"System"); y += 22;
     [card addSubview:L(@"Medium system pressure", [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold], NSColor.systemOrangeColor,
                        NSMakeRect(kPad, y, inner, 18), NSTextAlignmentLeft)];
-    [card addSubview:L(@"CPU 38% · Memory Low · 10.7 GB available · Swap 0 B",
-                       [NSFont systemFontOfSize:11], NSColor.secondaryLabelColor,
-                       NSMakeRect(kPad, y+18, inner, 14), NSTextAlignmentLeft)];
-    Gauge *cpu=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, y+36, inner, 4)];
+    NSTextField *summary=L(@"CPU 38% · Memory pressure Low · 10.7 GB available\nSwap none",
+                            [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
+                            NSMakeRect(kPad, y+18, inner, 28), NSTextAlignmentLeft);
+    summary.lineBreakMode=NSLineBreakByWordWrapping; summary.maximumNumberOfLines=2; [card addSubview:summary];
+    Gauge *cpu=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, y+50, inner, 4)];
     cpu.fraction=0.38; cpu.color=[NSColor.systemYellowColor colorWithAlphaComponent:0.9]; [card addSubview:cpu];
-    y += 50;
+    y += 64;
 
     void (^proc)(NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, double frac, NSColor *color){
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
@@ -174,17 +175,38 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
                           NSMakeRect(kPad, 7, inner, 14), NSTextAlignmentLeft)];
         [card addSubview:row]; y += 44;
     };
-    // Codex's gauge is read from its own session logs; Claude has no local quota
-    // source, so its row carries no gauge unless ~/.glancebar/ai-status.json provides one.
-    ai(@"Claude", @"—", @"No limit status · Stats through Jun 9", -1, NSColor.tertiaryLabelColor);
-    ai(@"Codex", @"27% left", @"Reset: 10:08 PM", 0.27, NSColor.systemOrangeColor);
+    // Claude stays private/off by default. Codex exposes both current windows from
+    // its local session state, matching the production dual-meter presentation.
+    ai(@"Claude", @"—", @"Account access off · transcript totals off", -1, NSColor.tertiaryLabelColor);
+    [card addSubview:L(@"Codex", [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
+                       NSMakeRect(kPad, y, inner, 15), NSTextAlignmentLeft)];
+    y += 19;
+    void (^limit)(NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, double frac, NSColor *color){
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
+        [row addSubview:L(name, [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium], nil,
+                          NSMakeRect(kPad, 11, 72, 15), NSTextAlignmentLeft)];
+        [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold], color,
+                          NSMakeRect(kW-kPad-76, 11, 76, 15), NSTextAlignmentRight)];
+        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad+80, 15, inner-164, 6)];
+        g.fraction=frac; g.color=color; [row addSubview:g]; [card addSubview:row]; y += 28;
+    };
+    limit(@"5-hour", @"27% left", 0.27, NSColor.systemOrangeColor);
+    limit(@"weekly", @"72% left", 0.72, NSColor.systemGreenColor);
+    [card addSubview:L(@"Resets — 5-hour 10:08 PM · weekly Mon 9:00 AM",
+                       [NSFont systemFontOfSize:10.5], NSColor.secondaryLabelColor,
+                       NSMakeRect(kPad, y, inner, 14), NSTextAlignmentLeft)];
+    y += 22;
 
     y += 4;
     NSBox *d4=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d4.boxType=NSBoxSeparator; [card addSubview:d4]; y+=9;
-    NSImageView *opts=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"slider.horizontal.3" accessibilityDescription:nil]];
-    opts.contentTintColor=NSColor.secondaryLabelColor; opts.frame=NSMakeRect(kPad-1, y+3, 17, 15); [card addSubview:opts];
+    [card addSubview:L(@"Checked: machine now · AI now", [NSFont systemFontOfSize:9.5], NSColor.tertiaryLabelColor,
+                       NSMakeRect(kPad, y, inner, 13), NSTextAlignmentLeft)];
+    y += 17;
+    NSBox *d5=[[NSBox alloc] initWithFrame:NSMakeRect(kPad,y,inner,1)]; d5.boxType=NSBoxSeparator; [card addSubview:d5]; y+=9;
+    [card addSubview:L(@"Options", [NSFont systemFontOfSize:12], NSColor.secondaryLabelColor,
+                       NSMakeRect(kPad, y+3, 66, 16), NSTextAlignmentLeft)];
     [card addSubview:L(@"Details…", [NSFont systemFontOfSize:12], NSColor.secondaryLabelColor,
-                       NSMakeRect(kPad+28, y+3, 76, 16), NSTextAlignmentLeft)];
+                       NSMakeRect(kPad+70, y+3, 76, 16), NSTextAlignmentLeft)];
     [card addSubview:L(@"Quit", [NSFont systemFontOfSize:12], NSColor.secondaryLabelColor,
                        NSMakeRect(kW-kPad-50, y+3, 50, 16), NSTextAlignmentRight)];
     y += 26;
@@ -228,4 +250,11 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     exit(0);
 }
 @end
-int main(void){ @autoreleasepool { NSApplication *a=NSApplication.sharedApplication; App *d=[App new]; a.delegate=d; [a run]; } return 0; }
+// Rendering does not require an application event loop or WindowServer connection.
+// Calling the delegate entry point directly keeps docs generation deterministic and
+// usable in CI/headless shells.
+int main(void){ @autoreleasepool {
+    App *d=[App new];
+    NSNotification *note=[NSNotification notificationWithName:NSApplicationDidFinishLaunchingNotification object:d];
+    [d applicationDidFinishLaunching:note];
+} return 0; }

@@ -207,33 +207,16 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
 }
 
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch) {
-    if (![usage isKindOfClass:NSDictionary.class]) return nil;
-    NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
-                             @"seven_day_opus": @"weekly Opus"};
+    // Use the exact same validation and provider semantics as the detailed meters so
+    // an unknown or reset-less placeholder cannot disagree with (or drive) the headline.
+    NSArray<NSDictionary *> *windows = ClaudeLimitWindows(usage, nowEpoch);
     NSDictionary *best = nil;
     double bestRemaining = 2;
-    for (NSString *key in usage) {
-        if ([key isEqualToString:@"extra_usage"]) continue;       // a credit budget, not a rate window
-        if ([key isEqualToString:@"seven_day_sonnet"]) continue;  // weekly Sonnet intentionally not surfaced
-        NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
-        id util = w[@"utilization"];
-        if (![util isKindOfClass:NSNumber.class]) continue;
-        double used = [util doubleValue];
-        if (used > 1.0) used /= 100.0;          // tolerate percent or fraction
-        double resets = 0;
-        id resetsAt = w[@"resets_at"];
-        if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
-        else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
-        if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
-        double remaining = 1.0 - used;
-        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+    for (NSDictionary *window in windows) {
+        double remaining = [window[@"remainingFraction"] doubleValue];
         if (remaining >= bestRemaining) continue;
         bestRemaining = remaining;
-        NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        d[@"remainingFraction"] = @(remaining);
-        d[@"window"] = labels[key] ?: key;
-        if (resets > 0) d[@"resetsAt"] = @(resets);
-        best = d;
+        best = window;
     }
     return best;
 }
@@ -275,8 +258,9 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
     for (NSString *key in order) {
         NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
         if (![w[@"utilization"] isKindOfClass:NSNumber.class]) continue;
-        double used = [w[@"utilization"] doubleValue];
-        if (used > 1.0) used /= 100.0;          // tolerate percent or fraction
+        // Anthropic's OAuth usage contract reports percentage utilization, including
+        // values below 1.0. Never infer a fraction from the value's magnitude.
+        double used = [w[@"utilization"] doubleValue] / 100.0;
         double resets = 0;
         id resetsAt = w[@"resets_at"];
         if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
