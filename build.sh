@@ -63,16 +63,42 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 
-# Signing is intentionally deterministic: use the exact identity supplied by the
-# builder, or ad-hoc signing for a local build. Never borrow an unrelated identity.
-IDENTITY="${GLANCEBAR_CODESIGN_IDENTITY:--}"
-if [[ "$IDENTITY" != "-" ]]; then
+# Sign with a stable identity. Ad-hoc signing changes the code hash on every build, which
+# invalidates the Keychain grant for the Claude Code credential and leaves SMAppService
+# without the durable code identity Launch at Login registers against.
+#
+# Resolution order:
+#   1. $GLANCEBAR_CODESIGN_IDENTITY — explicit override; fails loudly if not installed.
+#   2. GLANCEBAR_ADHOC=1 — deliberate ad-hoc, for CI and reproducible builds.
+#   3. An installed "Developer ID Application" identity. It carries a Team ID, which lets the
+#      Keychain grant occupy a durable "teamid:" partition — the only thing that makes the
+#      Claude account read prompt-free. Preferred automatically so a plain ./build.sh stays
+#      prompt-free once you have one. Set GLANCEBAR_ADHOC=1 on a shared machine.
+#   4. The "Glancebar Self-Signed" cert, matched by SHA-1 rather than display name so a
+#      regenerated same-named cert cannot silently change the signature.
+#   5. Ad-hoc "-", with a loud warning.
+SELF_SIGNED_SHA1="${GLANCEBAR_CODESIGN_SHA1:-A14E62A164EEEC5A633BFF74C2CA5409A1C4F9E7}"
+DEVELOPER_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -m1 "Developer ID Application" | sed -E 's/^[^"]*"([^"]+)".*/\1/')
+if [[ -n "${GLANCEBAR_CODESIGN_IDENTITY:-}" ]]; then
+    IDENTITY="$GLANCEBAR_CODESIGN_IDENTITY"
     if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
         echo "build.sh: ERROR — GLANCEBAR_CODESIGN_IDENTITY '$IDENTITY' is not available." >&2
         exit 1
     fi
+elif [[ "${GLANCEBAR_ADHOC:-0}" == "1" ]]; then
+    IDENTITY="-"
+    echo "Signing: ad-hoc (GLANCEBAR_ADHOC=1)"
+elif [[ -n "$DEVELOPER_ID" ]]; then
+    IDENTITY="$DEVELOPER_ID"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -qi "$SELF_SIGNED_SHA1"; then
+    IDENTITY="$SELF_SIGNED_SHA1"   # codesign accepts the cert SHA-1 as the identity selector
 else
-    echo "Signing: ad-hoc (set GLANCEBAR_CODESIGN_IDENTITY for a distributable build)"
+    IDENTITY="-"
+    echo "build.sh: WARNING — no stable signing identity found (no Developer ID, no cert" >&2
+    echo "  SHA-1 $SELF_SIGNED_SHA1, no \$GLANCEBAR_CODESIGN_IDENTITY). Falling back to AD-HOC" >&2
+    echo "  signing: the Keychain grant for the Claude Code credential re-prompts on every" >&2
+    echo "  rebuild, and Launch at Login may need re-approval. See docs/RELEASING.md." >&2
 fi
 
 CODESIGN_ARGS=(--force --sign "$IDENTITY")

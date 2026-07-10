@@ -41,6 +41,10 @@ jobs:
           done
 
       - name: Build Universal 2 app
+        env:
+          # Explicit, not incidental: a runner has no signing identity, but the build must
+          # not start picking one up if that ever changes.
+          GLANCEBAR_ADHOC: "1"
         run: ./build.sh
 
       - name: Verify CLI JSON contract

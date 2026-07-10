@@ -44,16 +44,21 @@ executables—and no admin rights**. Glancebar does invoke standard macOS tools 
 
 ```bash
 ./tests.sh                                  # run unit/regression + reader integration tests
-./build.sh                                  # test, build Universal 2, then ad-hoc sign
+./build.sh                                  # test, build Universal 2, then sign
 cp -R build/Glancebar.app /Applications/    # install
 open /Applications/Glancebar.app            # run
 ```
 
 The build uses `-Wall -Wextra -Werror`, the macOS hardened runtime, and both `arm64`
 and `x86_64` by default. Set `GLANCEBAR_ARCHS=native` if the local toolchain cannot
-cross-compile. It never chooses a certificate on your behalf: local builds are ad-hoc
-signed unless `GLANCEBAR_CODESIGN_IDENTITY` names an installed identity. Requires the
-Xcode Command Line Tools (`xcode-select --install`).
+cross-compile. Requires the Xcode Command Line Tools (`xcode-select --install`).
+
+Signing prefers, in order: `GLANCEBAR_CODESIGN_IDENTITY`, then an installed
+`Developer ID Application` identity, then the `Glancebar Self-Signed` cert, then ad-hoc.
+Prefer a stable identity: ad-hoc signing pins the designated requirement to the code
+hash, so every rebuild invalidates the Keychain grant for the Claude Code credential and
+the Launch at Login registration. Pass `GLANCEBAR_ADHOC=1` to force ad-hoc on a shared
+machine or in CI.
 
 This repository does not currently advertise a prebuilt or notarized download; build
 locally with `./build.sh`. Do not remove quarantine from an app obtained from someone
