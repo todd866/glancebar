@@ -19,8 +19,11 @@ the leading battery/system culprits in plain English, and Claude/Codex limit gau
 A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
 One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
-executables—and no admin rights**. Glancebar does invoke standard macOS tools such as
-`top`, `ps`, `sqlite3`, and (only after the Claude account opt-in) `/usr/bin/security`.
+executables**. Nothing it displays needs admin rights; the one privileged action is the
+optional *Stay awake with lid closed* toggle, which asks for your administrator password
+to set `pmset` (no helper is installed—see below). Glancebar invokes standard macOS tools
+such as `top`, `ps`, `sqlite3`, `pmset`, `osascript`, and (only after the Claude account
+opt-in) `/usr/bin/security`.
 
 ## Features
 
@@ -37,8 +40,14 @@ executables—and no admin rights**. Glancebar does invoke standard macOS tools 
   for both, counted the way a human would (cached context re-reads shown separately).
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
-- **Self-contained** — one binary, native AppKit, no runtime, no installer, no `sudo`,
-  no network requests unless you opt in.
+- **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
+  lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
+  admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
+  as an always-visible reminder, since the setting persists across restarts until you turn
+  it off.
+- **Self-contained** — one binary, native AppKit, no runtime, no installer, no bundled
+  helper, and no network requests unless you opt in. The only `sudo`-level action is the
+  opt-in *Stay awake with lid closed* toggle's standard admin prompt.
 
 ## Build & Install
 
@@ -106,6 +115,15 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   `vm.swapusage`. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
   and measured by physical footprint (what Activity Monitor shows), grouped under parent
   apps where possible.
+- **Stay awake with lid closed** — an opt-in Options toggle flips the system `SleepDisabled`
+  power setting by running `/usr/bin/pmset -a disablesleep 0|1` as root through Apple's
+  `osascript` administrator prompt. Nothing privileged is installed—no LaunchDaemon, no
+  bundled helper—`pmset` runs once, only when you flip the switch. This is the only reliable
+  way to defeat clamshell (lid-close) sleep; `caffeinate`/`IOPMAssertion` prevent idle sleep
+  only, never lid-close. `SleepDisabled` persists in the system power plist across restarts,
+  so the menu checkmark reflects the live setting (read via `pmset -g`) and, while it's on,
+  an orange `eye.fill` replaces the battery glyph in the menu bar as an always-visible
+  reminder to turn it back off (an awake Mac in a closed bag can overheat).
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
   turn in `~/.codex/sessions/**.jsonl` (and rotated
   `~/.codex/archived_sessions/**.jsonl`) records OpenAI's official rate-limit state
