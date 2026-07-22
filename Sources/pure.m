@@ -410,3 +410,14 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
     return @{@"cpu": RowsSortedBy(groups, @"cpu", topN),
              @"memory": RowsSortedBy(groups, @"bytes", topN)};
 }
+
+NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
+    for (NSString *line in [pmsetOutput componentsSeparatedByString:@"\n"]) {
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (NSString *s in [line componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet])
+            if (s.length) [parts addObject:s];
+        if (parts.count >= 2 && [parts[0] isEqualToString:@"SleepDisabled"])
+            return @(parts[1].integerValue != 0);
+    }
+    return nil;
+}

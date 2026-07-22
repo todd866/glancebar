@@ -316,6 +316,23 @@ int main(void) {
                   isEqual:@"Limit windows reset since last Codex session"],
               @"expired with no snapshot timestamp ⇒ undated stale message");
 
+        // --- ParseSleepDisabled (`pmset -g` → lid-closed-awake state) ---
+        check([ParseSleepDisabled(@" SleepDisabled\t\t0") isEqual:@NO], @"SleepDisabled 0 → NO");
+        check([ParseSleepDisabled(@" SleepDisabled 1") isEqual:@YES], @"SleepDisabled 1 → YES");
+        check(ParseSleepDisabled(@"") == nil, @"empty input → nil (unknown)");
+        check(ParseSleepDisabled(@"System-wide power settings:\n standby 1\n") == nil,
+              @"line absent → nil (unknown)");
+        NSString *pmsetOn =
+            @"System-wide power settings:\n SleepDisabled          1\n"
+             "Currently in use:\n standby              1\n hibernatemode        3\n";
+        check([ParseSleepDisabled(pmsetOn) isEqual:@YES], @"picks SleepDisabled=1 from a full pmset -g block");
+        NSString *pmsetOff =
+            @"System-wide power settings:\n SleepDisabled\t\t0\nCurrently in use:\n standby 1\n";
+        check([ParseSleepDisabled(pmsetOff) isEqual:@NO], @"picks SleepDisabled=0 from a full pmset -g block");
+        check(ParseSleepDisabled(@" SleepDisabledExtra 1") == nil,
+              @"does not match a longer token (SleepDisabledExtra)");
+        check([ParseSleepDisabled(@" SleepDisabled 2") isEqual:@YES], @"any nonzero value → YES");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

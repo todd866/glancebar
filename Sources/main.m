@@ -191,6 +191,34 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
+// Reads the live SleepDisabled system power setting (no admin needed — a plain IOKit read
+// surfaced by `pmset -g`). YES = the Mac is currently kept awake with the lid closed.
+static BOOL SleepDisabledNow(void) {
+    return ParseSleepDisabled(RunTaskOutput(@"/usr/bin/pmset", @[@"-g"]) ?: @"").boolValue;
+}
+
+// Applies `pmset -a disablesleep <0|1>` through an osascript administrator prompt: macOS
+// shows its own authentication dialog and runs pmset as root just this once — no background
+// helper or LaunchDaemon is installed. Returns YES only if the change was applied (NO when
+// the user cancels the prompt or authorization fails). The command and prompt are fixed
+// literals with no interpolated user input, so there is no shell/AppleScript injection path.
+static BOOL SetSleepDisabledViaAdmin(BOOL enable) {
+    NSString *prompt = enable
+        ? @"Glancebar needs administrator access to keep this Mac awake with the lid closed."
+        : @"Glancebar needs administrator access to restore normal lid-close sleep.";
+    NSString *script = [NSString stringWithFormat:
+        @"do shell script \"/usr/bin/pmset -a disablesleep %d\" with prompt \"%@\" with administrator privileges",
+        enable ? 1 : 0, prompt];
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+    t.arguments = @[@"-e", script];
+    t.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    t.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![t launchAndReturnError:NULL]) return NO;
+    [t waitUntilExit];
+    return t.terminationStatus == 0;
+}
+
 static NSArray<NSDictionary *> *SampleHogs(int topN) {
     NSString *out = RunTaskOutput(@"/usr/bin/top", @[@"-l", @"2", @"-s", @"1", @"-stats",
                                                      @"pid,command,power", @"-o", @"power", @"-n", @"40"]);
@@ -3529,6 +3557,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     h.enabled = _bat.valid;
     [m addItem:NSMenuItem.separatorItem];
 
+    // Reflects the live system setting, not a stored preference: it is global and other
+    // tools can change it, so the checkmark must read the real state.
+    NSMenuItem *lidAwake = [m addItemWithTitle:@"Stay awake with lid closed"
+                                        action:@selector(toggleStayAwake:) keyEquivalent:@""];
+    lidAwake.target = self;
+    lidAwake.state = SleepDisabledNow() ? NSControlStateValueOn : NSControlStateValueOff;
+    [m addItem:NSMenuItem.separatorItem];
+
     NSMenuItem *privacyTitle = [m addItemWithTitle:@"AI & privacy" action:nil keyEquivalent:@""];
     privacyTitle.enabled = NO;
     NSMenuItem *transcripts = [m addItemWithTitle:@"Claude transcript token totals"
@@ -3597,6 +3633,29 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     }
     [ud setBool:enabling forKey:@"useClaudeTranscripts"];
     [self refresh];
+}
+// Keeps the Mac running with the lid closed by flipping the SleepDisabled system power
+// setting via an admin prompt (chosen over caffeinate/IOPMAssertion, which only defeat
+// idle sleep — never clamshell/lid-close sleep). No preference is stored: the live setting
+// is the single source of truth — SleepDisabled persists in the system power plist across
+// reboots, and reading it live keeps the checkmark accurate however it was last changed.
+- (void)toggleStayAwake:(id)s {
+    BOOL enabling = !SleepDisabledNow();
+    if (enabling) {
+        NSAlert *alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleInformational;
+        alert.messageText = @"Stay awake with the lid closed?";
+        alert.informativeText = @"Glancebar will ask macOS for your administrator password to run pmset, which keeps this Mac running when the lid is closed (the display sleeps but the system stays awake). While it’s on, the Mac won’t sleep on its own at all. This setting persists across restarts until you turn it back off, so switch it off when you’re done—otherwise a closed Mac can keep running and overheat in a bag. No background helper is installed; Glancebar runs pmset only when you flip this switch.";
+        [alert addButtonWithTitle:@"Continue"];
+        [alert addButtonWithTitle:@"Cancel"];
+        [NSApp activateIgnoringOtherApps:YES];
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    }
+    // Run the (modal) admin prompt off the main thread so the app stays responsive; the
+    // menu re-reads the live state on next open, so a cancel or failure needs no rollback.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        SetSleepDisabledViaAdmin(enabling);
+    });
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }

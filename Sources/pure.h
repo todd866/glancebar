@@ -108,6 +108,12 @@ BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);
 NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
                                     double expiresAtEpoch, double nowEpoch);
 
+// Reads the SleepDisabled system power setting from `pmset -g` output: @YES when the Mac
+// is set to stay awake with the lid closed, @NO when normal, or nil when the line is
+// absent (state unknown). Parses text only — no I/O. Writing the setting needs root and
+// lives in the app shell; reading it does not.
+NSNumber *ParseSleepDisabled(NSString *pmsetOutput);
+
 // The user-facing reason when PickLimitWindow shows no Codex gauge: nil when a window
 // is current (caller shows the gauge), "do not carry" only when no usable rate_limits
 // were ever seen, and an explicit stale message when every usable window has already
