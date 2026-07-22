@@ -2533,6 +2533,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 - (void)showWelcomeIfNeeded;
 - (void)refreshVolumesAsync;
 - (void)refreshAIUsageAsync;
+- (void)refreshLidAwakeAsync;
 - (void)updateBar;
 - (void)refreshVisibleSurfaces;
 - (NSDictionary *)focusSnapshotForWindow:(NSWindow *)window rootView:(NSView *)root;
@@ -2567,6 +2568,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
+    BOOL _lidAwake, _lidAwakeReading;   // "stay awake with lid closed" state, read off-main
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
@@ -2697,6 +2699,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _sys = s;
     _lastMachineRefresh = NSDate.date;
     [self refreshAIUsageAsync];
+    [self refreshLidAwakeAsync];
     if (_bat.valid) {
         [_ampHistory addObject:@(_bat.amperage_mA)];
         while (_ampHistory.count > 6) [_ampHistory removeObjectAtIndex:0];
@@ -2821,13 +2824,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                               @"text": pct >= 0 ? [NSString stringWithFormat:@"%d%%", pct] : @"—",
                               @"color": driveTextColor}];
     }
+    BOOL lidAwakeShown = NO;
     if (_barShowBattery) {
         NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
         NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
         NSMutableDictionary *seg = [@{@"text": text, @"color": color} mutableCopy];
         if (_bat.valid) {   // no battery (desktop Mac): text-only, no misleading empty glyph
-            NSColor *fill = (_bat.percent <= 20 && !_bat.acConnected) ? BattBarColor(_bat.percent) : fg;
-            seg[@"image"] = BatteryMeterIcon(_bat, fg, fill);
+            if (_lidAwake) {
+                // "Stay awake with lid closed" is on: swap the battery glyph for an orange open
+                // eye — an always-visible reminder of a setting that persists across reboots.
+                // The % stays: battery drain is exactly what you watch while it's forced awake.
+                seg[@"image"] = TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor);
+                lidAwakeShown = YES;
+            } else {
+                NSColor *fill = (_bat.percent <= 20 && !_bat.acConnected) ? BattBarColor(_bat.percent) : fg;
+                seg[@"image"] = BatteryMeterIcon(_bat, fg, fill);
+            }
         }
         [segments addObject:seg];
     }
@@ -2842,6 +2854,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [segments addObject:@{@"symbol": @"sparkles", @"text": text,
                               @"color": lowest ? [self aiStatusColor:lowest] : NSColor.secondaryLabelColor}];
     }
+    // The eye normally rides in the battery segment; if that segment is hidden or there's no
+    // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
+    if (_lidAwake && !lidAwakeShown)
+        [segments insertObject:@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)} atIndex:0];
     return segments;
 }
 
@@ -2868,6 +2884,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                     lowest.limitStale ? @", cached; refresh failed" : @""]
                                 : @"AI limit status unavailable"];
     }
+    if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
 }
 
@@ -2887,6 +2904,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [_item.button setAccessibilityLabel:@"Glancebar"];
     [_item.button setAccessibilityValue:summary];
     [_item.button setAccessibilityHelp:@"Open Glancebar status and details"];
+}
+
+// SleepDisabled is read through a `pmset -g` subprocess, so — like the AI usage read — it
+// must stay off the main thread (refresh fires every 15s and on IOPS bursts). Single-flight:
+// a tick arriving mid-read is skipped. Only redraws the bar when the cached value changes.
+- (void)refreshLidAwakeAsync {
+    if (_lidAwakeReading) return;
+    _lidAwakeReading = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL awake = SleepDisabledNow();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_lidAwakeReading = NO;
+            if (awake != self->_lidAwake) { self->_lidAwake = awake; [self updateBar]; }
+        });
+    });
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
@@ -3655,6 +3687,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     // menu re-reads the live state on next open, so a cancel or failure needs no rollback.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         SetSleepDisabledViaAdmin(enabling);
+        // Re-read the true state (whether it applied or the user cancelled) and update the
+        // bar eye promptly, rather than waiting up to 15s for the next refresh tick.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshLidAwakeAsync]; });
     });
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
