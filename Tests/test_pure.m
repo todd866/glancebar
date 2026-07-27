@@ -316,6 +316,66 @@ int main(void) {
                   isEqual:@"Limit windows reset since last Codex session"],
               @"expired with no snapshot timestamp ⇒ undated stale message");
 
+        // --- PickCursorLimitWindow / CursorLimitWindows ---
+        // Pro/Team shape from GetCurrentPeriodUsage: included spend in cents.
+        NSDictionary *cursorPlan = @{
+            @"billingCycleStart": @"1768399334000",
+            @"billingCycleEnd": @"1771077734000",
+            @"planUsage": @{
+                @"totalSpend": @23222,
+                @"includedSpend": @23222,
+                @"remaining": @16778,
+                @"limit": @40000,
+                @"totalPercentUsed": @58.055,
+                @"apiPercentUsed": @46.444,
+                @"autoPercentUsed": @0
+            }
+        };
+        NSDictionary *cursorPick = PickCursorLimitWindow(cursorPlan, 1770000000.0);
+        check(fabs([cursorPick[@"remainingFraction"] doubleValue] - (16778.0 / 40000.0)) < 0.001,
+              @"cursor remaining/limit drives the gauge");
+        check([cursorPick[@"window"] isEqual:@"billing period"], @"cursor billing window labeled");
+        check(fabs([cursorPick[@"resetsAt"] doubleValue] - 1771077734.0) < 0.001,
+              @"cursor billingCycleEnd ms → epoch seconds");
+        check(PickCursorLimitWindow(cursorPlan, 1771077734.0) == nil,
+              @"cursor cycle that has already ended yields nil");
+        // Prefer remaining/limit over totalPercentUsed when both are present.
+        NSDictionary *cursorPctOnly = PickCursorLimitWindow(
+            @{@"billingCycleEnd": @1771077734000,
+              @"planUsage": @{@"totalPercentUsed": @25.0, @"limit": @10000}}, 1770000000.0);
+        check(fabs([cursorPctOnly[@"remainingFraction"] doubleValue] - 0.75) < 0.001,
+              @"cursor falls back to 1 - totalPercentUsed/100 when remaining absent");
+        NSDictionary *cursorSpendOnly = PickCursorLimitWindow(
+            @{@"billingCycleEnd": @"1771077734000",
+              @"planUsage": @{@"includedSpend": @2500, @"limit": @10000}}, 1770000000.0);
+        check(fabs([cursorSpendOnly[@"remainingFraction"] doubleValue] - 0.75) < 0.001,
+              @"cursor falls back to 1 - includedSpend/limit");
+        check(PickCursorLimitWindow(@{@"planUsage": @{@"limit": @0, @"remaining": @0}}, 1000) == nil,
+              @"cursor zero limit is not a usable gauge");
+        check(PickCursorLimitWindow(nil, 1000) == nil, @"cursor nil usage yields nil");
+        // Enterprise/legacy /auth/usage: request buckets.
+        NSDictionary *cursorAuth = @{
+            @"gpt-4": @{@"numRequests": @150, @"maxRequestUsage": @500},
+            @"gpt-3.5-turbo": @{@"numRequests": @10, @"maxRequestUsage": @0},
+            @"startOfMonth": @"2026-03-01T00:00:00.000Z"
+        };
+        NSDictionary *authPick = PickCursorLimitWindow(cursorAuth, 1770000000.0);
+        check(fabs([authPick[@"remainingFraction"] doubleValue] - 0.70) < 0.001,
+              @"cursor auth/usage remaining = 1 - num/max");
+        check([authPick[@"window"] isEqual:@"gpt-4"], @"cursor auth bucket labeled by model key");
+        NSArray *cursorWins = CursorLimitWindows(cursorPlan, 1770000000.0);
+        check(cursorWins.count == 1 && [cursorWins[0][@"window"] isEqual:@"billing period"],
+              @"cursor planUsage surfaces one billing window");
+        NSArray *authWins = CursorLimitWindows(cursorAuth, 1770000000.0);
+        check(authWins.count == 1 && [authWins[0][@"window"] isEqual:@"gpt-4"],
+              @"cursor auth/usage skips buckets with maxRequestUsage 0");
+        // planUsage wins when both shapes are somehow present.
+        NSMutableDictionary *mixed = [cursorPlan mutableCopy];
+        mixed[@"gpt-4"] = @{@"numRequests": @499, @"maxRequestUsage": @500};
+        NSDictionary *mixedPick = PickCursorLimitWindow(mixed, 1770000000.0);
+        check([mixedPick[@"window"] isEqual:@"billing period"],
+              @"cursor planUsage overrides legacy auth buckets");
+
         // --- ParseSleepDisabled (`pmset -g` → lid-closed-awake state) ---
         check([ParseSleepDisabled(@" SleepDisabled\t\t0") isEqual:@NO], @"SleepDisabled 0 → NO");
         check([ParseSleepDisabled(@" SleepDisabled 1") isEqual:@YES], @"SleepDisabled 1 → YES");

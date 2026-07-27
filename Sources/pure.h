@@ -82,6 +82,14 @@ NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
 NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch);
 
+// Picks the current Cursor included-quota window from either GetCurrentPeriodUsage
+// (planUsage spend in cents + billingCycleEnd) or legacy GET /auth/usage (per-model
+// request buckets). Same output shape as PickLimitWindow. planUsage wins when both
+// shapes are present. Returns nil when nothing usable/current remains.
+NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
+// All current Cursor windows for the dual meter (usually one). Empty when none apply.
+NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
+
 // Reads Anthropic's extra_usage credit budget. Returns nil when absent/disabled, else
 // @{@"description": display string, @"statusReason": short status,
 //   @"overageActive": @(YES when usage is at/over the paid limit)}.

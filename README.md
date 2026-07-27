@@ -36,8 +36,10 @@ opt-in) `/usr/bin/security`.
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
   popover shows the lead signals, Details keeps the longer lists.
 - **AI status** — Codex's official remaining-quota percentage and reset time from its
-  own session logs; an opt-in gauge for your Claude account; live per-day token totals
-  for both, counted the way a human would (cached context re-reads shown separately).
+  own session logs; an opt-in gauge for your Claude account; an opt-in gauge for your
+  Cursor account (included plan spend / request quota via Cursor's local session); live
+  per-day token totals for Claude and Codex, counted the way a human would (cached
+  context re-reads shown separately).
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
 - **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
@@ -173,6 +175,15 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   opaque message hashes in its protected local index—not prompts or responses. With
   both Claude toggles off, Glancebar reads local Codex state only—never Claude auth
   files or transcripts—and sends no network requests.
+
+  Cursor's quota gauge is a third **opt-in** (off by default), and only appears when
+  Cursor's local app data is present on the Mac. Enabling it reads the signed-in JWT
+  from Cursor's local `state.vscdb` (`cursorAuth/accessToken`) and polls
+  `api2.cursor.sh` at most every 15 minutes for included plan usage. The token stays
+  in process memory only and is never written by Glancebar. Like Claude's account
+  integration, this depends on undocumented endpoints and may break when Cursor
+  changes. Token totals for Cursor are not derived locally (Cursor does not expose
+  per-turn usage logs the way Codex/Claude do).
 
   `--dump` is local-only by default. Passing `--online` or setting
   `GLANCEBAR_ALLOW_ACCOUNT=1` permits the account request only after the integration

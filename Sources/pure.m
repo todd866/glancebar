@@ -280,6 +280,105 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
     return out;
 }
 
+static double CursorEpochSeconds(id value) {
+    if ([value isKindOfClass:NSNumber.class]) {
+        double n = [value doubleValue];
+        // Dashboard timestamps are unix ms; treat large values as ms.
+        return n > 1e12 ? n / 1000.0 : n;
+    }
+    if ([value isKindOfClass:NSString.class]) {
+        NSString *s = (NSString *)value;
+        if (!s.length) return 0;
+        NSScanner *scanner = [NSScanner scannerWithString:s];
+        double n = 0;
+        if ([scanner scanDouble:&n] && scanner.isAtEnd) return n > 1e12 ? n / 1000.0 : n;
+        NSDate *date = DateFromISO8601(s);
+        return date ? date.timeIntervalSince1970 : 0;
+    }
+    return 0;
+}
+
+static NSDictionary *CursorPlanWindow(NSDictionary *usage, double nowEpoch) {
+    NSDictionary *plan = [usage[@"planUsage"] isKindOfClass:NSDictionary.class] ? usage[@"planUsage"] : nil;
+    if (!plan) return nil;
+    double resets = CursorEpochSeconds(usage[@"billingCycleEnd"]);
+    if (resets > 0 && resets <= nowEpoch) return nil;
+
+    double remainingFrac = -1;
+    NSNumber *remaining = [plan[@"remaining"] isKindOfClass:NSNumber.class] ? plan[@"remaining"] : nil;
+    NSNumber *limit = [plan[@"limit"] isKindOfClass:NSNumber.class] ? plan[@"limit"] : nil;
+    if (remaining && limit && limit.doubleValue > 0)
+        remainingFrac = remaining.doubleValue / limit.doubleValue;
+    else if ([plan[@"totalPercentUsed"] isKindOfClass:NSNumber.class])
+        remainingFrac = 1.0 - [plan[@"totalPercentUsed"] doubleValue] / 100.0;
+    else if ([plan[@"includedSpend"] isKindOfClass:NSNumber.class] && limit && limit.doubleValue > 0)
+        remainingFrac = 1.0 - [plan[@"includedSpend"] doubleValue] / limit.doubleValue;
+    if (remainingFrac < 0) return nil;
+    remainingFrac = remainingFrac < 0 ? 0 : remainingFrac > 1 ? 1 : remainingFrac;
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"window"] = @"billing period";
+    d[@"remainingFraction"] = @(remainingFrac);
+    if (resets > 0) d[@"resetsAt"] = @(resets);
+    return d;
+}
+
+static NSArray<NSDictionary *> *CursorAuthWindows(NSDictionary *usage, double nowEpoch) {
+    // Prefer the gpt-4 included bucket (what community status bars surface); otherwise
+    // take every model with a positive maxRequestUsage, most-constrained first for Pick*.
+    NSMutableArray *out = [NSMutableArray array];
+    NSArray *preferred = @[@"gpt-4", @"gpt-4o", @"claude-4-opus", @"claude-4-sonnet"];
+    NSMutableSet *seen = [NSMutableSet set];
+    void (^addBucket)(NSString *) = ^(NSString *key) {
+        if (!key.length || [seen containsObject:key]) return;
+        NSDictionary *bucket = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
+        if (![bucket[@"numRequests"] isKindOfClass:NSNumber.class] ||
+            ![bucket[@"maxRequestUsage"] isKindOfClass:NSNumber.class]) return;
+        double max = [bucket[@"maxRequestUsage"] doubleValue];
+        if (max <= 0) return;
+        double used = [bucket[@"numRequests"] doubleValue];
+        double remaining = 1.0 - used / max;
+        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        d[@"window"] = key;
+        d[@"remainingFraction"] = @(remaining);
+        double resets = CursorEpochSeconds(usage[@"startOfMonth"]);
+        // startOfMonth is the cycle start, not the reset; only surface it when it is still
+        // in the future (unusual) — otherwise leave reset blank rather than lying.
+        if (resets > nowEpoch) d[@"resetsAt"] = @(resets);
+        [seen addObject:key];
+        [out addObject:d];
+    };
+    for (NSString *key in preferred) addBucket(key);
+    if (!out.count) {
+        for (NSString *key in usage) {
+            if (![usage[key] isKindOfClass:NSDictionary.class]) continue;
+            addBucket(key);
+        }
+    }
+    return out;
+}
+
+NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch) {
+    if (![usage isKindOfClass:NSDictionary.class]) return @[];
+    NSDictionary *plan = CursorPlanWindow(usage, nowEpoch);
+    if (plan) return @[plan];
+    return CursorAuthWindows(usage, nowEpoch);
+}
+
+NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch) {
+    NSArray<NSDictionary *> *windows = CursorLimitWindows(usage, nowEpoch);
+    NSDictionary *best = nil;
+    double bestRemaining = 2;
+    for (NSDictionary *window in windows) {
+        double remaining = [window[@"remainingFraction"] doubleValue];
+        if (remaining >= bestRemaining) continue;
+        bestRemaining = remaining;
+        best = window;
+    }
+    return best;
+}
+
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
     if (![usage isKindOfClass:NSDictionary.class]) return nil;
     NSDictionary *extra = [usage[@"extra_usage"] isKindOfClass:NSDictionary.class] ? usage[@"extra_usage"] : nil;

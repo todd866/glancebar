@@ -930,6 +930,138 @@ static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
     return json;
 }
 
+@interface GBCursorSessionDelegate : NSObject <NSURLSessionTaskDelegate>
+@end
+@implementation GBCursorSessionDelegate
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+                         newRequest:(NSURLRequest *)request
+                  completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
+    NSURL *url = request.URL;
+    BOOL sameTrustedHost = [url.scheme.lowercaseString isEqualToString:@"https"] &&
+                           [url.host.lowercaseString isEqualToString:@"api2.cursor.sh"];
+    completionHandler(sameTrustedHost ? request : nil);
+}
+@end
+
+// Opt-in only: Cursor stores the signed-in session JWT in its VS Code state DB (not the
+// Keychain). Returns the access token string, or nil when the DB/item is missing.
+static NSString *CursorStateDBPath(NSString *homeDirectory) {
+    NSString *home = homeDirectory.length ? homeDirectory : GBHomeDirectory();
+    return [home stringByAppendingPathComponent:
+        @"Library/Application Support/Cursor/User/globalStorage/state.vscdb"];
+}
+
+// Cursor only surfaces when its local app data is present — no empty "Cursor" card for
+// machines that never installed it.
+static BOOL CursorServicePresent(NSString *homeDirectory) {
+    return [NSFileManager.defaultManager fileExistsAtPath:CursorStateDBPath(homeDirectory)];
+}
+
+static NSString *CursorAccessTokenFromStateDB(NSString *homeDirectory) {
+    NSString *path = CursorStateDBPath(homeDirectory);
+    NSString *sql = @"SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1;";
+    NSString *raw = RunSQLite(path, sql);
+    if (!raw.length) return nil;
+    NSString *token = [[raw componentsSeparatedByString:@"\n"].firstObject
+                       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return token.length ? token : nil;
+}
+
+static NSDictionary *CursorFetchResult(NSData *data, NSHTTPURLResponse *http, NSError *err,
+                                       NSString *fallbackMessage) {
+    NSInteger statusCode = http.statusCode;
+    NSTimeInterval retryAfter = [http.allHeaderFields[@"Retry-After"] doubleValue];
+    if (!err && statusCode == 200 && data.length) {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([obj isKindOfClass:NSDictionary.class]) return obj;
+    }
+    NSString *errorMessage = nil;
+    if (data.length) {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSDictionary *dict = [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+        NSDictionary *error = [dict[@"error"] isKindOfClass:NSDictionary.class] ? dict[@"error"] : nil;
+        NSString *message = [error[@"message"] isKindOfClass:NSString.class] ? error[@"message"] : nil;
+        if (message.length) errorMessage = message;
+        else if ([dict[@"message"] isKindOfClass:NSString.class]) errorMessage = dict[@"message"];
+    }
+    if (!errorMessage.length && err.localizedDescription.length) errorMessage = err.localizedDescription;
+    if (!errorMessage.length) {
+        errorMessage = statusCode > 0 ? [NSHTTPURLResponse localizedStringForStatusCode:statusCode]
+                                      : fallbackMessage;
+    }
+    return @{@"_glancebarFetchError": @YES,
+             @"statusCode": @(statusCode),
+             @"rateLimited": @(statusCode == 429),
+             @"retryAfter": @(retryAfter),
+             @"message": errorMessage};
+}
+
+static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString *urlString,
+                                    NSDictionary *headers, NSData *body) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    req.HTTPMethod = method;
+    req.timeoutInterval = 10;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    req.HTTPBody = body;
+    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    for (NSString *key in headers) [req setValue:headers[key] forHTTPHeaderField:key];
+
+    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    cfg.URLCache = nil;
+    cfg.HTTPCookieStorage = nil;
+    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    cfg.HTTPShouldSetCookies = NO;
+    GBCursorSessionDelegate *delegate = [GBCursorSessionDelegate new];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:delegate delegateQueue:nil];
+
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSDictionary *json = nil;
+    __block BOOL completed = NO;
+    [[session dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            NSHTTPURLResponse *http = [resp isKindOfClass:NSHTTPURLResponse.class]
+                ? (NSHTTPURLResponse *)resp : nil;
+            json = CursorFetchResult(data, http, err, @"Cursor usage API request timed out");
+            completed = YES;
+            [session finishTasksAndInvalidate];
+            dispatch_semaphore_signal(done);
+        }] resume];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    if (!completed) [session invalidateAndCancel];
+    if (!json) {
+        return @{@"_glancebarFetchError": @YES,
+                 @"statusCode": @0,
+                 @"rateLimited": @NO,
+                 @"retryAfter": @0,
+                 @"message": @"Cursor usage API request timed out"};
+    }
+    return json;
+}
+
+// Prefer GetCurrentPeriodUsage (Pro/Team included spend). Fall back to legacy /auth/usage
+// request buckets when the dashboard response has no usable planUsage window.
+static NSDictionary *FetchCursorUsageJSON(NSString *token) {
+    double now = NSDate.date.timeIntervalSince1970;
+    NSData *emptyBody = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *period = CursorHTTPJSON(
+        token, @"POST",
+        @"https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+        @{@"Content-Type": @"application/json", @"Connect-Protocol-Version": @"1"},
+        emptyBody);
+    if (![period[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(period, now))
+        return period;
+
+    NSDictionary *auth = CursorHTTPJSON(token, @"GET", @"https://api2.cursor.sh/auth/usage", nil, nil);
+    if (![auth[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(auth, now))
+        return auth;
+    // Keep a successful-but-empty period body over a transport error so diagnostics stay useful.
+    if (![period[@"_glancebarFetchError"] boolValue]) return period;
+    if (![auth[@"_glancebarFetchError"] boolValue]) return auth;
+    return period;
+}
+
 static NSDate *FileMTime(NSString *path) {
     return [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
 }
@@ -948,6 +1080,8 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 @property BOOL useClaudeAccount;
 @property BOOL allowClaudeAccountFetch;
 @property BOOL allowClaudeTranscripts;
+@property BOOL useCursorAccount;
+@property BOOL allowCursorAccountFetch;
 // A bounded pass intentionally leaves large histories unfinished. UI callers can
 // immediately schedule another pass while needsImmediateRescan is true; diagnostics
 // can drive catch-up without waiting for the normal 15-second refresh.
@@ -964,6 +1098,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 // account is off, but no read runs while every AI surface is hidden, so withdrawing
 // consent from the menu must not wait for one. Call on _aiQueue.
 - (void)forgetClaudeAccountCredentials;
+- (void)forgetCursorAccountCredentials;
 // Writes out any state a catch-up pass left coalesced. Call on _aiQueue before quitting.
 - (void)flushPersistentState;
 @end
@@ -995,6 +1130,12 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     double _claudeKeychainNextTry;
     NSString *_claudeAccountStatus;
     double _claudeLastSuccessAt;
+    NSDictionary *_cursorUsageJSON;             // last good Cursor usage response
+    double _cursorNextFetch;
+    NSString *_cursorAccessToken;               // memory-only; never persisted by Glancebar
+    double _cursorStateNextTry;
+    NSString *_cursorAccountStatus;
+    double _cursorLastSuccessAt;
     NSString *_lastFetchSkipReason;
     NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
     NSUInteger _scanBytesRemaining;
@@ -1903,6 +2044,138 @@ static NSString *HashedMessageID(NSString *messageID) {
     _claudeNextFetch = 0;
 }
 
+- (NSString *)cursorAccessTokenForNow:(double)now {
+    if (_cursorAccessToken.length) return _cursorAccessToken;
+    if (now < _cursorStateNextTry) {
+        if (!_cursorAccountStatus.length) _cursorAccountStatus = @"Cursor session unavailable; retrying later";
+        return nil;
+    }
+    double readStart = CFAbsoluteTimeGetCurrent();
+    NSString *token = CursorAccessTokenFromStateDB(_homeDirectory);
+    double readMs = (CFAbsoluteTimeGetCurrent() - readStart) * 1000.0;
+    if (!token.length) {
+        _cursorAccessToken = nil;
+        _cursorStateNextTry = now + 3600;   // missing session: don't hammer sqlite every tick
+        _cursorAccountStatus = @"Cursor session unavailable; retrying later";
+        GBLog("cursor state read: missing (%.0f ms)", readMs);
+        return nil;
+    }
+    _cursorAccessToken = token;
+    _cursorStateNextTry = 0;
+    GBLog("cursor state read: ok (%.0f ms)", readMs);
+    return _cursorAccessToken;
+}
+
+- (void)rememberCursorFetchError:(NSDictionary *)fetch now:(double)now {
+    BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
+    double retry = [fetch[@"retryAfter"] doubleValue];
+    NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
+    if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue])) {
+        _cursorAccessToken = nil;   // revoked/expired; re-read state.vscdb next attempt
+    }
+    if (rateLimited) {
+        _cursorNextFetch = now + RateLimitRetryDelay(retry);
+        _cursorAccountStatus = @"Usage API rate-limited; retrying later";
+    } else {
+        _cursorAccountStatus = message.length ? [@"Usage API: " stringByAppendingString:message]
+                                              : @"Usage API unavailable";
+    }
+}
+
+- (AIUsage *)cursorUsage {
+    AIUsage *u = [AIUsage new];
+    u.name = @"Cursor";
+    u.source = @"Cursor local session + api2.cursor.sh";
+    u.remainingFraction = -1;
+    u.resetText = @"Not exposed locally";
+    u.statusReason = @"Cursor account access is off";
+    u.models = @[];
+    u.available = NO;
+
+    if (self.useCursorAccount) {
+        double now = NSDate.date.timeIntervalSince1970;
+        // Same visibility/throttle gate as Claude: reuse the pure decision.
+        if (ShouldFetchClaudeAccount(self.useCursorAccount, self.allowCursorAccountFetch,
+                                     _cursorUsageJSON != nil, _cursorAccountStatus.length > 0,
+                                     now, _cursorNextFetch)) {
+            _cursorNextFetch = now + 900;
+            _lastFetchSkipReason = nil;
+            NSString *token = [self cursorAccessTokenForNow:now];
+            NSDictionary *fetch = token ? FetchCursorUsageJSON(token) : nil;
+            if ([fetch[@"_glancebarFetchError"] boolValue]) {
+                [self rememberCursorFetchError:fetch now:now];
+                GBLog("cursor fetch: failed http=%ld rateLimited=%d",
+                      (long)[fetch[@"statusCode"] integerValue], [fetch[@"rateLimited"] boolValue]);
+            } else if (fetch && !fetch[@"error"]) {
+                _cursorUsageJSON = fetch;
+                _cursorAccountStatus = nil;
+                _cursorLastSuccessAt = now;
+                GBLog("cursor fetch: ok");
+            } else if (token.length) {
+                _cursorAccountStatus = @"Usage API unavailable";
+                GBLog("cursor fetch: unusable response");
+            }
+        } else {
+            NSString *skip = !self.allowCursorAccountFetch ? @"cursor-hidden" : @"cursor-throttled";
+            if (![skip isEqualToString:_lastFetchSkipReason]) {
+                GBLog("cursor fetch: skipped (%{public}@)", skip);
+                _lastFetchSkipReason = skip;
+            }
+        }
+
+        u.limitWindows = CursorLimitWindows(_cursorUsageJSON, now);
+        NSDictionary *pick = PickCursorLimitWindow(_cursorUsageJSON, now);
+        if (pick) {
+            u.available = YES;
+            u.limitStatusAvailable = YES;
+            u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
+            u.limitUpdatedAt = _cursorLastSuccessAt > 0
+                ? [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt] : nil;
+            NSNumber *resets = pick[@"resetsAt"];
+            if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+            NSString *window = [NSString stringWithFormat:@"%@ · your Cursor account", pick[@"window"]];
+            if (_cursorAccountStatus.length) {
+                u.limitStale = YES;
+                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
+                                  _cursorAccountStatus, window];
+                u.statusSource = @"Cached Cursor usage API response (opt-in)";
+            } else {
+                u.statusReason = window;
+                u.statusSource = @"Cursor usage API (opt-in)";
+            }
+            u.statusText = @"Limit status from Cursor account";
+        } else {
+            NSString *fallback = _cursorUsageJSON ? @"Cursor account response did not include a current limit window"
+                : self.allowCursorAccountFetch ? @"Cursor account status unavailable"
+                : @"Cursor account refresh paused until visible";
+            u.statusReason = _cursorAccountStatus ?: fallback;
+            if (self.allowCursorAccountFetch) u.limitRefreshError = _cursorAccountStatus ?: fallback;
+        }
+        if (u.limitStatusAvailable && !u.limitUpdatedAt && _cursorLastSuccessAt > 0)
+            u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt];
+        if (_cursorAccountStatus.length) u.limitRefreshError = _cursorAccountStatus;
+        u.diagnostics = [NSString stringWithFormat:@"usage JSON %@ · next fetch %@ · session %@",
+            _cursorUsageJSON ? @"cached" : @"none",
+            FmtEpochClock(_cursorNextFetch),
+            _cursorStateNextTry > now
+                ? [@"backoff until " stringByAppendingString:FmtEpochClock(_cursorStateNextTry)]
+                : _cursorAccessToken.length ? @"token cached" : @"not read"];
+    } else {
+        [self forgetCursorAccountCredentials];
+        u.diagnostics = @"account status not requested";
+    }
+    return u;
+}
+
+- (void)forgetCursorAccountCredentials {
+    _cursorAccessToken = nil;
+    _cursorUsageJSON = nil;
+    _cursorAccountStatus = nil;
+    _cursorLastSuccessAt = 0;
+    _cursorNextFetch = 0;
+    _cursorStateNextTry = 0;
+}
+
 // Session counts, per-model split, and last activity still come from the sqlite thread
 // store (the rollouts don't carry the model); re-queried only when the db changes.
 - (NSString *)codexStatePath {
@@ -2039,7 +2312,12 @@ static NSString *HashedMessageID(NSString *messageID) {
     _needsImmediateRescan = NO;
     [self scanRollouts];
     if (self.allowClaudeTranscripts) [self scanClaudeTranscripts];
-    NSArray<AIUsage *> *usage = @[[self claudeUsage], [self codexUsage]];
+    NSMutableArray<AIUsage *> *usage = [NSMutableArray arrayWithObjects:
+                                        [self claudeUsage], [self codexUsage], nil];
+    // Cursor is a local product, not a universal CLI — only surface it when Cursor's
+    // state DB exists on this Mac (same path the opt-in session read uses).
+    if (CursorServicePresent(_homeDirectory)) [usage addObject:[self cursorUsage]];
+    else if (self.useCursorAccount) [self forgetCursorAccountCredentials];
     NSString *statusPath = [_homeDirectory stringByAppendingPathComponent:@".glancebar/ai-status.json"];
     NSDictionary *status = JSONDictionaryAtPath(statusPath);
     if (status) {
@@ -2569,7 +2847,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
     BOOL _lidAwake, _lidAwakeReading;   // "stay awake with lid closed" state, read off-main
-    BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastAllowTranscripts;
+    BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
@@ -2601,7 +2879,8 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"barShowAI": @NO,
-                           @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO}];
+                           @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
+                           @"useCursorAccount": @NO}];
     _bat = ReadBattery();
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
@@ -2725,18 +3004,23 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _aiLoading = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
+    BOOL useCursorAccount = [ud boolForKey:@"useCursorAccount"];
     BOOL allowAccountFetch = showAI && useAccount;
+    BOOL allowCursorAccountFetch = showAI && useCursorAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
-        allowTranscripts != _lastAllowTranscripts) {
-        GBLog("gates: showAI=%d useClaudeAccount=%d transcripts=%d",
-              showAI, useAccount, allowTranscripts);
+        useCursorAccount != _lastUseCursorAccount || allowTranscripts != _lastAllowTranscripts) {
+        GBLog("gates: showAI=%d useClaudeAccount=%d useCursorAccount=%d transcripts=%d",
+              showAI, useAccount, useCursorAccount, allowTranscripts);
         _aiGatesLogged = YES; _lastShowAI = showAI;
-        _lastUseAccount = useAccount; _lastAllowTranscripts = allowTranscripts;
+        _lastUseAccount = useAccount; _lastUseCursorAccount = useCursorAccount;
+        _lastAllowTranscripts = allowTranscripts;
     }
     dispatch_async(_aiQueue, ^{
         self->_aiReader.useClaudeAccount = useAccount;
         self->_aiReader.allowClaudeAccountFetch = allowAccountFetch;
+        self->_aiReader.useCursorAccount = useCursorAccount;
+        self->_aiReader.allowCursorAccountFetch = allowCursorAccountFetch;
         self->_aiReader.allowClaudeTranscripts = allowTranscripts;
         NSArray<AIUsage *> *usage = [self->_aiReader read];
         BOOL needsImmediateRescan = self->_aiReader.needsImmediateRescan;
@@ -3609,6 +3893,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     acct.target = self;
     acct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]
         ? NSControlStateValueOn : NSControlStateValueOff;
+    if (CursorServicePresent(GBHomeDirectory())) {
+        NSMenuItem *cursorAcct = [m addItemWithTitle:@"Cursor account status via local session/API"
+                                              action:@selector(toggleCursorAccount:) keyEquivalent:@""];
+        cursorAcct.target = self;
+        cursorAcct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useCursorAccount"]
+            ? NSControlStateValueOn : NSControlStateValueOff;
+    }
     [m addItem:NSMenuItem.separatorItem];
 
     SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
@@ -3649,6 +3940,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     }
     [ud setBool:enabling forKey:@"useClaudeAccount"];
     if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
+    [self refresh];
+}
+- (void)toggleCursorAccount:(id)s {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL enabling = ![ud boolForKey:@"useCursorAccount"];
+    if (enabling) {
+        NSAlert *alert = [NSAlert new];
+        alert.alertStyle = NSAlertStyleInformational;
+        alert.messageText = @"Enable Cursor account status?";
+        alert.informativeText = @"Glancebar will read the signed-in Cursor session token from Cursor’s local state database (state.vscdb). It keeps the token only in memory and sends it only to api2.cursor.sh to request your included usage limits, at most every 15 minutes. This relies on Cursor’s private local layout and undocumented account endpoints, so it may stop working after an update.";
+        [alert addButtonWithTitle:@"Enable"];
+        [alert addButtonWithTitle:@"Cancel"];
+        if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    }
+    [ud setBool:enabling forKey:@"useCursorAccount"];
+    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetCursorAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleClaudeTranscripts:(id)s {
@@ -4090,6 +4397,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self addDetailKey:@"Claude transcripts"
                  value:[ud boolForKey:@"useClaudeTranscripts"] ? @"On · local ~/.claude/projects JSONL" : @"Off · transcripts not read"
                     to:root y:&y width:kDetailW];
+    if (CursorServicePresent(GBHomeDirectory())) {
+        [self addDetailKey:@"Cursor account"
+                     value:[ud boolForKey:@"useCursorAccount"]
+                        ? @"On · local Cursor session + api2.cursor.sh" : @"Off · no Cursor session/API access"
+                        to:root y:&y width:kDetailW];
+    }
     [self addDetailKey:@"Codex logs" value:@"On · local ~/.codex session JSONL"
                     to:root y:&y width:kDetailW];
     NSString *statusPath = [GBHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
@@ -4341,6 +4654,14 @@ static NSString *RequestedAIAccountError(NSArray<AIUsage *> *usage, BOOL account
     return nil;
 }
 
+static NSString *RequestedCursorAccountError(NSArray<AIUsage *> *usage, BOOL accountRequested) {
+    if (!accountRequested) return nil;
+    for (AIUsage *item in usage)
+        if ([item.name isEqualToString:@"Cursor"] && item.limitRefreshError.length)
+            return item.limitRefreshError;
+    return nil;
+}
+
 static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
     snapshot[@"schemaVersion"] = @1;
@@ -4435,12 +4756,17 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     };
 
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults registerDefaults:@{@"barShowAI": @NO, @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO}];
+    [defaults registerDefaults:@{@"barShowAI": @NO, @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
+                                 @"useCursorAccount": @NO}];
     BOOL accountEnabled = [defaults boolForKey:@"useClaudeAccount"];
     BOOL accountRequested = allowOnline && accountEnabled;
+    BOOL cursorAccountEnabled = [defaults boolForKey:@"useCursorAccount"];
+    BOOL cursorAccountRequested = allowOnline && cursorAccountEnabled;
     AIReader *reader = [[AIReader alloc] initWithHomeDirectory:GBHomeDirectory()];
     reader.useClaudeAccount = accountRequested;
     reader.allowClaudeAccountFetch = reader.useClaudeAccount;
+    reader.useCursorAccount = cursorAccountRequested;
+    reader.allowCursorAccountFetch = reader.useCursorAccount;
     reader.allowClaudeTranscripts = [defaults boolForKey:@"useClaudeTranscripts"];
     NSArray<AIUsage *> *usage = [reader readUntilCaughtUpWithTimeLimit:30.0];
     NSMutableArray *providers = [NSMutableArray array];
@@ -4474,16 +4800,21 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
         }];
     }
     NSString *accountError = RequestedAIAccountError(usage, accountRequested);
+    NSString *cursorAccountError = RequestedCursorAccountError(usage, cursorAccountRequested);
     NSMutableArray<NSString *> *aiErrors = [NSMutableArray array];
     if (!anyAIAvailable) [aiErrors addObject:@"No local AI status available"];
     if (reader.totalsIncomplete) [aiErrors addObject:@"AI history indexing incomplete"];
     if (accountError.length) [aiErrors addObject:[@"Claude account: " stringByAppendingString:accountError]];
+    if (cursorAccountError.length)
+        [aiErrors addObject:[@"Cursor account: " stringByAppendingString:cursorAccountError]];
     snapshot[@"ai"] = @{
         @"available": JSONBool(anyAIAvailable),
         @"error": aiErrors.count ? [aiErrors componentsJoinedByString:@"; "] : NSNull.null,
         @"onlineAllowed": JSONBool(allowOnline),
         @"accountEnabled": JSONBool(accountEnabled),
         @"accountRequested": JSONBool(accountRequested),
+        @"cursorAccountEnabled": JSONBool(cursorAccountEnabled),
+        @"cursorAccountRequested": JSONBool(cursorAccountRequested),
         @"transcriptsEnabled": JSONBool([defaults boolForKey:@"useClaudeTranscripts"]),
         @"totalsIncomplete": JSONBool(reader.totalsIncomplete),
         @"catchUpProgress": @(reader.catchUpProgress),
@@ -4501,6 +4832,7 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     if (reader.totalsIncomplete) [partialSources addObject:@"ai.history"];
     if (!anyAIAvailable) [partialSources addObject:@"ai"];
     if (accountError.length) [partialSources addObject:@"ai.account"];
+    if (cursorAccountError.length) [partialSources addObject:@"ai.cursorAccount"];
     snapshot[@"partialSources"] = partialSources;
     snapshot[@"status"] = partialSources.count ? @"partial" : @"complete";
     return snapshot;
@@ -4520,6 +4852,7 @@ static NSString *DumpBooleanTypeError(NSDictionary *snapshot) {
            @"keys": @[@"available", @"processSampleAvailable"] },
         @{ @"name": @"ai", @"value": snapshot[@"ai"] ?: @{},
            @"keys": @[@"available", @"onlineAllowed", @"accountEnabled", @"accountRequested",
+                       @"cursorAccountEnabled", @"cursorAccountRequested",
                        @"transcriptsEnabled", @"totalsIncomplete"] }
     ];
     for (NSDictionary *group in groups) {
@@ -4595,11 +4928,13 @@ static void PrintHumanDump(NSDictionary *snapshot) {
     }
 
     NSDictionary *ai = snapshot[@"ai"];
-    printf("ai toggles: useClaudeAccount=%s · useClaudeTranscripts=%s · onlinePermission=%s · accountRequest=%s\n",
+    printf("ai toggles: useClaudeAccount=%s · useCursorAccount=%s · useClaudeTranscripts=%s · onlinePermission=%s · accountRequest=%s · cursorAccountRequest=%s\n",
            [ai[@"accountEnabled"] boolValue] ? "on" : "off",
+           [ai[@"cursorAccountEnabled"] boolValue] ? "on" : "off",
            [ai[@"transcriptsEnabled"] boolValue] ? "on" : "off",
            [ai[@"onlineAllowed"] boolValue] ? "allowed" : "off",
-           [ai[@"accountRequested"] boolValue] ? "enabled" : "off");
+           [ai[@"accountRequested"] boolValue] ? "enabled" : "off",
+           [ai[@"cursorAccountRequested"] boolValue] ? "enabled" : "off");
     printf("ai status: %s\n", UTF8(ai[@"catchUpStatus"]));
     for (NSDictionary *provider in ai[@"providers"]) {
         NSString *remaining = provider[@"remainingPercent"] == NSNull.null ? @"remaining unavailable"
