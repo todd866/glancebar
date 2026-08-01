@@ -76,6 +76,18 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
     return out;
 }
 
+// Every scalar below is read out of JSON we do not control (Codex session logs, Claude
+// transcripts, account APIs). An *absent* key is harmless — messaging nil returns 0 — but a
+// literal JSON null decodes to NSNull, which answers no scalar selector and aborts the
+// process. Read null the same way we read absent: as zero.
+static double JSONDouble(id value) {
+    return [value isKindOfClass:NSNumber.class] ? [value doubleValue] : 0;
+}
+
+static long long JSONInteger(id value) {
+    return [value isKindOfClass:NSNumber.class] ? [value longLongValue] : 0;
+}
+
 NSDictionary *ParseTokenCountLine(NSString *line) {
     if (![line containsString:@"\"token_count\""]) return nil;   // cheap pre-filter
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
@@ -98,9 +110,9 @@ NSDictionary *ParseTokenCountLine(NSString *line) {
     out[@"tokens"] = total ?: @0;
     // ~94% of total_tokens is cached context re-read every turn; fresh = what a human
     // would call "tokens used".
-    long long input = [last[@"input_tokens"] longLongValue];
-    long long cachedInput = [last[@"cached_input_tokens"] longLongValue];
-    long long output = [last[@"output_tokens"] longLongValue];
+    long long input = JSONInteger(last[@"input_tokens"]);
+    long long cachedInput = JSONInteger(last[@"cached_input_tokens"]);
+    long long output = JSONInteger(last[@"output_tokens"]);
     long long fresh = (input > cachedInput ? input - cachedInput : 0) + output;
     out[@"fresh"] = @(fresh);
     if (limits) out[@"limits"] = limits;
@@ -118,10 +130,10 @@ NSDictionary *ParseClaudeUsageLine(NSString *line) {
     NSString *ts = [obj[@"timestamp"] isKindOfClass:NSString.class] ? obj[@"timestamp"] : nil;
     if (!usage || !ts.length) return nil;
 
-    long long input = [usage[@"input_tokens"] longLongValue];
-    long long output = [usage[@"output_tokens"] longLongValue];
-    long long cacheCreate = [usage[@"cache_creation_input_tokens"] longLongValue];
-    long long cacheRead = [usage[@"cache_read_input_tokens"] longLongValue];
+    long long input = JSONInteger(usage[@"input_tokens"]);
+    long long output = JSONInteger(usage[@"output_tokens"]);
+    long long cacheCreate = JSONInteger(usage[@"cache_creation_input_tokens"]);
+    long long cacheRead = JSONInteger(usage[@"cache_read_input_tokens"]);
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     out[@"ts"] = ts;
     out[@"fresh"] = @(input + output);                            // input is already non-cached
@@ -163,8 +175,8 @@ NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *ex
         NSString *ts = [e[@"ts"] isKindOfClass:NSString.class] ? e[@"ts"] : nil;
         NSDate *date = ts ? DateFromISO8601(ts) : nil;
         if (!date) continue;
-        long long tokens = [e[@"tokens"] longLongValue];
-        long long fresh = [e[@"fresh"] longLongValue];
+        long long tokens = JSONInteger(e[@"tokens"]);
+        long long fresh = JSONInteger(e[@"fresh"]);
         if (tokens > 0 || fresh > 0) {
             NSString *day = [dayFmt stringFromDate:date];
             NSDictionary *cur = days[day];
@@ -188,13 +200,13 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
     for (NSString *key in @[@"primary", @"secondary"]) {
         NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
         if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
-        double resets = [w[@"resets_at"] doubleValue];
+        double resets = JSONDouble(w[@"resets_at"]);
         if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
         double remaining = 1.0 - [w[@"used_percent"] doubleValue] / 100.0;
         remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
         if (remaining >= bestRemaining) continue;
         bestRemaining = remaining;
-        long mins = [w[@"window_minutes"] longValue];
+        long mins = (long)JSONInteger(w[@"window_minutes"]);
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"remainingFraction"] = @(remaining);
         d[@"window"] = mins == 10080 ? @"weekly" : mins == 300 ? @"5-hour"
@@ -228,11 +240,11 @@ NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowE
     for (NSString *key in @[@"primary", @"secondary"]) {   // 5h then weekly, as the source presents them
         NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
         if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
-        double resets = [w[@"resets_at"] doubleValue];
+        double resets = JSONDouble(w[@"resets_at"]);
         if (resets > 0 && resets <= nowEpoch) continue;   // window already reset; gauge obsolete
         double remaining = 1.0 - [w[@"used_percent"] doubleValue] / 100.0;
         remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
-        long mins = [w[@"window_minutes"] longValue];
+        long mins = (long)JSONInteger(w[@"window_minutes"]);
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"window"] = mins == 10080 ? @"weekly" : mins == 300 ? @"5-hour"
                      : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
@@ -385,9 +397,10 @@ NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
     if (!extra || ![extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) return nil;
     id enabled = extra[@"is_enabled"];
     if ([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) return nil;
-    double utilization = [extra[@"utilization"] doubleValue];
-    double usedCredits = [extra[@"used_credits"] doubleValue];
-    double monthlyLimit = [extra[@"monthly_limit"] doubleValue];
+    // The API sends null for these counters until extra usage is consumed; read them as zero.
+    double utilization = JSONDouble(extra[@"utilization"]);
+    double usedCredits = JSONDouble(extra[@"used_credits"]);
+    double monthlyLimit = JSONDouble(extra[@"monthly_limit"]);
     NSString *currency = [extra[@"currency"] isKindOfClass:NSString.class] ? extra[@"currency"] : @"";
     BOOL overage = utilization >= 100.0 || (monthlyLimit > 0 && usedCredits >= monthlyLimit);
     NSString *description = [NSString stringWithFormat:@"%.0f of %@ %@ (%.0f%%)",
@@ -430,7 +443,7 @@ NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, d
         NSDictionary *w = [rateLimits[key] isKindOfClass:NSDictionary.class] ? rateLimits[key] : nil;
         if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
         sawUsable = YES;
-        double resets = [w[@"resets_at"] doubleValue];
+        double resets = JSONDouble(w[@"resets_at"]);
         if (!(resets > 0 && resets <= nowEpoch)) return nil;   // current window — gauge shows
     }
     if (!sawUsable) return @"Codex session logs do not carry limit status";

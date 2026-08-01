@@ -90,6 +90,10 @@ int main(void) {
         check(ParseClaudeUsageLine(@"{\"type\":\"user\",\"message\":{\"role\":\"user\"}}") == nil,
               @"non-usage line skipped");
         check(ParseClaudeUsageLine(@"junk with \"usage\" inside") == nil, @"malformed claude line skipped");
+        NSDictionary *nullUsage = ParseClaudeUsageLine(@"{\"timestamp\":\"2026-06-10T00:00:01Z\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":null,\"cache_read_input_tokens\":null}}}");
+        check(nullUsage && [nullUsage[@"tokens"] longLongValue] == 5, @"null token counters read as zero");
+        NSDictionary *nullTok = ParseTokenCountLine(@"{\"timestamp\":\"2026-06-10T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":9,\"input_tokens\":null,\"cached_input_tokens\":null,\"output_tokens\":null}}}}");
+        check(nullTok && [nullTok[@"fresh"] longLongValue] == 0, @"null codex token counters read as zero");
 
         // --- AccumulateTokenEvents ---
         NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:10 * 3600];
@@ -120,6 +124,16 @@ int main(void) {
         NSDictionary *pick3 = PickLimitWindow(limits, 3000);
         check([pick3[@"window"] isEqual:@"weekly"], @"reset window excluded, current one kept");
         check(PickLimitWindow(nil, 1000) == nil, @"nil limits yield nil");
+        // JSON null in any scalar must read as zero, never abort the process.
+        NSDictionary *nullLimits = @{@"primary": @{@"used_percent": @83.0,
+                                                   @"window_minutes": NSNull.null,
+                                                   @"resets_at": NSNull.null}};
+        NSDictionary *npick = PickLimitWindow(nullLimits, 1000);
+        check(npick != nil, @"null resets_at/window_minutes still yields a window");
+        check([npick[@"window"] isEqual:@"usage"], @"null window_minutes falls back to generic label");
+        check(npick[@"resetsAt"] == nil, @"null resets_at surfaces no reset time");
+        check(CodexLimitWindows(nullLimits, 1000).count == 1, @"codex tolerates null scalars");
+        check(CodexLimitStatusReason(nullLimits, @"", 1000) == nil, @"status reason tolerates null resets_at");
 
         // --- PickClaudeLimitWindow ---
         NSDictionary *cu = @{@"five_hour": @{@"utilization": @37, @"resets_at": @"1970-01-01T00:33:20Z"},
@@ -186,6 +200,19 @@ int main(void) {
                                                                            @"utilization": @105.0}});
         check([overage[@"overageActive"] boolValue], @"extra_usage over limit is overage");
         check([overage[@"statusReason"] isEqual:@"Overage billing active"], @"overage status is explicit");
+        // The live API sends JSON null for these before any extra usage is consumed;
+        // NSNull does not respond to doubleValue, so unguarded reads abort the app.
+        NSDictionary *nulls = ClaudeExtraUsageStatus(@{@"extra_usage": @{@"is_enabled": @YES,
+                                                                         @"used_credits": NSNull.null,
+                                                                         @"monthly_limit": @10000,
+                                                                         @"currency": @"USD",
+                                                                         @"utilization": NSNull.null}});
+        check(nulls != nil, @"null utilization/used_credits still yields a status");
+        check(![nulls[@"overageActive"] boolValue], @"null usage counters are not overage");
+        check([nulls[@"description"] isEqual:@"0 of 10000 USD (0%)"], @"null usage counters read as zero");
+        NSDictionary *missing = ClaudeExtraUsageStatus(@{@"extra_usage": @{@"is_enabled": @YES,
+                                                                           @"monthly_limit": @10000}});
+        check(missing && ![missing[@"overageActive"] boolValue], @"absent usage counters are not overage");
         check(!ShouldFetchClaudeAccount(YES, NO, NO, NO, 1000, 2000),
               @"hidden Claude account UI does not fetch");
         check(ShouldFetchClaudeAccount(YES, YES, NO, NO, 1000, 2000),
