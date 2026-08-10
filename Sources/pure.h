@@ -64,6 +64,8 @@ NSDictionary *ParseClaudeUsageLine(NSString *line);
 // @{@"remainingFraction": @(0..1), @"window": @"5-hour"/@"weekly"/…,
 //   @"resetsAt": @(epoch) (optional), @"plan": plan string (optional)}.
 NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
+// ALL still-current Codex limit windows for the dual meter (primary→secondary).
+NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
 
 // Picks the most constrained, still-current window from Anthropic's OAuth usage
 // response (window dicts like five_hour/seven_day carrying utilization + resets_at).
@@ -71,16 +73,20 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
 // may be ISO-8601 or epoch. Unknown and reset-less placeholder windows are excluded.
 // Returns nil when nothing is current, else the same shape as PickLimitWindow.
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
-
-// ALL still-current limit windows (for the dual-meter breakdown), in fixed reading
-// order rather than most-constrained-first: Codex primary→secondary, Claude
-// 5-hour→weekly→weekly Opus (weekly Sonnet is intentionally not surfaced). Obsolete
-// (reset-elapsed) windows, reset-less Claude placeholders, and Claude's extra_usage
-// credit budget are excluded. Each element has the same shape as PickLimitWindow. Empty
-// array when none apply. (The bar's single gauge still uses the Pick*LimitWindow pickers
-// above; these feed the popover/details breakdown.)
-NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
+// ALL still-current Claude limit windows (5-hour→weekly→weekly Opus; weekly Sonnet is
+// never surfaced). Obsolete/reset-less/unknown windows and extra_usage are excluded.
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch);
+
+// Elapsed known Claude windows only (same keys/labels as ClaudeLimitWindows). Used when
+// the live set is empty so the UI can keep showing last-known % + reset. Reset-less
+// placeholders and unknown buckets stay excluded. Empty when nothing elapsed.
+NSArray<NSDictionary *> *ClaudeStaleLimitWindows(NSDictionary *usage, double nowEpoch);
+// Most recently expired window from ClaudeStaleLimitWindows (highest resetsAt). Nil when
+// the stale set is empty.
+NSDictionary *PickClaudeStaleLimitWindow(NSDictionary *usage, double nowEpoch);
+// Nil while any live Claude window remains; dated "reset since last Claude refresh" when
+// every known window has elapsed; otherwise the missing-window fallback string.
+NSString *ClaudeLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch);
 
 // Picks the current Cursor included-quota window from either GetCurrentPeriodUsage
 // (planUsage spend in cents + billingCycleEnd) or legacy GET /auth/usage (per-model
@@ -89,6 +95,12 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
 NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
 // All current Cursor windows for the dual meter (usually one). Empty when none apply.
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
+
+// Elapsed Cursor windows (billing cycle ended, or auth buckets with a past cycle marker).
+// Same role as ClaudeStaleLimitWindows. Empty when nothing elapsed-and-usable remains.
+NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double nowEpoch);
+NSDictionary *PickCursorStaleLimitWindow(NSDictionary *usage, double nowEpoch);
+NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch);
 
 // Reads Anthropic's extra_usage credit budget. Returns nil when absent/disabled, else
 // @{@"description": display string, @"statusReason": short status,

@@ -513,6 +513,88 @@ int main(void) {
         check(RequestedAIAccountError(@[claude], NO) == nil,
               @"unrequested Claude account source is optional");
 
+        // Last-good Claude usage JSON is persisted like Codex limits, so a restart can
+        // paint the gauge without a network round-trip (marked stale until a live fetch).
+        NSString *persistHome = [root stringByAppendingPathComponent:@"home-persist"];
+        NSString *persistSupport = [root stringByAppendingPathComponent:@"support-persist"];
+        [fm createDirectoryAtPath:persistSupport withIntermediateDirectories:YES attributes:nil error:nil];
+        // CursorUsage is only attached when Cursor's local session DB exists.
+        NSString *cursorDBDir = [persistHome stringByAppendingPathComponent:
+            @"Library/Application Support/Cursor/User/globalStorage"];
+        [fm createDirectoryAtPath:cursorDBDir withIntermediateDirectories:YES attributes:nil error:nil];
+        [@"" writeToFile:[cursorDBDir stringByAppendingPathComponent:@"state.vscdb"]
+               atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        AIReader *persistWriter = [[AIReader alloc] initWithHomeDirectory:persistHome
+                                              applicationSupportDirectory:persistSupport];
+        persistWriter.useClaudeAccount = YES;
+        persistWriter.allowClaudeAccountFetch = NO;
+        persistWriter.useCursorAccount = YES;
+        persistWriter.allowCursorAccountFetch = NO;
+        double persistNow = NSDate.date.timeIntervalSince1970;
+        [persistWriter setValue:@{ @"five_hour": @{ @"utilization": @30,
+                                                     @"resets_at": @(persistNow + 7200) },
+                                   @"seven_day": @{ @"utilization": @70,
+                                                    @"resets_at": @(persistNow + 86400) } }
+                          forKey:@"claudeUsageJSON"];
+        [persistWriter setValue:@(persistNow - 30) forKey:@"claudeLastSuccessAt"];
+        [persistWriter setValue:@{ @"billingCycleEnd": @((persistNow + 86400) * 1000.0),
+                                   @"planUsage": @{ @"remaining": @1000, @"limit": @4000 } }
+                          forKey:@"cursorUsageJSON"];
+        [persistWriter setValue:@(persistNow - 30) forKey:@"cursorLastSuccessAt"];
+        [persistWriter setValue:@YES forKey:@"stateDirty"];
+        [persistWriter flushPersistentState];
+        NSString *persistStatePath = [persistSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
+        NSDictionary *persisted = [NSJSONSerialization JSONObjectWithData:
+            [NSData dataWithContentsOfFile:persistStatePath] options:0 error:nil];
+        check([persisted[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class],
+              @"Claude usage JSON was written to the state file");
+        check([persisted[@"claudeUsageFetchedAt"] isKindOfClass:NSString.class],
+              @"Claude fetch timestamp was written");
+        check([persisted[@"cursorUsageJSON"] isKindOfClass:NSDictionary.class],
+              @"Cursor usage JSON was written to the state file");
+
+        AIReader *restored = [[AIReader alloc] initWithHomeDirectory:persistHome
+                                         applicationSupportDirectory:persistSupport];
+        restored.useClaudeAccount = YES;
+        restored.allowClaudeAccountFetch = NO;
+        restored.useCursorAccount = YES;
+        restored.allowCursorAccountFetch = NO;
+        NSArray<AIUsage *> *restoredUsage = [restored read];
+        AIUsage *restoredClaude = UsageNamed(restoredUsage, @"Claude");
+        AIUsage *restoredCursor = UsageNamed(restoredUsage, @"Cursor");
+        check(restoredClaude.limitStatusAvailable, @"restored Claude gauge without network");
+        check(restoredClaude.limitStale, @"disk-restored Claude is stale until fetch this run");
+        check(fabs(restoredClaude.remainingFraction - 0.30) < 0.001,
+              @"restored Claude picks the most constrained live window");
+        check(restoredCursor.limitStatusAvailable, @"restored Cursor gauge without network");
+        check(restoredCursor.limitStale, @"disk-restored Cursor is stale until fetch this run");
+
+        // Elapsed-only Claude windows still surface last-known % + reset as stale.
+        AIReader *elapsedReader = [[AIReader alloc] initWithHomeDirectory:persistHome
+                                              applicationSupportDirectory:persistSupport];
+        elapsedReader.useClaudeAccount = YES;
+        elapsedReader.allowClaudeAccountFetch = NO;
+        [elapsedReader setValue:@{ @"five_hour": @{ @"utilization": @40, @"resets_at": @(persistNow - 100) },
+                                   @"seven_day": @{ @"utilization": @85, @"resets_at": @(persistNow - 10) } }
+                          forKey:@"claudeUsageJSON"];
+        [elapsedReader setValue:@(persistNow - 200) forKey:@"claudeLastSuccessAt"];
+        AIUsage *elapsedClaude = UsageNamed([elapsedReader read], @"Claude");
+        check(elapsedClaude.limitStatusAvailable, @"elapsed Claude windows still show a gauge");
+        check(elapsedClaude.limitStale, @"elapsed Claude windows are marked stale");
+        check(fabs(elapsedClaude.remainingFraction - 0.15) < 0.001,
+              @"elapsed Claude pick keeps last-known weekly utilization");
+        check([elapsedClaude.statusReason hasPrefix:@"Limit windows reset since last Claude refresh"],
+              @"elapsed Claude status names the last refresh");
+
+        // Toggle-off clears the persisted account usage fields.
+        restored.useClaudeAccount = NO;
+        restored.useCursorAccount = NO;
+        [restored read];
+        NSDictionary *cleared = [NSJSONSerialization JSONObjectWithData:
+            [NSData dataWithContentsOfFile:persistStatePath] options:0 error:nil];
+        check(cleared[@"claudeUsageJSON"] == nil, @"Claude usage JSON cleared when account toggle is off");
+        check(cleared[@"cursorUsageJSON"] == nil, @"Cursor usage JSON cleared when account toggle is off");
+
         [fm removeItemAtPath:root error:nil];
     }
     if (failures) fprintf(stderr, "%d AIReader integration test(s) failed\n", failures);

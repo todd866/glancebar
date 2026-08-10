@@ -256,7 +256,19 @@ NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowE
     return out;
 }
 
+static NSArray<NSDictionary *> *ClaudeWindowsFiltered(NSDictionary *usage, double nowEpoch,
+                                                      BOOL elapsedOnly);
+
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch) {
+    return ClaudeWindowsFiltered(usage, nowEpoch, NO);
+}
+
+NSArray<NSDictionary *> *ClaudeStaleLimitWindows(NSDictionary *usage, double nowEpoch) {
+    return ClaudeWindowsFiltered(usage, nowEpoch, YES);
+}
+
+static NSArray<NSDictionary *> *ClaudeWindowsFiltered(NSDictionary *usage, double nowEpoch,
+                                                      BOOL elapsedOnly) {
     if (![usage isKindOfClass:NSDictionary.class]) return @[];
     // Fixed reading order so the dual meter always renders 5-hour before weekly,
     // independent of dictionary iteration order. Only known windows are surfaced
@@ -277,19 +289,55 @@ NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch
         id resetsAt = w[@"resets_at"];
         if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
         else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
-        // Require a real, still-future reset: this drops both elapsed windows and the
-        // reset-less placeholder buckets the API returns for models you aren't using
-        // (e.g. an always-100% "weekly Opus" with no resets_at), which are not live limits.
-        if (resets <= 0 || resets <= nowEpoch) continue;
+        // Live: require a still-future reset (drops elapsed windows and reset-less
+        // placeholders). Stale: require a real elapsed reset (same placeholder exclusion).
+        if (resets <= 0) continue;
+        if (elapsedOnly) {
+            if (resets > nowEpoch) continue;
+        } else if (resets <= nowEpoch) {
+            continue;
+        }
         double remaining = 1.0 - used;
         remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
         NSMutableDictionary *d = [NSMutableDictionary dictionary];
         d[@"window"] = labels[key];
         d[@"remainingFraction"] = @(remaining);
-        if (resets > 0) d[@"resetsAt"] = @(resets);
+        d[@"resetsAt"] = @(resets);
         [out addObject:d];
     }
     return out;
+}
+
+NSDictionary *PickClaudeStaleLimitWindow(NSDictionary *usage, double nowEpoch) {
+    NSArray<NSDictionary *> *windows = ClaudeStaleLimitWindows(usage, nowEpoch);
+    NSDictionary *best = nil;
+    double bestResets = -1;
+    double bestRemaining = 2;
+    for (NSDictionary *window in windows) {
+        double resets = [window[@"resetsAt"] doubleValue];
+        double remaining = [window[@"remainingFraction"] doubleValue];
+        if (resets > bestResets || (resets == bestResets && remaining < bestRemaining)) {
+            bestResets = resets;
+            bestRemaining = remaining;
+            best = window;
+        }
+    }
+    return best;
+}
+
+static NSString *DatedLimitResetReason(NSString *prefix, NSString *fetchedAtISO) {
+    NSDate *snapshot = fetchedAtISO.length ? DateFromISO8601(fetchedAtISO) : nil;
+    if (!snapshot) return prefix;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    [fmt setLocalizedDateFormatFromTemplate:@"d MMM"];
+    return [NSString stringWithFormat:@"%@ (%@)", prefix, [fmt stringFromDate:snapshot]];
+}
+
+NSString *ClaudeLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch) {
+    if (ClaudeLimitWindows(usage, nowEpoch).count) return nil;
+    if (ClaudeStaleLimitWindows(usage, nowEpoch).count)
+        return DatedLimitResetReason(@"Limit windows reset since last Claude refresh", fetchedAtISO);
+    return @"Claude account response did not include a current limit window";
 }
 
 static double CursorEpochSeconds(id value) {
@@ -310,11 +358,15 @@ static double CursorEpochSeconds(id value) {
     return 0;
 }
 
-static NSDictionary *CursorPlanWindow(NSDictionary *usage, double nowEpoch) {
+static NSDictionary *CursorPlanWindowFiltered(NSDictionary *usage, double nowEpoch, BOOL elapsedOnly) {
     NSDictionary *plan = [usage[@"planUsage"] isKindOfClass:NSDictionary.class] ? usage[@"planUsage"] : nil;
     if (!plan) return nil;
     double resets = CursorEpochSeconds(usage[@"billingCycleEnd"]);
-    if (resets > 0 && resets <= nowEpoch) return nil;
+    if (elapsedOnly) {
+        if (!(resets > 0 && resets <= nowEpoch)) return nil;
+    } else if (resets > 0 && resets <= nowEpoch) {
+        return nil;
+    }
 
     double remainingFrac = -1;
     NSNumber *remaining = [plan[@"remaining"] isKindOfClass:NSNumber.class] ? plan[@"remaining"] : nil;
@@ -333,6 +385,10 @@ static NSDictionary *CursorPlanWindow(NSDictionary *usage, double nowEpoch) {
     d[@"remainingFraction"] = @(remainingFrac);
     if (resets > 0) d[@"resetsAt"] = @(resets);
     return d;
+}
+
+static NSDictionary *CursorPlanWindow(NSDictionary *usage, double nowEpoch) {
+    return CursorPlanWindowFiltered(usage, nowEpoch, NO);
 }
 
 static NSArray<NSDictionary *> *CursorAuthWindows(NSDictionary *usage, double nowEpoch) {
@@ -389,6 +445,38 @@ NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch) {
         best = window;
     }
     return best;
+}
+
+NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double nowEpoch) {
+    if (![usage isKindOfClass:NSDictionary.class]) return @[];
+    // Plan billing cycles are the Cursor windows that actually expire. Auth buckets have
+    // no reliable past reset marker, so they are not inventing a stale gauge here.
+    NSDictionary *plan = CursorPlanWindowFiltered(usage, nowEpoch, YES);
+    return plan ? @[plan] : @[];
+}
+
+NSDictionary *PickCursorStaleLimitWindow(NSDictionary *usage, double nowEpoch) {
+    NSArray<NSDictionary *> *windows = CursorStaleLimitWindows(usage, nowEpoch);
+    NSDictionary *best = nil;
+    double bestResets = -1;
+    double bestRemaining = 2;
+    for (NSDictionary *window in windows) {
+        double resets = [window[@"resetsAt"] doubleValue];
+        double remaining = [window[@"remainingFraction"] doubleValue];
+        if (resets > bestResets || (resets == bestResets && remaining < bestRemaining)) {
+            bestResets = resets;
+            bestRemaining = remaining;
+            best = window;
+        }
+    }
+    return best;
+}
+
+NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch) {
+    if (CursorLimitWindows(usage, nowEpoch).count) return nil;
+    if (CursorStaleLimitWindows(usage, nowEpoch).count)
+        return DatedLimitResetReason(@"Limit windows reset since last Cursor refresh", fetchedAtISO);
+    return @"Cursor account response did not include a current limit window";
 }
 
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {

@@ -270,6 +270,42 @@ int main(void) {
         check(cwins8.count == 1 && [cwins8[0][@"window"] isEqual:@"weekly"],
               @"claude dual meter drops a window whose reset is exactly elapsed");
 
+        // --- ClaudeStaleLimitWindows / PickClaudeStaleLimitWindow / ClaudeLimitStatusReason ---
+        NSDictionary *elapsed = @{@"five_hour": @{@"utilization": @40.0, @"resets_at": @500},
+                                  @"seven_day": @{@"utilization": @80.0, @"resets_at": @900}};
+        check(ClaudeLimitWindows(elapsed, 1000).count == 0, @"live claude empty when all elapsed");
+        NSArray *staleWins = ClaudeStaleLimitWindows(elapsed, 1000);
+        check(staleWins.count == 2, @"stale claude keeps elapsed known windows");
+        check([staleWins[0][@"window"] isEqual:@"5-hour"], @"stale claude keeps live order");
+        check([staleWins[1][@"window"] isEqual:@"weekly"], @"stale claude weekly second");
+        NSDictionary *stalePick = PickClaudeStaleLimitWindow(elapsed, 1000);
+        check([stalePick[@"window"] isEqual:@"weekly"], @"stale pick prefers most recently expired");
+        check(fabs([stalePick[@"remainingFraction"] doubleValue] - 0.20) < 0.001,
+              @"stale pick keeps utilization");
+        check([stalePick[@"resetsAt"] doubleValue] == 900, @"stale pick keeps last-known reset");
+        check(PickClaudeStaleLimitWindow(@{@"seven_day_opus": @{@"utilization": @100}}, 1000) == nil,
+              @"reset-less placeholder cannot be stale pick");
+        check(PickClaudeStaleLimitWindow(
+                  @{@"five_hour": @{@"utilization": @10, @"resets_at": @9000}}, 1000) == nil,
+              @"still-current window is not a stale pick");
+        check(ClaudeStaleLimitWindows(
+                  @{@"five_hour": @{@"utilization": @10, @"resets_at": @9000},
+                    @"seven_day_opus": @{@"utilization": @100}}, 1000).count == 0,
+              @"stale list excludes live windows and reset-less placeholders");
+        NSString *claudeElapsedReason = ClaudeLimitStatusReason(elapsed, @"2026-08-10T01:41:00Z", 1000);
+        check([claudeElapsedReason hasPrefix:@"Limit windows reset since last Claude refresh ("],
+              @"claude elapsed status is dated");
+        check(ClaudeLimitStatusReason(
+                  @{@"five_hour": @{@"utilization": @10, @"resets_at": @9000}},
+                  @"2026-08-10T01:41:00Z", 1000) == nil,
+              @"claude status nil while a live window exists");
+        check([ClaudeLimitStatusReason(@{}, @"", 1000)
+                  isEqual:@"Claude account response did not include a current limit window"],
+              @"claude empty usage yields the missing-window reason");
+        check([ClaudeLimitStatusReason(elapsed, nil, 1000)
+                  isEqual:@"Limit windows reset since last Claude refresh"],
+              @"claude elapsed with no fetch timestamp is undated");
+
         // --- CodexLimitWindows (all current windows for the dual meter) ---
         NSDictionary *xlimits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @4000},
                                   @"secondary": @{@"used_percent": @90.0, @"window_minutes": @10080, @"resets_at": @9000},
@@ -402,6 +438,36 @@ int main(void) {
         NSDictionary *mixedPick = PickCursorLimitWindow(mixed, 1770000000.0);
         check([mixedPick[@"window"] isEqual:@"billing period"],
               @"cursor planUsage overrides legacy auth buckets");
+
+        // --- CursorStaleLimitWindows / PickCursorStaleLimitWindow / CursorLimitStatusReason ---
+        NSDictionary *cursorElapsed = @{
+            @"billingCycleEnd": @1771077734000,
+            @"planUsage": @{@"remaining": @16778, @"limit": @40000}
+        };
+        check(CursorLimitWindows(cursorElapsed, 1771077734.0).count == 0,
+              @"live cursor empty when billing cycle ended");
+        NSArray *cursorStaleWins = CursorStaleLimitWindows(cursorElapsed, 1771077734.0);
+        check(cursorStaleWins.count == 1, @"stale cursor keeps elapsed billing window");
+        NSDictionary *cursorStalePick = PickCursorStaleLimitWindow(cursorElapsed, 1771077734.0);
+        check([cursorStalePick[@"window"] isEqual:@"billing period"], @"stale cursor billing labeled");
+        check(fabs([cursorStalePick[@"remainingFraction"] doubleValue] - (16778.0 / 40000.0)) < 0.001,
+              @"stale cursor keeps remaining fraction");
+        check(fabs([cursorStalePick[@"resetsAt"] doubleValue] - 1771077734.0) < 0.001,
+              @"stale cursor keeps last-known cycle end");
+        check(PickCursorStaleLimitWindow(cursorPlan, 1770000000.0) == nil,
+              @"still-current cursor cycle is not a stale pick");
+        NSString *cursorElapsedReason = CursorLimitStatusReason(cursorElapsed, @"2026-08-10T01:41:00Z",
+                                                                1771077734.0);
+        check([cursorElapsedReason hasPrefix:@"Limit windows reset since last Cursor refresh ("],
+              @"cursor elapsed status is dated");
+        check(CursorLimitStatusReason(cursorPlan, @"2026-08-10T01:41:00Z", 1770000000.0) == nil,
+              @"cursor status nil while a live window exists");
+        check([CursorLimitStatusReason(@{}, @"", 1000)
+                  isEqual:@"Cursor account response did not include a current limit window"],
+              @"cursor empty usage yields the missing-window reason");
+        check([CursorLimitStatusReason(cursorElapsed, nil, 1771077734.0)
+                  isEqual:@"Limit windows reset since last Cursor refresh"],
+              @"cursor elapsed with no fetch timestamp is undated");
 
         // --- ParseSleepDisabled (`pmset -g` → lid-closed-awake state) ---
         check([ParseSleepDisabled(@" SleepDisabled\t\t0") isEqual:@NO], @"SleepDisabled 0 → NO");
