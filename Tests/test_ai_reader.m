@@ -569,6 +569,42 @@ int main(void) {
         check(restoredCursor.limitStatusAvailable, @"restored Cursor gauge without network");
         check(restoredCursor.limitStale, @"disk-restored Cursor is stale until fetch this run");
 
+        // Rate-limit after a good cache must keep the gauge and name the last refresh.
+        AIReader *rateLimited = [[AIReader alloc] initWithHomeDirectory:persistHome
+                                            applicationSupportDirectory:persistSupport];
+        rateLimited.useClaudeAccount = YES;
+        rateLimited.allowClaudeAccountFetch = NO;
+        [rateLimited setValue:@"Usage API rate-limited; retrying later" forKey:@"claudeAccountStatus"];
+        AIUsage *rateLimitedClaude = UsageNamed([rateLimited read], @"Claude");
+        check(rateLimitedClaude.limitStatusAvailable,
+              @"rate-limited Claude still shows last-known gauge");
+        check(rateLimitedClaude.limitStale, @"rate-limited Claude is marked stale");
+        check([rateLimitedClaude.statusReason containsString:@"Cached limit"],
+              @"rate-limited Claude status keeps Cached limit framing");
+        check([rateLimitedClaude.statusReason containsString:@"rate-limited"],
+              @"rate-limited Claude status keeps the refresh error");
+        check([rateLimitedClaude.statusReason containsString:@"as of"],
+              @"rate-limited Claude status includes known last-success time");
+        check(rateLimitedClaude.resetText.length &&
+              ![rateLimitedClaude.resetText isEqualToString:@"Not exposed locally"],
+              @"rate-limited Claude still exposes last-known reset text");
+
+        // A reader that indexes/saves without a Claude fetch must not wipe a sibling's
+        // persisted account cache (dump/offline writers used to omit the keys).
+        AIReader *indexer = [[AIReader alloc] initWithHomeDirectory:persistHome
+                                        applicationSupportDirectory:persistSupport];
+        indexer.useClaudeAccount = YES;
+        indexer.allowClaudeAccountFetch = NO;
+        // Drop the in-memory cache as if this process never fetched, then dirty+save.
+        [indexer setValue:nil forKey:@"claudeUsageJSON"];
+        [indexer setValue:@0 forKey:@"claudeLastSuccessAt"];
+        [indexer setValue:@YES forKey:@"stateDirty"];
+        [indexer flushPersistentState];
+        NSDictionary *preserved = [NSJSONSerialization JSONObjectWithData:
+            [NSData dataWithContentsOfFile:persistStatePath] options:0 error:nil];
+        check([preserved[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class],
+              @"save without an in-memory Claude cache preserves the on-disk last-known");
+
         // Elapsed-only Claude windows still surface last-known % + reset as stale.
         AIReader *elapsedReader = [[AIReader alloc] initWithHomeDirectory:persistHome
                                               applicationSupportDirectory:persistSupport];

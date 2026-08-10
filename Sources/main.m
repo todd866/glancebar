@@ -569,6 +569,12 @@ static NSString *ResetTextFromDate(NSDate *date) {
     return [fmt stringFromDate:date];
 }
 
+static NSString *AsOfTextFromEpoch(double epoch) {
+    if (epoch <= 0) return nil;
+    NSString *when = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:epoch]);
+    return when.length ? [@"as of " stringByAppendingString:when] : nil;
+}
+
 static NSDictionary *JSONDictionaryAtPath(NSString *path) {
     NSData *data = [NSData dataWithContentsOfFile:path options:0 error:nil];
     if (!data.length) return nil;
@@ -1131,6 +1137,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     NSString *_claudeAccountStatus;
     double _claudeLastSuccessAt;
     BOOL _claudeFetchedThisRun;                 // NO after disk restore until a live fetch succeeds
+    BOOL _claudeUsageCacheAbandoned;            // YES after explicit forget; allows omitting on save
     NSDictionary *_cursorUsageJSON;             // last good Cursor usage response
     double _cursorNextFetch;
     NSString *_cursorAccessToken;               // memory-only; never persisted by Glancebar
@@ -1138,6 +1145,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     NSString *_cursorAccountStatus;
     double _cursorLastSuccessAt;
     BOOL _cursorFetchedThisRun;
+    BOOL _cursorUsageCacheAbandoned;
     NSString *_lastFetchSkipReason;
     NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
     NSUInteger _scanBytesRemaining;
@@ -1217,6 +1225,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         NSDate *when = DateFromStatusString(fetched);
         if (when) _claudeLastSuccessAt = when.timeIntervalSince1970;
         _claudeFetchedThisRun = NO;
+        _claudeUsageCacheAbandoned = NO;
     }
     NSDictionary *cursorUsage = [root[@"cursorUsageJSON"] isKindOfClass:NSDictionary.class]
         ? root[@"cursorUsageJSON"] : nil;
@@ -1227,6 +1236,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         NSDate *when = DateFromStatusString(fetched);
         if (when) _cursorLastSuccessAt = when.timeIntervalSince1970;
         _cursorFetchedThisRun = NO;
+        _cursorUsageCacheAbandoned = NO;
     }
 }
 
@@ -1249,6 +1259,12 @@ static const double kAIStateWriteInterval = 2.0;
     if (_stateMustPersist) force = YES;
     double now = CFAbsoluteTimeGetCurrent();
     if (!force && _lastStateWrite > 0 && now - _lastStateWrite < kAIStateWriteInterval) return;
+    NSDictionary *existingRoot = nil;
+    {
+        NSData *existingData = [NSData dataWithContentsOfFile:_statePath options:0 error:nil];
+        id obj = existingData.length ? [NSJSONSerialization JSONObjectWithData:existingData options:0 error:nil] : nil;
+        if ([obj isKindOfClass:NSDictionary.class]) existingRoot = obj;
+    }
     NSMutableDictionary *root = [@{
         @"version": @2,
         @"timeZone": NSTimeZone.localTimeZone.name ?: @"",
@@ -1259,23 +1275,31 @@ static const double kAIStateWriteInterval = 2.0;
         root[@"codexLimits"] = _limits;
         root[@"codexLimitsTs"] = _limitsTs;
     }
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
     if ([_claudeUsageJSON isKindOfClass:NSDictionary.class]) {
         root[@"claudeUsageJSON"] = _claudeUsageJSON;
-        if (_claudeLastSuccessAt > 0) {
-            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
-            iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+        if (_claudeLastSuccessAt > 0)
             root[@"claudeUsageFetchedAt"] = [iso stringFromDate:
                 [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt]];
-        }
+    } else if (!_claudeUsageCacheAbandoned) {
+        // Another process (or this one, before a successful fetch) may have the last-known
+        // account snapshot on disk. Omitting the keys here would wipe it.
+        if ([existingRoot[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class])
+            root[@"claudeUsageJSON"] = existingRoot[@"claudeUsageJSON"];
+        if ([existingRoot[@"claudeUsageFetchedAt"] isKindOfClass:NSString.class])
+            root[@"claudeUsageFetchedAt"] = existingRoot[@"claudeUsageFetchedAt"];
     }
     if ([_cursorUsageJSON isKindOfClass:NSDictionary.class]) {
         root[@"cursorUsageJSON"] = _cursorUsageJSON;
-        if (_cursorLastSuccessAt > 0) {
-            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
-            iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+        if (_cursorLastSuccessAt > 0)
             root[@"cursorUsageFetchedAt"] = [iso stringFromDate:
                 [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt]];
-        }
+    } else if (!_cursorUsageCacheAbandoned) {
+        if ([existingRoot[@"cursorUsageJSON"] isKindOfClass:NSDictionary.class])
+            root[@"cursorUsageJSON"] = existingRoot[@"cursorUsageJSON"];
+        if ([existingRoot[@"cursorUsageFetchedAt"] isKindOfClass:NSString.class])
+            root[@"cursorUsageFetchedAt"] = existingRoot[@"cursorUsageFetchedAt"];
     }
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:&err];
@@ -2001,6 +2025,7 @@ static NSString *HashedMessageID(NSString *messageID) {
                 _claudeAccountStatus = nil;
                 _claudeLastSuccessAt = now;
                 _claudeFetchedThisRun = YES;
+                _claudeUsageCacheAbandoned = NO;
                 _stateDirty = _stateMustPersist = YES;
                 [self savePersistentStateForcingWrite:YES];
                 GBLog("claude fetch: ok");
@@ -2047,16 +2072,22 @@ static NSString *HashedMessageID(NSString *messageID) {
             BOOL diskRestoredOnly = !_claudeFetchedThisRun && _claudeUsageJSON != nil;
             if (usingStaleWindows || diskRestoredOnly || _claudeAccountStatus.length)
                 u.limitStale = YES;
+            NSString *asOf = AsOfTextFromEpoch(_claudeLastSuccessAt);
             if (_claudeAccountStatus.length) {
-                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
-                                  _claudeAccountStatus, window];
+                u.statusReason = asOf
+                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@ · %@",
+                       _claudeAccountStatus, window, asOf]
+                    : [NSString stringWithFormat:@"Cached limit · %@ · %@",
+                       _claudeAccountStatus, window];
                 u.statusSource = @"Cached Anthropic usage API response (opt-in)";
             } else if (usingStaleWindows) {
                 u.statusReason = ClaudeLimitStatusReason(_claudeUsageJSON, fetchedAtISO, nowForWindows)
                     ?: window;
                 u.statusSource = @"Cached Anthropic usage API response (opt-in)";
             } else if (diskRestoredOnly) {
-                u.statusReason = [@"Cached limit · " stringByAppendingString:window];
+                u.statusReason = asOf
+                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@", window, asOf]
+                    : [@"Cached limit · " stringByAppendingString:window];
                 u.statusSource = @"Cached Anthropic usage API response (opt-in)";
             } else {
                 u.statusReason = window;
@@ -2105,7 +2136,7 @@ static NSString *HashedMessageID(NSString *messageID) {
 }
 
 - (void)forgetClaudeAccountCredentials {
-    BOOL hadCache = _claudeUsageJSON != nil || _claudeLastSuccessAt > 0;
+    BOOL hadCache = _claudeUsageJSON != nil || _claudeLastSuccessAt > 0 || !_claudeUsageCacheAbandoned;
     _claudeAccessToken = nil;
     _claudeAccessTokenExpiresAt = 0;
     _claudeUsageJSON = nil;
@@ -2113,6 +2144,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     _claudeLastSuccessAt = 0;
     _claudeNextFetch = 0;
     _claudeFetchedThisRun = NO;
+    _claudeUsageCacheAbandoned = YES;
     if (hadCache) {
         _stateDirty = _stateMustPersist = YES;
         [self savePersistentStateForcingWrite:YES];
@@ -2186,6 +2218,7 @@ static NSString *HashedMessageID(NSString *messageID) {
                 _cursorAccountStatus = nil;
                 _cursorLastSuccessAt = now;
                 _cursorFetchedThisRun = YES;
+                _cursorUsageCacheAbandoned = NO;
                 _stateDirty = _stateMustPersist = YES;
                 [self savePersistentStateForcingWrite:YES];
                 GBLog("cursor fetch: ok");
@@ -2230,16 +2263,22 @@ static NSString *HashedMessageID(NSString *messageID) {
             BOOL diskRestoredOnly = !_cursorFetchedThisRun && _cursorUsageJSON != nil;
             if (usingStaleWindows || diskRestoredOnly || _cursorAccountStatus.length)
                 u.limitStale = YES;
+            NSString *asOf = AsOfTextFromEpoch(_cursorLastSuccessAt);
             if (_cursorAccountStatus.length) {
-                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
-                                  _cursorAccountStatus, window];
+                u.statusReason = asOf
+                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@ · %@",
+                       _cursorAccountStatus, window, asOf]
+                    : [NSString stringWithFormat:@"Cached limit · %@ · %@",
+                       _cursorAccountStatus, window];
                 u.statusSource = @"Cached Cursor usage API response (opt-in)";
             } else if (usingStaleWindows) {
                 u.statusReason = CursorLimitStatusReason(_cursorUsageJSON, fetchedAtISO, now)
                     ?: window;
                 u.statusSource = @"Cached Cursor usage API response (opt-in)";
             } else if (diskRestoredOnly) {
-                u.statusReason = [@"Cached limit · " stringByAppendingString:window];
+                u.statusReason = asOf
+                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@", window, asOf]
+                    : [@"Cached limit · " stringByAppendingString:window];
                 u.statusSource = @"Cached Cursor usage API response (opt-in)";
             } else {
                 u.statusReason = window;
@@ -2271,7 +2310,7 @@ static NSString *HashedMessageID(NSString *messageID) {
 }
 
 - (void)forgetCursorAccountCredentials {
-    BOOL hadCache = _cursorUsageJSON != nil || _cursorLastSuccessAt > 0;
+    BOOL hadCache = _cursorUsageJSON != nil || _cursorLastSuccessAt > 0 || !_cursorUsageCacheAbandoned;
     _cursorAccessToken = nil;
     _cursorUsageJSON = nil;
     _cursorAccountStatus = nil;
@@ -2279,6 +2318,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     _cursorNextFetch = 0;
     _cursorStateNextTry = 0;
     _cursorFetchedThisRun = NO;
+    _cursorUsageCacheAbandoned = YES;
     if (hadCache) {
         _stateDirty = _stateMustPersist = YES;
         [self savePersistentStateForcingWrite:YES];
@@ -3542,7 +3582,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
     if (u.overageActive && u.statusReason.length) return u.statusReason;
-    if (u.limitStale && u.statusReason.length) return u.statusReason;
+    if (u.limitStale && u.statusReason.length) {
+        // Stale account refresh errors used to hide the last-known reset entirely.
+        NSString *reset = u.resetText ?: @"";
+        if (u.limitStatusAvailable && reset.length &&
+            ![reset isEqualToString:@"Not exposed locally"] &&
+            ![reset isEqualToString:@"Not provided"])
+            return [NSString stringWithFormat:@"%@ · Reset: %@", u.statusReason, reset];
+        return u.statusReason;
+    }
     if (u.limitStatusAvailable) return [self compactResetText:u];
     if (u.statusReason.length) return u.statusReason;
     if (!u.available) return @"No local state";
@@ -4872,10 +4920,13 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     BOOL cursorAccountEnabled = [defaults boolForKey:@"useCursorAccount"];
     BOOL cursorAccountRequested = allowOnline && cursorAccountEnabled;
     AIReader *reader = [[AIReader alloc] initWithHomeDirectory:GBHomeDirectory()];
-    reader.useClaudeAccount = accountRequested;
-    reader.allowClaudeAccountFetch = reader.useClaudeAccount;
-    reader.useCursorAccount = cursorAccountRequested;
-    reader.allowCursorAccountFetch = reader.useCursorAccount;
+    // Consent (toggle) controls whether the last-known account cache is used and whether
+    // forget runs. Online permission only gates the network fetch — otherwise offline
+    // --dump would call forget and wipe the disk cache.
+    reader.useClaudeAccount = accountEnabled;
+    reader.allowClaudeAccountFetch = accountRequested;
+    reader.useCursorAccount = cursorAccountEnabled;
+    reader.allowCursorAccountFetch = cursorAccountRequested;
     reader.allowClaudeTranscripts = [defaults boolForKey:@"useClaudeTranscripts"];
     NSArray<AIUsage *> *usage = [reader readUntilCaughtUpWithTimeLimit:30.0];
     NSMutableArray *providers = [NSMutableArray array];
