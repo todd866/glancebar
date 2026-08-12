@@ -42,6 +42,10 @@ opt-in) `/usr/bin/security`.
   context re-reads shown separately).
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
+- **Never evicted** — on notched Macs the item automatically narrows (full →
+  icons → single glyph) to fit the space the notch and system items leave, and
+  widens back when space returns; VoiceOver and the hover tooltip always carry
+  the full summary.
 - **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
   lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
   admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
@@ -218,10 +222,14 @@ glancebar/
 
 ### A note on notched Macs
 
-macOS adds new menu bar items at the left end of the status area, so on a notched MacBook
-a fresh icon can land under the notch and look invisible. Free up space (System Settings →
-Control Center → set icons you don't need to "Don't Show in Menu Bar") and it appears.
-Glancebar being a single item makes this far less likely.
+macOS hides a menu bar item wholesale when it no longer fits beside the notch —
+system items (AirPods, Now Playing, Weather) can crowd one out with no warning.
+Glancebar measures the space that actually exists and adapts: full display when
+there's room, icons-only when it tightens, and a single gauge glyph (the orange
+eye, if *Stay awake with lid closed* is on) when space is scarce — the popover
+stays one click away at every width. It re-expands automatically, after the
+space has stayed free for a while, so a transient AirPods connection can't make
+it flap. Hover the item for the full summary at any width.
 
 ## Credits
 
