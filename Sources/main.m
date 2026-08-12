@@ -2951,12 +2951,6 @@ static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width)
     return img;
 }
 
-static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
-    CGFloat w = 0;
-    NSArray<NSDictionary *> *draw = BarLayout(segments, fg, &w);
-    return BarImageFromLayout(draw, w);
-}
-
 #pragma mark - Controller
 
 static const CGFloat kW = 320, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
@@ -3016,6 +3010,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
+    BarTierState _barTier;             // adaptive bar width; zero-init = full tier
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
@@ -3338,6 +3333,68 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
 }
 
+// The status strip's left boundary is the notch. Glancebar is assumed leftmost in
+// the strip (it is the machine's only third-party item; system items hug the right
+// edge) — if that assumption breaks, the eviction net below still recovers us.
+// Window bounds/PIDs from CGWindowList carry no TCC gate (names would; we read none)
+// and no network — consistent with the README's privacy stance.
+static double MeasuredBarGap(NSStatusItem *item) {
+    NSScreen *screen = NSScreen.screens.firstObject;   // the menu bar owner
+    NSWindow *win = item.button.window;
+    if (!screen || !win) return -1;
+    NSRect aux = screen.auxiliaryTopRightArea;         // zero rect = no notch
+    if (NSWidth(aux) <= 0) return -1;
+    double notchRight = NSMinX(aux);
+    double rightEdge = NSMaxX(screen.frame);
+    NSArray *list = CFBridgingRelease(
+        CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
+    double leftmost = rightEdge;
+    for (NSDictionary *w in list) {
+        NSNumber *num = w[(__bridge NSString *)kCGWindowNumber];
+        if (num.integerValue == win.windowNumber) continue;   // our own occupancy is ours to spend
+        CGRect b = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b)) continue;
+        // Primary display's menu-bar band only (global CG coords: its top is y=0).
+        if (b.origin.y > 1 || b.size.height > 40) continue;
+        if (b.origin.x < notchRight || b.origin.x >= rightEdge) continue;
+        if (b.origin.x < leftmost) leftmost = b.origin.x;
+    }
+    return MAX(0.0, leftmost - notchRight);
+}
+
+// Eviction signature observed live 2026-08-12: macOS parks the item's window well
+// below the bar (mid-screen, ~0 alpha) rather than merely occluding it. Occlusion
+// alone is NOT eviction — display sleep occludes every window without moving it,
+// so this tests position, plus isVisible as a belt-and-braces OR. A false positive
+// costs one measured re-expansion cycle (~1 min at glyph), never a disappearance.
+static BOOL BarItemEvicted(NSStatusItem *item) {
+    NSWindow *win = item.button.window;
+    NSScreen *screen = NSScreen.screens.firstObject;
+    if (!win || !screen) return NO;                    // no window yet ≠ evicted
+    if (!win.isVisible) return YES;
+    return NSMaxY(win.frame) < NSMaxY(screen.frame) - 40;
+}
+
+- (NSArray<NSDictionary *> *)barSegmentsForTier:(int)tier full:(NSArray<NSDictionary *> *)full {
+    if (tier == BarTierFull) return full;
+    if (tier == BarTierIcons) {
+        // Same segments, text dropped: the meter icons and alert colors still read.
+        NSMutableArray *icons = [NSMutableArray arrayWithCapacity:full.count];
+        for (NSDictionary *seg in full) {
+            NSMutableDictionary *d = [seg mutableCopy];
+            [d removeObjectForKey:@"text"];
+            [icons addObject:d];
+        }
+        return icons;
+    }
+    // Glyph tier: identity mark — except the lid-awake eye takes over, so that
+    // always-visible reminder survives every tier at zero extra width.
+    if (_lidAwake)
+        return @[@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)}];
+    return @[@{@"symbol": @"gauge.with.dots.needle.50percent"}];
+}
+
 - (void)updateBar {
     // The bar is drawn into a detached, non-template NSImage, so dynamic colors like
     // controlTextColor resolve against whatever drawing appearance is current. Left to
@@ -3347,7 +3404,30 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     // alert colors all resolve to the shade the menu bar actually uses. barSegments
     // builds the meter icons eagerly (each lockFocuses), so it must run inside the block.
     [_item.button.effectiveAppearance performAsCurrentDrawingAppearance:^{
-        self->_item.button.image = BarImage([self barSegments], NSColor.controlTextColor);
+        NSColor *fg = NSColor.controlTextColor;
+        NSArray<NSDictionary *> *full = [self barSegments];
+        NSArray<NSDictionary *> *tierSegs[3] = {
+            full,
+            [self barSegmentsForTier:BarTierIcons full:full],
+            [self barSegmentsForTier:BarTierGlyph full:full],
+        };
+        double widths[3]; NSArray<NSDictionary *> *draws[3];
+        for (int t = 0; t < 3; t++) {
+            CGFloat w = 0;
+            draws[t] = BarLayout(tierSegs[t], fg, &w);
+            widths[t] = w;
+        }
+        double gap = MeasuredBarGap(self->_item);
+        BOOL evicted = BarItemEvicted(self->_item);
+        BarTierState chosen = ChooseBarTier(self->_barTier, gap, widths, evicted);
+        // The streak counts decisions, not seconds: IOPS bursts can add ticks, so
+        // expansion can arrive a little sooner than 2×15 s. Harmless.
+        if (getenv("GLANCEBAR_BAR_DEBUG"))
+            NSLog(@"bar: gap=%.0f widths=[%.0f %.0f %.0f] evicted=%d tier %d→%d streak=%d",
+                  gap, widths[0], widths[1], widths[2], evicted,
+                  self->_barTier.tier, chosen.tier, chosen.expandStreak);
+        self->_barTier = chosen;
+        self->_item.button.image = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);
     }];
     NSString *summary = [self barAccessibilityText];
     _item.button.toolTip = [@"Glancebar — " stringByAppendingString:summary];

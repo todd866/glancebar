@@ -57,6 +57,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     "${ARCH_FLAGS[@]}" \
     Sources/pure.m Sources/main.m \
     -framework Cocoa \
+    -framework CoreGraphics \
     -framework IOKit \
     -framework ServiceManagement \
     -o "$APP/Contents/MacOS/Glancebar"
