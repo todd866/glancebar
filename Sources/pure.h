@@ -148,3 +148,28 @@ NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, d
 NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString *psOutput, int topN,
                                                                         NSString *(^groupForPid)(pid_t),
                                                                         unsigned long long (^bytesForPid)(pid_t));
+
+// --- Adaptive bar width ---
+// The menu bar item renders at one of three tiers; macOS evicts an item wholesale
+// when it cannot fit beside the notch, so Glancebar sizes itself to what exists.
+enum { BarTierFull = 0, BarTierIcons = 1, BarTierGlyph = 2 };
+
+typedef struct {
+    int tier;          // current rendering tier (BarTier*)
+    int expandStreak;  // consecutive decisions the next-wider tier fit with slack
+} BarTierState;
+
+// Hysteresis: shrink the moment the current tier doesn't fit (small margin);
+// expand one tier per decision, only after kBarExpandTicks consecutive decisions
+// where the wider tier fit with kBarExpandMarginPt of slack — transient menu bar
+// churn (AirPods connect, Now Playing) can shrink us but cannot bounce us.
+extern const double kBarShrinkMarginPt;   // 4
+extern const double kBarExpandMarginPt;   // 24
+extern const int    kBarExpandTicks;      // 2
+
+// gapPt: measured free points beside the notch, < 0 = unmeasurable (hold tier).
+// widths[]: this tick's rendered width of each tier. evicted: the shell saw the
+// item's window parked off the bar — forces glyph regardless of the measurement,
+// which is by definition stale when eviction has already happened.
+BarTierState ChooseBarTier(BarTierState prev, double gapPt,
+                           const double widths[3], BOOL evicted);

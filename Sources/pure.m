@@ -621,3 +621,29 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
     }
     return nil;
 }
+
+#pragma mark - Adaptive bar width
+
+const double kBarShrinkMarginPt = 4;
+const double kBarExpandMarginPt = 24;
+const int    kBarExpandTicks    = 2;
+
+BarTierState ChooseBarTier(BarTierState prev, double gapPt,
+                           const double widths[3], BOOL evicted) {
+    BarTierState s = { .tier = MIN(MAX(prev.tier, BarTierFull), BarTierGlyph),
+                       .expandStreak = 0 };
+    if (evicted) { s.tier = BarTierGlyph; return s; }
+    if (gapPt < 0) return s;
+    if (widths[s.tier] + kBarShrinkMarginPt > gapPt) {
+        // Widest tier that fits with margin; the glyph is the floor — Glancebar
+        // never voluntarily hides, even if macOS may still evict the glyph.
+        while (s.tier < BarTierGlyph && widths[s.tier] + kBarShrinkMarginPt > gapPt)
+            s.tier++;
+        return s;
+    }
+    if (s.tier > BarTierFull && widths[s.tier - 1] + kBarExpandMarginPt <= gapPt) {
+        s.expandStreak = prev.expandStreak + 1;
+        if (s.expandStreak >= kBarExpandTicks) { s.tier--; s.expandStreak = 0; }
+    }
+    return s;
+}
