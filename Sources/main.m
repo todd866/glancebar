@@ -2889,13 +2889,15 @@ static NSImage *BatteryMeterIcon(BatteryState b, NSColor *fg, NSColor *fill) {
 }
 
 // Builds the menu-bar image from selected metric segments.
-static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
+// Measures segments into a draw list + total width without rendering. Split from
+// BarImage so updateBar can price all three tiers per tick and draw only one.
+static NSArray<NSDictionary *> *BarLayout(NSArray<NSDictionary *> *segments, NSColor *fg,
+                                          CGFloat *outWidth) {
     CGFloat pt = 13, gap = 4, pad = 2;
     NSFont *font = [NSFont monospacedDigitSystemFontOfSize:12.5 weight:NSFontWeightRegular];
     if (!segments.count)
         segments = @[@{@"symbol": @"gauge.with.dots.needle.50percent", @"text": @"Glancebar"}];
 
-    CGFloat h = 18;
     CGFloat w = pad;
     NSMutableArray<NSDictionary *> *draw = [NSMutableArray array];
     for (NSDictionary *seg in segments) {
@@ -2904,8 +2906,9 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
         NSString *text = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : @"";
         NSImage *customImage = [seg[@"image"] isKindOfClass:NSImage.class] ? seg[@"image"] : nil;
         NSImage *sym = customImage ?: (symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil);
-        NSString *drawText = [NSString stringWithFormat:@" %@", text];
-        NSSize textSize = [drawText sizeWithAttributes:@{NSFontAttributeName:font}];
+        // Icons-only tiers drop the text: no leading space, so icons pack tight.
+        NSString *drawText = text.length ? [NSString stringWithFormat:@" %@", text] : @"";
+        NSSize textSize = drawText.length ? [drawText sizeWithAttributes:@{NSFontAttributeName:font}] : NSZeroSize;
         CGFloat segW = (sym ? sym.size.width : 0) + textSize.width;
         if (draw.count) w += gap*2;
         w += segW;
@@ -2914,8 +2917,14 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
                           @"color": seg[@"color"] ?: fg}];
     }
     w += pad;
+    if (outWidth) *outWidth = ceil(w);
+    return draw;
+}
 
-    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(ceil(w), h)];
+static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width) {
+    CGFloat gap = 4, pad = 2, h = 18;
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:12.5 weight:NSFontWeightRegular];
+    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(width, h)];
     [img lockFocus];
     CGFloat x = pad;
     BOOL first = YES;
@@ -2930,14 +2939,22 @@ static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
                     fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
             x += sym.size.width;
         }
-        [text drawAtPoint:NSMakePoint(x, (h - textSize.height)/2)
-           withAttributes:@{NSFontAttributeName:font,
-                            NSForegroundColorAttributeName:(seg[@"color"] ?: fg)}];
-        x += textSize.width;
+        if (text.length) {
+            [text drawAtPoint:NSMakePoint(x, (h - textSize.height)/2)
+               withAttributes:@{NSFontAttributeName:font,
+                                NSForegroundColorAttributeName:(seg[@"color"] ?: NSColor.controlTextColor)}];
+            x += textSize.width;
+        }
     }
     [img unlockFocus];
     img.template = NO;  // we already used the adaptive fg color
     return img;
+}
+
+static NSImage *BarImage(NSArray<NSDictionary *> *segments, NSColor *fg) {
+    CGFloat w = 0;
+    NSArray<NSDictionary *> *draw = BarLayout(segments, fg, &w);
+    return BarImageFromLayout(draw, w);
 }
 
 #pragma mark - Controller
