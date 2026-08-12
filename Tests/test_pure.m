@@ -489,52 +489,67 @@ int main(void) {
         // --- ChooseBarTier ---
         {
             const double W[3] = {121, 55, 22};   // full, icons, glyph (points)
-            BarTierState s = {BarTierFull, 0};
+            const double T = 10000;              // arbitrary epoch base for the clock
+            double t = T;
+            BarTierState s = {BarTierFull, 0, 0};
             // Plenty of room: stays full, no streak.
-            s = ChooseBarTier(s, 200, W, NO);
+            s = ChooseBarTier(s, 200, W, NO, t);
             check(s.tier == BarTierFull && s.expandStreak == 0, @"tier: roomy gap holds full");
             // Gap collapses to 31 pt (the 2026-08-12 incident): straight to glyph.
-            s = ChooseBarTier(s, 31, W, NO);
+            s = ChooseBarTier(s, 31, W, NO, t += 15);
             check(s.tier == BarTierGlyph, @"tier: 31pt gap shrinks past icons to glyph");
             // Gap that fits icons exactly with shrink margin picks icons, not glyph.
-            s = (BarTierState){BarTierFull, 0};
-            s = ChooseBarTier(s, 60, W, NO);
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, 60, W, NO, t += 15);
             check(s.tier == BarTierIcons, @"tier: 60pt gap fits icons (55+4<=60)");
             // Nothing fits: glyph is the floor — never voluntarily hidden.
-            s = (BarTierState){BarTierGlyph, 0};
-            s = ChooseBarTier(s, 10, W, NO);
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            s = ChooseBarTier(s, 10, W, NO, t += 15);
             check(s.tier == BarTierGlyph, @"tier: glyph floor even when glyph overflows");
             // Expansion needs slack: icons fit without the 24pt margin ⇒ no expand ever.
-            s = (BarTierState){BarTierGlyph, 0};
-            s = ChooseBarTier(s, 70, W, NO);
-            s = ChooseBarTier(s, 70, W, NO);
-            s = ChooseBarTier(s, 70, W, NO);
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            for (int i = 0; i < 3; i++) s = ChooseBarTier(s, 70, W, NO, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 0, @"tier: fit-without-slack never expands (anti-flap)");
-            // With slack (55+24<=85): expands after exactly kBarExpandTicks decisions, one tier.
-            s = (BarTierState){BarTierGlyph, 0};
-            s = ChooseBarTier(s, 85, W, NO);
+            // With slack (55+24<=85): expands after exactly kBarExpandTicks counted decisions.
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            s = ChooseBarTier(s, 85, W, NO, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 1, @"tier: first slack tick only counts");
-            s = ChooseBarTier(s, 85, W, NO);
+            s = ChooseBarTier(s, 85, W, NO, t += 15);
             check(s.tier == BarTierIcons && s.expandStreak == 0, @"tier: second slack tick expands one tier");
+            // THE BURST GUARD: updateBar fires many times per second during IOPS bursts.
+            // Qualifying decisions closer together than kBarExpandMinIntervalSec must not
+            // count, or a 30-second promise collapses into milliseconds (observed live).
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            s = ChooseBarTier(s, 85, W, NO, t += 15);
+            check(s.expandStreak == 1, @"tier: burst — first decision counts");
+            for (int i = 0; i < 20; i++) s = ChooseBarTier(s, 85, W, NO, t += 0.01);
+            check(s.tier == BarTierGlyph && s.expandStreak == 1,
+                  @"tier: burst of 20 qualifying decisions in 0.2s cannot expand");
+            s = ChooseBarTier(s, 85, W, NO, t += kBarExpandMinIntervalSec);
+            check(s.tier == BarTierIcons, @"tier: expands once the wall clock actually advances");
             // An interruption resets the streak.
-            s = (BarTierState){BarTierGlyph, 0};
-            s = ChooseBarTier(s, 85, W, NO);
-            s = ChooseBarTier(s, -1, W, NO);
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            s = ChooseBarTier(s, 85, W, NO, t += 15);
+            s = ChooseBarTier(s, -1, W, NO, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 0, @"tier: unknown gap holds tier, resets streak");
-            s = ChooseBarTier(s, 85, W, NO);
+            s = ChooseBarTier(s, 85, W, NO, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 1, @"tier: streak restarts after reset");
             // Eviction overrides a (stale) roomy measurement.
-            s = (BarTierState){BarTierFull, 1};
-            s = ChooseBarTier(s, 500, W, YES);
+            s = (BarTierState){BarTierFull, 1, 0};
+            s = ChooseBarTier(s, 500, W, YES, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 0, @"tier: eviction forces glyph despite roomy gap");
             // Full recovery from glyph is one tier per step: glyph→icons→full.
-            s = (BarTierState){BarTierGlyph, 0};
-            s = ChooseBarTier(s, 500, W, NO);
-            s = ChooseBarTier(s, 500, W, NO);
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            for (int i = 0; i < 2; i++) s = ChooseBarTier(s, 500, W, NO, t += 15);
             check(s.tier == BarTierIcons, @"tier: recovery step 1 lands icons");
-            s = ChooseBarTier(s, 500, W, NO);
-            s = ChooseBarTier(s, 500, W, NO);
+            for (int i = 0; i < 2; i++) s = ChooseBarTier(s, 500, W, NO, t += 15);
             check(s.tier == BarTierFull, @"tier: recovery step 2 lands full");
+            // A degenerate width vector (a tier that measures wider than the one below it)
+            // must still terminate at a real tier, never spin or overrun the array.
+            const double DEGEN[3] = {18, 4, 22};
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, 12, DEGEN, NO, t += 15);
+            check(s.tier >= BarTierFull && s.tier <= BarTierGlyph, @"tier: degenerate widths stay in range");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

@@ -155,8 +155,9 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
 enum { BarTierFull = 0, BarTierIcons = 1, BarTierGlyph = 2 };
 
 typedef struct {
-    int tier;          // current rendering tier (BarTier*)
-    int expandStreak;  // consecutive decisions the next-wider tier fit with slack
+    int tier;             // current rendering tier (BarTier*)
+    int expandStreak;     // consecutive decisions the next-wider tier fit with slack
+    double lastCountedAt; // epoch of the last counted decision (rate-limits the streak)
 } BarTierState;
 
 // Hysteresis: shrink the moment the current tier doesn't fit (small margin);
@@ -166,10 +167,16 @@ typedef struct {
 extern const double kBarShrinkMarginPt;   // 4
 extern const double kBarExpandMarginPt;   // 24
 extern const int    kBarExpandTicks;      // 2
+// updateBar fires from many uncoordinated sources (15s timer, IOPS bursts, volume
+// scans, appearance changes), so a "consecutive decisions" streak alone can be
+// satisfied in milliseconds. Counted decisions must be spaced in wall-clock time or
+// the anti-flap guarantee is decisions-shaped, not time-shaped.
+extern const double kBarExpandMinIntervalSec;   // 10
 
 // gapPt: measured free points beside the notch, < 0 = unmeasurable (hold tier).
 // widths[]: this tick's rendered width of each tier. evicted: the shell saw the
 // item's window parked off the bar — forces glyph regardless of the measurement,
 // which is by definition stale when eviction has already happened.
+// nowEpoch: monotonic-ish wall clock used only to rate-limit streak counting.
 BarTierState ChooseBarTier(BarTierState prev, double gapPt,
-                           const double widths[3], BOOL evicted);
+                           const double widths[3], BOOL evicted, double nowEpoch);

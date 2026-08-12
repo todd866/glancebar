@@ -3011,6 +3011,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
     BarTierState _barTier;             // adaptive bar width; zero-init = full tier
+    BOOL _barWasOnBar;                 // arms the eviction net only after a real sighting
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
@@ -3356,37 +3357,56 @@ static double MeasuredBarGap(NSStatusItem *item) {
         if (!CGRectMakeWithDictionaryRepresentation(
                 (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b)) continue;
         // Primary display's menu-bar band only (global CG coords: its top is y=0).
-        if (b.origin.y > 1 || b.size.height > 40) continue;
+        // y must be non-negative too: a display arranged ABOVE the primary sits at
+        // negative CG y, and its own status items would otherwise pass as neighbours
+        // and fake a tiny gap on a roomy bar.
+        if (b.origin.y < 0 || b.origin.y > 1 || b.size.height > 40) continue;
+        // Degenerate 1-px windows (several apps park them at the screen origin) are
+        // not status items and do not occupy bar space.
+        if (b.size.width < 8) continue;
         if (b.origin.x < notchRight || b.origin.x >= rightEdge) continue;
         if (b.origin.x < leftmost) leftmost = b.origin.x;
     }
     return MAX(0.0, leftmost - notchRight);
 }
 
-// Eviction signature observed live 2026-08-12: macOS parks the item's window well
-// below the bar (mid-screen, ~0 alpha) rather than merely occluding it. Occlusion
-// alone is NOT eviction — display sleep occludes every window without moving it,
-// so this tests position, plus isVisible as a belt-and-braces OR. A false positive
-// costs one measured re-expansion cycle (~1 min at glyph), never a disappearance.
-static BOOL BarItemEvicted(NSStatusItem *item) {
+// Is the item sitting in the menu bar right now? Stated positively, because the
+// interesting question at launch is "has it ever been in the bar", not "is it
+// missing" — a window that exists but has not yet been ordered in looks identical
+// to an evicted one, and treating that as eviction forced the glyph tier on every
+// launch (observed live 2026-08-12: `evicted=1 tier 0→2` against a roomy 160pt gap).
+// Worse, on a Mac with no notch the gap is never measurable, so that false eviction
+// latched the glyph permanently. The caller therefore only trusts a NO from this
+// once it has seen a YES. Judged by position: display sleep occludes every window
+// without moving it, so occlusion must not read as eviction. Measured against the
+// window's OWN screen — with several displays the item follows the active menu bar,
+// and comparing it to the primary's top edge would false-positive forever.
+static BOOL BarItemOnBar(NSStatusItem *item) {
     NSWindow *win = item.button.window;
-    NSScreen *screen = NSScreen.screens.firstObject;
-    if (!win || !screen) return NO;                    // no window yet ≠ evicted
-    if (!win.isVisible) return YES;
-    return NSMaxY(win.frame) < NSMaxY(screen.frame) - 40;
+    NSScreen *screen = win.screen ?: NSScreen.screens.firstObject;
+    if (!win || !screen) return NO;
+    return win.isVisible && NSMaxY(win.frame) >= NSMaxY(screen.frame) - 40;
 }
 
 - (NSArray<NSDictionary *> *)barSegmentsForTier:(int)tier full:(NSArray<NSDictionary *> *)full {
     if (tier == BarTierFull) return full;
     if (tier == BarTierIcons) {
         // Same segments, text dropped: the meter icons and alert colors still read.
+        // A text-only segment (a batteryless Mac renders battery as a bare "—") has
+        // nothing left once the text goes: it would contribute an invisible segment
+        // that still eats an inter-segment gap, and in the worst case — battery the
+        // only segment — leave a 4pt blank item, which is precisely the disappearance
+        // this feature exists to prevent. Drop those, and fall back to the glyph if
+        // dropping them empties the tier, so tier widths stay non-increasing.
         NSMutableArray *icons = [NSMutableArray arrayWithCapacity:full.count];
         for (NSDictionary *seg in full) {
+            if (!seg[@"image"] && !seg[@"symbol"]) continue;
             NSMutableDictionary *d = [seg mutableCopy];
             [d removeObjectForKey:@"text"];
             [icons addObject:d];
         }
-        return icons;
+        if (icons.count) return icons;
+        tier = BarTierGlyph;
     }
     // Glyph tier: identity mark — except the lid-awake eye takes over, so that
     // always-visible reminder survives every tier at zero extra width.
@@ -3418,13 +3438,18 @@ static BOOL BarItemEvicted(NSStatusItem *item) {
             widths[t] = w;
         }
         double gap = MeasuredBarGap(self->_item);
-        BOOL evicted = BarItemEvicted(self->_item);
-        BarTierState chosen = ChooseBarTier(self->_barTier, gap, widths, evicted);
-        // The streak counts decisions, not seconds: IOPS bursts can add ticks, so
-        // expansion can arrive a little sooner than 2×15 s. Harmless.
+        // Only a fall FROM the bar is eviction. Before the item has ever been in the
+        // bar there is nothing to have been evicted from, so the safety net stays
+        // disarmed — otherwise every launch starts at the glyph tier, and on a Mac
+        // with no notch (gap permanently unmeasurable) it would never recover.
+        BOOL onBar = BarItemOnBar(self->_item);
+        if (onBar) self->_barWasOnBar = YES;
+        BOOL evicted = self->_barWasOnBar && !onBar;
+        BarTierState chosen = ChooseBarTier(self->_barTier, gap, widths, evicted,
+                                            CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
-            NSLog(@"bar: gap=%.0f widths=[%.0f %.0f %.0f] evicted=%d tier %d→%d streak=%d",
-                  gap, widths[0], widths[1], widths[2], evicted,
+            NSLog(@"bar: gap=%.0f widths=[%.0f %.0f %.0f] onBar=%d evicted=%d tier %d→%d streak=%d",
+                  gap, widths[0], widths[1], widths[2], onBar, evicted,
                   self->_barTier.tier, chosen.tier, chosen.expandStreak);
         self->_barTier = chosen;
         self->_item.button.image = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);

@@ -627,11 +627,14 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
 const double kBarShrinkMarginPt = 4;
 const double kBarExpandMarginPt = 24;
 const int    kBarExpandTicks    = 2;
+const double kBarExpandMinIntervalSec = 10;
 
 BarTierState ChooseBarTier(BarTierState prev, double gapPt,
-                           const double widths[3], BOOL evicted) {
+                           const double widths[3], BOOL evicted, double nowEpoch) {
+    // Every non-qualifying path resets the streak AND its clock, so the next
+    // qualifying decision starts a fresh window and counts immediately.
     BarTierState s = { .tier = MIN(MAX(prev.tier, BarTierFull), BarTierGlyph),
-                       .expandStreak = 0 };
+                       .expandStreak = 0, .lastCountedAt = 0 };
     if (evicted) { s.tier = BarTierGlyph; return s; }
     if (gapPt < 0) return s;
     if (widths[s.tier] + kBarShrinkMarginPt > gapPt) {
@@ -642,8 +645,16 @@ BarTierState ChooseBarTier(BarTierState prev, double gapPt,
         return s;
     }
     if (s.tier > BarTierFull && widths[s.tier - 1] + kBarExpandMarginPt <= gapPt) {
-        s.expandStreak = prev.expandStreak + 1;
-        if (s.expandStreak >= kBarExpandTicks) { s.tier--; s.expandStreak = 0; }
+        if (nowEpoch - prev.lastCountedAt >= kBarExpandMinIntervalSec) {
+            s.expandStreak = prev.expandStreak + 1;
+            s.lastCountedAt = nowEpoch;
+            if (s.expandStreak >= kBarExpandTicks) { s.tier--; s.expandStreak = 0; }
+        } else {
+            // Still qualifying, just too soon to count again: hold the streak and
+            // its clock rather than resetting (a burst must not punish us either).
+            s.expandStreak = prev.expandStreak;
+            s.lastCountedAt = prev.lastCountedAt;
+        }
     }
     return s;
 }
