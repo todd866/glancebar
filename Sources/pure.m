@@ -183,13 +183,133 @@ NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *ex
             days[day] = @{@"t": @([cur[@"t"] longLongValue] + tokens),
                           @"f": @([cur[@"f"] longLongValue] + fresh)};
         }
-        if (e[@"limits"] && (!latestTs || [ts compare:latestTs] == NSOrderedDescending)) {
-            latestTs = ts;
-            latestLimits = e[@"limits"];
+        // Fold every snapshot, not just the newest: the last one to carry a window is
+        // often not the last one to arrive. See MergeCodexRateLimits.
+        if (e[@"limits"]) {
+            latestLimits = MergeCodexRateLimits(latestLimits, latestTs, e[@"limits"], ts);
+            if (!latestTs || [ts compare:latestTs] == NSOrderedDescending) latestTs = ts;
         }
     }
     NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:days forKey:@"days"];
     if (latestLimits) { out[@"latestLimits"] = latestLimits; out[@"latestTs"] = latestTs; }
+    return out;
+}
+
+// --- Codex rate-limit meters ---
+// A snapshot's `primary`/`secondary`/`credits` are independent meters that appear and
+// disappear separately, so they are merged and aged separately too. The stamp is ours,
+// not OpenAI's; it rides inside the meter so it survives the state file round-trip.
+static NSString *const kCodexObservedAtKey = @"_glancebarObservedAt";
+
+static BOOL CodexWindowUsable(id meter) {
+    return [meter isKindOfClass:NSDictionary.class] &&
+           [((NSDictionary *)meter)[@"used_percent"] isKindOfClass:NSNumber.class];
+}
+
+static BOOL CodexCreditsUsable(id meter) {
+    if (![meter isKindOfClass:NSDictionary.class]) return NO;
+    NSDictionary *d = meter;
+    return [d[@"has_credits"] isKindOfClass:NSNumber.class] || [d[@"unlimited"] isKindOfClass:NSNumber.class];
+}
+
+// When this meter was actually observed: its own stamp once carried forward, otherwise
+// the snapshot it arrived in.
+static NSString *CodexMeterObservedAt(NSDictionary *meter, NSString *snapshotTs) {
+    NSString *stamp = [meter[kCodexObservedAtKey] isKindOfClass:NSString.class]
+        ? meter[kCodexObservedAtKey] : nil;
+    return stamp.length ? stamp : snapshotTs;
+}
+
+static NSDictionary *CodexStampedMeter(NSDictionary *meter, NSString *ts) {
+    if (!meter || !ts.length || meter[kCodexObservedAtKey]) return meter;
+    NSMutableDictionary *stamped = [meter mutableCopy];
+    stamped[kCodexObservedAtKey] = ts;
+    return stamped;
+}
+
+// One meter's winner: a usable reading always beats an absent one, and between two
+// usable readings the later observation wins (Codex timestamps are ISO-8601 UTC, so
+// they order lexicographically — the same assumption the rest of this file makes).
+static NSDictionary *CodexBetterMeter(id kept, NSString *keptTs, id incoming, NSString *incomingTs,
+                                      BOOL isCredits) {
+    BOOL keptOK = isCredits ? CodexCreditsUsable(kept) : CodexWindowUsable(kept);
+    BOOL incomingOK = isCredits ? CodexCreditsUsable(incoming) : CodexWindowUsable(incoming);
+    if (!incomingOK) return keptOK ? CodexStampedMeter(kept, keptTs) : nil;
+    if (!keptOK) return CodexStampedMeter(incoming, incomingTs);
+    NSString *keptAt = CodexMeterObservedAt(kept, keptTs);
+    NSString *incomingAt = CodexMeterObservedAt(incoming, incomingTs);
+    BOOL incomingWins = !keptAt.length ||
+        (incomingAt.length && [incomingAt compare:keptAt] != NSOrderedAscending);
+    return incomingWins ? CodexStampedMeter(incoming, incomingTs) : CodexStampedMeter(kept, keptTs);
+}
+
+// When a snapshot's window pair was observed: the later of the two stamps it carries.
+// Nil when the snapshot has no usable window at all.
+static NSString *CodexWindowsObservedAt(NSDictionary *snapshot, NSString *snapshotTs) {
+    NSString *best = nil;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        if (!CodexWindowUsable(snapshot[key])) continue;
+        NSString *at = CodexMeterObservedAt(snapshot[key], snapshotTs);
+        if (at.length && (!best || [at compare:best] == NSOrderedDescending)) best = at;
+    }
+    return best;
+}
+
+NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
+                                   NSDictionary *incoming, NSString *incomingTs) {
+    if (![kept isKindOfClass:NSDictionary.class]) kept = nil;
+    if (![incoming isKindOfClass:NSDictionary.class]) incoming = nil;
+    if (!kept && !incoming) return nil;
+    // Scalars (limit_id, plan_type, rate_limit_reached_type) describe the snapshot as a
+    // whole, so they come from whichever snapshot is newer.
+    BOOL incomingIsNewer = !kept || !keptTs.length ||
+        (incomingTs.length && [incomingTs compare:keptTs] != NSOrderedAscending);
+    NSMutableDictionary *out = [(incoming && incomingIsNewer ? incoming : (kept ?: incoming)) mutableCopy];
+
+    // The window pair moves together, from whichever snapshot last carried one. primary
+    // and secondary describe ONE bucket at ONE instant: taking the newest of each
+    // separately can pair a spent weekly window with an untouched weekly window from a
+    // bucket the account was billed to days ago, which reads as "0% left" and
+    // "100% left" side by side. Both true once; together, a lie.
+    NSString *keptAt = CodexWindowsObservedAt(kept, keptTs);
+    NSString *incomingAt = CodexWindowsObservedAt(incoming, incomingTs);
+    BOOL takeIncoming = incomingAt.length &&
+        (!keptAt.length || [incomingAt compare:keptAt] != NSOrderedAscending);
+    NSDictionary *windows = takeIncoming ? incoming : (keptAt.length ? kept : nil);
+    NSString *windowsTs = takeIncoming ? incomingTs : keptTs;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        NSDictionary *w = CodexWindowUsable(windows[key]) ? CodexStampedMeter(windows[key], windowsTs) : nil;
+        if (w) out[key] = w;
+        else [out removeObjectForKey:key];   // drop JSON null rather than store NSNull
+    }
+    // Credits are one account-level meter with no pairing to preserve, so the newest
+    // usable reading simply wins.
+    NSDictionary *credits = CodexBetterMeter(kept[@"credits"], keptTs, incoming[@"credits"], incomingTs, YES);
+    if (credits) out[@"credits"] = credits;
+    else [out removeObjectForKey:@"credits"];
+    return out;
+}
+
+NSDictionary *CodexCreditsStatus(NSDictionary *rateLimits) {
+    if (![rateLimits isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *credits = [rateLimits[@"credits"] isKindOfClass:NSDictionary.class]
+        ? rateLimits[@"credits"] : nil;
+    if (!CodexCreditsUsable(credits)) return nil;
+    BOOL unlimited = [credits[@"unlimited"] boolValue];
+    BOOL has = [credits[@"has_credits"] boolValue];
+    NSString *balance = [credits[@"balance"] isKindOfClass:NSString.class] ? credits[@"balance"]
+        : [credits[@"balance"] isKindOfClass:NSNumber.class] ? [credits[@"balance"] stringValue] : nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    out[@"unlimited"] = @(unlimited);
+    out[@"exhausted"] = @(!unlimited && !has);
+    if (balance.length) out[@"balance"] = balance;
+    out[@"description"] = unlimited ? @"Unlimited credits"
+        : has ? (balance.length ? [NSString stringWithFormat:@"Credits available (balance %@)", balance]
+                                : @"Credits available")
+              : (balance.length ? [NSString stringWithFormat:@"No credits (balance %@)", balance]
+                                : @"No credits");
+    NSString *observed = CodexMeterObservedAt(credits, nil);
+    if (observed.length) out[@"observedAt"] = observed;
     return out;
 }
 
@@ -213,6 +333,8 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
                      : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
         if (resets > 0) d[@"resetsAt"] = @(resets);
         if ([rateLimits[@"plan_type"] isKindOfClass:NSString.class]) d[@"plan"] = rateLimits[@"plan_type"];
+        NSString *observed = CodexMeterObservedAt(w, nil);
+        if (observed.length) d[@"observedAt"] = observed;   // a carried-forward window is older than its snapshot
         best = d;
     }
     return best;
@@ -251,6 +373,8 @@ NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowE
         d[@"remainingFraction"] = @(remaining);
         if (resets > 0) d[@"resetsAt"] = @(resets);
         if (plan) d[@"plan"] = plan;
+        NSString *observed = CodexMeterObservedAt(w, nil);
+        if (observed.length) d[@"observedAt"] = observed;
         [out addObject:d];
     }
     return out;

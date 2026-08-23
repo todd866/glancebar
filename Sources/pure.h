@@ -67,6 +67,33 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch);
 // ALL still-current Codex limit windows for the dual meter (primary→secondary).
 NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowEpoch);
 
+// Folds a newly-seen rate_limits snapshot onto what is already known: the newest
+// snapshot supplies the scalars, and the primary/secondary pair comes — as a pair —
+// from whichever snapshot last carried one.
+//
+// Codex sends `"primary": null` once requests are billed to a different bucket — the
+// weekly allowance runs out under limit_id "codex" and the next snapshot arrives under
+// "premium" with both windows null. Taking the newest snapshot wholesale therefore
+// erases the only record of when that allowance returns, exactly when the user most
+// wants to know. A retained window expires on its own resets_at, so carrying it forward
+// cannot outlive its truth. Each meter is stamped with the snapshot it came from, so a
+// carried-forward window can still say how old it is.
+//
+// Order-independent: fold snapshots in any sequence and the result is the same.
+NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
+                                   NSDictionary *incoming, NSString *incomingTs);
+
+// Reads the `credits` object that newer Codex builds send beside the windows. Returns
+// nil when absent, else @{@"exhausted": @(nothing left to spend), @"unlimited": @(...),
+//   @"balance": balance string when present, @"description": display string,
+//   @"observedAt": ISO-8601 stamp when the meter was carried forward}.
+//
+// NOT a substitute for the windows: this account reported has_credits=false with a
+// zero balance for days while the weekly window still had room and Codex answered
+// normally. A zero balance means "no credit balance to fall back on", never "refused" —
+// only an exhausted window means that. Report it as context, never as the gauge.
+NSDictionary *CodexCreditsStatus(NSDictionary *rateLimits);
+
 // Picks the most constrained, still-current window from Anthropic's OAuth usage
 // response (window dicts like five_hour/seven_day carrying utilization + resets_at).
 // Anthropic defines utilization as a percentage (so 1.0 means 1%, not 100%); resets_at

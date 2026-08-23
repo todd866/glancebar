@@ -1689,8 +1689,11 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
             NSString *limitsKey = [prefix stringByAppendingString:@"Limits"];
             NSString *ts = [record[tsKey] isKindOfClass:NSString.class] ? record[tsKey] : nil;
             NSDictionary *limits = [record[limitsKey] isKindOfClass:NSDictionary.class] ? record[limitsKey] : nil;
-            if (limits && ts.length && (!bestTs || [ts compare:bestTs] == NSOrderedDescending)) {
-                bestTs = ts; bestLimits = limits;
+            // Meter-wise, not snapshot-wise: once the weekly allowance is spent Codex
+            // stops sending windows at all, so the newest snapshot alone knows least.
+            if (limits && ts.length) {
+                bestLimits = MergeCodexRateLimits(bestLimits, bestTs, limits, ts);
+                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) bestTs = ts;
             }
         }
     }
@@ -1724,10 +1727,11 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
     NSDictionary *acc = AccumulateTokenEvents(record[@"days"], events, nil);
     record[@"days"] = acc[@"days"] ?: @{};
     NSString *ts = acc[@"latestTs"];
-    if (ts.length && (![record[@"latestTs"] isKindOfClass:NSString.class] ||
-                      [ts compare:record[@"latestTs"]] == NSOrderedDescending)) {
-        record[@"latestLimits"] = acc[@"latestLimits"];
-        record[@"latestTs"] = ts;
+    if (ts.length) {
+        NSString *keptTs = [record[@"latestTs"] isKindOfClass:NSString.class] ? record[@"latestTs"] : nil;
+        NSDictionary *merged = MergeCodexRateLimits(record[@"latestLimits"], keptTs, acc[@"latestLimits"], ts);
+        if (merged) record[@"latestLimits"] = merged;
+        if (!keptTs || [ts compare:keptTs] == NSOrderedDescending) record[@"latestTs"] = ts;
     }
     _stateDirty = YES;
 }
@@ -1816,8 +1820,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             NSDictionary *event = ParseTokenCountLine(line);
             NSString *ts = [event[@"ts"] isKindOfClass:NSString.class] ? event[@"ts"] : nil;
             NSDictionary *limits = [event[@"limits"] isKindOfClass:NSDictionary.class] ? event[@"limits"] : nil;
-            if (limits && ts.length && (!bestTs || [ts compare:bestTs] == NSOrderedDescending)) {
-                bestTs = ts; bestLimits = limits;
+            if (limits && ts.length) {
+                bestLimits = MergeCodexRateLimits(bestLimits, bestTs, limits, ts);
+                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) bestTs = ts;
             }
         });
         if (bestLimits) {
@@ -2443,9 +2448,20 @@ static NSString *HashedMessageID(NSString *messageID) {
             ? [NSString stringWithFormat:@"%@ window · %@ plan", pick[@"window"], plan]
             : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
         u.statusSource = @"~/.codex session logs";
-        u.limitUpdatedAt = DateFromStatusString(_limitsTs);
+        // A window carried forward from an earlier snapshot is as old as its own
+        // observation, not as old as the latest snapshot — and that makes it stale,
+        // which is exactly what the row's "cached" marker exists to say.
+        NSString *observed = [pick[@"observedAt"] isKindOfClass:NSString.class] ? pick[@"observedAt"] : nil;
+        u.limitUpdatedAt = DateFromStatusString(observed ?: _limitsTs);
+        if (observed.length && _limitsTs.length && [observed compare:_limitsTs] == NSOrderedAscending)
+            u.limitStale = YES;
     }
     else u.statusReason = CodexLimitStatusReason(_limits, _limitsTs, now);
+
+    // Context, never the gauge: a zero credit balance is normal while the plan window
+    // still has room. See CodexCreditsStatus.
+    NSDictionary *credits = CodexCreditsStatus(_limits);
+    if (credits[@"description"]) u.extraUsage = credits[@"description"];
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     [parts addObject:[NSString stringWithFormat:@"limits snapshot %@",
                       _limitsTs.length ? _limitsTs : @"never seen"]];
@@ -5110,6 +5126,7 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
             @"status": JSONValue(item.statusText),
             @"statusReason": JSONValue(item.statusReason),
             @"statusSource": JSONValue(item.statusSource),
+            @"extraUsage": JSONValue(item.extraUsage),
             @"source": JSONValue(item.source),
             @"overageActive": JSONBool(item.overageActive),
             @"todayFreshTokens": @(item.todayTokens),

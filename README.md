@@ -136,7 +136,13 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   turn in `~/.codex/sessions/**.jsonl` (and rotated
   `~/.codex/archived_sessions/**.jsonl`) records OpenAI's official rate-limit state
   (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
-  the most constrained window that is still current. The same per-turn records carry
+  the most constrained window that is still current. Once an allowance is spent, Codex
+  stops sending windows altogether — the next snapshots arrive under a different
+  `limit_id` with `"primary": null` — so Glancebar carries the last window pair forward
+  until its own `resets_at` passes, marks it cached, and keeps answering the only
+  question that matters in that state: when the allowance comes back. A `credits`
+  balance, when present, is reported as context in Details; it is not a gauge (a zero
+  balance is normal while the plan window still has room). The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed. Headline counts are
   **fresh tokens** (non-cached input + output); cached-context re-reads are shown
   separately. If enabled, Claude's token counts come the same way — live from the

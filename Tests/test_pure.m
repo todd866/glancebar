@@ -552,6 +552,88 @@ int main(void) {
             check(s.tier >= BarTierFull && s.tier <= BarTierGlyph, @"tier: degenerate widths stay in range");
         }
 
+        // --- MergeCodexRateLimits / CodexCreditsStatus ---
+        // Shapes taken from real ~/.codex rollouts across the 2026-08-22 transition,
+        // where a spent weekly allowance under limit_id "codex" was followed by
+        // null-window snapshots under limit_id "premium".
+        {
+            NSString *windowedTs = @"2026-08-22T02:24:10.143Z";
+            NSString *nullTs = @"2026-08-23T04:26:27.057Z";
+            NSDictionary *credits = @{@"has_credits": @NO, @"unlimited": @NO, @"balance": @"0"};
+            NSDictionary *windowed = @{@"limit_id": @"codex",
+                                       @"primary": @{@"used_percent": @100.0, @"window_minutes": @10080,
+                                                     @"resets_at": @1787802739},
+                                       @"secondary": NSNull.null,
+                                       @"credits": credits};
+            NSDictionary *blank = @{@"limit_id": @"premium",
+                                    @"primary": NSNull.null, @"secondary": NSNull.null,
+                                    @"credits": credits};
+            double before = 1787479938;   // 2026-08-23, four days short of the reset
+
+            NSDictionary *merged = MergeCodexRateLimits(windowed, windowedTs, blank, nullTs);
+            check([merged[@"limit_id"] isEqual:@"premium"], @"codex merge: newest snapshot supplies the scalars");
+            NSDictionary *pick = PickLimitWindow(merged, before);
+            check(pick && [pick[@"window"] isEqual:@"weekly"],
+                  @"codex merge: a null-window snapshot cannot erase the known window");
+            check([pick[@"remainingFraction"] doubleValue] == 0, @"codex merge: spent window still reads 0%");
+            check([pick[@"resetsAt"] doubleValue] == 1787802739, @"codex merge: the reset survives");
+            check([pick[@"observedAt"] isEqual:windowedTs],
+                  @"codex merge: a carried-forward window reports its own observation, not the snapshot's");
+            // Order independence: the log is not guaranteed to arrive newest-last.
+            NSDictionary *reversed = MergeCodexRateLimits(blank, nullTs, windowed, windowedTs);
+            NSDictionary *reversedPick = PickLimitWindow(reversed, before);
+            check(reversedPick && [reversedPick[@"resetsAt"] doubleValue] == 1787802739,
+                  @"codex merge: folding in either order keeps the window");
+            check([reversed[@"limit_id"] isEqual:@"premium"],
+                  @"codex merge: folding in either order keeps the newest scalars");
+            // A newer real reading replaces an older one rather than being retained.
+            NSDictionary *fresher = @{@"limit_id": @"codex",
+                                      @"primary": @{@"used_percent": @12.0, @"window_minutes": @10080,
+                                                    @"resets_at": @1788407539}};
+            NSDictionary *advanced = MergeCodexRateLimits(merged, nullTs, fresher, @"2026-08-27T14:00:00.000Z");
+            check([[PickLimitWindow(advanced, before) valueForKey:@"resetsAt"] doubleValue] == 1788407539,
+                  @"codex merge: a newer window reading wins outright");
+            // The regression that made this a pair: primary and secondary describe one
+            // bucket, so a secondary from a bucket billed days ago must not pair with a
+            // primary from today — that renders as 0% left beside 100% left.
+            NSDictionary *otherBucket = @{@"limit_id": @"codex_bengalfox",
+                                          @"secondary": @{@"used_percent": @0.0, @"window_minutes": @10080,
+                                                          @"resets_at": @1787848682}};
+            NSDictionary *mixed = MergeCodexRateLimits(otherBucket, @"2026-08-20T16:38:33.384Z",
+                                                       windowed, windowedTs);
+            check(CodexLimitWindows(mixed, before).count == 1,
+                  @"codex merge: windows move as a pair, never mixed across buckets");
+            NSDictionary *stillMixed = MergeCodexRateLimits(mixed, windowedTs, blank, nullTs);
+            check(CodexLimitWindows(stillMixed, before).count == 1,
+                  @"codex merge: the discarded bucket does not return on the next fold");
+
+            check(CodexCreditsStatus(nil) == nil, @"codex credits: absent ⇒ nil");
+            check(CodexCreditsStatus(@{@"primary": NSNull.null}) == nil, @"codex credits: no credits object ⇒ nil");
+            NSDictionary *empty = CodexCreditsStatus(merged);
+            check([empty[@"exhausted"] boolValue], @"codex credits: no balance ⇒ exhausted");
+            check([empty[@"description"] isEqual:@"No credits (balance 0)"], @"codex credits: names the balance");
+            NSDictionary *unlimited = CodexCreditsStatus(@{@"credits": @{@"unlimited": @YES, @"has_credits": @NO}});
+            check(![unlimited[@"exhausted"] boolValue], @"codex credits: unlimited is never exhausted");
+            NSDictionary *funded = CodexCreditsStatus(@{@"credits": @{@"has_credits": @YES, @"unlimited": @NO,
+                                                                      @"balance": @"12.34"}});
+            check(![funded[@"exhausted"] boolValue] && [funded[@"description"] containsString:@"12.34"],
+                  @"codex credits: a real balance is reported, not flagged");
+            // Credits are the one meter with no pair, so they survive a snapshot that omits them.
+            NSDictionary *creditless = MergeCodexRateLimits(merged, nullTs,
+                                                            @{@"limit_id": @"premium"}, @"2026-08-23T05:00:00.000Z");
+            check([CodexCreditsStatus(creditless)[@"exhausted"] boolValue],
+                  @"codex merge: credits survive a snapshot that omits them");
+
+            // The accumulator folds every event, so a trailing null snapshot in one
+            // batch cannot drop the window seen earlier in that same batch.
+            NSArray *events = @[@{@"ts": windowedTs, @"tokens": @10, @"fresh": @5, @"limits": windowed},
+                                @{@"ts": nullTs, @"tokens": @0, @"fresh": @0, @"limits": blank}];
+            NSDictionary *acc = AccumulateTokenEvents(nil, events, [NSTimeZone timeZoneWithName:@"UTC"]);
+            check([acc[@"latestTs"] isEqual:nullTs], @"codex accumulate: latestTs is the newest snapshot");
+            check(PickLimitWindow(acc[@"latestLimits"], before) != nil,
+                  @"codex accumulate: the window survives a later null snapshot in the same batch");
+        }
+
         // --- ResetPhrase / ResetClockText ---
         // The AI row's whole job. Built from calendar components rather than epoch
         // arithmetic so the day-boundary branches are exercised in the local calendar,
