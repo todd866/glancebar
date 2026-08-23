@@ -1127,8 +1127,12 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     NSArray<NSDictionary *> *_claudeInventory;
     double _codexInventoryValidUntil, _claudeInventoryValidUntil;
     NSMutableDictionary<NSString *, NSDictionary *> *_days;  // local "yyyy-MM-dd" -> @{@"t":, @"f":}
-    NSDictionary *_limits;          // newest rate_limits seen
+    NSDictionary *_limits;          // best known meters, merged across snapshots
     NSString *_limitsTs;
+    // The newest snapshot verbatim. _limits is a deliberate blend of the best-known
+    // meters, so asking IT whether Codex still speaks a shape we understand answers the
+    // wrong question: one carried-forward window makes any blend look readable.
+    NSDictionary *_limitsNewest;
     NSDate *_dbStamp;               // change detection for the sqlite extras
     NSString *_dbDay;
     long long _sessionsToday;
@@ -1675,7 +1679,7 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
 - (void)rebuildCodexDerivedState {
     NSString *weekStart = WeekStartDayString();
     NSMutableDictionary *sum = [NSMutableDictionary dictionary];
-    NSDictionary *bestLimits = nil;
+    NSDictionary *bestLimits = nil, *newestLimits = nil;
     NSString *bestTs = nil;
     for (NSMutableDictionary *record in _codexFiles.allValues) {
         NSMutableDictionary *recordDays = [([record[@"days"] isKindOfClass:NSDictionary.class]
@@ -1693,13 +1697,17 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
             // stops sending windows at all, so the newest snapshot alone knows least.
             if (limits && ts.length) {
                 bestLimits = MergeCodexRateLimits(bestLimits, bestTs, limits, ts);
-                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) bestTs = ts;
+                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) {
+                    bestTs = ts;
+                    newestLimits = limits;   // kept verbatim, for the drift check
+                }
             }
         }
     }
     _days = sum;
     _limits = bestLimits;
     _limitsTs = bestTs;
+    _limitsNewest = newestLimits;
 }
 
 - (void)rebuildClaudeDerivedState {
@@ -2433,6 +2441,8 @@ static NSString *HashedMessageID(NSString *messageID) {
     u.lastActivity = _lastActivity;
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
 
+    // Read drift from the newest snapshot as it arrived, not from the merged view.
+    NSString *drift = CodexSchemaDriftReason(_limitsNewest);
     u.limitWindows = CodexLimitWindows(_limits, now);
     NSDictionary *pick = PickLimitWindow(_limits, now);
     if (pick) {
@@ -2456,15 +2466,23 @@ static NSString *HashedMessageID(NSString *messageID) {
         if (observed.length && _limitsTs.length && [observed compare:_limitsTs] == NSOrderedAscending)
             u.limitStale = YES;
     }
-    else u.statusReason = CodexLimitStatusReason(_limits, _limitsTs, now);
+    // With no gauge left, "the payload changed shape" beats "the windows have reset":
+    // both are true, but only one tells the user why no new number is coming.
+    else u.statusReason = drift ?: CodexLimitStatusReason(_limits, _limitsTs, now);
 
     // Context, never the gauge: a zero credit balance is normal while the plan window
     // still has room. See CodexCreditsStatus.
     NSDictionary *credits = CodexCreditsStatus(_limits);
     if (credits[@"description"]) u.extraUsage = credits[@"description"];
+    // Say it even while a carried-forward window still reads, or the cause hides behind
+    // up to a week of apparently-healthy rows. limitRefreshError is exactly "why the
+    // figure above is the last-known one", and Codex never sets it otherwise.
+    // (--strict consults only Claude/Cursor, so this cannot change an exit code.)
+    if (drift.length) u.limitRefreshError = drift;
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     [parts addObject:[NSString stringWithFormat:@"limits snapshot %@",
                       _limitsTs.length ? _limitsTs : @"never seen"]];
+    if (drift.length) [parts addObject:drift];
     BOOL anyCurrent = NO, anyUsable = NO;
     for (NSString *key in @[@"primary", @"secondary"]) {
         NSDictionary *w = [_limits[key] isKindOfClass:NSDictionary.class] ? _limits[key] : nil;

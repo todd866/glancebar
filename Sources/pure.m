@@ -238,9 +238,19 @@ static NSDictionary *CodexBetterMeter(id kept, NSString *keptTs, id incoming, NS
     if (!keptOK) return CodexStampedMeter(incoming, incomingTs);
     NSString *keptAt = CodexMeterObservedAt(kept, keptTs);
     NSString *incomingAt = CodexMeterObservedAt(incoming, incomingTs);
-    BOOL incomingWins = !keptAt.length ||
-        (incomingAt.length && [incomingAt compare:keptAt] != NSOrderedAscending);
-    return incomingWins ? CodexStampedMeter(incoming, incomingTs) : CodexStampedMeter(kept, keptTs);
+    if (!keptAt.length) return CodexStampedMeter(incoming, incomingTs);
+    if (!incomingAt.length) return CodexStampedMeter(kept, keptTs);
+    NSComparisonResult order = [incomingAt compare:keptAt];
+    // Equal stamps are the same observation, so either reading is equally true — but the
+    // caller folds records in whatever order a dictionary hands them over, and "either"
+    // has to resolve the same way every run. Break ties toward the reading that claims
+    // LESS left: never grant room that an equally-current reading says is spent.
+    if (order == NSOrderedSame) {
+        BOOL keptExhausted = [CodexCreditsStatus(@{@"credits": kept})[@"exhausted"] boolValue];
+        return keptExhausted ? CodexStampedMeter(kept, keptTs) : CodexStampedMeter(incoming, incomingTs);
+    }
+    return order == NSOrderedDescending ? CodexStampedMeter(incoming, incomingTs)
+                                        : CodexStampedMeter(kept, keptTs);
 }
 
 // When a snapshot's window pair was observed: the later of the two stamps it carries.
@@ -253,6 +263,17 @@ static NSString *CodexWindowsObservedAt(NSDictionary *snapshot, NSString *snapsh
         if (at.length && (!best || [at compare:best] == NSOrderedDescending)) best = at;
     }
     return best;
+}
+
+// The most-spent usable window in a snapshot, for resolving equal stamps.
+static double CodexWindowsSpend(NSDictionary *snapshot) {
+    double spend = -1;
+    for (NSString *key in @[@"primary", @"secondary"]) {
+        if (!CodexWindowUsable(snapshot[key])) continue;
+        double used = JSONDouble(((NSDictionary *)snapshot[key])[@"used_percent"]);
+        if (used > spend) spend = used;
+    }
+    return spend;
 }
 
 NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
@@ -273,13 +294,31 @@ NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
     // "100% left" side by side. Both true once; together, a lie.
     NSString *keptAt = CodexWindowsObservedAt(kept, keptTs);
     NSString *incomingAt = CodexWindowsObservedAt(incoming, incomingTs);
-    BOOL takeIncoming = incomingAt.length &&
-        (!keptAt.length || [incomingAt compare:keptAt] != NSOrderedAscending);
+    BOOL takeIncoming;
+    if (!incomingAt.length) takeIncoming = NO;
+    else if (!keptAt.length) takeIncoming = YES;
+    else {
+        NSComparisonResult order = [incomingAt compare:keptAt];
+        // Ties: the more-spent pair wins, so an arbitrary fold order can never be the
+        // difference between reporting room and reporting none. See CodexBetterMeter.
+        takeIncoming = order == NSOrderedSame ? CodexWindowsSpend(incoming) > CodexWindowsSpend(kept)
+                                              : order == NSOrderedDescending;
+    }
     NSDictionary *windows = takeIncoming ? incoming : (keptAt.length ? kept : nil);
     NSString *windowsTs = takeIncoming ? incomingTs : keptTs;
+    // Carrying a window past a newer snapshot is only safe because it expires on its own
+    // resets_at. One without a reset would never age out — it would sit there claiming a
+    // stale percentage until the rollout file itself falls out of the 8-day inventory. A
+    // window observed in the CURRENT snapshot is a live reading and needs no such proof.
+    NSString *newestTs = !keptTs.length ? incomingTs
+        : !incomingTs.length ? keptTs
+        : ([incomingTs compare:keptTs] == NSOrderedDescending ? incomingTs : keptTs);
+    BOOL carriedForward = windowsTs.length && newestTs.length &&
+        [windowsTs compare:newestTs] == NSOrderedAscending;
     for (NSString *key in @[@"primary", @"secondary"]) {
-        NSDictionary *w = CodexWindowUsable(windows[key]) ? CodexStampedMeter(windows[key], windowsTs) : nil;
-        if (w) out[key] = w;
+        NSDictionary *w = CodexWindowUsable(windows[key]) ? windows[key] : nil;
+        if (w && carriedForward && JSONDouble(w[@"resets_at"]) <= 0) w = nil;
+        if (w) out[key] = CodexStampedMeter(w, windowsTs);
         else [out removeObjectForKey:key];   // drop JSON null rather than store NSNull
     }
     // Credits are one account-level meter with no pairing to preserve, so the newest
@@ -295,8 +334,15 @@ NSDictionary *CodexCreditsStatus(NSDictionary *rateLimits) {
     NSDictionary *credits = [rateLimits[@"credits"] isKindOfClass:NSDictionary.class]
         ? rateLimits[@"credits"] : nil;
     if (!CodexCreditsUsable(credits)) return nil;
-    BOOL unlimited = [credits[@"unlimited"] boolValue];
-    BOOL has = [credits[@"has_credits"] boolValue];
+    // These payloads use JSON null freely (limit_name, individual_limit, primary…), and
+    // CodexCreditsUsable passes when EITHER flag is a number — so -boolValue here would
+    // meet NSNull and abort. Read both defensively, and say nothing rather than guess
+    // when the flag that carries the meaning is the one that is missing.
+    BOOL unlimited = [credits[@"unlimited"] isKindOfClass:NSNumber.class] &&
+                     [credits[@"unlimited"] boolValue];
+    BOOL hasKnown = [credits[@"has_credits"] isKindOfClass:NSNumber.class];
+    BOOL has = hasKnown && [credits[@"has_credits"] boolValue];
+    if (!unlimited && !hasKnown) return nil;
     NSString *balance = [credits[@"balance"] isKindOfClass:NSString.class] ? credits[@"balance"]
         : [credits[@"balance"] isKindOfClass:NSNumber.class] ? [credits[@"balance"] stringValue] : nil;
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
@@ -696,6 +742,54 @@ NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
     return @{@"ok": @YES, @"token": token, @"expiresAt": @(expiresAtEpoch)};
 }
 
+NSString *CodexSchemaDriftReason(NSDictionary *rateLimits) {
+    if (![rateLimits isKindOfClass:NSDictionary.class] || !((NSDictionary *)rateLimits).count) return nil;
+    // Anything readable means the format still works, whatever else it carries.
+    if (CodexWindowUsable(rateLimits[@"primary"]) || CodexWindowUsable(rateLimits[@"secondary"]) ||
+        CodexCreditsUsable(rateLimits[@"credits"])) return nil;
+
+    // A window that is present as an object but unreadable changed its insides — a
+    // renamed used_percent looks exactly like this. An explicit null did not.
+    for (NSString *key in @[@"primary", @"secondary"])
+        if ([rateLimits[key] isKindOfClass:NSDictionary.class])
+            return @"Limit windows changed shape (no used_percent)";
+    if ([rateLimits[@"credits"] isKindOfClass:NSDictionary.class])
+        return @"Credit balance changed shape";
+
+    static NSSet *known;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        known = [NSSet setWithArray:@[@"primary", @"secondary", @"credits", @"limit_id", @"limit_name",
+                                      @"plan_type", @"individual_limit", @"rate_limit_reached_type",
+                                      @"spend_control_reached"]];
+    });
+    // Filter before sorting, not after: this function exists to survive payloads nobody
+    // predicted, and -compare: on a non-string key would raise inside the sort.
+    NSMutableArray<NSString *> *unknown = [NSMutableArray array];
+    for (id key in rateLimits.allKeys)
+        if ([key isKindOfClass:NSString.class] && ![known containsObject:key] &&
+            ![key hasPrefix:@"_glancebar"]) [unknown addObject:key];
+    [unknown sortUsingSelector:@selector(compare:)];   // stable naming across refreshes
+    if (!unknown.count) return nil;   // known keys, no values: understood and empty
+
+    // One name you can grep the payload for beats two that truncate mid-word. Field
+    // names vary wildly in length, so the budget is characters, not a field count:
+    // "weekly_allowance_v2" alone spends what two short names would.
+    const NSUInteger kNameBudget = 26;   // ≈ 270pt at 10.5pt with the label, inside a 288pt row
+    NSMutableArray<NSString *> *shown = [NSMutableArray array];
+    NSUInteger used = 0;
+    for (NSString *key in unknown) {
+        NSUInteger cost = key.length + (shown.count ? 2 : 0);
+        if (shown.count && used + cost > kNameBudget) break;
+        [shown addObject:key];
+        used += cost;
+    }
+    NSUInteger hidden = unknown.count - shown.count;
+    return [NSString stringWithFormat:@"Unknown limit fields: %@%@",
+            [shown componentsJoinedByString:@", "],
+            hidden ? [NSString stringWithFormat:@" +%lu", (unsigned long)hidden] : @""];
+}
+
 NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, double nowEpoch) {
     BOOL sawUsable = NO;
     for (NSString *key in @[@"primary", @"secondary"]) {
@@ -705,7 +799,10 @@ NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, d
         double resets = JSONDouble(w[@"resets_at"]);
         if (!(resets > 0 && resets <= nowEpoch)) return nil;   // current window — gauge shows
     }
-    if (!sawUsable) return @"Codex session logs do not carry limit status";
+    if (!sawUsable) {
+        NSString *drift = CodexSchemaDriftReason(rateLimits);
+        return drift ?: @"Codex session logs do not carry limit status";
+    }
     NSDate *snapshot = limitsTs.length ? DateFromISO8601(limitsTs) : nil;
     if (!snapshot) return @"Limit windows reset since last Codex session";
     NSDateFormatter *fmt = [NSDateFormatter new];

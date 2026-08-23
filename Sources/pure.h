@@ -79,7 +79,11 @@ NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowE
 // cannot outlive its truth. Each meter is stamped with the snapshot it came from, so a
 // carried-forward window can still say how old it is.
 //
-// Order-independent: fold snapshots in any sequence and the result is the same.
+// Order-independent: fold snapshots in any sequence and the result is the same. Equal
+// stamps are resolved toward the reading that claims LESS quota left, so an arbitrary
+// enumeration order can never be the difference between reporting room and reporting
+// none. CONTRACT: each (snapshot, ts) pair must belong together — a meter is stamped
+// with the ts it is folded under, and that stamp then travels with it.
 NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
                                    NSDictionary *incoming, NSString *incomingTs);
 
@@ -93,6 +97,20 @@ NSDictionary *MergeCodexRateLimits(NSDictionary *kept, NSString *keptTs,
 // normally. A zero balance means "no credit balance to fall back on", never "refused" —
 // only an exhausted window means that. Report it as context, never as the gauge.
 NSDictionary *CodexCreditsStatus(NSDictionary *rateLimits);
+
+// Names a rate_limits snapshot Glancebar cannot read, so schema drift reports itself
+// instead of hiding behind "no limit status". Nil while the snapshot makes sense.
+//
+// Two things must not be confused. A snapshot that says `"primary": null` is UNDERSTOOD
+// and empty — that is Codex's normal way of saying an allowance is not being metered
+// right now, and it must stay silent. Drift is a snapshot that carries no readable meter
+// AND either a window object whose insides changed (a dict with no numeric used_percent)
+// or top-level keys this build has never heard of.
+//
+// This distinction is the whole point: Glancebar spent a day telling its user "Codex
+// session logs do not carry limit status" when the logs carried it fine and only the
+// selection was wrong. An app that cannot read its source should say so in those words.
+NSString *CodexSchemaDriftReason(NSDictionary *rateLimits);
 
 // Picks the most constrained, still-current window from Anthropic's OAuth usage
 // response (window dicts like five_hour/seven_day carrying utilization + resets_at).

@@ -358,9 +358,11 @@ int main(void) {
         check([CodexLimitStatusReason(nil, nil, 1000)
                   isEqual:@"Codex session logs do not carry limit status"],
               @"no rate_limits ever seen ⇒ do-not-carry");
+        // Was "do-not-carry": a window object with no used_percent is malformed, and
+        // saying which way it is malformed beats blaming the logs for carrying nothing.
         check([CodexLimitStatusReason(@{@"primary": @{@"window_minutes": @300}}, nil, 1000)
-                  isEqual:@"Codex session logs do not carry limit status"],
-              @"windows without used_percent are malformed ⇒ do-not-carry");
+                  isEqual:@"Limit windows changed shape (no used_percent)"],
+              @"windows without used_percent report the shape change, not silence");
         check(CodexLimitStatusReason(@{@"primary": @{@"used_percent": @83.0, @"resets_at": @2000}},
                                      @"2026-06-10T09:25:32Z", 1000) == nil,
               @"unexpired window ⇒ nil (gauge shows)");
@@ -632,6 +634,92 @@ int main(void) {
             check([acc[@"latestTs"] isEqual:nullTs], @"codex accumulate: latestTs is the newest snapshot");
             check(PickLimitWindow(acc[@"latestLimits"], before) != nil,
                   @"codex accumulate: the window survives a later null snapshot in the same batch");
+        }
+
+        // --- CodexSchemaDriftReason ---
+        // The line between "understood and empty" and "we can no longer read this".
+        {
+            NSDictionary *credits = @{@"has_credits": @NO, @"unlimited": @NO, @"balance": @"0"};
+            check(CodexSchemaDriftReason(nil) == nil, @"codex drift: no snapshot ⇒ silent");
+            check(CodexSchemaDriftReason(@{}) == nil, @"codex drift: empty snapshot ⇒ silent");
+            // The real 2026-08-23 payload. Firing here would cry wolf every time an
+            // allowance runs out, which is the one moment the row must stay trustworthy.
+            check(CodexSchemaDriftReason(@{@"limit_id": @"premium", @"primary": NSNull.null,
+                                           @"secondary": NSNull.null, @"credits": credits}) == nil,
+                  @"codex drift: explicit nulls beside readable credits are understood");
+            check(CodexSchemaDriftReason(@{@"limit_id": @"premium", @"primary": NSNull.null,
+                                           @"secondary": NSNull.null}) == nil,
+                  @"codex drift: known keys with no values are understood, not drift");
+            check([CodexSchemaDriftReason(@{@"primary": @{@"percent_used": @40, @"window_minutes": @300}})
+                      isEqual:@"Limit windows changed shape (no used_percent)"],
+                  @"codex drift: a renamed field inside a window is caught");
+            check([CodexSchemaDriftReason(@{@"credits": @{@"remaining_credits": @5}})
+                      isEqual:@"Credit balance changed shape"],
+                  @"codex drift: a reshaped credits object is caught");
+            check([CodexSchemaDriftReason(@{@"limit_id": @"premium", @"quota_v2": @{@"left": @3}})
+                      isEqual:@"Unknown limit fields: quota_v2"],
+                  @"codex drift: an unknown top-level field is named");
+            check([CodexSchemaDriftReason(@{@"allowance": @1, @"budget": @2, @"quota_v2": @3, @"zebra": @4})
+                      isEqual:@"Unknown limit fields: allowance, budget +2"],
+                  @"codex drift: short names share the budget, the rest are counted");
+            // One long name spends the whole budget, and must not drag a second in after it.
+            check([CodexSchemaDriftReason(@{@"spend_envelope": @1, @"weekly_allowance_v2": @2})
+                      isEqual:@"Unknown limit fields: spend_envelope +1"],
+                  @"codex drift: a long name is reported alone rather than truncated");
+            check(CodexSchemaDriftReason(@{@"quota_v2": @{@"left": @3},
+                                           @"primary": @{@"used_percent": @40.0}}) == nil,
+                  @"codex drift: an unknown field beside a readable meter is not drift");
+            // Our own provenance stamp must never read as OpenAI inventing a field.
+            check(CodexSchemaDriftReason(@{@"limit_id": @"premium", @"_glancebarObservedAt": @"2026-08-22T02:24:10Z"}) == nil,
+                  @"codex drift: Glancebar's own stamp is not an unknown field");
+            check([CodexLimitStatusReason(@{@"quota_v2": @{@"left": @3}}, nil, 1000)
+                      isEqual:@"Unknown limit fields: quota_v2"],
+                  @"codex drift: the status reason reports drift instead of shrugging");
+            check([CodexLimitStatusReason(@{@"limit_id": @"premium", @"primary": NSNull.null}, nil, 1000)
+                      isEqual:@"Codex session logs do not carry limit status"],
+                  @"codex drift: a merely empty snapshot keeps the old, true message");
+        }
+
+        // --- Codex merge hardening (findings from an independent review) ---
+        {
+            double before = 1787479938;
+            NSString *tie = @"2026-08-22T02:24:10.143Z";
+            // A tie in timestamps must not let dictionary enumeration order decide how
+            // much quota the user is told they have.
+            NSDictionary *spent = @{@"limit_id": @"codex",
+                                    @"primary": @{@"used_percent": @100.0, @"resets_at": @1787802739}};
+            NSDictionary *roomy = @{@"limit_id": @"codex",
+                                    @"primary": @{@"used_percent": @20.0, @"resets_at": @1787802739}};
+            check([PickLimitWindow(MergeCodexRateLimits(spent, tie, roomy, tie), before)[@"remainingFraction"]
+                      doubleValue] == 0,
+                  @"codex merge: an equal-stamped tie resolves to the more-spent window (incoming first)");
+            check([PickLimitWindow(MergeCodexRateLimits(roomy, tie, spent, tie), before)[@"remainingFraction"]
+                      doubleValue] == 0,
+                  @"codex merge: the same tie resolves the same way from the other side");
+            NSDictionary *someCredits = @{@"credits": @{@"has_credits": @YES, @"unlimited": @NO, @"balance": @"9"}};
+            NSDictionary *noCredits = @{@"credits": @{@"has_credits": @NO, @"unlimited": @NO, @"balance": @"0"}};
+            check([CodexCreditsStatus(MergeCodexRateLimits(someCredits, tie, noCredits, tie))[@"exhausted"] boolValue] &&
+                  [CodexCreditsStatus(MergeCodexRateLimits(noCredits, tie, someCredits, tie))[@"exhausted"] boolValue],
+                  @"codex merge: a credits tie resolves to exhausted from either side");
+
+            // Carrying a window forward is only safe because it expires on its own, so a
+            // reset-less one must not be carried — it would never age out.
+            NSDictionary *resetless = @{@"limit_id": @"codex", @"primary": @{@"used_percent": @55.0}};
+            NSDictionary *blank2 = @{@"limit_id": @"premium", @"primary": NSNull.null};
+            check(PickLimitWindow(MergeCodexRateLimits(resetless, @"2026-08-22T02:24:10.143Z",
+                                                       blank2, @"2026-08-23T04:26:27.057Z"), before) == nil,
+                  @"codex merge: a reset-less window is not carried past a newer snapshot");
+            check(PickLimitWindow(MergeCodexRateLimits(nil, nil, resetless, tie), before) != nil,
+                  @"codex merge: a reset-less window from the current snapshot still shows");
+
+            // JSON null appears all over these payloads; the credits reader must not meet
+            // it with a scalar selector.
+            check(CodexCreditsStatus(@{@"credits": @{@"has_credits": @NO, @"unlimited": NSNull.null}}) != nil,
+                  @"codex credits: a null unlimited flag is read, not crashed on");
+            check(CodexCreditsStatus(@{@"credits": @{@"has_credits": NSNull.null, @"unlimited": @YES}}) != nil,
+                  @"codex credits: a null has_credits beside unlimited still reads");
+            check(CodexCreditsStatus(@{@"credits": @{@"has_credits": NSNull.null, @"unlimited": @NO}}) == nil,
+                  @"codex credits: with neither flag readable, say nothing rather than guess");
         }
 
         // --- ResetPhrase / ResetClockText ---

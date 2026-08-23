@@ -142,7 +142,10 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   until its own `resets_at` passes, marks it cached, and keeps answering the only
   question that matters in that state: when the allowance comes back. A `credits`
   balance, when present, is reported as context in Details; it is not a gauge (a zero
-  balance is normal while the plan window still has room). The same per-turn records carry
+  balance is normal while the plan window still has room). If a snapshot ever arrives in
+  a shape Glancebar cannot read — a renamed field, an unfamiliar meter — the row says
+  which fields it did not recognise rather than reporting no status at all, so schema
+  drift looks like schema drift and not like an idle account. The same per-turn records carry
   exact token deltas, which is how today/7-day totals are computed. Headline counts are
   **fresh tokens** (non-cached input + output); cached-context re-reads are shown
   separately. If enabled, Claude's token counts come the same way — live from the
