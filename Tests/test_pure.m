@@ -300,7 +300,7 @@ int main(void) {
                   @"2026-08-10T01:41:00Z", 1000) == nil,
               @"claude status nil while a live window exists");
         check([ClaudeLimitStatusReason(@{}, @"", 1000)
-                  isEqual:@"Claude account response did not include a current limit window"],
+                  isEqual:@"Account response has no current limit window"],
               @"claude empty usage yields the missing-window reason");
         check([ClaudeLimitStatusReason(elapsed, nil, 1000)
                   isEqual:@"Limit windows reset since last Claude refresh"],
@@ -463,7 +463,7 @@ int main(void) {
         check(CursorLimitStatusReason(cursorPlan, @"2026-08-10T01:41:00Z", 1770000000.0) == nil,
               @"cursor status nil while a live window exists");
         check([CursorLimitStatusReason(@{}, @"", 1000)
-                  isEqual:@"Cursor account response did not include a current limit window"],
+                  isEqual:@"Account response has no current limit window"],
               @"cursor empty usage yields the missing-window reason");
         check([CursorLimitStatusReason(cursorElapsed, nil, 1771077734.0)
                   isEqual:@"Limit windows reset since last Cursor refresh"],
@@ -550,6 +550,47 @@ int main(void) {
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 12, DEGEN, NO, t += 15);
             check(s.tier >= BarTierFull && s.tier <= BarTierGlyph, @"tier: degenerate widths stay in range");
+        }
+
+        // --- ResetPhrase / ResetClockText ---
+        // The AI row's whole job. Built from calendar components rather than epoch
+        // arithmetic so the day-boundary branches are exercised in the local calendar,
+        // which is the one the reader is standing in.
+        {
+            NSCalendar *cal = NSCalendar.currentCalendar;
+            NSDate *(^at)(NSInteger, NSInteger, NSInteger) = ^NSDate *(NSInteger day, NSInteger hour, NSInteger minute) {
+                NSDateComponents *c = [NSDateComponents new];
+                c.year = 2026; c.month = 6; c.day = day; c.hour = hour; c.minute = minute;
+                return [cal dateFromComponents:c];
+            };
+            NSDate *now = at(10, 10, 0);   // Wed 10 June 2026, 10:00 local
+            check(ResetPhrase(nil, now) == nil, @"reset: no instant → no phrase");
+            check(ResetClockText(nil, now) == nil, @"reset: no instant → no clock text");
+            check([ResetPhrase(at(10, 9, 0), now) isEqual:@"Reset has passed"],
+                  @"reset: an elapsed cached window says so instead of counting backwards");
+            check([ResetPhrase([now dateByAddingTimeInterval:30], now) hasSuffix:@"any moment"],
+                  @"reset: under a minute is 'any moment'");
+            check([ResetPhrase(at(10, 10, 42), now) hasSuffix:@"in 42m"], @"reset: minutes countdown");
+            check([ResetPhrase(at(10, 13, 20), now) hasSuffix:@"in 3h 20m"], @"reset: hours + minutes countdown");
+            check([ResetPhrase(at(10, 15, 0), now) hasSuffix:@"in 5h"], @"reset: whole hours drop the minutes");
+            check([ResetPhrase(at(10, 15, 0), now) hasPrefix:@"Resets "], @"reset: the phrase leads with the answer");
+            NSString *sameDay = ResetClockText(at(10, 15, 0), now);
+            check(![sameDay containsString:@"tomorrow"] && sameDay.length <= 8,
+                  @"reset: today is a bare clock time");
+            NSString *tomorrow = ResetPhrase(at(11, 9, 0), now);
+            check([tomorrow containsString:@"tomorrow"] && [tomorrow hasSuffix:@"in 23h"],
+                  @"reset: the next calendar day is 'tomorrow', not a weekday");
+            NSString *thisWeek = ResetPhrase(at(14, 9, 0), now);
+            check([thisWeek hasSuffix:@"in 3d"] && ![thisWeek containsString:@"tomorrow"],
+                  @"reset: inside the week counts whole days");
+            NSDateFormatter *dayFmt = [NSDateFormatter new];
+            [dayFmt setLocalizedDateFormatFromTemplate:@"EEE"];
+            check([ResetClockText(at(14, 9, 0), now) hasPrefix:[dayFmt stringFromDate:at(14, 9, 0)]],
+                  @"reset: inside the week names the weekday");
+            // 11 calendar days out: a weekday would be ambiguous, so the date has to appear.
+            check([ResetPhrase(at(21, 9, 0), now) hasSuffix:@"in 10d"], @"reset: beyond a week still counts days");
+            check([ResetClockText(at(21, 9, 0), now) containsString:@"21"],
+                  @"reset: beyond a week the clock text carries the date");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

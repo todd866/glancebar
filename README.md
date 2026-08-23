@@ -39,7 +39,9 @@ opt-in) `/usr/bin/security`.
   own session logs; an opt-in gauge for your Claude account; an opt-in gauge for your
   Cursor account (included plan spend / request quota via Cursor's local session); live
   per-day token totals for Claude and Codex, counted the way a human would (cached
-  context re-reads shown separately).
+  context re-reads shown separately). Each row's subtitle answers one question — when
+  the quota comes back ("Resets Thu 21:00 · in 4d") — and a figure that couldn't be
+  refreshed says how old it is ("· cached 3h ago"); why the refresh failed is in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
 - **Never evicted** — on notched Macs the item automatically narrows (full →

@@ -482,10 +482,15 @@ static NSColor *CPUColor(double cpu) {
 @property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
 @property (strong) NSDate *lastActivity;
 @property (strong) NSDate *limitUpdatedAt;
+@property (strong) NSDate *resetAt;   // the reset instant behind resetText, for countdowns
 @property (copy) NSArray<NSDictionary *> *models;
 @property (copy) NSArray<NSDictionary *> *limitWindows;   // all current limit windows (dual meter); bar still uses remainingFraction
 @end
 @implementation AIUsage @end
+
+// How often an account limit may be re-fetched. Both endpoints rate-limit readily, so a
+// cached figure younger than this is as current as a fresh fetch would have made it.
+static const double kAccountPollInterval = 900;   // 15 minutes
 
 // Unified logging for the AI pipeline: transitions only, metadata only (booleans,
 // HTTP codes, our own status strings — never tokens, counts, or credentials).
@@ -702,6 +707,7 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     if (resetDate) reset = ResetTextFromDate(resetDate);
     if (reset.length && (replacedGauge || (u.limitStatusAvailable && u.remainingFraction >= 0))) {
         u.resetText = reset;
+        u.resetAt = resetDate;   // nil when the override gave free text — then the string is all we have
         replacedGauge = YES;
     }
 
@@ -2012,7 +2018,7 @@ static NSString *HashedMessageID(NSString *messageID) {
         if (ShouldFetchClaudeAccount(self.useClaudeAccount, self.allowClaudeAccountFetch,
                                      _claudeUsageJSON != nil, _claudeAccountStatus.length > 0,
                                      now, _claudeNextFetch)) {
-            _claudeNextFetch = now + 900;   // the endpoint rate-limits readily; 15 min cap
+            _claudeNextFetch = now + kAccountPollInterval;   // the endpoint rate-limits readily
             _lastFetchSkipReason = nil;
             NSString *token = [self claudeAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
@@ -2067,7 +2073,10 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.limitUpdatedAt = _claudeLastSuccessAt > 0
                 ? [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt] : nil;
             NSNumber *resets = pick[@"resetsAt"];
-            if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+            if (resets) {
+                u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
+                u.resetText = ResetTextFromDate(u.resetAt);
+            }
             NSString *window = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
             BOOL diskRestoredOnly = !_claudeFetchedThisRun && _claudeUsageJSON != nil;
             if (usingStaleWindows || diskRestoredOnly || _claudeAccountStatus.length)
@@ -2095,7 +2104,7 @@ static NSString *HashedMessageID(NSString *messageID) {
             }
         } else {
             NSString *fallback = ClaudeLimitStatusReason(_claudeUsageJSON, fetchedAtISO, nowForWindows)
-                ?: (_claudeUsageJSON ? @"Claude account response did not include a current limit window"
+                ?: (_claudeUsageJSON ? @"Account response has no current limit window"
                     : self.allowClaudeAccountFetch ? @"Claude account status unavailable"
                     : @"Claude account refresh paused until visible");
             u.statusReason = _claudeAccountStatus ?: (extraStatus[@"statusReason"] ?: fallback);
@@ -2106,13 +2115,15 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.remainingFraction = 0;
             u.overageActive = YES;
             u.resetText = @"Not provided";
+            u.resetAt = nil;   // the window's own reset says nothing about paid overage
+            // "You are being billed for overage" is the whole message here, so it stays
+            // the whole reason. That the figure is cached rides on limitStale, and the
+            // refresh error on limitRefreshError — both have their own place to appear.
+            u.statusReason = extraStatus[@"statusReason"];
             if (_claudeAccountStatus.length) {
                 u.limitStale = YES;
-                u.statusReason = [NSString stringWithFormat:@"Cached limit · %@ · %@",
-                                  _claudeAccountStatus, extraStatus[@"statusReason"]];
                 u.statusSource = @"Cached Anthropic usage API response (opt-in)";
             } else {
-                u.statusReason = extraStatus[@"statusReason"];
                 u.statusSource = @"Anthropic usage API (opt-in)";
             }
         }
@@ -2205,7 +2216,7 @@ static NSString *HashedMessageID(NSString *messageID) {
         if (ShouldFetchClaudeAccount(self.useCursorAccount, self.allowCursorAccountFetch,
                                      _cursorUsageJSON != nil, _cursorAccountStatus.length > 0,
                                      now, _cursorNextFetch)) {
-            _cursorNextFetch = now + 900;
+            _cursorNextFetch = now + kAccountPollInterval;
             _lastFetchSkipReason = nil;
             NSString *token = [self cursorAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchCursorUsageJSON(token) : nil;
@@ -2258,7 +2269,10 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.limitUpdatedAt = _cursorLastSuccessAt > 0
                 ? [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt] : nil;
             NSNumber *resets = pick[@"resetsAt"];
-            if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+            if (resets) {
+                u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
+                u.resetText = ResetTextFromDate(u.resetAt);
+            }
             NSString *window = [NSString stringWithFormat:@"%@ · your Cursor account", pick[@"window"]];
             BOOL diskRestoredOnly = !_cursorFetchedThisRun && _cursorUsageJSON != nil;
             if (usingStaleWindows || diskRestoredOnly || _cursorAccountStatus.length)
@@ -2287,7 +2301,7 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.statusText = @"Limit status from Cursor account";
         } else {
             NSString *fallback = CursorLimitStatusReason(_cursorUsageJSON, fetchedAtISO, now)
-                ?: (_cursorUsageJSON ? @"Cursor account response did not include a current limit window"
+                ?: (_cursorUsageJSON ? @"Account response has no current limit window"
                     : self.allowCursorAccountFetch ? @"Cursor account status unavailable"
                     : @"Cursor account refresh paused until visible");
             u.statusReason = _cursorAccountStatus ?: fallback;
@@ -2420,7 +2434,10 @@ static NSString *HashedMessageID(NSString *messageID) {
         u.limitStatusAvailable = YES;
         u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
         NSNumber *resets = pick[@"resetsAt"];
-        if (resets) u.resetText = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+        if (resets) {
+            u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
+            u.resetText = ResetTextFromDate(u.resetAt);
+        }
         NSString *plan = [pick[@"plan"] isKindOfClass:NSString.class] ? pick[@"plan"] : nil;
         u.statusReason = plan.length
             ? [NSString stringWithFormat:@"%@ window · %@ plan", pick[@"window"], plan]
@@ -3696,25 +3713,44 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return row;
 }
 
+// The reset instant as a line of English, or nil when this provider has none to give.
+// Falls back to whatever preformatted string the source supplied when there is no date
+// behind it (a status-file override may hand over free text).
 - (NSString *)compactResetText:(AIUsage *)u {
-    NSString *reset = u.resetText ?: @"Not exposed locally";
-    if ([reset isEqualToString:@"Not exposed locally"]) return @"No local reset";
-    return [NSString stringWithFormat:@"Reset: %@", reset];
+    NSString *phrase = ResetPhrase(u.resetAt, NSDate.date);
+    if (phrase.length) return phrase;
+    NSString *reset = u.resetText ?: @"";
+    if (!reset.length || [reset isEqualToString:@"Not exposed locally"] ||
+        [reset isEqualToString:@"Not provided"])
+        return nil;
+    return [NSString stringWithFormat:@"Resets %@", reset];
 }
 
+// How old the shown figure is, when it isn't live: "cached 3h ago" inline after the reset,
+// "Cached 3h ago" on the dual meter's own line. WHY the refresh is failing is a plumbing
+// question and lives in the details sheet, not in the one line the reader came to read.
+//
+// A figure restored from disk is flagged stale even when it is a minute old, because the
+// reader means "I did not fetch this myself". Saying so below the poll interval would be
+// a warning about nothing: a successful fetch at that age would have returned the same
+// numbers. Past it, the age is the whole point.
+- (NSString *)aiStalenessNote:(AIUsage *)u capitalized:(BOOL)capitalized {
+    if (!u.limitStale) return nil;
+    if (!u.limitUpdatedAt) return capitalized ? @"Cached figure" : @"cached";
+    if (-u.limitUpdatedAt.timeIntervalSinceNow < kAccountPollInterval) return nil;
+    return [NSString stringWithFormat:@"%@ %@", capitalized ? @"Cached" : @"cached",
+            [self shortAgeForDate:u.limitUpdatedAt]];
+}
+
+// One line, one job: when does this quota come back. Diagnostics only get the line when
+// there is no reset to report — otherwise they push the answer off the end of the row.
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
-    if (u.overageActive && u.statusReason.length) return u.statusReason;
-    if (u.limitStale && u.statusReason.length) {
-        // Stale account refresh errors used to hide the last-known reset entirely.
-        NSString *reset = u.resetText ?: @"";
-        if (u.limitStatusAvailable && reset.length &&
-            ![reset isEqualToString:@"Not exposed locally"] &&
-            ![reset isEqualToString:@"Not provided"])
-            return [NSString stringWithFormat:@"%@ · Reset: %@", u.statusReason, reset];
-        return u.statusReason;
-    }
-    if (u.limitStatusAvailable) return [self compactResetText:u];
-    if (u.statusReason.length) return u.statusReason;
+    NSString *note = [self aiStalenessNote:u capitalized:NO];
+    // Overage has no reset to report — the paid budget is not a window that rolls over.
+    NSString *lead = u.overageActive ? nil : [self compactResetText:u];
+    if (!lead.length) lead = u.statusReason;
+    if (lead.length)
+        return note.length ? [NSString stringWithFormat:@"%@ · %@", lead, note] : lead;
     if (!u.available) return @"No local state";
     if (u.stale && u.statusText.length)   // e.g. Claude's cache computes through yesterday
         return [NSString stringWithFormat:@"No limit status · %@", u.statusText];
@@ -3756,13 +3792,16 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return row;
 }
 
-// "Resets — 5-hour 3:10pm · weekly Mon 9am" from a window list (skips windows with no reset).
+// "Resets — 5-hour 3:10 pm · weekly Wed 9:00 am" from a window list (skips windows with
+// no reset). Each window is already named beside its own gauge, so this line carries the
+// clock time only — the countdown would double the width to repeat what the clock says.
 - (NSString *)windowsResetSummary:(NSArray<NSDictionary *> *)windows {
+    NSDate *now = NSDate.date;
     NSMutableArray *parts = [NSMutableArray array];
     for (NSDictionary *w in windows) {
         NSNumber *resets = w[@"resetsAt"];
         if (![resets isKindOfClass:NSNumber.class]) continue;
-        NSString *t = ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]);
+        NSString *t = ResetClockText([NSDate dateWithTimeIntervalSince1970:resets.doubleValue], now);
         if (t.length) [parts addObject:[NSString stringWithFormat:@"%@ %@", w[@"window"], t]];
     }
     return parts.count ? [@"Resets — " stringByAppendingString:[parts componentsJoinedByString:@" · "]] : @"";
@@ -3794,8 +3833,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                               at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
         y += 16;
     }
-    if (u.limitStale && u.statusReason.length) {
-        [root addSubview:[self text:u.statusReason font:[NSFont systemFontOfSize:10.5]
+    NSString *staleness = [self aiStalenessNote:u capitalized:YES];
+    if (staleness.length) {
+        [root addSubview:[self text:staleness font:[NSFont systemFontOfSize:10.5]
                               color:NSColor.systemOrangeColor
                                  at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
         y += 16;
@@ -4662,6 +4702,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                         to:root y:&y width:kDetailW];
         if (u.limitUpdatedAt)
             [self addDetailKey:@"Limit checked" value:ClockText(u.limitUpdatedAt) to:root y:&y width:kDetailW];
+        if (u.limitRefreshError.length)   // why the figure above is the last-known one
+            [self addDetailKey:@"Refresh" value:u.limitRefreshError to:root y:&y width:kDetailW];
         if (u.extraUsage)
             [self addDetailKey:@"Extra usage" value:u.extraUsage to:root y:&y width:kDetailW];
         if (u.statusSource)

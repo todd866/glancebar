@@ -337,7 +337,7 @@ NSString *ClaudeLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, d
     if (ClaudeLimitWindows(usage, nowEpoch).count) return nil;
     if (ClaudeStaleLimitWindows(usage, nowEpoch).count)
         return DatedLimitResetReason(@"Limit windows reset since last Claude refresh", fetchedAtISO);
-    return @"Claude account response did not include a current limit window";
+    return @"Account response has no current limit window";
 }
 
 static double CursorEpochSeconds(id value) {
@@ -476,7 +476,7 @@ NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, d
     if (CursorLimitWindows(usage, nowEpoch).count) return nil;
     if (CursorStaleLimitWindows(usage, nowEpoch).count)
         return DatedLimitResetReason(@"Limit windows reset since last Cursor refresh", fetchedAtISO);
-    return @"Cursor account response did not include a current limit window";
+    return @"Account response has no current limit window";
 }
 
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
@@ -496,6 +496,53 @@ NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
     return @{@"description": description,
              @"statusReason": overage ? @"Overage billing active" : @"Extra usage active",
              @"overageActive": @(overage)};
+}
+
+// --- AI status line ---
+
+// "in 42m" / "in 3h 20m" / "in 4d" — coarse enough to stay true between refreshes,
+// specific enough to plan the next hour around.
+static NSString *ResetCountdown(NSTimeInterval seconds) {
+    if (seconds < 60) return @"any moment";
+    if (seconds < 3600) return [NSString stringWithFormat:@"in %dm", (int)(seconds / 60)];
+    if (seconds < 86400) {
+        int hours = (int)(seconds / 3600), minutes = (int)((seconds - hours * 3600) / 60);
+        return minutes ? [NSString stringWithFormat:@"in %dh %dm", hours, minutes]
+                       : [NSString stringWithFormat:@"in %dh", hours];
+    }
+    return [NSString stringWithFormat:@"in %dd", (int)(seconds / 86400)];
+}
+
+NSString *ResetClockText(NSDate *resetAt, NSDate *now) {
+    if (!resetAt) return nil;
+    NSDate *reference = now ?: NSDate.date;
+    NSCalendar *cal = NSCalendar.currentCalendar;
+    // Calendar days, not elapsed hours: "Wed" is unambiguous up to a week out, and a
+    // reset 20 hours away can still land the day after tomorrow.
+    NSInteger days = [cal components:NSCalendarUnitDay
+                            fromDate:[cal startOfDayForDate:reference]
+                              toDate:[cal startOfDayForDate:resetAt]
+                             options:0].day;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    if (days <= 0 || days == 1) {
+        fmt.dateStyle = NSDateFormatterNoStyle;
+        fmt.timeStyle = NSDateFormatterShortStyle;
+        NSString *time = [fmt stringFromDate:resetAt];
+        return days == 1 ? [@"tomorrow " stringByAppendingString:time] : time;
+    }
+    [fmt setLocalizedDateFormatFromTemplate:days <= 6 ? @"EEE jmm" : @"d MMM jmm"];
+    return [fmt stringFromDate:resetAt];
+}
+
+NSString *ResetPhrase(NSDate *resetAt, NSDate *now) {
+    if (!resetAt) return nil;
+    NSDate *reference = now ?: NSDate.date;
+    NSTimeInterval remaining = [resetAt timeIntervalSinceDate:reference];
+    // Only a cached window whose reset has already come and gone lands here: the figure
+    // above the line is last-known, and the refresh that would clear it hasn't landed.
+    if (remaining <= 0) return @"Reset has passed";
+    return [NSString stringWithFormat:@"Resets %@ · %@",
+            ResetClockText(resetAt, reference), ResetCountdown(remaining)];
 }
 
 BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,

@@ -107,6 +107,21 @@ NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, d
 //   @"overageActive": @(YES when usage is at/over the paid limit)}.
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage);
 
+// --- AI status line ---
+// The popover's AI row has one job: say when the quota comes back. Format the reset the
+// way a reader thinks about it — a clock time, plus a countdown while the window is near
+// enough to plan around — and let the plumbing diagnostics live in the details sheet.
+//   "Resets 9:12 pm · in 3h 20m" / "Resets tomorrow 9:00 am · in 14h"
+//   "Resets Wed 9:00 am · in 4d"  / "Resets 3 Sep, 10:24 pm · in 11d"
+// A reset already in the past means the cached window rolled over unseen, so it reports
+// that plainly ("Reset has passed") and leaves the age of the figure to the caller.
+// Nil when there is no reset instant at all.
+NSString *ResetPhrase(NSDate *resetAt, NSDate *now);
+// Just the "when" half — "9:12 pm" / "tomorrow 9:00 am" / "Wed 9:00 am" / "3 Sep, 10:24 pm"
+// — for surfaces that already say what is resetting, like the dual-meter card. Nil for a
+// nil date; unlike ResetPhrase it will happily format an instant that has already passed.
+NSString *ResetClockText(NSDate *resetAt, NSDate *now);
+
 // Claude account fetches are gated by visibility, but a newly visible UI with no
 // cached account state must fetch even if an older retry timer is in the future.
 BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,
