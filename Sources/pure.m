@@ -893,7 +893,7 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
 #pragma mark - Adaptive bar width
 
 const double kBarShrinkMarginPt = 4;
-const double kBarExpandMarginPt = 24;
+const double kBarExpandMarginPt = 8;
 const int    kBarExpandTicks    = 2;
 const double kBarExpandMinIntervalSec = 10;
 

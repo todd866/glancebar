@@ -212,7 +212,8 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
 // --- Adaptive bar width ---
 // The menu bar item renders at one of three tiers; macOS evicts an item wholesale
 // when it cannot fit beside the notch, so Glancebar sizes itself to what exists.
-enum { BarTierFull = 0, BarTierIcons = 1, BarTierGlyph = 2 };
+// Compact keeps the most useful configured reading rather than erasing all text.
+enum { BarTierFull = 0, BarTierCompact = 1, BarTierGlyph = 2 };
 
 typedef struct {
     int tier;             // current rendering tier (BarTier*)
@@ -225,7 +226,7 @@ typedef struct {
 // where the wider tier fit with kBarExpandMarginPt of slack — transient menu bar
 // churn (AirPods connect, Now Playing) can shrink us but cannot bounce us.
 extern const double kBarShrinkMarginPt;   // 4
-extern const double kBarExpandMarginPt;   // 24
+extern const double kBarExpandMarginPt;   // 8
 extern const int    kBarExpandTicks;      // 2
 // updateBar fires from many uncoordinated sources (15s timer, IOPS bursts, volume
 // scans, appearance changes), so a "consecutive decisions" streak alone can be

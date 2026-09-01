@@ -236,11 +236,14 @@ glancebar/
 macOS hides a menu bar item wholesale when it no longer fits beside the notch —
 system items (AirPods, Now Playing, Weather) can crowd one out with no warning.
 Glancebar measures the space that actually exists and adapts: full display when
-there's room, icons-only when it tightens, and a single gauge glyph (the orange
-eye, if *Stay awake with lid closed* is on) when space is scarce — the popover
-stays one click away at every width. It re-expands automatically, after the
-space has stayed free for a while, so a transient AirPods connection can't make
-it flap. Hover the item for the full summary at any width.
+there's room, a compact battery percentage when it tightens (configured meter
+icons when battery is disabled; the orange eye takes priority while *Stay awake
+with lid closed* is on), and a single gauge glyph when space is scarce. The
+popover stays one click away at every width. It re-expands automatically after
+the space has stayed free for a while; only modest headroom is required, so
+removing one neighboring icon can
+restore the display without letting a transient AirPods connection make it flap.
+Hover the item for the full summary at any width.
 
 ## Credits
 

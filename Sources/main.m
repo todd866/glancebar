@@ -2957,7 +2957,7 @@ static NSArray<NSDictionary *> *BarLayout(NSArray<NSDictionary *> *segments, NSC
         NSString *text = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : @"";
         NSImage *customImage = [seg[@"image"] isKindOfClass:NSImage.class] ? seg[@"image"] : nil;
         NSImage *sym = customImage ?: (symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil);
-        // Icons-only tiers drop the text: no leading space, so icons pack tight.
+        // When compact mode falls back to icons, empty text adds no leading space.
         NSString *drawText = text.length ? [NSString stringWithFormat:@" %@", text] : @"";
         NSSize textSize = drawText.length ? [drawText sizeWithAttributes:@{NSFontAttributeName:font}] : NSZeroSize;
         CGFloat segW = (sym ? sym.size.width : 0) + textSize.width;
@@ -3327,6 +3327,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
         NSMutableDictionary *seg = [@{@"text": text, @"color": color} mutableCopy];
         if (_bat.valid) {   // no battery (desktop Mac): text-only, no misleading empty glyph
+            // The compact tier keeps exactly one high-value reading. Battery percentage
+            // wins because macOS may have hidden its own percentage to make room for us.
+            seg[@"compactPriority"] = @YES;
+            // In the ordinary case the number alone is the densest useful form. Keep the
+            // orange eye when lid-awake is active: that safety reminder outranks width.
+            if (!_lidAwake) seg[@"compactTextOnly"] = @YES;
             if (_lidAwake) {
                 // "Stay awake with lid closed" is on: swap the battery glyph for an orange open
                 // eye — an always-visible reminder of a setting that persists across reboots.
@@ -3354,7 +3360,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     // The eye normally rides in the battery segment; if that segment is hidden or there's no
     // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
     if (_lidAwake && !lidAwakeShown)
-        [segments insertObject:@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)} atIndex:0];
+        [segments insertObject:@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor),
+                                 @"compactPriority": @YES} atIndex:0];
     return segments;
 }
 
@@ -3441,8 +3448,28 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 - (NSArray<NSDictionary *> *)barSegmentsForTier:(int)tier full:(NSArray<NSDictionary *> *)full {
     if (tier == BarTierFull) return full;
-    if (tier == BarTierIcons) {
-        // Same segments, text dropped: the meter icons and alert colors still read.
+    if (tier == BarTierCompact) {
+        // Preserve one deliberately prioritised reading before falling all the way to
+        // pictograms. On a MacBook that is battery percentage: it is more actionable
+        // than two unlabeled meters and remains useful even in a crowded menu bar.
+        NSMutableArray *priority = [NSMutableArray array];
+        for (NSDictionary *seg in full) {
+            if (![seg[@"compactPriority"] boolValue]) continue;
+            NSMutableDictionary *d = [seg mutableCopy];
+            if ([d[@"compactTextOnly"] boolValue]) {
+                [d removeObjectForKey:@"image"];
+                [d removeObjectForKey:@"symbol"];
+                [d removeObjectForKey:@"var"];
+            }
+            [d removeObjectForKey:@"compactPriority"];
+            [d removeObjectForKey:@"compactTextOnly"];
+            [priority addObject:d];
+            break;   // compact mode has one job: preserve the highest-priority reading
+        }
+        if (priority.count) return priority;
+
+        // No reading opted into compact mode (for example, battery is disabled): keep
+        // the old icons-only fallback so another configured metric still survives.
         // A text-only segment (a batteryless Mac renders battery as a bare "—") has
         // nothing left once the text goes: it would contribute an invisible segment
         // that still eats an inter-segment gap, and in the worst case — battery the
@@ -3479,7 +3506,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSArray<NSDictionary *> *full = [self barSegments];
         NSArray<NSDictionary *> *tierSegs[3] = {
             full,
-            [self barSegmentsForTier:BarTierIcons full:full],
+            [self barSegmentsForTier:BarTierCompact full:full],
             [self barSegmentsForTier:BarTierGlyph full:full],
         };
         double widths[3]; NSArray<NSDictionary *> *draws[3];

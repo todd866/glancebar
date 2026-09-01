@@ -41,6 +41,10 @@ static AIUsage *UsageNamed(NSArray<AIUsage *> *usage, NSString *name) {
                   to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width;
 @end
 
+@interface Controller (BarTierTestAccess)
+- (NSArray<NSDictionary *> *)barSegmentsForTier:(int)tier full:(NSArray<NSDictionary *> *)full;
+@end
+
 // Builds the Local History subtree the way aiDetailsView does, optionally giving Claude the
 // conditional Models section, and reports the identifiers of Codex's provider heading, its
 // Models heading, and its model row. Every one of them must be blind to whether Claude's
@@ -157,6 +161,30 @@ int main(void) {
               @"JSONBool emits real JSON booleans");
         check(!IsJSONBoolean(@1) && !IsJSONBoolean(@0),
               @"schema guard rejects numeric 0/1 masquerading as booleans");
+
+        Controller *barController = [Controller new];
+        NSArray *fullBar = @[
+            @{@"symbol": @"externaldrive", @"text": @"72%"},
+            @{@"symbol": @"battery.100percent", @"text": @"90%",
+              @"compactPriority": @YES, @"compactTextOnly": @YES},
+        ];
+        NSArray *compactBar = [barController barSegmentsForTier:BarTierCompact full:fullBar];
+        check(compactBar.count == 1 && [compactBar[0][@"text"] isEqual:@"90%"],
+              @"compact bar keeps the priority battery percentage and drops other readings");
+        check(compactBar[0][@"symbol"] == nil && compactBar[0][@"image"] == nil,
+              @"ordinary compact battery is text-only for the smallest useful width");
+        check(compactBar[0][@"compactPriority"] == nil && compactBar[0][@"compactTextOnly"] == nil,
+              @"compact bar removes its private layout metadata before rendering");
+        CGFloat fullBarWidth = 0, compactBarWidth = 0;
+        BarLayout(fullBar, NSColor.controlTextColor, &fullBarWidth);
+        BarLayout(compactBar, NSColor.controlTextColor, &compactBarWidth);
+        check(compactBarWidth < fullBarWidth,
+              @"compact battery percentage is strictly narrower than the full bar");
+        NSArray *iconFallback = [barController barSegmentsForTier:BarTierCompact
+                                                              full:@[@{@"symbol": @"externaldrive", @"text": @"72%"}]];
+        check(iconFallback.count == 1 && iconFallback[0][@"text"] == nil &&
+              [iconFallback[0][@"symbol"] isEqual:@"externaldrive"],
+              @"compact bar falls back to configured icons when no reading has priority");
 
         FlippedView *existingView = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, 200, 80)];
         NSTextField *existingLabel = [NSTextField labelWithString:@"CPU 10%"];
