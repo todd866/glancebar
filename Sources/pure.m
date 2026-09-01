@@ -898,27 +898,57 @@ BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
 
 #pragma mark - Adaptive bar width
 
+double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
+                                  BarWindowSpan own,
+                                  const BarWindowSpan *spans, size_t count) {
+    if (!isfinite(leftBoundary) || !isfinite(rightEdge) || rightEdge <= leftBoundary ||
+        !isfinite(own.x) || !isfinite(own.width) || own.width <= 0 ||
+        own.x < leftBoundary - 1.0 || own.x + own.width > rightEdge + 1.0 ||
+        (count && !spans))
+        return -1;
+
+    double ownRight = own.x + own.width;
+    double obstacleRight = leftBoundary;
+    for (size_t i = 0; i < count; i++) {
+        BarWindowSpan span = spans[i];
+        if (!isfinite(span.x) || !isfinite(span.width) || span.width <= 0) continue;
+        double spanRight = span.x + span.width;
+        // A substantial overlap identifies our visible Control Centre host or one of
+        // its wrappers. A real neighbour may touch or round across our edge by a point;
+        // do not erase that obstacle merely because the compositor rounded differently.
+        double overlap = MIN(spanRight, ownRight) - MAX(span.x, own.x);
+        double selfThreshold = MAX(2.0, MIN(span.width, own.width) * 0.5);
+        if (overlap >= selfThreshold) continue;
+        if (spanRight <= leftBoundary || span.x >= rightEdge) continue;
+        // Status items grow left. The current right edge already accounts for every
+        // item to our right; only the closest obstacle on our left limits expansion.
+        if (spanRight <= own.x + 1.0)
+            obstacleRight = MAX(obstacleRight, spanRight);
+    }
+    return MIN(rightEdge - leftBoundary, MAX(0.0, ownRight - obstacleRight));
+}
+
 const double kBarShrinkMarginPt = 4;
 const double kBarExpandMarginPt = 8;
 const int    kBarExpandTicks    = 2;
 const double kBarExpandMinIntervalSec = 10;
 
-BarTierState ChooseBarTier(BarTierState prev, double gapPt,
+BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
                            const double widths[3], BOOL evicted, double nowEpoch) {
     // Every non-qualifying path resets the streak AND its clock, so the next
     // qualifying decision starts a fresh window and counts immediately.
     BarTierState s = { .tier = MIN(MAX(prev.tier, BarTierFull), BarTierGlyph),
                        .expandStreak = 0, .lastCountedAt = 0 };
     if (evicted) { s.tier = BarTierGlyph; return s; }
-    if (gapPt < 0) return s;
-    if (widths[s.tier] + kBarShrinkMarginPt > gapPt) {
+    if (capacityPt < 0) return s;
+    if (widths[s.tier] + kBarShrinkMarginPt > capacityPt) {
         // Widest tier that fits with margin; the glyph is the floor — Glancebar
         // never voluntarily hides, even if macOS may still evict the glyph.
-        while (s.tier < BarTierGlyph && widths[s.tier] + kBarShrinkMarginPt > gapPt)
+        while (s.tier < BarTierGlyph && widths[s.tier] + kBarShrinkMarginPt > capacityPt)
             s.tier++;
         return s;
     }
-    if (s.tier > BarTierFull && widths[s.tier - 1] + kBarExpandMarginPt <= gapPt) {
+    if (s.tier > BarTierFull && widths[s.tier - 1] + kBarExpandMarginPt <= capacityPt) {
         if (nowEpoch - prev.lastCountedAt >= kBarExpandMinIntervalSec) {
             s.expandStreak = prev.expandStreak + 1;
             s.lastCountedAt = nowEpoch;

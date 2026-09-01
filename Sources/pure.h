@@ -223,6 +223,20 @@ BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
 enum { BarTierFull = 0, BarTierCompact = 1, BarTierGlyph = 2 };
 
 typedef struct {
+    double x;
+    double width;
+} BarWindowSpan;
+
+// Points our live item may occupy while growing left, bounded by the notch (or screen
+// edge) and the nearest window already to its left. Control Centre hosts app status
+// items on macOS 26, so the visible copy can have a different window number from the
+// app-side NSWindow. Exclude a substantially overlapping host span geometrically
+// instead of relying on window identity alone.
+double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
+                                  BarWindowSpan own,
+                                  const BarWindowSpan *spans, size_t count);
+
+typedef struct {
     int tier;             // current rendering tier (BarTier*)
     int expandStreak;     // consecutive decisions the next-wider tier fit with slack
     double lastCountedAt; // epoch of the last counted decision (rate-limits the streak)
@@ -241,10 +255,11 @@ extern const int    kBarExpandTicks;      // 2
 // the anti-flap guarantee is decisions-shaped, not time-shaped.
 extern const double kBarExpandMinIntervalSec;   // 10
 
-// gapPt: measured free points beside the notch, < 0 = unmeasurable (hold tier).
-// widths[]: this tick's rendered width of each tier. evicted: the shell saw the
+// capacityPt: measured physical points the current status-item host may occupy while
+// growing left, < 0 = unmeasurable (hold tier). widths[]: this tick's physical host
+// width for each tier (rendered image plus shell chrome). evicted: the shell saw the
 // item's window parked off the bar — forces glyph regardless of the measurement,
 // which is by definition stale when eviction has already happened.
 // nowEpoch: monotonic-ish wall clock used only to rate-limit streak counting.
-BarTierState ChooseBarTier(BarTierState prev, double gapPt,
+BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
                            const double widths[3], BOOL evicted, double nowEpoch);

@@ -3063,6 +3063,8 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
     BarTierState _barTier;             // adaptive bar width; zero-init = full tier
     BOOL _barWasOnBar;                 // arms the eviction net only after a real sighting
+    double _barChromeWidth;            // shell padding around the rendered image (16pt live)
+    BOOL _barChromeKnown;
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
@@ -3392,40 +3394,52 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
 }
 
-// The status strip's left boundary is the notch. Glancebar is assumed leftmost in
-// the strip (it is the machine's only third-party item; system items hug the right
-// edge) — if that assumption breaks, the eviction net below still recovers us.
+// A notched status strip grows left as far as the notch; on a notchless display it
+// grows toward the nearest app-menu/status window instead. Measuring from the live
+// item's right edge also works when another third-party item sits to its left.
 // Window bounds/PIDs from CGWindowList carry no TCC gate (names would; we read none)
 // and no network — consistent with the README's privacy stance.
-static double MeasuredBarGap(NSStatusItem *item) {
-    NSScreen *screen = NSScreen.screens.firstObject;   // the menu bar owner
+//
+// macOS 26 hosts the visible status-item window inside Control Centre, with a window
+// number unrelated to the app-side NSWindow. Excluding only that number counted our
+// own current width as occupied space: Full measured 114pt against its own 115pt
+// image, collapsed to Compact, then expanded and repeated forever. Match the hosted
+// copy by horizontal geometry and measure the live slot's leftward growth capacity.
+static double MeasuredBarCapacity(NSStatusItem *item) {
     NSWindow *win = item.button.window;
+    NSScreen *screen = win.screen ?: NSScreen.screens.firstObject;
     if (!screen || !win) return -1;
-    NSRect aux = screen.auxiliaryTopRightArea;         // zero rect = no notch
-    if (NSWidth(aux) <= 0) return -1;
-    double notchRight = NSMinX(aux);
-    double rightEdge = NSMaxX(screen.frame);
+    NSNumber *screenNumber = screen.deviceDescription[@"NSScreenNumber"];
+    if (![screenNumber isKindOfClass:NSNumber.class]) return -1;
+    CGRect displayBounds = CGDisplayBounds((CGDirectDisplayID)screenNumber.unsignedIntValue);
+    if (CGRectIsEmpty(displayBounds)) return -1;
+    NSRect aux = screen.auxiliaryTopRightArea;
+    double leftBoundary = NSWidth(aux) > 0 ? NSMinX(aux) : CGRectGetMinX(displayBounds);
+    double rightEdge = CGRectGetMaxX(displayBounds);
+    double menuBarY = CGRectGetMinY(displayBounds);
     NSArray *list = CFBridgingRelease(
         CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
-    double leftmost = rightEdge;
+    if (![list isKindOfClass:NSArray.class] || list.count == 0) return -1;
+    NSMutableData *spanData = [NSMutableData dataWithLength:list.count * sizeof(BarWindowSpan)];
+    BarWindowSpan *spans = spanData.mutableBytes;
+    size_t spanCount = 0;
     for (NSDictionary *w in list) {
         NSNumber *num = w[(__bridge NSString *)kCGWindowNumber];
         if (num.integerValue == win.windowNumber) continue;   // our own occupancy is ours to spend
         CGRect b = CGRectZero;
         if (!CGRectMakeWithDictionaryRepresentation(
                 (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b)) continue;
-        // Primary display's menu-bar band only (global CG coords: its top is y=0).
-        // y must be non-negative too: a display arranged ABOVE the primary sits at
-        // negative CG y, and its own status items would otherwise pass as neighbours
-        // and fake a tiny gap on a roomy bar.
-        if (b.origin.y < 0 || b.origin.y > 1 || b.size.height > 40) continue;
+        // The item's own display's menu-bar band. Quartz coordinates put each
+        // display's top at CGDisplayBounds.minY, including vertically arranged screens.
+        if (fabs(b.origin.y - menuBarY) > 1 || b.size.height > 40) continue;
         // Degenerate 1-px windows (several apps park them at the screen origin) are
         // not status items and do not occupy bar space.
         if (b.size.width < 8) continue;
-        if (b.origin.x < notchRight || b.origin.x >= rightEdge) continue;
-        if (b.origin.x < leftmost) leftmost = b.origin.x;
+        if (CGRectGetMaxX(b) <= leftBoundary || b.origin.x >= rightEdge) continue;
+        spans[spanCount++] = (BarWindowSpan){b.origin.x, b.size.width};
     }
-    return MAX(0.0, leftmost - notchRight);
+    BarWindowSpan own = {NSMinX(win.frame), NSWidth(win.frame)};
+    return BarCapacityFromWindowSpans(leftBoundary, rightEdge, own, spans, spanCount);
 }
 
 // Is the item sitting in the menu bar right now? Stated positively, because the
@@ -3514,19 +3528,39 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             draws[t] = BarLayout(tierSegs[t], fg, &w);
             widths[t] = w;
         }
-        double gap = MeasuredBarGap(self->_item);
         // Only a fall FROM the bar is eviction. Before the item has ever been in the
         // bar there is nothing to have been evicted from, so the safety net stays
-        // disarmed — otherwise every launch starts at the glyph tier, and on a Mac
-        // with no notch (gap permanently unmeasurable) it would never recover.
+        // disarmed — otherwise every launch can start at the glyph tier before Control
+        // Centre has placed the host window we need for a real capacity measurement.
         BOOL onBar = BarItemOnBar(self->_item);
+        // Before the hosted item is actually on-bar, its app-side frame is not a valid
+        // self-exclusion key. Hold the current tier until Control Centre places it.
+        double capacity = onBar ? MeasuredBarCapacity(self->_item) : -1;
+        // The status-item host is wider than its image (16pt on the live Tahoe shell).
+        // Price that chrome into every candidate tier or a 115pt image can be judged to
+        // fit in 130pt even though its real 131pt host will be evicted. Derive it from
+        // the currently installed image, not _barTier: Control Centre resizes the host
+        // asynchronously after a tier change, so those two can briefly disagree.
+        NSImage *installedImage = self->_item.button.image;
+        if (onBar && installedImage) {
+            double chrome = NSWidth(self->_item.button.window.frame) - installedImage.size.width;
+            if (isfinite(chrome) && chrome >= 0 && chrome <= 40) {
+                self->_barChromeWidth = chrome;
+                self->_barChromeKnown = YES;
+            }
+        }
+        double occupiedWidths[3];
+        double chrome = self->_barChromeKnown ? self->_barChromeWidth : 0;
+        for (int t = 0; t < 3; t++) occupiedWidths[t] = widths[t] + chrome;
         if (onBar) self->_barWasOnBar = YES;
         BOOL evicted = self->_barWasOnBar && !onBar;
-        BarTierState chosen = ChooseBarTier(self->_barTier, gap, widths, evicted,
+        BarTierState chosen = ChooseBarTier(self->_barTier, capacity, occupiedWidths, evicted,
                                             CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
-            NSLog(@"bar: gap=%.0f widths=[%.0f %.0f %.0f] onBar=%d evicted=%d tier %d→%d streak=%d",
-                  gap, widths[0], widths[1], widths[2], onBar, evicted,
+            NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f] occupied=[%.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d",
+                  capacity, widths[0], widths[1], widths[2],
+                  occupiedWidths[0], occupiedWidths[1], occupiedWidths[2], chrome,
+                  onBar, evicted,
                   self->_barTier.tier, chosen.tier, chosen.expandStreak);
         self->_barTier = chosen;
         self->_item.button.image = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);

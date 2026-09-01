@@ -502,6 +502,71 @@ int main(void) {
 
         // --- ChooseBarTier ---
         {
+            // Tahoe renders app status items in Control Centre-owned host windows, so
+            // the visible self can have a different window number from the app-side
+            // NSWindow. Geometry must exclude both the full and compact hosted spans
+            // and leave the same genuine-neighbour capacity in either state.
+            const BarWindowSpan fullHosts[] = {
+                {939, 131},   // Glancebar Full host (self)
+                {1070, 38},   // first genuine neighbour
+                {1108, 67},
+            };
+            double fullCapacity = BarCapacityFromWindowSpans(
+                825, 1470, (BarWindowSpan){939, 131}, fullHosts,
+                sizeof(fullHosts) / sizeof(fullHosts[0]));
+            check(fabs(fullCapacity - 245) < 0.001,
+                  @"capacity: excludes Tahoe-hosted Full self by overlap");
+
+            const BarWindowSpan compactHosts[] = {
+                {1019, 51},   // the same Glancebar host after Compact redraw (self)
+                {1070, 38},
+                {1108, 67},
+            };
+            double compactCapacity = BarCapacityFromWindowSpans(
+                825, 1470, (BarWindowSpan){1019, 51}, compactHosts,
+                sizeof(compactHosts) / sizeof(compactHosts[0]));
+            check(fabs(compactCapacity - 245) < 0.001,
+                  @"capacity: Compact redraw does not change available strip width");
+            const BarWindowSpan wrappedHosts[] = {
+                {935, 137},   // differently sized Control Centre wrapper for self
+                {1070, 38},
+            };
+            check(fabs(BarCapacityFromWindowSpans(825, 1470,
+                                                  (BarWindowSpan){939, 131},
+                                                  wrappedHosts, 2) - 245) < 0.001,
+                  @"capacity: substantially overlapping wrapper is also self");
+            const BarWindowSpan leftNeighbour[] = {
+                {900, 40},    // one-point compositor overlap at the left edge
+                {939, 131},   // self
+                {1070, 38},
+            };
+            check(fabs(BarCapacityFromWindowSpans(825, 1470,
+                                                  (BarWindowSpan){939, 131},
+                                                  leftNeighbour, 3) - 130) < 0.001,
+                  @"capacity: rounded left neighbour limits growth instead of looking like self");
+            check(fabs(BarCapacityFromWindowSpans(825, 1470,
+                                                  (BarWindowSpan){939, 131},
+                                                  NULL, 0) - 245) < 0.001,
+                  @"capacity: zero candidate spans still use the live own frame");
+            check(BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){939, 131},
+                                             NULL, 1) < 0,
+                  @"capacity: nonzero span count requires a span array");
+            const BarWindowSpan notchlessHosts[] = {
+                {0, 300},     // application menus to the left
+                {1000, 50},   // self
+                {1050, 38},
+            };
+            double notchlessCapacity = BarCapacityFromWindowSpans(
+                0, 1470, (BarWindowSpan){1000, 50}, notchlessHosts, 3);
+            check(fabs(notchlessCapacity - 750) < 0.001,
+                  @"capacity: notchless display grows from the nearest left obstacle");
+            check(BarCapacityFromWindowSpans(825, 825, (BarWindowSpan){939, 131},
+                                             fullHosts, 3) < 0,
+                  @"capacity: invalid screen geometry is unknown");
+            check(BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){800, 50},
+                                             fullHosts, 3) < 0,
+                  @"capacity: stale own span outside the target display is unknown");
+
             const double W[3] = {121, 55, 22};   // full, compact, glyph (points)
             const double T = 10000;              // arbitrary epoch base for the clock
             double t = T;
@@ -509,6 +574,21 @@ int main(void) {
             // Plenty of room: stays full, no streak.
             s = ChooseBarTier(s, 200, W, NO, t);
             check(s.tier == BarTierFull && s.expandStreak == 0, @"tier: roomy gap holds full");
+            const double LIVE_W[3] = {115, 35, 19};
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, fullCapacity, LIVE_W, NO, t);
+            check(s.tier == BarTierFull,
+                  @"tier: live Tahoe capacity keeps the two-meter Full bar");
+            const double LIVE_OCCUPIED_W[3] = {131, 51, 35};
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, 130, LIVE_OCCUPIED_W, NO, t);
+            check(s.tier == BarTierCompact,
+                  @"tier: shell chrome selects Compact before the Full host is evicted");
+            s = (BarTierState){BarTierCompact, 0, 0};
+            s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);
+            s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);
+            check(s.tier == BarTierFull,
+                  @"tier: a roomy notchless display recovers from Compact");
             // Gap collapses to 31 pt (the 2026-08-12 incident): straight to glyph.
             s = ChooseBarTier(s, 31, W, NO, t += 15);
             check(s.tier == BarTierGlyph, @"tier: 31pt gap shrinks past compact to glyph");
