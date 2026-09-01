@@ -66,6 +66,12 @@ cp -R build/Glancebar.app /Applications/    # install
 open /Applications/Glancebar.app            # run
 ```
 
+For GUI launches, use Finder, `open`, or Launch at Login. Do not run
+`Glancebar.app/Contents/MacOS/Glancebar` without a CLI option: on macOS 26,
+Control Centre can otherwise persistently attribute its menu-bar item to the
+terminal or parent app. Glancebar detects that launch path and relaunches itself
+through Launch Services before creating the item.
+
 The build uses `-Wall -Wextra -Werror`, the macOS hardened runtime, and both `arm64`
 and `x86_64` by default. Set `GLANCEBAR_ARCHS=native` if the local toolchain cannot
 cross-compile. Requires the Xcode Command Line Tools (`xcode-select --install`).

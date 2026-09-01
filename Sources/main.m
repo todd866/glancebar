@@ -5378,21 +5378,67 @@ static void PrintUsage(FILE *stream) {
         UTF8(GBVersion));
 }
 
+// Launching an app bundle's executable directly leaves the process anonymous to
+// Launch Services. On macOS 26, Control Centre can then persistently file the app's
+// status item under the terminal (or another parent app) and inherit that app's
+// "Allow in the Menu Bar" setting. Relaunch before NSApplication creates any item.
+// CLI modes return above and intentionally remain ordinary direct processes.
+static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched) {
+    NSString *expected = NSBundle.mainBundle.bundleIdentifier;
+    if (expected.length == 0) {
+        fprintf(stderr, "Glancebar: app bundle has no identifier; refusing GUI launch\n");
+        return 70;
+    }
+
+    NSString *running = NSRunningApplication.currentApplication.bundleIdentifier;
+    if (!GUIRequiresLaunchServicesRelaunch(running, expected)) return -1;
+
+    if (alreadyRelaunched) {
+        fprintf(stderr, "Glancebar: Launch Services did not establish the app identity; refusing to relaunch again\n");
+        return 70;
+    }
+
+    NSURL *bundleURL = NSBundle.mainBundle.bundleURL;
+    if (![[bundleURL.pathExtension lowercaseString] isEqualToString:@"app"]) {
+        fprintf(stderr, "Glancebar: GUI mode must be launched from Glancebar.app\n");
+        return 70;
+    }
+
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
+    task.arguments = @[bundleURL.path, @"--args", @"--glancebar-launch-services-relaunch"];
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        fprintf(stderr, "Glancebar: could not relaunch through Launch Services: %s\n",
+                UTF8(error.localizedDescription));
+        return 70;
+    }
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) {
+        fprintf(stderr, "Glancebar: Launch Services relaunch failed (%d)\n",
+                task.terminationStatus);
+        return 70;
+    }
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        BOOL dump = NO, json = NO, strict = NO;
+        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO;
         const char *onlineEnvironment = getenv("GLANCEBAR_ALLOW_ACCOUNT");
         BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--dump") == 0) dump = YES;
             else if (strcmp(argv[i], "--json") == 0) json = YES;
             else if (strcmp(argv[i], "--strict") == 0) strict = YES;
-            else if (strcmp(argv[i], "--online") == 0) allowOnline = YES;
+            else if (strcmp(argv[i], "--online") == 0) { allowOnline = YES; onlineArgument = YES; }
+            else if (strcmp(argv[i], "--glancebar-launch-services-relaunch") == 0)
+                alreadyRelaunched = YES;
             else if (strcmp(argv[i], "--version") == 0) { printf("Glancebar %s\n", UTF8(GBVersion)); return 0; }
             else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { PrintUsage(stdout); return 0; }
             else { fprintf(stderr, "Glancebar: unknown option '%s'\n", argv[i]); PrintUsage(stderr); return 64; }
         }
-        if ((json || strict || allowOnline) && !dump && argc > 1) {
+        if ((json || strict || onlineArgument) && !dump) {
             fprintf(stderr, "Glancebar: --json, --strict, and --online require --dump\n");
             return 64;
         }
@@ -5403,6 +5449,8 @@ int main(int argc, const char **argv) {
             } else PrintHumanDump(snapshot);
             return strict && [snapshot[@"status"] isEqualToString:@"partial"] ? 2 : 0;
         }
+        int relaunchResult = RelaunchGUIThroughLaunchServicesIfNeeded(alreadyRelaunched);
+        if (relaunchResult >= 0) return relaunchResult;
         NSApplication *app = NSApplication.sharedApplication;
         Controller *controller = [Controller new];
         app.delegate = controller;

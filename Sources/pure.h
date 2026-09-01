@@ -209,6 +209,13 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
                                                                         NSString *(^groupForPid)(pid_t),
                                                                         unsigned long long (^bytesForPid)(pid_t));
 
+// macOS 26 can permanently attribute an NSStatusItem to the terminal/host app when a
+// GUI executable is started directly instead of through Launch Services. The running
+// application identifier is present on a normal Finder/open/login-item launch and must
+// match the app's own bundle identifier before the controller creates its status item.
+BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
+                                      NSString *expectedBundleID);
+
 // --- Adaptive bar width ---
 // The menu bar item renders at one of three tiers; macOS evicts an item wholesale
 // when it cannot fit beside the notch, so Glancebar sizes itself to what exists.

@@ -488,6 +488,18 @@ int main(void) {
               @"does not match a longer token (SleepDisabledExtra)");
         check([ParseSleepDisabled(@" SleepDisabled 2") isEqual:@YES], @"any nonzero value → YES");
 
+        // --- GUIRequiresLaunchServicesRelaunch ---
+        check(!GUIRequiresLaunchServicesRelaunch(@"com.iantodd.glancebar",
+                                                 @"com.iantodd.glancebar"),
+              @"launch guard: matching Launch Services identity is accepted");
+        check(GUIRequiresLaunchServicesRelaunch(nil, @"com.iantodd.glancebar"),
+              @"launch guard: direct executable launch is relaunched");
+        check(GUIRequiresLaunchServicesRelaunch(@"com.openai.codex",
+                                                @"com.iantodd.glancebar"),
+              @"launch guard: foreign parent attribution is relaunched");
+        check(!GUIRequiresLaunchServicesRelaunch(@"com.iantodd.glancebar", nil),
+              @"launch guard: malformed bundle identity is handled by the caller");
+
         // --- ChooseBarTier ---
         {
             const double W[3] = {121, 55, 22};   // full, compact, glyph (points)

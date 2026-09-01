@@ -890,6 +890,12 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
     return nil;
 }
 
+BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
+                                      NSString *expectedBundleID) {
+    return expectedBundleID.length > 0 &&
+           ![runningBundleID isEqualToString:expectedBundleID];
+}
+
 #pragma mark - Adaptive bar width
 
 const double kBarShrinkMarginPt = 4;
