@@ -3484,7 +3484,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             [icons addObject:d];
         }
         if (icons.count) return icons;
-        tier = BarTierGlyph;
     }
     // Glyph tier: identity mark — except the lid-awake eye takes over, so that
     // always-visible reminder survives every tier at zero extra width.
