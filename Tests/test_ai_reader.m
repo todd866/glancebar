@@ -650,6 +650,184 @@ int main(void) {
         check([elapsedClaude.statusReason hasPrefix:@"Limit windows reset since last Claude refresh"],
               @"elapsed Claude status names the last refresh");
 
+        // Codex meters several limit_id buckets in one session (shapes from 2026-09-07:
+        // the plan bucket's weekly window at 99% in the PRIMARY slot, a side bucket at
+        // 0%/0% seconds later, then "premium" with both windows null and no credits).
+        // The spent plan bucket must govern even though the side bucket reported last.
+        {
+            NSString *bHome = [root stringByAppendingPathComponent:@"home-buckets"];
+            NSString *bSupport = [root stringByAppendingPathComponent:@"support-buckets"];
+            NSString *bSessions = [bHome stringByAppendingPathComponent:@".codex/sessions/2026/09/07"];
+            [fm createDirectoryAtPath:bSessions withIntermediateDirectories:YES attributes:nil error:nil];
+            long long nowEpoch = (long long)NSDate.date.timeIntervalSince1970;
+            NSString *usage = @"\"info\":{\"last_token_usage\":{\"total_tokens\":10,\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":0}}";
+            NSString *credits = @"\"credits\":{\"has_credits\":false,\"unlimited\":false,\"balance\":\"0\"}";
+            NSString *lines = [NSString stringWithFormat:
+                @"{\"timestamp\":\"2026-09-07T05:45:58.309Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":99.0,\"window_minutes\":10080,\"resets_at\":%lld},\"secondary\":null,%@}}}\n"
+                 "{\"timestamp\":\"2026-09-07T05:53:27.384Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex_bengalfox\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":0.0,\"window_minutes\":300,\"resets_at\":%lld},\"secondary\":{\"used_percent\":0.0,\"window_minutes\":10080,\"resets_at\":%lld},%@}}}\n"
+                 "{\"timestamp\":\"2026-09-07T05:54:01.194Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"premium\",\"plan_type\":\"pro\",\"primary\":null,\"secondary\":null,%@}}}\n",
+                usage, nowEpoch + 5 * 86400, credits,
+                usage, nowEpoch + 3600, nowEpoch + 7 * 86400, credits,
+                usage, credits];
+            NSString *rolloutPath = [bSessions stringByAppendingPathComponent:@"rollout-buckets.jsonl"];
+            [lines writeToFile:rolloutPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            AIReader *bucketReader = [[AIReader alloc] initWithHomeDirectory:bHome applicationSupportDirectory:bSupport];
+            AIUsage *codexB = UsageNamed([bucketReader readUntilCaughtUpWithTimeLimit:5.0], @"Codex");
+            check(codexB.limitStatusAvailable && fabs(codexB.remainingFraction - 0.01) < 0.001,
+                  @"buckets: the spent plan window is the gauge, not the untouched side bucket");
+            check(codexB.limitWindows.count == 3, @"buckets: all three current windows are listed");
+            check([codexB.limitWindows[0][@"bucket"] isEqual:@"codex"], @"buckets: the plan bucket is listed first");
+            check([codexB.billingNote isEqual:@"Requests now bill to credits · none available"],
+                  @"buckets: the billing note says where requests go now");
+            check([codexB.statusReason containsString:@"weekly window · plan bucket · pro plan"],
+                  @"buckets: the status names the governing bucket");
+            check([codexB.extraUsage isEqual:@"No credits (balance 0)"], @"buckets: credits still read from the newest bucket");
+            check(codexB.limitRefreshError == nil, @"buckets: a null-window premium snapshot is not schema drift");
+            check(codexB.resetAt && fabs(codexB.resetAt.timeIntervalSince1970 - (nowEpoch + 5 * 86400)) < 1,
+                  @"buckets: the reset is the plan window's own");
+
+            NSString *bState = [bSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
+            NSDictionary *bRoot = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:bState]
+                                                                   options:0 error:nil];
+            check([bRoot[@"codexBuckets"] count] == 3, @"buckets: persisted per limit_id");
+            check(bRoot[@"codexLimits"] == nil, @"buckets: the blended codexLimits key is retired");
+            NSDictionary *bucketRecord = [bRoot[@"codexFiles"] allValues].firstObject;
+            check(bucketRecord[@"latestBuckets"] != nil || bucketRecord[@"peekBuckets"] != nil,
+                  @"buckets: records carry per-bucket limits");
+            check(bucketRecord[@"latestLimits"] == nil, @"buckets: records no longer carry the blend");
+            AIReader *bucketRestored = [[AIReader alloc] initWithHomeDirectory:bHome applicationSupportDirectory:bSupport];
+            AIUsage *codexRestored = UsageNamed([bucketRestored read], @"Codex");
+            check(fabs(codexRestored.remainingFraction - 0.01) < 0.001, @"buckets: restored state keeps the plan gauge");
+
+            // Upgrade path: a pre-bucket record carries one blended latestLimits filed under
+            // whichever limit_id reported last. It is not trusted; the tail is re-peeked.
+            NSMutableDictionary *legacyRoot = [bRoot mutableCopy];
+            NSMutableDictionary *legacyFiles = [NSMutableDictionary dictionary];
+            NSDictionary *blend = @{@"limit_id": @"premium", @"plan_type": @"pro",
+                                    @"primary": @{@"used_percent": @0.0, @"window_minutes": @300,
+                                                  @"resets_at": @(nowEpoch + 3600)}};
+            for (NSString *key in bRoot[@"codexFiles"]) {
+                NSMutableDictionary *r = [bRoot[@"codexFiles"][key] mutableCopy];
+                for (NSString *k in @[@"latestBuckets", @"latestNewest", @"latestNewestTs",
+                                      @"peekBuckets", @"peekNewest", @"peekNewestTs"])
+                    [r removeObjectForKey:k];
+                r[@"latestLimits"] = blend;
+                r[@"latestTs"] = @"2026-09-07T05:54:01.194Z";
+                r[@"tailSize"] = r[@"size"];   // "already peeked" — the upgrade must undo this
+                legacyFiles[key] = r;
+            }
+            legacyRoot[@"codexFiles"] = legacyFiles;
+            [legacyRoot removeObjectForKey:@"codexBuckets"];
+            legacyRoot[@"codexLimits"] = blend;
+            legacyRoot[@"codexLimitsTs"] = @"2026-09-07T05:54:01.194Z";
+            [[NSJSONSerialization dataWithJSONObject:legacyRoot options:0 error:nil] writeToFile:bState atomically:YES];
+            AIReader *upgraded = [[AIReader alloc] initWithHomeDirectory:bHome applicationSupportDirectory:bSupport];
+            AIUsage *codexUpgraded = UsageNamed([upgraded readUntilCaughtUpWithTimeLimit:5.0], @"Codex");
+            check(fabs(codexUpgraded.remainingFraction - 0.01) < 0.001,
+                  @"upgrade: a blended legacy record is re-peeked, not trusted");
+            check(codexUpgraded.limitWindows.count == 3, @"upgrade: the re-peek restores every bucket");
+        }
+
+        // Claude activity comes from the transcripts themselves: per-model tokens,
+        // sessions (subagent transcripts excluded), messages, tool calls, last activity.
+        {
+            NSString *cHome = [root stringByAppendingPathComponent:@"home-claude-activity"];
+            NSString *cSupport = [root stringByAppendingPathComponent:@"support-claude-activity"];
+            NSString *proj = [cHome stringByAppendingPathComponent:@".claude/projects/p"];
+            NSString *subDir = [proj stringByAppendingPathComponent:@"session-1/subagents"];
+            [fm createDirectoryAtPath:subDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSISO8601DateFormatter *isoNow = [NSISO8601DateFormatter new];
+            NSString *(^message)(NSString *, NSString *, long long, int) = ^(NSString *msgID, NSString *model, long long out, int tools) {
+                NSMutableString *content = [NSMutableString stringWithString:@"[{\"type\":\"text\",\"text\":\"x\"}"];
+                for (int i = 0; i < tools; i++) [content appendFormat:@",{\"type\":\"tool_use\",\"id\":\"t%d\",\"name\":\"Bash\"}", i];
+                [content appendString:@"]"];
+                return [NSString stringWithFormat:
+                    @"{\"type\":\"assistant\",\"timestamp\":\"%@\",\"message\":{\"id\":\"%@\",\"model\":\"%@\",\"content\":%@,"
+                     "\"usage\":{\"input_tokens\":1,\"output_tokens\":%lld,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n",
+                    [isoNow stringFromDate:NSDate.date], msgID, model, content, out];
+            };
+            NSString *main1 = [message(@"m1", @"claude-fable-5-1", 100, 1) stringByAppendingString:message(@"m2", @"claude-fable-5-1", 50, 0)];
+            [main1 writeToFile:[proj stringByAppendingPathComponent:@"session-1.jsonl"] atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            [message(@"m3", @"claude-sonnet-5", 30, 0) writeToFile:[proj stringByAppendingPathComponent:@"session-2.jsonl"]
+                                                        atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            [message(@"m4", @"claude-fable-5-1", 20, 0) writeToFile:[subDir stringByAppendingPathComponent:@"agent-a.jsonl"]
+                                                         atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            // A streamed message: three lines with one id, usage a running placeholder on the
+            // first two (output 1, 1) and the real count on the last (385); blocks text /
+            // tool_use / tool_use. The real shape from ~/.claude/projects on 2026-09-07.
+            NSString *(^streamed)(NSString *, long long, NSString *) = ^(NSString *msgID, long long out, NSString *block) {
+                return [NSString stringWithFormat:
+                    @"{\"type\":\"assistant\",\"timestamp\":\"%@\",\"message\":{\"id\":\"%@\",\"model\":\"claude-fable-5-1\",\"content\":[%@],"
+                     "\"usage\":{\"input_tokens\":2,\"output_tokens\":%lld,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100}}}\n",
+                    [isoNow stringFromDate:NSDate.date], msgID, block, out];
+            };
+            NSString *text = @"{\"type\":\"text\",\"text\":\"x\"}", *tool = @"{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Bash\"}";
+            NSString *streamedPath = [proj stringByAppendingPathComponent:@"session-3.jsonl"];
+            NSString *firstTwo = [streamed(@"s1", 1, text) stringByAppendingString:streamed(@"s1", 1, tool)];
+            [firstTwo writeToFile:streamedPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            AIReader *streamReader = [[AIReader alloc] initWithHomeDirectory:cHome applicationSupportDirectory:cSupport];
+            streamReader.allowClaudeTranscripts = YES;
+            AIUsage *streamed1 = UsageNamed([streamReader readUntilCaughtUpWithTimeLimit:5.0], @"Claude");
+            long long baseline = 204;   // the other three transcripts
+            check(streamed1.todayTokens == baseline + 3, @"streamed: the first reading counts once");
+            // The completing line lands in a LATER pass: only the growth is added.
+            NSFileHandle *appendHandle = [NSFileHandle fileHandleForWritingAtPath:streamedPath];
+            [appendHandle seekToEndOfFile];
+            [appendHandle writeData:[streamed(@"s1", 385, tool) dataUsingEncoding:NSUTF8StringEncoding]];
+            [appendHandle closeFile];
+            AIUsage *streamed2 = UsageNamed([streamReader readUntilCaughtUpWithTimeLimit:5.0], @"Claude");
+            check(streamed2.todayTokens == baseline + 387, @"streamed: the final reading replaces the placeholder, not adds to it");
+            check(streamed2.todayTokensAll == baseline + 387 + 100, @"streamed: cached context is counted once per message too");
+            check(streamed2.todayMessages == 5, @"streamed: one message, however many lines");
+            check(streamed2.todayToolCalls == 3, @"streamed: tool_use blocks across all lines add up");
+            NSString *streamState = [NSString stringWithContentsOfFile:
+                [cSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"] encoding:NSUTF8StringEncoding error:nil];
+            check(![streamState containsString:@"\"ids\""] && [streamState containsString:@"\"idv\""],
+                  @"streamed: per-id readings replace the bare hash list");
+            [fm removeItemAtPath:streamedPath error:nil];
+            [fm removeItemAtPath:[cSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"] error:nil];
+
+            AIReader *activityReader = [[AIReader alloc] initWithHomeDirectory:cHome applicationSupportDirectory:cSupport];
+            activityReader.allowClaudeTranscripts = YES;
+            AIUsage *activity = UsageNamed([activityReader readUntilCaughtUpWithTimeLimit:5.0], @"Claude");
+            check(activity.todaySessions == 2 && activity.weekSessions == 2, @"activity: subagent transcripts are not sessions");
+            check(activity.todayMessages == 4, @"activity: every assistant message counts, subagents included");
+            check(activity.todayToolCalls == 1, @"activity: tool_use blocks are counted");
+            check(activity.todayTokens == 4 + 200, @"activity: token totals unchanged by the new counters");
+            check(activity.models.count == 2 && [activity.models[0][@"name"] isEqual:@"claude-fable-5-1"] &&
+                  [activity.models[0][@"tokens"] longLongValue] == 173 && [activity.models[1][@"tokens"] longLongValue] == 31,
+                  @"activity: models ranked by 7-day fresh tokens");
+            check([activity.topModel isEqual:@"claude-fable-5-1"], @"activity: top model follows the ranking");
+            check(activity.lastActivity && fabs(activity.lastActivity.timeIntervalSinceNow) < 120,
+                  @"activity: last activity is the newest message time, not a stats-cache mtime");
+            check([activity.source isEqual:@"~/.claude transcripts"], @"activity: the source no longer claims the stats cache");
+            NSString *cState = [cSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
+            NSString *cStateText = [NSString stringWithContentsOfFile:cState encoding:NSUTF8StringEncoding error:nil];
+            check(![cStateText containsString:@"subagents"] && ![cStateText containsString:@"session-1"],
+                  @"activity: the subagent flag persists without any path");
+
+            // A record indexed before these counters existed is re-read from the start.
+            NSMutableDictionary *cRoot = [[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:cState]
+                                                                          options:0 error:nil] mutableCopy];
+            NSMutableDictionary *oldFiles = [NSMutableDictionary dictionary];
+            for (NSString *key in cRoot[@"claudeFiles"]) {
+                NSMutableDictionary *r = [cRoot[@"claudeFiles"][key] mutableCopy];
+                [r removeObjectForKey:@"v"]; [r removeObjectForKey:@"lastTs"]; [r removeObjectForKey:@"sub"];
+                NSMutableDictionary *days = [NSMutableDictionary dictionary];
+                for (NSString *day in r[@"days"])
+                    days[day] = @{@"t": r[@"days"][day][@"t"], @"f": r[@"days"][day][@"f"]};
+                r[@"days"] = days;
+                oldFiles[key] = r;
+            }
+            cRoot[@"claudeFiles"] = oldFiles;
+            [[NSJSONSerialization dataWithJSONObject:cRoot options:0 error:nil] writeToFile:cState atomically:YES];
+            AIReader *reindexed = [[AIReader alloc] initWithHomeDirectory:cHome applicationSupportDirectory:cSupport];
+            reindexed.allowClaudeTranscripts = YES;
+            AIUsage *again = UsageNamed([reindexed readUntilCaughtUpWithTimeLimit:5.0], @"Claude");
+            check(again.models.count == 2 && again.todaySessions == 2 && again.todayTokens == 204,
+                  @"upgrade: a pre-schema transcript record is re-indexed once, without double counting");
+        }
+
         // Toggle-off clears the persisted account usage fields.
         restored.useClaudeAccount = NO;
         restored.useCursorAccount = NO;

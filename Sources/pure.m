@@ -139,6 +139,15 @@ NSDictionary *ParseClaudeUsageLine(NSString *line) {
     out[@"fresh"] = @(input + output);                            // input is already non-cached
     out[@"tokens"] = @(input + output + cacheCreate + cacheRead);
     if ([message[@"id"] isKindOfClass:NSString.class]) out[@"id"] = message[@"id"];
+    NSString *model = [message[@"model"] isKindOfClass:NSString.class] ? message[@"model"] : nil;
+    if (model.length) out[@"model"] = model;
+    // Tool calls are content blocks on the same message. `usage.iterations[]` restates
+    // the top-level counters for the same message and is deliberately never read.
+    long long tools = 0;
+    NSArray *content = [message[@"content"] isKindOfClass:NSArray.class] ? message[@"content"] : nil;
+    for (id block in content)
+        if ([block isKindOfClass:NSDictionary.class] && [block[@"type"] isEqual:@"tool_use"]) tools++;
+    if (tools > 0) out[@"tools"] = @(tools);
     return out;
 }
 
@@ -162,10 +171,36 @@ static NSDate *DateFromISO8601(NSString *s) {
     return [plain dateFromString:stripped];
 }
 
+NSDictionary *MergeDayCounts(NSDictionary *a, NSDictionary *b) {
+    if (![a isKindOfClass:NSDictionary.class]) a = nil;
+    if (![b isKindOfClass:NSDictionary.class]) b = nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *key in @[@"t", @"f", @"n", @"c"]) {
+        long long sum = JSONInteger(a[key]) + JSONInteger(b[key]);
+        // t and f are the day's identity and are always written; the newer counters
+        // appear only once they are nonzero, so Codex records do not grow keys they never use.
+        if (sum != 0 || [key isEqualToString:@"t"] || [key isEqualToString:@"f"]) out[key] = @(sum);
+    }
+    NSDictionary *ma = [a[@"m"] isKindOfClass:NSDictionary.class] ? a[@"m"] : nil;
+    NSDictionary *mb = [b[@"m"] isKindOfClass:NSDictionary.class] ? b[@"m"] : nil;
+    if (ma.count || mb.count) {
+        NSMutableDictionary *models = [NSMutableDictionary dictionary];
+        for (NSDictionary *source in @[ma ?: @{}, mb ?: @{}]) {
+            for (NSString *model in source) {
+                if (![model isKindOfClass:NSString.class] || !model.length) continue;
+                long long value = JSONInteger(source[model]);
+                if (value > 0) models[model] = @(JSONInteger(models[model]) + value);
+            }
+        }
+        if (models.count) out[@"m"] = models;
+    }
+    return out;
+}
+
 NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
                                     NSArray<NSDictionary *> *events, NSTimeZone *tz) {
     NSMutableDictionary *days = existingDays ? [existingDays mutableCopy] : [NSMutableDictionary dictionary];
-    NSDictionary *latestLimits = nil;
+    NSDictionary *latestLimits = nil, *newestLimits = nil, *buckets = nil;
     NSString *latestTs = nil;
     NSDateFormatter *dayFmt = [NSDateFormatter new];
     dayFmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -177,21 +212,37 @@ NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *ex
         if (!date) continue;
         long long tokens = JSONInteger(e[@"tokens"]);
         long long fresh = JSONInteger(e[@"fresh"]);
-        if (tokens > 0 || fresh > 0) {
+        long long tools = JSONInteger(e[@"tools"]);
+        if (tokens > 0 || fresh > 0 || tools > 0) {
             NSString *day = [dayFmt stringFromDate:date];
-            NSDictionary *cur = days[day];
-            days[day] = @{@"t": @([cur[@"t"] longLongValue] + tokens),
-                          @"f": @([cur[@"f"] longLongValue] + fresh)};
+            // An amendment grows a message already counted: its tokens and tool calls
+            // add, but it is not another message.
+            BOOL amend = [e[@"amend"] isKindOfClass:NSNumber.class] && [e[@"amend"] boolValue];
+            NSMutableDictionary *add = [@{@"t": @(tokens), @"f": @(fresh), @"n": @(amend ? 0 : 1)} mutableCopy];
+            if (tools > 0) add[@"c"] = @(tools);
+            NSString *model = [e[@"model"] isKindOfClass:NSString.class] ? e[@"model"] : nil;
+            if (model.length && fresh > 0) add[@"m"] = @{model: @(fresh)};
+            days[day] = MergeDayCounts(days[day], add);
         }
         // Fold every snapshot, not just the newest: the last one to carry a window is
-        // often not the last one to arrive. See MergeCodexRateLimits.
-        if (e[@"limits"]) {
+        // often not the last one to arrive. See MergeCodexRateLimits — and keep each
+        // limit_id apart, see FoldCodexSnapshotIntoBuckets.
+        if ([e[@"limits"] isKindOfClass:NSDictionary.class]) {
             latestLimits = MergeCodexRateLimits(latestLimits, latestTs, e[@"limits"], ts);
-            if (!latestTs || [ts compare:latestTs] == NSOrderedDescending) latestTs = ts;
+            buckets = FoldCodexSnapshotIntoBuckets(buckets, e[@"limits"], ts);
+            if (!latestTs || [ts compare:latestTs] == NSOrderedDescending) {
+                latestTs = ts;
+                newestLimits = e[@"limits"];
+            }
         }
     }
     NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:days forKey:@"days"];
-    if (latestLimits) { out[@"latestLimits"] = latestLimits; out[@"latestTs"] = latestTs; }
+    if (latestLimits) {
+        out[@"latestLimits"] = latestLimits;
+        out[@"latestTs"] = latestTs;
+        if (buckets) out[@"buckets"] = buckets;
+        if (newestLimits) { out[@"newestLimits"] = newestLimits; out[@"newestTs"] = latestTs; }
+    }
     return out;
 }
 
@@ -437,43 +488,95 @@ NSArray<NSDictionary *> *ClaudeStaleLimitWindows(NSDictionary *usage, double now
     return ClaudeWindowsFiltered(usage, nowEpoch, YES);
 }
 
+static double ClaudeResetEpoch(id resetsAt) {
+    if ([resetsAt isKindOfClass:NSNumber.class]) return [resetsAt doubleValue];
+    if ([resetsAt isKindOfClass:NSString.class]) return DateFromISO8601(resetsAt).timeIntervalSince1970;
+    return 0;
+}
+
+// The display name of one `limits[]` entry, or nil for an entry with no readable kind.
+static NSString *ClaudeLimitEntryLabel(NSDictionary *entry) {
+    NSString *kind = [entry[@"kind"] isKindOfClass:NSString.class] ? entry[@"kind"] : nil;
+    if (!kind.length) return nil;
+    if ([kind isEqualToString:@"session"]) return @"5-hour";
+    if ([kind isEqualToString:@"weekly_all"]) return @"weekly";
+    if ([kind isEqualToString:@"weekly_scoped"]) {
+        NSDictionary *scope = [entry[@"scope"] isKindOfClass:NSDictionary.class] ? entry[@"scope"] : nil;
+        NSDictionary *model = [scope[@"model"] isKindOfClass:NSDictionary.class] ? scope[@"model"] : nil;
+        NSString *name = [model[@"display_name"] isKindOfClass:NSString.class] ? model[@"display_name"] : nil;
+        return name.length ? [@"weekly " stringByAppendingString:name] : @"weekly (model)";
+    }
+    // An unfamiliar kind still names itself ("monthly_all" → "monthly all") rather than
+    // vanishing: the array is explicit about what each entry is.
+    return [kind stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+}
+
+// One reading → one window dict, or nil when it does not belong in this set.
+static NSMutableDictionary *ClaudeWindowReading(NSString *label, double usedPercent, double resets,
+                                                double nowEpoch, BOOL elapsedOnly, BOOL allowFresh) {
+    // Anthropic reports a PERCENTAGE, including values below 1.0. Never infer a fraction
+    // from the value's magnitude.
+    if (resets <= 0) {
+        // No reset instant. With nothing used this is a fresh window — 100% left, and
+        // its clock starts on first use. Anything else reset-less is a placeholder.
+        if (elapsedOnly || !allowFresh || usedPercent > 0) return nil;
+        return [@{@"window": label, @"remainingFraction": @1.0, @"fresh": @YES} mutableCopy];
+    }
+    // Live: require a still-future reset. Stale: require a real elapsed reset.
+    if (elapsedOnly ? resets > nowEpoch : resets <= nowEpoch) return nil;
+    double remaining = 1.0 - usedPercent / 100.0;
+    remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
+    return [@{@"window": label, @"remainingFraction": @(remaining), @"resetsAt": @(resets)} mutableCopy];
+}
+
 static NSArray<NSDictionary *> *ClaudeWindowsFiltered(NSDictionary *usage, double nowEpoch,
                                                       BOOL elapsedOnly) {
     if (![usage isKindOfClass:NSDictionary.class]) return @[];
-    // Fixed reading order so the dual meter always renders 5-hour before weekly,
-    // independent of dictionary iteration order. Only known windows are surfaced
-    // (extra_usage is a credit budget, not a rate window, and is never included).
-    // weekly Sonnet (seven_day_sonnet) is intentionally absent from this order, so it is
-    // never surfaced in the dual meter regardless of what the API reports for it.
-    NSArray *order = @[@"five_hour", @"seven_day", @"seven_day_opus"];
-    NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
-                             @"seven_day_opus": @"weekly Opus"};
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *key in order) {
-        NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
-        if (![w[@"utilization"] isKindOfClass:NSNumber.class]) continue;
-        // Anthropic's OAuth usage contract reports percentage utilization, including
-        // values below 1.0. Never infer a fraction from the value's magnitude.
-        double used = [w[@"utilization"] doubleValue] / 100.0;
-        double resets = 0;
-        id resetsAt = w[@"resets_at"];
-        if ([resetsAt isKindOfClass:NSNumber.class]) resets = [resetsAt doubleValue];
-        else if ([resetsAt isKindOfClass:NSString.class]) resets = DateFromISO8601(resetsAt).timeIntervalSince1970;
-        // Live: require a still-future reset (drops elapsed windows and reset-less
-        // placeholders). Stale: require a real elapsed reset (same placeholder exclusion).
-        if (resets <= 0) continue;
-        if (elapsedOnly) {
-            if (resets > nowEpoch) continue;
-        } else if (resets <= nowEpoch) {
-            continue;
+    // Readings: @{label, used (percent), resets (epoch or 0), kind?, active?}.
+    NSMutableArray<NSDictionary *> *readings = [NSMutableArray array];
+    // The `limits` array is authoritative whenever it is present and readable: it is the
+    // only place the model-scoped weekly is named, and the legacy dicts mirror it.
+    NSArray *limits = [usage[@"limits"] isKindOfClass:NSArray.class] ? usage[@"limits"] : nil;
+    for (id entry in limits) {
+        if (![entry isKindOfClass:NSDictionary.class]) continue;
+        if (![entry[@"percent"] isKindOfClass:NSNumber.class]) continue;
+        NSString *label = ClaudeLimitEntryLabel(entry);
+        if (!label) continue;
+        NSMutableDictionary *r = [@{@"label": label, @"used": entry[@"percent"],
+                                    @"resets": @(ClaudeResetEpoch(entry[@"resets_at"]))} mutableCopy];
+        r[@"kind"] = entry[@"kind"];
+        if ([entry[@"is_active"] isKindOfClass:NSNumber.class]) r[@"active"] = entry[@"is_active"];
+        [readings addObject:r];
+    }
+    if (!readings.count) {
+        // Legacy shape. Fixed reading order so the dual meter always renders 5-hour
+        // before weekly, independent of dictionary iteration order. Only known windows
+        // are surfaced (extra_usage is a credit budget, not a rate window, and is never
+        // included); weekly Sonnet (seven_day_sonnet) is intentionally absent.
+        NSArray *order = @[@"five_hour", @"seven_day", @"seven_day_opus"];
+        NSDictionary *labels = @{@"five_hour": @"5-hour", @"seven_day": @"weekly",
+                                 @"seven_day_opus": @"weekly Opus"};
+        for (NSString *key in order) {
+            NSDictionary *w = [usage[key] isKindOfClass:NSDictionary.class] ? usage[key] : nil;
+            if (![w[@"utilization"] isKindOfClass:NSNumber.class]) continue;
+            [readings addObject:@{@"label": labels[key], @"used": w[@"utilization"],
+                                  @"resets": @(ClaudeResetEpoch(w[@"resets_at"]))}];
         }
-        double remaining = 1.0 - used;
-        remaining = remaining < 0 ? 0 : remaining > 1 ? 1 : remaining;
-        NSMutableDictionary *d = [NSMutableDictionary dictionary];
-        d[@"window"] = labels[key];
-        d[@"remainingFraction"] = @(remaining);
-        d[@"resetsAt"] = @(resets);
-        [out addObject:d];
+    }
+    if (!readings.count) return @[];
+    // Fresh windows surface only when the whole account is fresh; a lone reset-less
+    // entry beside live windows is an unused scoped weekly, and stays hidden as before.
+    BOOL allFresh = YES;
+    for (NSDictionary *r in readings)
+        if ([r[@"resets"] doubleValue] > 0 || [r[@"used"] doubleValue] > 0) { allFresh = NO; break; }
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *r in readings) {
+        NSMutableDictionary *w = ClaudeWindowReading(r[@"label"], [r[@"used"] doubleValue],
+                                                     [r[@"resets"] doubleValue], nowEpoch, elapsedOnly, allFresh);
+        if (!w) continue;
+        if (r[@"kind"]) w[@"kind"] = r[@"kind"];
+        if (r[@"active"]) w[@"active"] = r[@"active"];
+        [out addObject:w];
     }
     return out;
 }
@@ -504,6 +607,9 @@ static NSString *DatedLimitResetReason(NSString *prefix, NSString *fetchedAtISO)
 }
 
 NSString *ClaudeLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch) {
+    // No response at all is the caller's story to tell (never fetched, paused, failed);
+    // only a response that exists can be said to carry no window.
+    if (![usage isKindOfClass:NSDictionary.class]) return nil;
     if (ClaudeLimitWindows(usage, nowEpoch).count) return nil;
     if (ClaudeStaleLimitWindows(usage, nowEpoch).count)
         return DatedLimitResetReason(@"Limit windows reset since last Claude refresh", fetchedAtISO);
@@ -643,6 +749,7 @@ NSDictionary *PickCursorStaleLimitWindow(NSDictionary *usage, double nowEpoch) {
 }
 
 NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch) {
+    if (![usage isKindOfClass:NSDictionary.class]) return nil;
     if (CursorLimitWindows(usage, nowEpoch).count) return nil;
     if (CursorStaleLimitWindows(usage, nowEpoch).count)
         return DatedLimitResetReason(@"Limit windows reset since last Cursor refresh", fetchedAtISO);
@@ -654,7 +761,15 @@ NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage) {
     NSDictionary *extra = [usage[@"extra_usage"] isKindOfClass:NSDictionary.class] ? usage[@"extra_usage"] : nil;
     if (!extra || ![extra[@"monthly_limit"] isKindOfClass:NSNumber.class]) return nil;
     id enabled = extra[@"is_enabled"];
-    if ([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) return nil;
+    if ([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) {
+        // Context only: why there is no paid overage to fall back on when the plan runs
+        // out. Never a gauge, never a status reason.
+        NSString *reason = [extra[@"disabled_reason"] isKindOfClass:NSString.class] ? extra[@"disabled_reason"] : nil;
+        NSString *description = reason.length
+            ? [@"Off · " stringByAppendingString:[reason stringByReplacingOccurrencesOfString:@"_" withString:@" "]]
+            : @"Off";
+        return @{@"description": description, @"overageActive": @NO};
+    }
     // The API sends null for these counters until extra usage is consumed; read them as zero.
     double utilization = JSONDouble(extra[@"utilization"]);
     double usedCredits = JSONDouble(extra[@"used_credits"]);
@@ -815,8 +930,22 @@ static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
+// The executable's basename, unless that is a bare version number: Claude Code's native
+// install runs ~/.local/share/claude/versions/2.1.261, and "2.1.261" is no name. Walk
+// back past version-shaped and structural components to the first real one ("claude").
 static NSString *FallbackProcessName(NSString *command) {
     NSString *trimmed = Trimmed(command);
+    static NSRegularExpression *versionLike;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        versionLike = [NSRegularExpression regularExpressionWithPattern:@"^v?[0-9]+(\\.[0-9]+)*$" options:0 error:nil];
+    });
+    for (NSString *part in trimmed.pathComponents.reverseObjectEnumerator) {
+        if (!part.length || [part isEqualToString:@"/"]) continue;
+        if ([part isEqualToString:@"versions"] || [part isEqualToString:@"bin"] || [part isEqualToString:@"MacOS"]) continue;
+        if ([versionLike firstMatchInString:part options:0 range:NSMakeRange(0, part.length)]) continue;
+        return part;
+    }
     NSString *last = trimmed.lastPathComponent;
     return last.length ? last : trimmed;
 }
@@ -961,4 +1090,168 @@ BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
         }
     }
     return s;
+}
+
+// --- Codex limit buckets ---
+
+NSString *CodexLimitBucketID(NSDictionary *rateLimits) {
+    NSString *limitID = [rateLimits[@"limit_id"] isKindOfClass:NSString.class] ? rateLimits[@"limit_id"] : nil;
+    return limitID.length ? limitID : @"codex";
+}
+
+NSString *CodexBucketLabel(NSString *bucketID) {
+    if (!bucketID.length || [bucketID isEqualToString:@"codex"]) return @"plan";
+    if ([bucketID isEqualToString:@"premium"]) return @"credits";
+    if ([bucketID hasPrefix:@"codex_"] && bucketID.length > 6) return [bucketID substringFromIndex:6];
+    return bucketID;
+}
+
+static NSString *BucketTs(NSDictionary *entry) {
+    return [entry[@"ts"] isKindOfClass:NSString.class] ? entry[@"ts"] : nil;
+}
+static NSDictionary *BucketLimits(NSDictionary *entry) {
+    return [entry[@"limits"] isKindOfClass:NSDictionary.class] ? entry[@"limits"] : nil;
+}
+
+static NSDictionary *MergeBucketEntries(NSDictionary *a, NSDictionary *b) {
+    NSDictionary *limits = MergeCodexRateLimits(BucketLimits(a), BucketTs(a), BucketLimits(b), BucketTs(b));
+    if (!limits) return nil;
+    NSString *ta = BucketTs(a), *tb = BucketTs(b);
+    NSString *ts = !ta.length ? tb : !tb.length ? ta : ([tb compare:ta] == NSOrderedDescending ? tb : ta);
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:limits forKey:@"limits"];
+    if (ts.length) out[@"ts"] = ts;
+    return out;
+}
+
+NSDictionary *FoldCodexSnapshotIntoBuckets(NSDictionary *buckets, NSDictionary *snapshot, NSString *ts) {
+    if (![snapshot isKindOfClass:NSDictionary.class]) return [buckets isKindOfClass:NSDictionary.class] ? buckets : nil;
+    NSMutableDictionary *out = [buckets isKindOfClass:NSDictionary.class] ? [buckets mutableCopy]
+                                                                          : [NSMutableDictionary dictionary];
+    NSString *bucketID = CodexLimitBucketID(snapshot);
+    NSDictionary *incoming = ts.length ? @{@"limits": snapshot, @"ts": ts} : @{@"limits": snapshot};
+    NSDictionary *kept = [out[bucketID] isKindOfClass:NSDictionary.class] ? out[bucketID] : nil;
+    NSDictionary *merged = MergeBucketEntries(kept, incoming);
+    if (merged) out[bucketID] = merged;
+    return out;
+}
+
+NSDictionary *MergeCodexLimitBuckets(NSDictionary *a, NSDictionary *b) {
+    if (![a isKindOfClass:NSDictionary.class]) a = nil;
+    if (![b isKindOfClass:NSDictionary.class]) b = nil;
+    if (!a && !b) return nil;
+    NSMutableSet *ids = [NSMutableSet setWithArray:a.allKeys ?: @[]];
+    [ids addObjectsFromArray:b.allKeys ?: @[]];
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *bucketID in ids) {
+        if (![bucketID isKindOfClass:NSString.class]) continue;
+        NSDictionary *ea = [a[bucketID] isKindOfClass:NSDictionary.class] ? a[bucketID] : nil;
+        NSDictionary *eb = [b[bucketID] isKindOfClass:NSDictionary.class] ? b[bucketID] : nil;
+        NSDictionary *merged = ea && eb ? MergeBucketEntries(ea, eb) : (ea ?: eb);
+        if (BucketLimits(merged)) out[bucketID] = merged;
+    }
+    return out;
+}
+
+NSString *CodexNewestBucketID(NSDictionary *buckets) {
+    if (![buckets isKindOfClass:NSDictionary.class]) return nil;
+    NSString *best = nil, *bestTs = nil;
+    for (NSString *bucketID in buckets) {
+        NSString *ts = BucketTs(buckets[bucketID]);
+        if (!ts.length) continue;
+        NSComparisonResult order = bestTs ? [ts compare:bestTs] : NSOrderedDescending;
+        // Equal stamps: pick deterministically so a fold order cannot change the answer.
+        if (order == NSOrderedDescending || (order == NSOrderedSame && [bucketID compare:best] == NSOrderedAscending)) {
+            best = bucketID;
+            bestTs = ts;
+        }
+    }
+    return best;
+}
+
+NSDictionary *CodexNewestBucketLimits(NSDictionary *buckets) {
+    NSString *bucketID = CodexNewestBucketID(buckets);
+    return bucketID ? BucketLimits(buckets[bucketID]) : nil;
+}
+
+NSArray<NSDictionary *> *CodexBucketWindows(NSDictionary *buckets, double nowEpoch) {
+    if (![buckets isKindOfClass:NSDictionary.class]) return @[];
+    NSMutableArray<NSDictionary *> *groups = [NSMutableArray array];
+    for (NSString *bucketID in buckets) {
+        if (![bucketID isKindOfClass:NSString.class]) continue;
+        NSDictionary *entry = buckets[bucketID];
+        NSArray<NSDictionary *> *windows = CodexLimitWindows(BucketLimits(entry), nowEpoch);
+        if (!windows.count) continue;
+        double least = 2;
+        NSMutableArray *tagged = [NSMutableArray array];
+        for (NSDictionary *w in windows) {
+            NSMutableDictionary *d = [w mutableCopy];
+            d[@"bucket"] = bucketID;
+            d[@"bucketLabel"] = CodexBucketLabel(bucketID);
+            [tagged addObject:d];
+            least = MIN(least, [w[@"remainingFraction"] doubleValue]);
+        }
+        [groups addObject:@{@"id": bucketID, @"least": @(least), @"ts": BucketTs(entry) ?: @"", @"windows": tagged}];
+    }
+    [groups sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult order = [a[@"least"] compare:b[@"least"]];
+        if (order != NSOrderedSame) return order;
+        order = [b[@"ts"] compare:a[@"ts"]];   // newer snapshot first
+        if (order != NSOrderedSame) return order;
+        return [a[@"id"] compare:b[@"id"]];
+    }];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *group in groups) [out addObjectsFromArray:group[@"windows"]];
+    return out;
+}
+
+NSDictionary *PickCodexBucketWindow(NSDictionary *buckets, double nowEpoch) {
+    NSDictionary *best = nil;
+    double bestRemaining = 2;
+    for (NSDictionary *w in CodexBucketWindows(buckets, nowEpoch)) {
+        double remaining = [w[@"remainingFraction"] doubleValue];
+        if (remaining >= bestRemaining) continue;   // first (most constrained bucket) wins ties
+        bestRemaining = remaining;
+        best = w;
+    }
+    return best;
+}
+
+NSString *CodexBucketsStatusReason(NSDictionary *buckets, double nowEpoch) {
+    if (![buckets isKindOfClass:NSDictionary.class] || !buckets.count)
+        return CodexLimitStatusReason(nil, nil, nowEpoch);
+    NSString *fallback = nil, *fallbackTs = nil;
+    BOOL fallbackCarriedWindows = NO;
+    for (NSString *bucketID in buckets) {
+        NSDictionary *entry = buckets[bucketID];
+        NSDictionary *limits = BucketLimits(entry);
+        NSString *reason = CodexLimitStatusReason(limits, BucketTs(entry), nowEpoch);
+        if (!reason) return nil;   // a current window exists somewhere — the gauge shows
+        // Prefer the bucket that actually carried windows (its dated "reset since" message
+        // says more than "do not carry"), then the newest snapshot.
+        BOOL carried = CodexWindowUsable(limits[@"primary"]) || CodexWindowUsable(limits[@"secondary"]);
+        NSString *ts = BucketTs(entry);
+        BOOL better = !fallback || (carried && !fallbackCarriedWindows) ||
+            (carried == fallbackCarriedWindows && ts.length &&
+             (!fallbackTs.length || [ts compare:fallbackTs] == NSOrderedDescending));
+        if (better) { fallback = reason; fallbackTs = ts; fallbackCarriedWindows = carried; }
+    }
+    return fallback;
+}
+
+NSString *CodexBillingNote(NSDictionary *buckets, double nowEpoch) {
+    NSString *newest = CodexNewestBucketID(buckets);
+    if (!newest.length) return nil;
+    NSDictionary *pick = PickCodexBucketWindow(buckets, nowEpoch);
+    if (!pick || [pick[@"bucket"] isEqualToString:newest]) return nil;
+    if (![newest isEqualToString:@"premium"])
+        return [NSString stringWithFormat:@"Requests now under the %@ bucket", CodexBucketLabel(newest)];
+    // Credits are one account-level meter, whichever bucket last reported them.
+    NSDictionary *credits = CodexCreditsStatus(BucketLimits(buckets[newest]));
+    for (NSString *bucketID in buckets) if (!credits) credits = CodexCreditsStatus(BucketLimits(buckets[bucketID]));
+    if (!credits) return @"Requests now bill to credits";
+    if ([credits[@"unlimited"] boolValue]) return @"Requests now bill to credits · unlimited";
+    if ([credits[@"exhausted"] boolValue]) return @"Requests now bill to credits · none available";
+    NSString *balance = [credits[@"balance"] isKindOfClass:NSString.class] ? credits[@"balance"] : nil;
+    return balance.length ? [NSString stringWithFormat:@"Requests now bill to credits · balance %@", balance]
+                          : @"Requests now bill to credits";
 }

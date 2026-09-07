@@ -36,18 +36,22 @@ opt-in) `/usr/bin/security`.
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
   popover shows the lead signals, Details keeps the longer lists.
 - **AI status** — Codex's official remaining-quota percentage and reset time from its
-  own session logs; an opt-in gauge for your Claude account; an opt-in gauge for your
-  Cursor account (included plan spend / request quota via Cursor's local session); live
-  per-day token totals for Claude and Codex, counted the way a human would (cached
-  context re-reads shown separately). Each row's subtitle answers one question — when
-  the quota comes back ("Resets Thu 21:00 · in 4d") — and a figure that couldn't be
-  refreshed says how old it is ("· cached 3h ago"); why the refresh failed is in Details.
+  own session logs, kept apart per allowance bucket so a spent plan window is never
+  hidden behind an untouched side bucket, plus where requests bill once the plan is
+  spent ("Requests now bill to credits · none available"); an opt-in gauge for your
+  Claude account (5-hour, weekly, and the model-scoped weekly, e.g. "weekly Fable"); an
+  opt-in gauge for your Cursor account (included plan spend / request quota via Cursor's
+  local session); live per-day token totals, sessions, messages, tool calls and a
+  per-model split for Claude and Codex, counted the way a human would (cached context
+  re-reads shown separately). Each row's subtitle answers one question — when the quota
+  comes back ("Resets Thu 21:00 · in 4d") — and a figure that couldn't be refreshed says
+  how old it is ("· cached 3h ago"); why the refresh failed is in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
 - **Never evicted** — on notched Macs the item automatically narrows (full →
-  icons → single glyph) to fit the space the notch and system items leave, and
-  widens back when space returns; VoiceOver and the hover tooltip always carry
-  the full summary.
+  compact battery percentage → single glyph) to fit the space the notch and system
+  items leave, and widens back when space returns; VoiceOver and the hover tooltip
+  always carry the full summary.
 - **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
   lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
   admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
@@ -77,7 +81,8 @@ and `x86_64` by default. Set `GLANCEBAR_ARCHS=native` if the local toolchain can
 cross-compile. Requires the Xcode Command Line Tools (`xcode-select --install`).
 
 Signing prefers, in order: `GLANCEBAR_CODESIGN_IDENTITY`, then an installed
-`Developer ID Application` identity, then the `Glancebar Self-Signed` cert, then ad-hoc.
+`Developer ID Application` identity (auto-selected when exactly one is present), then
+the `Glancebar Self-Signed` cert, then ad-hoc.
 Prefer a stable identity: ad-hoc signing pins the designated requirement to the code hash,
 so every rebuild looks like a new program and Launch at Login is re-registered. It does not
 affect the Keychain prompt — the Claude Code credential is read through Apple's
@@ -101,9 +106,12 @@ build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json # exit 2 if 
 ```
 
 `--help` and `--version` are available for scripts. JSON is written by itself to
-stdout; unknown options are usage errors. `--online` permits the account request only
-when the Claude account integration has already been enabled in Glancebar. In schema
-v1, each top-level source (`storage`, `battery`, `sampledEnergyImpact`, `system`, and
+stdout; unknown options are usage errors. `--online` permits the Claude and Cursor
+account requests only for integrations already enabled in Glancebar, and honours the
+same 15-minute throttle as the app (a cached response younger than that is reused).
+`GLANCEBAR_HOME=<dir>` redirects every home-relative read (`~/.codex`, `~/.claude`,
+`~/.glancebar`, the state file) to a fixture tree; the preference toggles are not
+redirected. In schema v1, each top-level source (`storage`, `battery`, `sampledEnergyImpact`, `system`, and
 `ai`) exposes `available` and `error`; `partialSources` names every unavailable or
 incomplete source that makes `--strict` exit 2. An unconfigured Claude account source
 is optional; after `--online` explicitly requests an enabled integration, a failed or
@@ -141,33 +149,53 @@ stale account refresh is reported as `ai.account` and is strict-partial.
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
   turn in `~/.codex/sessions/**.jsonl` (and rotated
   `~/.codex/archived_sessions/**.jsonl`) records OpenAI's official rate-limit state
-  (`used_percent` and reset time for the 5-hour and weekly windows), and Glancebar shows
-  the most constrained window that is still current. Once an allowance is spent, Codex
-  stops sending windows altogether — the next snapshots arrive under a different
-  `limit_id` with `"primary": null` — so Glancebar carries the last window pair forward
-  until its own `resets_at` passes, marks it cached, and keeps answering the only
-  question that matters in that state: when the allowance comes back. A `credits`
-  balance, when present, is reported as context in Details; it is not a gauge (a zero
-  balance is normal while the plan window still has room). If a snapshot ever arrives in
-  a shape Glancebar cannot read — a renamed field, an unfamiliar meter — the row says
-  which fields it did not recognise rather than reporting no status at all, so schema
-  drift looks like schema drift and not like an idle account. The same per-turn records carry
-  exact token deltas, which is how today/7-day totals are computed. Headline counts are
-  **fresh tokens** (non-cached input + output); cached-context re-reads are shown
-  separately. If enabled, Claude's token counts come the same way — live from the
-  per-message usage records in `~/.claude/projects/**.jsonl` transcripts.
+  (`used_percent` and reset time per window) under a `limit_id` naming the allowance
+  bucket it was billed to — `codex` for the plan allowance, `codex_<name>` for side
+  buckets, `premium` once requests bill to credits. Codex meters several buckets at
+  once and one session's snapshots alternate between them, so Glancebar keeps each
+  bucket's windows apart and shows the most constrained window that is still current
+  across all of them (never the room one bucket reports while another says the plan is
+  spent). With more than one bucket on show, each row names its bucket ("weekly · plan",
+  "weekly · bengalfox"). Once an allowance is spent, Codex stops sending that bucket's
+  windows — the next snapshots arrive under `premium` with `"primary": null` — so
+  Glancebar carries the bucket's last window pair forward until its own `resets_at`
+  passes, marks it cached, and keeps answering the question that matters: when the
+  allowance comes back, and where requests bill meanwhile ("Requests now bill to
+  credits · none available"). A `credits` balance is reported as context in Details; it
+  is not a gauge (a zero balance is normal while the plan window still has room). If a
+  snapshot ever arrives in a shape Glancebar cannot read — a renamed field, an unfamiliar
+  meter — the row says which fields it did not recognise rather than reporting no status
+  at all, so schema drift looks like schema drift and not like an idle account. The same
+  per-turn records carry exact token deltas, which is how today/7-day totals are
+  computed. Headline counts are **fresh tokens** (non-cached input + output);
+  cached-context re-reads are shown separately. If enabled, Claude's token counts come
+  the same way — live from the per-message usage records in `~/.claude/projects/**.jsonl`
+  transcripts. Claude Code writes one line per content block with the same message id
+  and a running usage figure; Glancebar counts each message once at its final reading
+  (an earlier build kept the first line and under-counted output by about 40%). The
+  transcripts also supply Claude's per-model split, sessions (subagent transcripts spend
+  tokens but are not sessions), messages, tool calls and last activity; the
+  `~/.claude/stats-cache.json` file, which Claude Code stopped updating in June 2026, is
+  read only when transcript scanning is off.
 
   Glancebar keeps a persistent incremental index at
   `~/Library/Application Support/Glancebar/ai-reader-state-v2.json`. The cache stores
-  file identity/offset metadata, day totals, opaque hashes, and the last Codex limits —
-  never transcript text, prompts, responses, or OAuth credentials. It is written
-  atomically with mode `0600`. Each catch-up pass has one global 16 MiB / 350 ms budget,
+  file identity/offset metadata, day totals (per model), opaque per-message hashes with
+  the counted reading, the last Codex limits per bucket, and — while the account toggles
+  are on — the last Claude/Cursor account usage responses (never a token) — never
+  transcript text, prompts, responses, or OAuth credentials. It is written atomically
+  with mode `0600`. Each catch-up pass has one global 16 MiB / 350 ms budget,
   visits newest activity first, and exposes explicit indexing progress instead of
   presenting partial history as complete. It detects appends, rotations, inode
   replacement, truncation/regrowth, and time-zone changes safely.
 
   Claude's *quota* gauge has no on-disk source (Claude Code fetches it from the API at
-  display time), so it fills in one of two ways. The options menu has an **opt-in**
+  display time), so it fills in one of two ways. The account response carries a `limits`
+  array (a 5-hour session window, the weekly window across models, and a weekly window
+  scoped to one model, named after it); a window nobody has used yet has no reset time
+  and shows as 100% left, "not started", rather than as a missing gauge. Because only
+  Claude Code refreshes its OAuth token, the gauge goes stale while Claude Code is idle
+  for longer than the token lives; the row then says how old the figure is. The options menu has an **opt-in**
   "Claude account status via Keychain/API" toggle, off by default. Enabling it first presents
   an in-app confirmation that explains the trust boundary. If confirmed, Glancebar
   invokes Apple's signed `/usr/bin/security` tool to read the OAuth token Claude Code
@@ -191,9 +219,10 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   ```
 
   Claude transcript token totals are a separate **opt-in** toggle because transcript
-  JSONL files contain conversation records. Glancebar extracts usage counters and
-  timestamps, then persists only file identity/offset metadata, daily totals, and
-  opaque message hashes in its protected local index—not prompts or responses. With
+  JSONL files contain conversation records. Glancebar extracts usage counters, the model
+  id, tool-call counts and timestamps, then persists only file identity/offset metadata,
+  daily totals, and opaque message hashes in its protected local index—not prompts or
+  responses. With
   both Claude toggles off, Glancebar reads local Codex state only—never Claude auth
   files or transcripts—and sends no network requests.
 
@@ -207,9 +236,9 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   per-turn usage logs the way Codex/Claude do).
 
   `--dump` is local-only by default. Passing `--online` or setting
-  `GLANCEBAR_ALLOW_ACCOUNT=1` permits the account request only after the integration
-  has already been enabled in the GUI; neither switch enables credential access by
-  itself. Other environment values, including `0`, do not grant online access.
+  `GLANCEBAR_ALLOW_ACCOUNT=1` permits the Claude and Cursor account requests only after
+  the integration has already been enabled in the GUI; neither switch enables credential
+  access by itself. Other environment values, including `0`, do not grant online access.
 
   App signing does not change this credential-access behavior: `/usr/bin/security` is
   the process Keychain evaluates. Signing is still required for normal macOS distribution,

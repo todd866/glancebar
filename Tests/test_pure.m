@@ -65,6 +65,19 @@ int main(void) {
         check([stats2[@"memory"][1][@"bytes"] unsignedLongLongValue] == 300000ULL * 1024ULL,
               @"zero footprint falls back to RSS (grouped helpers summed)");
 
+        // --- process naming: a version-numbered executable takes its parent's name ---
+        NSDictionary *versioned = ParseProcessStats(
+            @"  201 12.0 1000 /Users/x/.local/share/claude/versions/2.1.261\n  202  3.0  500 /usr/bin/top\n  203  1.0  500 node\n", 5,
+            ^NSString *(pid_t __unused pid) { return nil; }, nil);
+        check([versioned[@"cpu"][0][@"name"] isEqual:@"claude"], @"naming: a version-number basename yields the tool's name");
+        check([versioned[@"cpu"][1][@"name"] isEqual:@"top"] && [versioned[@"cpu"][2][@"name"] isEqual:@"node"],
+              @"naming: ordinary basenames are unchanged");
+
+        // --- FmtDuration ---
+        check([FmtDuration(-1) isEqual:@"estimating…"], @"duration: negative minutes are still estimating");
+        check([FmtDuration(0) isEqual:@"0:00"] && [FmtDuration(75) isEqual:@"1:15"] && [FmtDuration(605) isEqual:@"10:05"],
+              @"duration: h:mm with zero-padded minutes");
+
         // --- ParseTokenCountLine ---
         NSString *tok = @"{\"timestamp\":\"2026-06-10T09:04:20.778Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":104303},\"last_token_usage\":{\"input_tokens\":74038,\"cached_input_tokens\":63360,\"output_tokens\":668,\"total_tokens\":74706},\"model_context_window\":272000},\"rate_limits\":{\"primary\":{\"used_percent\":83.0,\"window_minutes\":300,\"resets_at\":1781093380},\"secondary\":{\"used_percent\":90.0,\"window_minutes\":10080,\"resets_at\":1781179715},\"plan_type\":\"prolite\"}}}";
         NSDictionary *ev = ParseTokenCountLine(tok);
@@ -94,6 +107,15 @@ int main(void) {
         check(nullUsage && [nullUsage[@"tokens"] longLongValue] == 5, @"null token counters read as zero");
         NSDictionary *nullTok = ParseTokenCountLine(@"{\"timestamp\":\"2026-06-10T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":9,\"input_tokens\":null,\"cached_input_tokens\":null,\"output_tokens\":null}}}}");
         check(nullTok && [nullTok[@"fresh"] longLongValue] == 0, @"null codex token counters read as zero");
+        // 2026-09 transcript shape: the model rides on the message, tool calls are content
+        // blocks, and usage.iterations[] restates the same counters (never double count).
+        NSString *cl2 = @"{\"type\":\"assistant\",\"timestamp\":\"2026-09-07T06:05:49.980Z\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-fable-5-1\",\"content\":[{\"type\":\"text\",\"text\":\"x\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\"},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Read\"}],\"usage\":{\"input_tokens\":32,\"cache_creation_input_tokens\":4689,\"cache_read_input_tokens\":174555,\"output_tokens\":2372,\"output_tokens_details\":{\"thinking_tokens\":808},\"iterations\":[{\"input_tokens\":32,\"output_tokens\":2372,\"cache_read_input_tokens\":174555}]}}}";
+        NSDictionary *cev2 = ParseClaudeUsageLine(cl2);
+        check([cev2[@"model"] isEqual:@"claude-fable-5-1"], @"claude model id surfaced");
+        check([cev2[@"tools"] longLongValue] == 2, @"claude tool_use blocks counted");
+        check([cev2[@"fresh"] longLongValue] == 32 + 2372, @"claude iterations[] is not double counted");
+        check(cev[@"model"] == nil || [cev[@"model"] isEqual:@"claude-fable-5"], @"claude model optional");
+        check(cev[@"tools"] == nil, @"claude line without content has no tools key");
 
         // --- AccumulateTokenEvents ---
         NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:10 * 3600];
@@ -111,6 +133,42 @@ int main(void) {
             @[@{@"ts": @"2026-06-10T02:00:00Z", @"tokens": @3, @"fresh": @1}], tz);
         check([acc2[@"days"][@"2026-06-10"][@"t"] longLongValue] == 110, @"accumulation merges into existing days");
         check([acc2[@"days"][@"2026-06-10"][@"f"] longLongValue] == 13, @"fresh merges too");
+        // Per-day activity counters: messages, tool calls, and a per-model fresh split.
+        NSDictionary *acc3 = AccumulateTokenEvents(nil, @[
+            @{@"ts": @"2026-06-10T01:00:00Z", @"tokens": @100, @"fresh": @10, @"model": @"a", @"tools": @2},
+            @{@"ts": @"2026-06-10T02:00:00Z", @"tokens": @5, @"fresh": @5, @"model": @"b"},
+            @{@"ts": @"2026-06-10T03:00:00Z", @"tokens": @1, @"fresh": @1, @"model": @"a"},
+            @{@"ts": @"2026-06-10T04:00:00Z", @"tokens": @0, @"fresh": @0, @"model": @"a",
+              @"limits": @{@"plan_type": @"prolite"}},
+        ], tz);
+        NSDictionary *day = acc3[@"days"][@"2026-06-10"];
+        check([day[@"n"] longLongValue] == 3, @"events with tokens count as messages; a limits-only event does not");
+        check([day[@"c"] longLongValue] == 2, @"tool calls summed per day");
+        check([day[@"m"][@"a"] longLongValue] == 11 && [day[@"m"][@"b"] longLongValue] == 5,
+              @"fresh tokens split per model");
+        check(acc2[@"days"][@"2026-06-10"][@"m"] == nil, @"events without a model add no model map");
+        NSDictionary *acc4 = AccumulateTokenEvents(acc3[@"days"],
+            @[@{@"ts": @"2026-06-10T05:00:00Z", @"tokens": @2, @"fresh": @2, @"model": @"b", @"tools": @1}], tz);
+        NSDictionary *day4 = acc4[@"days"][@"2026-06-10"];
+        check([day4[@"n"] longLongValue] == 4 && [day4[@"c"] longLongValue] == 3 &&
+              [day4[@"m"][@"b"] longLongValue] == 7 && [day4[@"m"][@"a"] longLongValue] == 11,
+              @"activity counters merge into existing days");
+        check([acc3[@"buckets"][@"codex"][@"limits"][@"plan_type"] isEqual:@"prolite"],
+              @"limits without a limit_id land in the codex bucket");
+        check([acc3[@"newestLimits"][@"plan_type"] isEqual:@"prolite"] &&
+              [acc3[@"newestTs"] isEqual:@"2026-06-10T04:00:00Z"], @"newest snapshot kept verbatim");
+        NSDictionary *acc5 = AccumulateTokenEvents(nil, @[
+            @{@"ts": @"2026-06-10T01:00:00Z", @"tokens": @10, @"fresh": @3, @"model": @"a", @"tools": @1},
+            @{@"ts": @"2026-06-10T01:00:02Z", @"tokens": @300, @"fresh": @384, @"model": @"a", @"tools": @1, @"amend": @YES},
+            @{@"ts": @"2026-06-10T01:00:03Z", @"tokens": @0, @"fresh": @0, @"model": @"a", @"tools": @1, @"amend": @YES},
+        ], tz);
+        NSDictionary *day5 = acc5[@"days"][@"2026-06-10"];
+        check([day5[@"n"] longLongValue] == 1 && [day5[@"f"] longLongValue] == 387 && [day5[@"c"] longLongValue] == 3 &&
+              [day5[@"m"][@"a"] longLongValue] == 387,
+              @"an amendment adds tokens and tool calls without counting another message");
+        NSDictionary *summed = MergeDayCounts(@{@"t": @1, @"f": @1, @"m": @{@"x": @1}}, nil);
+        check([summed[@"t"] longLongValue] == 1 && [summed[@"m"][@"x"] longLongValue] == 1 && summed[@"n"] == nil,
+              @"MergeDayCounts tolerates a missing side and omits zero counters");
 
         // --- PickLimitWindow ---
         NSDictionary *limits = @{@"primary": @{@"used_percent": @83.0, @"window_minutes": @300, @"resets_at": @2000},
@@ -299,6 +357,8 @@ int main(void) {
                   @{@"five_hour": @{@"utilization": @10, @"resets_at": @9000}},
                   @"2026-08-10T01:41:00Z", 1000) == nil,
               @"claude status nil while a live window exists");
+        check(ClaudeLimitStatusReason(nil, @"", 1000) == nil && CursorLimitStatusReason(nil, @"", 1000) == nil,
+              @"no response at all is not 'no current limit window' — the caller explains that");
         check([ClaudeLimitStatusReason(@{}, @"", 1000)
                   isEqual:@"Account response has no current limit window"],
               @"claude empty usage yields the missing-window reason");
@@ -321,6 +381,185 @@ int main(void) {
                                               @"secondary": @{@"used_percent": @90.0, @"window_minutes": @10080, @"resets_at": @9000}}, 1000);
         check(xwins2.count == 1 && [xwins2[0][@"window"] isEqual:@"weekly"], @"codex drops reset-elapsed window");
         check(CodexLimitWindows(nil, 1000).count == 0, @"codex nil ⇒ empty");
+
+        // --- Codex limit buckets (limit_id) ---
+        // Shapes taken verbatim from ~/.codex rollouts on 2026-09-07: the plan bucket's
+        // weekly window (in the PRIMARY slot, no secondary) climbed to 99% while a side
+        // bucket reported 0%/0% in the same sessions seconds apart, and the next snapshot
+        // arrived under "premium" with both windows null and no credits.
+        {
+            NSDictionary *noCredits = @{@"has_credits": @NO, @"unlimited": @NO, @"balance": @"0"};
+            NSDictionary *plan = @{@"limit_id": @"codex", @"plan_type": @"pro", @"credits": noCredits,
+                                   @"primary": @{@"used_percent": @99.0, @"window_minutes": @10080,
+                                                 @"resets_at": @1789167190},
+                                   @"secondary": NSNull.null};
+            NSDictionary *fox = @{@"limit_id": @"codex_bengalfox", @"plan_type": @"pro", @"credits": noCredits,
+                                  @"primary": @{@"used_percent": @0.0, @"window_minutes": @300,
+                                                @"resets_at": @1788778395},
+                                  @"secondary": @{@"used_percent": @0.0, @"window_minutes": @10080,
+                                                  @"resets_at": @1789365195}};
+            NSDictionary *premium = @{@"limit_id": @"premium", @"plan_type": @"pro", @"credits": noCredits,
+                                      @"primary": NSNull.null, @"secondary": NSNull.null};
+            NSString *planTs = @"2026-09-07T05:45:58.309Z", *foxTs = @"2026-09-07T05:53:27.384Z",
+                     *premiumTs = @"2026-09-07T05:54:01.194Z";
+            double now = 1788761000;   // 2026-09-07T06:03Z
+
+            check([CodexLimitBucketID(plan) isEqual:@"codex"] && [CodexLimitBucketID(@{}) isEqual:@"codex"],
+                  @"buckets: limit_id names the bucket, absent means the plan bucket");
+            check([CodexBucketLabel(@"codex") isEqual:@"plan"] && [CodexBucketLabel(@"premium") isEqual:@"credits"] &&
+                  [CodexBucketLabel(@"codex_bengalfox") isEqual:@"bengalfox"] && [CodexBucketLabel(@"other") isEqual:@"other"],
+                  @"buckets: labels are short and human");
+
+            NSDictionary *b = FoldCodexSnapshotIntoBuckets(nil, plan, planTs);
+            b = FoldCodexSnapshotIntoBuckets(b, fox, foxTs);
+            b = FoldCodexSnapshotIntoBuckets(b, premium, premiumTs);
+            check(b.count == 3, @"buckets: one entry per limit_id");
+            NSDictionary *pick = PickCodexBucketWindow(b, now);
+            check([pick[@"bucket"] isEqual:@"codex"] && [pick[@"window"] isEqual:@"weekly"],
+                  @"buckets: the spent plan window governs, not the newest untouched bucket");
+            check(fabs([pick[@"remainingFraction"] doubleValue] - 0.01) < 0.001, @"buckets: 1% left");
+            check([pick[@"resetsAt"] doubleValue] == 1789167190 && [pick[@"plan"] isEqual:@"pro"],
+                  @"buckets: the pick keeps the window's own reset and plan");
+            check([pick[@"bucketLabel"] isEqual:@"plan"], @"buckets: the pick is labeled");
+            NSArray *wins = CodexBucketWindows(b, now);
+            check(wins.count == 3, @"buckets: every current window across buckets is listed");
+            check([wins[0][@"bucket"] isEqual:@"codex"], @"buckets: most constrained bucket first");
+            check([wins[1][@"bucketLabel"] isEqual:@"bengalfox"] && [wins[1][@"window"] isEqual:@"5-hour"] &&
+                  [wins[2][@"bucketLabel"] isEqual:@"bengalfox"] && [wins[2][@"window"] isEqual:@"weekly"],
+                  @"buckets: other buckets follow, primary before secondary");
+            check([CodexNewestBucketID(b) isEqual:@"premium"], @"buckets: newest snapshot names where requests bill now");
+            check([CodexNewestBucketLimits(b)[@"limit_id"] isEqual:@"premium"], @"buckets: newest limits are the premium snapshot");
+            check([CodexBillingNote(b, now) isEqual:@"Requests now bill to credits · none available"],
+                  @"buckets: billing note says the plan is spent and no credits remain");
+            check(CodexBucketsStatusReason(b, now) == nil, @"buckets: a current window means no fallback reason");
+
+            // Fold order must not change anything.
+            NSDictionary *r = FoldCodexSnapshotIntoBuckets(nil, premium, premiumTs);
+            r = FoldCodexSnapshotIntoBuckets(r, fox, foxTs);
+            r = FoldCodexSnapshotIntoBuckets(r, plan, planTs);
+            check([PickCodexBucketWindow(r, now)[@"bucket"] isEqual:@"codex"], @"buckets: fold order does not change the pick");
+            check([CodexNewestBucketID(r) isEqual:@"premium"], @"buckets: fold order does not change the newest bucket");
+            // Union of two maps (records from different files) is a per-bucket merge.
+            NSDictionary *u = MergeCodexLimitBuckets(FoldCodexSnapshotIntoBuckets(nil, plan, planTs),
+                                                     FoldCodexSnapshotIntoBuckets(nil, fox, foxTs));
+            check(u.count == 2 && [PickCodexBucketWindow(u, now)[@"bucket"] isEqual:@"codex"],
+                  @"buckets: merging maps keeps both buckets and the spent one still governs");
+            NSDictionary *fresher = @{@"limit_id": @"codex", @"plan_type": @"pro",
+                                      @"primary": @{@"used_percent": @12.0, @"window_minutes": @10080,
+                                                    @"resets_at": @1789772000}};
+            NSDictionary *u2 = MergeCodexLimitBuckets(u, FoldCodexSnapshotIntoBuckets(nil, fresher, @"2026-09-12T08:00:00.000Z"));
+            check(fabs([PickCodexBucketWindow(u2, 1789200000)[@"remainingFraction"] doubleValue] - 0.88) < 0.001,
+                  @"buckets: within a bucket the newer reading wins");
+            check(MergeCodexLimitBuckets(nil, nil) == nil && [MergeCodexLimitBuckets(u, nil) count] == 2,
+                  @"buckets: merge tolerates nil");
+            // Legacy null-window carry-forward still works inside one bucket.
+            NSDictionary *carried = FoldCodexSnapshotIntoBuckets(
+                FoldCodexSnapshotIntoBuckets(nil, plan, planTs),
+                @{@"limit_id": @"codex", @"primary": NSNull.null, @"secondary": NSNull.null}, premiumTs);
+            check([PickCodexBucketWindow(carried, now)[@"resetsAt"] doubleValue] == 1789167190,
+                  @"buckets: a null-window snapshot in the same bucket cannot erase the known window");
+
+            // After the plan window resets, the side bucket is what remains current.
+            check([PickCodexBucketWindow(b, 1789167200)[@"bucket"] isEqual:@"codex_bengalfox"],
+                  @"buckets: once the plan window resets, the side bucket governs");
+            check(CodexBillingNote(b, 1789167200) != nil, @"buckets: billing note persists while premium is newest");
+            // When every window has reset, say so, dated from the bucket that carried windows.
+            check(PickCodexBucketWindow(b, 1790000000) == nil, @"buckets: all-expired yields no pick");
+            check([CodexBucketsStatusReason(b, 1790000000) hasPrefix:@"Limit windows reset since last Codex session"],
+                  @"buckets: all-expired names the reset, not a missing source");
+            check(CodexBucketWindows(nil, now).count == 0 && PickCodexBucketWindow(nil, now) == nil,
+                  @"buckets: nil map is empty");
+            check([CodexBucketsStatusReason(nil, now) isEqual:@"Codex session logs do not carry limit status"],
+                  @"buckets: no buckets ever means no source");
+        }
+
+        // --- ClaudeLimitWindows: the 2026-09 `limits` array ---
+        {
+            NSDictionary *live = @{
+                @"limits": @[
+                    @{@"kind": @"session", @"group": @"session", @"is_active": @YES, @"percent": @7,
+                      @"resets_at": @"2026-09-07T10:49:59.601495+00:00", @"scope": NSNull.null, @"severity": @"normal"},
+                    @{@"kind": @"weekly_all", @"group": @"weekly", @"is_active": @NO, @"percent": @2,
+                      @"resets_at": @"2026-09-08T12:59:59.601557+00:00", @"scope": NSNull.null},
+                    @{@"kind": @"weekly_scoped", @"group": @"weekly", @"is_active": @NO, @"percent": @3,
+                      @"resets_at": @"2026-09-08T12:59:59.601909+00:00",
+                      @"scope": @{@"model": @{@"id": NSNull.null, @"display_name": @"Fable"}, @"surface": NSNull.null}}],
+                @"five_hour": @{@"utilization": @7, @"resets_at": @"2026-09-07T10:49:59.601495+00:00"},
+                @"seven_day": @{@"utilization": @2, @"resets_at": @"2026-09-08T12:59:59.601557+00:00"},
+                @"seven_day_opus": NSNull.null, @"nimbus_quill": @{@"utilization": @0, @"resets_at": NSNull.null}};
+            double now = 1788761000;   // 2026-09-07T06:03Z
+            NSArray *w = ClaudeLimitWindows(live, now);
+            check(w.count == 3, @"limits[]: all three windows surface");
+            check([w[0][@"window"] isEqual:@"5-hour"] && fabs([w[0][@"remainingFraction"] doubleValue] - 0.93) < 0.001,
+                  @"limits[]: session is the 5-hour window");
+            check([w[1][@"window"] isEqual:@"weekly"] && fabs([w[1][@"remainingFraction"] doubleValue] - 0.98) < 0.001,
+                  @"limits[]: weekly_all is the weekly window");
+            check([w[2][@"window"] isEqual:@"weekly Fable"] && fabs([w[2][@"remainingFraction"] doubleValue] - 0.97) < 0.001,
+                  @"limits[]: the model-scoped weekly is named after its model");
+            check([w[0][@"active"] boolValue] && ![w[1][@"active"] boolValue] && [w[2][@"kind"] isEqual:@"weekly_scoped"],
+                  @"limits[]: kind and is_active ride along");
+            check(fabs([w[1][@"resetsAt"] doubleValue] - 1788872399.6) < 1, @"limits[]: microsecond ISO resets parse");
+            check([PickClaudeLimitWindow(live, now)[@"window"] isEqual:@"5-hour"], @"limits[]: most constrained wins");
+            check(ClaudeLimitStatusReason(live, @"2026-09-07T06:08:45Z", now) == nil, @"limits[]: live windows need no reason");
+            NSArray *elapsed = ClaudeStaleLimitWindows(live, 1789000000);
+            check(elapsed.count == 3 && [elapsed[2][@"window"] isEqual:@"weekly Fable"], @"limits[]: elapsed set keeps names");
+
+            // A fresh week (2026-09-05 shape): every window reset-less with nothing used.
+            NSDictionary *fresh = @{
+                @"limits": @[
+                    @{@"kind": @"session", @"is_active": @YES, @"percent": @0, @"resets_at": NSNull.null},
+                    @{@"kind": @"weekly_all", @"is_active": @NO, @"percent": @0, @"resets_at": NSNull.null},
+                    @{@"kind": @"weekly_scoped", @"is_active": @NO, @"percent": @0, @"resets_at": NSNull.null,
+                      @"scope": @{@"model": @{@"display_name": @"Fable"}}}],
+                @"five_hour": @{@"utilization": @0, @"resets_at": NSNull.null},
+                @"seven_day": @{@"utilization": @0, @"resets_at": NSNull.null}};
+            NSArray *fw = ClaudeLimitWindows(fresh, now);
+            check(fw.count == 3, @"limits[]: an unused account still has windows to show");
+            check([fw[0][@"fresh"] boolValue] && [fw[0][@"remainingFraction"] doubleValue] == 1.0 && fw[0][@"resetsAt"] == nil,
+                  @"limits[]: an unused window is 100% left with no reset yet");
+            check([PickClaudeLimitWindow(fresh, now)[@"fresh"] boolValue], @"limits[]: the pick says it is fresh");
+            check(ClaudeLimitStatusReason(fresh, nil, now) == nil, @"limits[]: fresh windows count as current, not 'no window'");
+            check(ClaudeStaleLimitWindows(fresh, now).count == 0, @"limits[]: fresh windows are never stale");
+            // Legacy-only fresh shape (an older cached response) gets the same treatment.
+            NSDictionary *legacyFresh = @{@"five_hour": @{@"utilization": @0, @"resets_at": NSNull.null},
+                                          @"seven_day": @{@"utilization": @0, @"resets_at": NSNull.null}};
+            check(ClaudeLimitWindows(legacyFresh, now).count == 2, @"legacy fresh shape shows two unused windows");
+            // A lone reset-less entry beside live windows is a placeholder and stays hidden.
+            NSDictionary *mixed = @{@"limits": @[
+                @{@"kind": @"session", @"percent": @7, @"resets_at": @9000000000},
+                @{@"kind": @"weekly_scoped", @"percent": @0, @"resets_at": NSNull.null,
+                  @"scope": @{@"model": @{@"display_name": @"Opus"}}}]};
+            NSArray *mw = ClaudeLimitWindows(mixed, now);
+            check(mw.count == 1 && [mw[0][@"window"] isEqual:@"5-hour"], @"limits[]: an unused scoped weekly beside a live window stays hidden");
+            check(ClaudeLimitWindows(@{@"limits": @[@{@"kind": @"weekly_all", @"percent": @5, @"resets_at": NSNull.null}]}, now).count == 0,
+                  @"limits[]: used-but-reset-less is a placeholder, not fresh");
+            // Units: percent 1 is 1%.
+            NSArray *one = ClaudeLimitWindows(@{@"limits": @[@{@"kind": @"weekly_all", @"percent": @1, @"resets_at": @9000000000}]}, now);
+            check(one.count == 1 && fabs([one[0][@"remainingFraction"] doubleValue] - 0.99) < 0.001,
+                  @"limits[]: percent 1 is 1% used, never fully used");
+            // The array wins over legacy dicts when both are present.
+            NSDictionary *disagree = @{@"limits": @[@{@"kind": @"session", @"percent": @50, @"resets_at": @9000000000}],
+                                       @"five_hour": @{@"utilization": @10, @"resets_at": @9000000000}};
+            check(fabs([ClaudeLimitWindows(disagree, now)[0][@"remainingFraction"] doubleValue] - 0.5) < 0.001,
+                  @"limits[]: the array is authoritative over the legacy mirror");
+            // An unreadable array falls back to the legacy dicts.
+            NSDictionary *unreadable = @{@"limits": @[@{@"kind": @"session", @"percent": @"seven"}],
+                                         @"five_hour": @{@"utilization": @10, @"resets_at": @9000000000}};
+            check(ClaudeLimitWindows(unreadable, now).count == 1, @"limits[]: an unreadable array falls back to legacy");
+            // Unknown kinds name themselves; an entry with no kind is skipped.
+            NSArray *odd = ClaudeLimitWindows(@{@"limits": @[@{@"kind": @"monthly_all", @"percent": @50, @"resets_at": @9000000000},
+                                                              @{@"percent": @50, @"resets_at": @9000000000}]}, now);
+            check(odd.count == 1 && [odd[0][@"window"] isEqual:@"monthly all"], @"limits[]: unknown kinds still name themselves");
+            // A scoped weekly with no model name still has a label.
+            NSArray *noName = ClaudeLimitWindows(@{@"limits": @[@{@"kind": @"weekly_scoped", @"percent": @1, @"resets_at": @9000000000}]}, now);
+            check([noName[0][@"window"] isEqual:@"weekly (model)"], @"limits[]: scoped weekly without a name is still labeled");
+
+            // Extra usage that is switched off explains itself as context only.
+            NSDictionary *off = ClaudeExtraUsageStatus(@{@"extra_usage": @{@"is_enabled": @NO, @"disabled_reason": @"out_of_credits",
+                                                                         @"monthly_limit": @20000, @"currency": @"AUD"}});
+            check([off[@"description"] isEqual:@"Off · out of credits"] && off[@"statusReason"] == nil && ![off[@"overageActive"] boolValue],
+                  @"extra_usage off: description only, no status, no overage");
+        }
 
         // --- RateLimitRetryDelay ---
         check(RateLimitRetryDelay(0) == 900, @"no Retry-After ⇒ 900s floor");

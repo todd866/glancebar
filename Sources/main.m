@@ -193,8 +193,14 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
 
 // Reads the live SleepDisabled system power setting (no admin needed — a plain IOKit read
 // surfaced by `pmset -g`). YES = the Mac is currently kept awake with the lid closed.
+// nil when pmset could not be read — callers must not mistake that for "normal sleep",
+// or the toggle would offer to ENABLE staying awake on a Mac that already is.
+static NSNumber *SleepDisabledState(void) {
+    NSString *out = RunTaskOutput(@"/usr/bin/pmset", @[@"-g"]);
+    return out.length ? ParseSleepDisabled(out) : nil;
+}
 static BOOL SleepDisabledNow(void) {
-    return ParseSleepDisabled(RunTaskOutput(@"/usr/bin/pmset", @[@"-g"]) ?: @"").boolValue;
+    return SleepDisabledState().boolValue;
 }
 
 // Applies `pmset -a disablesleep <0|1>` through an osascript administrator prompt: macOS
@@ -222,7 +228,18 @@ static BOOL SetSleepDisabledViaAdmin(BOOL enable) {
 static NSArray<NSDictionary *> *SampleHogs(int topN) {
     NSString *out = RunTaskOutput(@"/usr/bin/top", @[@"-l", @"2", @"-s", @"1", @"-stats",
                                                      @"pid,command,power", @"-o", @"power", @"-n", @"40"]);
-    return ParseHogs(out ? out : @"", topN, ^NSString *(pid_t pid){ return AppGroupForPid(pid); });
+    // The sampler's own `top` scores itself (12% of an idle sample on 2026-09-07). It is
+    // measurement, not a hog; drop it and let the next real row up.
+    NSArray<NSDictionary *> *rows = ParseHogs(out ? out : @"", topN + 1,
+                                              ^NSString *(pid_t pid){ return AppGroupForPid(pid); });
+    NSMutableArray *kept = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        NSArray *commands = [row[@"commands"] isKindOfClass:NSArray.class] ? row[@"commands"] : @[];
+        if ([row[@"name"] isEqual:@"top"] && commands.count == 1 && [commands.firstObject isEqual:@"top"]) continue;
+        if ((int)kept.count >= topN) break;
+        [kept addObject:row];
+    }
+    return kept;
 }
 
 // Physical footprint (what Activity Monitor shows) — unlike RSS it does not count
@@ -475,6 +492,7 @@ static NSColor *CPUColor(double cpu) {
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
 @property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
 @property (copy) NSString *limitRefreshError;
+@property (copy) NSString *billingNote;   // Codex: where requests bill when not the shown window's bucket
 @property (copy) NSString *diagnostics;   // --dump only: why the gauge is or isn't shown
 @property BOOL available, stale, limitStatusAvailable, limitStale, overageActive;
 @property double remainingFraction;
@@ -704,6 +722,9 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSString *reset = StatusStringForKeys(entry, @[@"resetText", @"reset", @"resets"]);
     NSString *resetAt = StatusStringForKeys(entry, @[@"resetAt", @"resetTime", @"resetsAt"]);
     NSDate *resetDate = DateFromStatusString(resetAt);
+    // A dated override is a statement about one window. Once that window has reset the
+    // file is stale, and the provider's own figure is the truth again.
+    if (resetDate && resetDate.timeIntervalSinceNow <= 0) return;
     if (resetDate) reset = ResetTextFromDate(resetDate);
     if (reset.length && (replacedGauge || (u.limitStatusAvailable && u.remainingFraction >= 0))) {
         u.resetText = reset;
@@ -1126,19 +1147,27 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     NSArray<NSDictionary *> *_codexInventory;
     NSArray<NSDictionary *> *_claudeInventory;
     double _codexInventoryValidUntil, _claudeInventoryValidUntil;
-    NSMutableDictionary<NSString *, NSDictionary *> *_days;  // local "yyyy-MM-dd" -> @{@"t":, @"f":}
-    NSDictionary *_limits;          // best known meters, merged across snapshots
-    NSString *_limitsTs;
-    // The newest snapshot verbatim. _limits is a deliberate blend of the best-known
+    NSMutableDictionary<NSString *, NSDictionary *> *_days;  // local "yyyy-MM-dd" -> @{@"t":, @"f":, ...}
+    // Best known meters per limit_id — see FoldCodexSnapshotIntoBuckets. Buckets are
+    // compared, never blended: on 2026-09-07 a blend read "100% left" off an untouched
+    // side bucket while the plan bucket sat at 99% used.
+    NSDictionary *_buckets;
+    NSString *_limitsTs;            // newest snapshot's timestamp across buckets
+    // The newest snapshot verbatim. A bucket is a deliberate merge of its best-known
     // meters, so asking IT whether Codex still speaks a shape we understand answers the
-    // wrong question: one carried-forward window makes any blend look readable.
+    // wrong question: one carried-forward window makes any merge look readable.
     NSDictionary *_limitsNewest;
     NSDate *_dbStamp;               // change detection for the sqlite extras
     NSString *_dbDay;
-    long long _sessionsToday;
+    long long _sessionsToday, _sessionsWeek;
     NSArray<NSDictionary *> *_models;
     NSDate *_lastActivity;
     NSMutableDictionary<NSString *, NSDictionary *> *_claudeDays;
+    // Derived from the transcript index, not the stats cache (which Claude Code stopped
+    // writing in June 2026): 7-day fresh tokens per model, sessions, messages, tool calls.
+    NSArray<NSDictionary *> *_claudeModels;
+    long long _claudeSessionsToday, _claudeSessionsWeek, _claudeMessagesToday, _claudeToolsToday;
+    NSDate *_claudeLastActivity;
     NSDictionary *_claudeUsageJSON;             // last good OAuth usage response
     double _claudeNextFetch;                    // epoch; throttles the usage endpoint
     NSString *_claudeAccessToken;               // memory-only; never persisted by Glancebar
@@ -1156,7 +1185,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     double _cursorLastSuccessAt;
     BOOL _cursorFetchedThisRun;
     BOOL _cursorUsageCacheAbandoned;
-    NSString *_lastFetchSkipReason;
+    NSString *_claudeFetchSkipReason, *_cursorFetchSkipReason;
     NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
     NSUInteger _scanBytesRemaining;
     double _scanDeadline;
@@ -1221,11 +1250,28 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     }
     for (NSString *key in claude) {
         NSDictionary *record = [claude[key] isKindOfClass:NSDictionary.class] ? claude[key] : nil;
-        if (key.length && record) _claudeFiles[key] = [record mutableCopy];
+        if (key.length && record) _claudeFiles[key] = [self upgradedClaudeRecord:[record mutableCopy]];
     }
-    NSDictionary *limits = [root[@"codexLimits"] isKindOfClass:NSDictionary.class] ? root[@"codexLimits"] : nil;
-    NSString *limitsTs = [root[@"codexLimitsTs"] isKindOfClass:NSString.class] ? root[@"codexLimitsTs"] : nil;
-    if (limits && limitsTs.length) { _limits = limits; _limitsTs = limitsTs; }
+    // Records written before limit buckets existed carry `latestLimits`, a blend across
+    // every limit_id the file saw, filed under whichever id reported last. Re-reading
+    // 15 GB of rollouts is not an option; instead the blend is ignored and the newest
+    // files are re-peeked (tailSize cleared) so the current picture returns at once.
+    for (NSMutableDictionary *record in _codexFiles.allValues) {
+        if (record[@"latestLimits"] || record[@"peekLimits"]) {
+            [record removeObjectForKey:@"latestLimits"];
+            [record removeObjectForKey:@"latestTs"];
+            [record removeObjectForKey:@"peekLimits"];
+            [record removeObjectForKey:@"peekTs"];
+            [record removeObjectForKey:@"tailSize"];
+            _stateDirty = YES;
+        }
+    }
+    NSDictionary *buckets = [root[@"codexBuckets"] isKindOfClass:NSDictionary.class] ? root[@"codexBuckets"] : nil;
+    if (buckets.count) {
+        _buckets = buckets;
+        _limitsTs = BucketsNewestTs(buckets);
+        _limitsNewest = CodexNewestBucketLimits(buckets);
+    }
     NSDictionary *claudeUsage = [root[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class]
         ? root[@"claudeUsageJSON"] : nil;
     if (claudeUsage) {
@@ -1234,6 +1280,9 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
             ? root[@"claudeUsageFetchedAt"] : nil;
         NSDate *when = DateFromStatusString(fetched);
         if (when) _claudeLastSuccessAt = when.timeIntervalSince1970;
+        // The throttle survives restarts and --dump runs: a figure younger than the poll
+        // interval is as current as a fresh fetch would make it, and the endpoint rate-limits.
+        if (when) _claudeNextFetch = _claudeLastSuccessAt + kAccountPollInterval;
         _claudeFetchedThisRun = NO;
         _claudeUsageCacheAbandoned = NO;
     }
@@ -1245,9 +1294,31 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
             ? root[@"cursorUsageFetchedAt"] : nil;
         NSDate *when = DateFromStatusString(fetched);
         if (when) _cursorLastSuccessAt = when.timeIntervalSince1970;
+        if (when) _cursorNextFetch = _cursorLastSuccessAt + kAccountPollInterval;
         _cursorFetchedThisRun = NO;
         _cursorUsageCacheAbandoned = NO;
     }
+}
+
+static NSString *BucketsNewestTs(NSDictionary *buckets) {
+    NSString *newest = CodexNewestBucketID(buckets);
+    NSDictionary *entry = newest ? buckets[newest] : nil;
+    return [entry[@"ts"] isKindOfClass:NSString.class] ? entry[@"ts"] : nil;
+}
+
+// A transcript record indexed before per-model/activity counters existed knows only
+// day totals. The 8-day window it can still contribute to is re-read from offset 0 (a
+// few hundred MB at most, reported as "Indexing transcripts N%"); identity is kept so
+// the file is not mistaken for a new one.
+static const NSInteger kClaudeRecordSchema = 2;
+- (NSMutableDictionary *)upgradedClaudeRecord:(NSMutableDictionary *)record {
+    if ([record[@"v"] integerValue] >= kClaudeRecordSchema) return record;
+    NSMutableDictionary *fresh = [NSMutableDictionary dictionaryWithObject:@0 forKey:@"offset"];
+    if (record[@"dev"]) fresh[@"dev"] = record[@"dev"];
+    if (record[@"ino"]) fresh[@"ino"] = record[@"ino"];
+    fresh[@"v"] = @(kClaudeRecordSchema);
+    _stateDirty = YES;
+    return fresh;
 }
 
 // Indexing a large backlog drives read() in a tight catch-up loop, and each pass rewrote the
@@ -1255,10 +1326,6 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 // a re-read of the last couple of seconds' bytes, since offsets and totals move together.
 // The pass that finishes the backlog always writes, so a settled index is never stale.
 static const double kAIStateWriteInterval = 2.0;
-
-- (void)savePersistentStateIfNeeded {
-    [self savePersistentStateForcingWrite:YES];
-}
 
 - (void)savePersistentStateCoalesced {
     [self savePersistentStateForcingWrite:NO];
@@ -1281,10 +1348,7 @@ static const double kAIStateWriteInterval = 2.0;
         @"codexFiles": _codexFiles,
         @"claudeFiles": _claudeFiles
     } mutableCopy];
-    if (_limits && _limitsTs.length) {
-        root[@"codexLimits"] = _limits;
-        root[@"codexLimitsTs"] = _limitsTs;
-    }
+    if (_buckets.count) root[@"codexBuckets"] = _buckets;
     NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
     iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
     if ([_claudeUsageJSON isKindOfClass:NSDictionary.class]) {
@@ -1517,12 +1581,13 @@ static NSComparisonResult NewestCandidateFirst(NSDictionary *a, NSDictionary *b)
         files[key] = record;
         _stateDirty = YES;
     }
-    for (NSString *field in @[@"dev", @"ino", @"size", @"mtime"]) {
+    for (NSString *field in @[@"dev", @"ino", @"size", @"mtime", @"sub"]) {
         if ([field isEqualToString:@"size"] && [record[@"inventoryMismatch"] boolValue]) continue;
         id value = candidate[field];
         if (value && ![record[field] isEqual:value]) { record[field] = value; _stateDirty = YES; }
     }
     if (!record[@"offset"]) record[@"offset"] = @0;
+    if (files == _claudeFiles && !record[@"v"]) { record[@"v"] = @(kClaudeRecordSchema); _stateDirty = YES; }
     return record;
 }
 
@@ -1643,6 +1708,9 @@ static NSComparisonResult NewestCandidateFirst(NSDictionary *a, NSDictionary *b)
         } mutableCopy];
         if (dev) candidate[@"dev"] = dev;
         if (ino) candidate[@"ino"] = ino;
+        // Subagent transcripts spend tokens like any other, but they are not sessions the
+        // user started; the flag (never the path) lets the session count skip them.
+        if ([rel.pathComponents containsObject:@"subagents"]) candidate[@"sub"] = @YES;
         [inventory addObject:candidate];
     }
     [inventory sortUsingComparator:
@@ -1669,18 +1737,17 @@ static NSComparisonResult NewestCandidateFirst(NSDictionary *a, NSDictionary *b)
 
 static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDictionary *days) {
     for (NSString *day in days) {
-        NSDictionary *old = sum[day], *add = [days[day] isKindOfClass:NSDictionary.class] ? days[day] : nil;
+        NSDictionary *add = [days[day] isKindOfClass:NSDictionary.class] ? days[day] : nil;
         if (!add) continue;
-        sum[day] = @{@"t": @([old[@"t"] longLongValue] + [add[@"t"] longLongValue]),
-                     @"f": @([old[@"f"] longLongValue] + [add[@"f"] longLongValue])};
+        sum[day] = MergeDayCounts(sum[day], add);
     }
 }
 
 - (void)rebuildCodexDerivedState {
     NSString *weekStart = WeekStartDayString();
     NSMutableDictionary *sum = [NSMutableDictionary dictionary];
-    NSDictionary *bestLimits = nil, *newestLimits = nil;
-    NSString *bestTs = nil;
+    NSDictionary *buckets = nil, *newestLimits = nil;
+    NSString *newestTs = nil;
     for (NSMutableDictionary *record in _codexFiles.allValues) {
         NSMutableDictionary *recordDays = [([record[@"days"] isKindOfClass:NSDictionary.class]
                                              ? record[@"days"] : @{}) mutableCopy];
@@ -1688,31 +1755,34 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
         PruneDays(recordDays, weekStart);
         if (recordDays.count != before) { record[@"days"] = recordDays; _stateDirty = YES; }
         AddDays(sum, recordDays);
+        // Bucket-wise and meter-wise, not snapshot-wise: once an allowance is spent Codex
+        // stops sending its windows, so the newest snapshot alone knows least — and it
+        // may belong to a different bucket altogether.
         for (NSString *prefix in @[@"latest", @"peek"]) {
-            NSString *tsKey = [prefix stringByAppendingString:@"Ts"];
-            NSString *limitsKey = [prefix stringByAppendingString:@"Limits"];
-            NSString *ts = [record[tsKey] isKindOfClass:NSString.class] ? record[tsKey] : nil;
-            NSDictionary *limits = [record[limitsKey] isKindOfClass:NSDictionary.class] ? record[limitsKey] : nil;
-            // Meter-wise, not snapshot-wise: once the weekly allowance is spent Codex
-            // stops sending windows at all, so the newest snapshot alone knows least.
-            if (limits && ts.length) {
-                bestLimits = MergeCodexRateLimits(bestLimits, bestTs, limits, ts);
-                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) {
-                    bestTs = ts;
-                    newestLimits = limits;   // kept verbatim, for the drift check
-                }
+            NSDictionary *recordBuckets = record[[prefix stringByAppendingString:@"Buckets"]];
+            if ([recordBuckets isKindOfClass:NSDictionary.class] && recordBuckets.count)
+                buckets = MergeCodexLimitBuckets(buckets, recordBuckets);
+            NSString *ts = record[[prefix stringByAppendingString:@"NewestTs"]];
+            NSDictionary *limits = record[[prefix stringByAppendingString:@"Newest"]];
+            if ([limits isKindOfClass:NSDictionary.class] && [ts isKindOfClass:NSString.class] && ts.length &&
+                (!newestTs || [ts compare:newestTs] == NSOrderedDescending)) {
+                newestTs = ts;
+                newestLimits = limits;   // verbatim, for the drift check
             }
         }
     }
     _days = sum;
-    _limits = bestLimits;
-    _limitsTs = bestTs;
-    _limitsNewest = newestLimits;
+    _buckets = buckets;
+    _limitsTs = newestTs ?: BucketsNewestTs(buckets);
+    _limitsNewest = newestLimits ?: CodexNewestBucketLimits(buckets);
 }
 
 - (void)rebuildClaudeDerivedState {
     NSString *weekStart = WeekStartDayString();
+    NSString *today = LocalDateString(NSDate.date);
     NSMutableDictionary *sum = [NSMutableDictionary dictionary];
+    long long sessionsToday = 0, sessionsWeek = 0;
+    NSString *lastTs = nil;
     for (NSMutableDictionary *record in _claudeFiles.allValues) {
         NSMutableDictionary *recordDays = [([record[@"days"] isKindOfClass:NSDictionary.class]
                                              ? record[@"days"] : @{}) mutableCopy];
@@ -1720,8 +1790,33 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
         PruneDays(recordDays, weekStart);
         if (recordDays.count != before) { record[@"days"] = recordDays; _stateDirty = YES; }
         AddDays(sum, recordDays);
+        // One transcript file is one session the user started; subagent transcripts are
+        // not. A session counts on every local day it produced a message.
+        if (![record[@"sub"] boolValue]) {
+            BOOL anyDay = NO;
+            for (NSString *day in recordDays) {
+                if ([recordDays[day][@"n"] longLongValue] <= 0) continue;
+                anyDay = YES;
+                if ([day isEqualToString:today]) sessionsToday++;
+            }
+            if (anyDay) sessionsWeek++;
+        }
+        NSString *ts = [record[@"lastTs"] isKindOfClass:NSString.class] ? record[@"lastTs"] : nil;
+        if (ts.length && (!lastTs || [ts compare:lastTs] == NSOrderedDescending)) lastTs = ts;
     }
     _claudeDays = sum;
+    _claudeSessionsToday = sessionsToday;
+    _claudeSessionsWeek = sessionsWeek;
+    _claudeMessagesToday = [sum[today][@"n"] longLongValue];
+    _claudeToolsToday = [sum[today][@"c"] longLongValue];
+    _claudeLastActivity = lastTs ? DateFromStatusString(lastTs) : nil;
+    NSMutableDictionary *models = [NSMutableDictionary dictionary];
+    for (NSDictionary *day in sum.allValues) {
+        NSDictionary *byModel = [day[@"m"] isKindOfClass:NSDictionary.class] ? day[@"m"] : nil;
+        for (NSString *model in byModel)
+            models[model] = @([models[model] longLongValue] + [byModel[model] longLongValue]);
+    }
+    _claudeModels = ModelRowsFromTokenDictionary(models);
 }
 
 - (void)consumeCodexData:(NSData *)chunk record:(NSMutableDictionary *)record {
@@ -1734,12 +1829,15 @@ static void AddDays(NSMutableDictionary<NSString *, NSDictionary *> *sum, NSDict
     if (!events.count) return;
     NSDictionary *acc = AccumulateTokenEvents(record[@"days"], events, nil);
     record[@"days"] = acc[@"days"] ?: @{};
-    NSString *ts = acc[@"latestTs"];
-    if (ts.length) {
-        NSString *keptTs = [record[@"latestTs"] isKindOfClass:NSString.class] ? record[@"latestTs"] : nil;
-        NSDictionary *merged = MergeCodexRateLimits(record[@"latestLimits"], keptTs, acc[@"latestLimits"], ts);
-        if (merged) record[@"latestLimits"] = merged;
-        if (!keptTs || [ts compare:keptTs] == NSOrderedDescending) record[@"latestTs"] = ts;
+    if ([acc[@"buckets"] isKindOfClass:NSDictionary.class]) {
+        NSDictionary *merged = MergeCodexLimitBuckets(record[@"latestBuckets"], acc[@"buckets"]);
+        if (merged.count) record[@"latestBuckets"] = merged;
+        NSString *ts = acc[@"newestTs"];
+        NSString *keptTs = [record[@"latestNewestTs"] isKindOfClass:NSString.class] ? record[@"latestNewestTs"] : nil;
+        if (ts.length && acc[@"newestLimits"] && (!keptTs || [ts compare:keptTs] == NSOrderedDescending)) {
+            record[@"latestNewest"] = acc[@"newestLimits"];
+            record[@"latestNewestTs"] = ts;
+        }
     }
     _stateDirty = YES;
 }
@@ -1752,26 +1850,51 @@ static NSString *HashedMessageID(NSString *messageID) {
 
 - (void)consumeClaudeData:(NSData *)chunk record:(NSMutableDictionary *)record {
     if (!chunk.length) return;
-    NSMutableArray *ids = [([record[@"ids"] isKindOfClass:NSArray.class] ? record[@"ids"] : @[]) mutableCopy];
-    NSMutableSet *seen = [NSMutableSet setWithArray:ids];
+    // One message arrives as several lines sharing its message.id — one per content
+    // block — and the usage on the early lines is a running figure (output_tokens 1–7)
+    // that only the last line completes. Keeping the first line lost about 40% of the
+    // fresh output tokens (2026-09-07 audit). So remember what has been counted for each
+    // id and apply only the growth; every line's content blocks are new, so tool calls
+    // simply add up. Hashes are compact and carry neither content nor the provider id.
+    NSMutableDictionary *counted = [([record[@"idv"] isKindOfClass:NSDictionary.class] ? record[@"idv"] : @{}) mutableCopy];
     NSMutableArray *events = [NSMutableArray array];
     ForEachMatchingLine(chunk, "\"usage\"", ^(NSString *line) {
         NSDictionary *event = ParseClaudeUsageLine(line);
         if (!event) return;
         NSString *messageID = [event[@"id"] isKindOfClass:NSString.class] ? event[@"id"] : nil;
-        if (messageID.length) {
-            NSString *hashed = HashedMessageID(messageID);
-            if ([seen containsObject:hashed]) return;
-            [seen addObject:hashed];
-            [ids addObject:hashed];
+        if (!messageID.length) { [events addObject:event]; return; }
+        NSString *hashed = HashedMessageID(messageID);
+        long long fresh = [event[@"fresh"] longLongValue], tokens = [event[@"tokens"] longLongValue];
+        NSArray *prev = [counted[hashed] isKindOfClass:NSArray.class] ? counted[hashed] : nil;
+        if (prev.count < 2) {
+            counted[hashed] = @[@(fresh), @(tokens)];
+            [events addObject:event];
+            return;
         }
-        [events addObject:event];
+        long long prevFresh = [prev[0] longLongValue], prevTokens = [prev[1] longLongValue];
+        NSMutableDictionary *amend = [event mutableCopy];
+        amend[@"amend"] = @YES;
+        amend[@"fresh"] = @(MAX(0LL, fresh - prevFresh));
+        amend[@"tokens"] = @(MAX(0LL, tokens - prevTokens));
+        if (fresh > prevFresh || tokens > prevTokens)
+            counted[hashed] = @[@(MAX(fresh, prevFresh)), @(MAX(tokens, prevTokens))];
+        if ([amend[@"fresh"] longLongValue] > 0 || [amend[@"tokens"] longLongValue] > 0 ||
+            [event[@"tools"] longLongValue] > 0)
+            [events addObject:amend];
     });
-    // Keep hashes for the record's whole seven-day lifetime. A small rolling window can
-    // double-count an older message amended much later; hashes are compact and contain
-    // neither message content nor the original provider identifier.
-    record[@"ids"] = ids;
-    if (events.count) record[@"days"] = AccumulateTokenEvents(record[@"days"], events, nil)[@"days"] ?: @{};
+    // Keep the per-id readings for the record's whole seven-day lifetime: a small rolling
+    // window would double-count an older message amended much later.
+    record[@"idv"] = counted;
+    [record removeObjectForKey:@"ids"];
+    if (events.count) {
+        record[@"days"] = AccumulateTokenEvents(record[@"days"], events, nil)[@"days"] ?: @{};
+        NSString *lastTs = [record[@"lastTs"] isKindOfClass:NSString.class] ? record[@"lastTs"] : nil;
+        for (NSDictionary *event in events) {
+            NSString *ts = event[@"ts"];
+            if (ts.length && (!lastTs || [ts compare:lastTs] == NSOrderedDescending)) lastTs = ts;
+        }
+        if (lastTs.length) record[@"lastTs"] = lastTs;
+    }
     _stateDirty = YES;
 }
 
@@ -1822,20 +1945,21 @@ static NSString *HashedMessageID(NSString *messageID) {
         if (failed) { _codexBlocked = YES; continue; }
         record[@"tailSize"] = @(size);
         _stateDirty = YES;
-        __block NSDictionary *bestLimits = nil;
-        __block NSString *bestTs = nil;
+        __block NSDictionary *buckets = nil, *newest = nil;
+        __block NSString *newestTs = nil;
         ForEachMatchingLine(tail, "\"token_count\"", ^(NSString *line) {
             NSDictionary *event = ParseTokenCountLine(line);
             NSString *ts = [event[@"ts"] isKindOfClass:NSString.class] ? event[@"ts"] : nil;
             NSDictionary *limits = [event[@"limits"] isKindOfClass:NSDictionary.class] ? event[@"limits"] : nil;
             if (limits && ts.length) {
-                bestLimits = MergeCodexRateLimits(bestLimits, bestTs, limits, ts);
-                if (!bestTs || [ts compare:bestTs] == NSOrderedDescending) bestTs = ts;
+                buckets = FoldCodexSnapshotIntoBuckets(buckets, limits, ts);
+                if (!newestTs || [ts compare:newestTs] == NSOrderedDescending) { newestTs = ts; newest = limits; }
             }
         });
-        if (bestLimits) {
-            record[@"peekLimits"] = bestLimits;
-            record[@"peekTs"] = bestTs;
+        if (buckets.count) {
+            record[@"peekBuckets"] = buckets;
+            record[@"peekNewest"] = newest;
+            record[@"peekNewestTs"] = newestTs;
             break;   // newest modified file with a snapshot wins in normal Codex logs
         }
     }
@@ -2010,7 +2134,16 @@ static NSString *HashedMessageID(NSString *messageID) {
                     : [NSString stringWithFormat:@"Indexing transcripts %.0f%% · totals incomplete",
                        _claudeTotalBytes ? 100.0 * _claudeDoneBytes / _claudeTotalBytes : 0.0];
             else u.statusText = @"Tokens live from local transcripts";
-            u.source = @"~/.claude transcripts + stats cache";
+            u.source = @"~/.claude transcripts";
+            // Activity comes from the same index. Claude Code stopped writing its stats
+            // cache in June 2026, so the cache-derived figures above are months stale.
+            u.models = _claudeModels ?: @[];
+            u.topModel = u.models.count ? u.models.firstObject[@"name"] : nil;
+            u.todaySessions = _claudeSessionsToday;
+            u.weekSessions = _claudeSessionsWeek;
+            u.todayMessages = _claudeMessagesToday;
+            u.todayToolCalls = _claudeToolsToday;
+            if (_claudeLastActivity) u.lastActivity = _claudeLastActivity;
         }
     } else {
         // Withdrawn consent: the transcript index (message-ID hashes, per-day totals) must
@@ -2032,7 +2165,7 @@ static NSString *HashedMessageID(NSString *messageID) {
                                      _claudeUsageJSON != nil, _claudeAccountStatus.length > 0,
                                      now, _claudeNextFetch)) {
             _claudeNextFetch = now + kAccountPollInterval;   // the endpoint rate-limits readily
-            _lastFetchSkipReason = nil;
+            _claudeFetchSkipReason = nil;
             NSString *token = [self claudeAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
             if ([fetch[@"_glancebarFetchError"] boolValue]) {
@@ -2054,9 +2187,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             }
         } else {
             NSString *skip = !self.allowClaudeAccountFetch ? @"hidden" : @"throttled";
-            if (![skip isEqualToString:_lastFetchSkipReason]) {
+            if (![skip isEqualToString:_claudeFetchSkipReason]) {
                 GBLog("claude fetch: skipped (%{public}@)", skip);
-                _lastFetchSkipReason = skip;
+                _claudeFetchSkipReason = skip;
             }
         }
         NSDictionary *extraStatus = ClaudeExtraUsageStatus(_claudeUsageJSON);
@@ -2090,7 +2223,16 @@ static NSString *HashedMessageID(NSString *messageID) {
                 u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
                 u.resetText = ResetTextFromDate(u.resetAt);
             }
-            NSString *window = [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
+            BOOL fresh = [pick[@"fresh"] boolValue];
+            if (fresh) {
+                // A window nobody has used yet has no reset to count down to; its clock
+                // starts on the first request. Say that instead of inventing a time.
+                u.resetText = @"Not started";
+                u.resetAt = nil;
+            }
+            NSString *window = fresh
+                ? [NSString stringWithFormat:@"%@ window · nothing used yet · your Claude account", pick[@"window"]]
+                : [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
             BOOL diskRestoredOnly = !_claudeFetchedThisRun && _claudeUsageJSON != nil;
             if (usingStaleWindows || diskRestoredOnly || _claudeAccountStatus.length)
                 u.limitStale = YES;
@@ -2230,7 +2372,7 @@ static NSString *HashedMessageID(NSString *messageID) {
                                      _cursorUsageJSON != nil, _cursorAccountStatus.length > 0,
                                      now, _cursorNextFetch)) {
             _cursorNextFetch = now + kAccountPollInterval;
-            _lastFetchSkipReason = nil;
+            _cursorFetchSkipReason = nil;
             NSString *token = [self cursorAccessTokenForNow:now];
             NSDictionary *fetch = token ? FetchCursorUsageJSON(token) : nil;
             if ([fetch[@"_glancebarFetchError"] boolValue]) {
@@ -2252,9 +2394,9 @@ static NSString *HashedMessageID(NSString *messageID) {
             }
         } else {
             NSString *skip = !self.allowCursorAccountFetch ? @"cursor-hidden" : @"cursor-throttled";
-            if (![skip isEqualToString:_lastFetchSkipReason]) {
+            if (![skip isEqualToString:_cursorFetchSkipReason]) {
                 GBLog("cursor fetch: skipped (%{public}@)", skip);
-                _lastFetchSkipReason = skip;
+                _cursorFetchSkipReason = skip;
             }
         }
 
@@ -2369,7 +2511,7 @@ static NSString *HashedMessageID(NSString *messageID) {
 
 - (void)refreshDBExtras {
     NSString *path = [self codexStatePath];
-    if (!path) { _sessionsToday = 0; _models = @[]; _lastActivity = nil; return; }
+    if (!path) { _sessionsToday = _sessionsWeek = 0; _models = @[]; _lastActivity = nil; return; }
     NSDate *m1 = FileMTime(path), *m2 = FileMTime([path stringByAppendingString:@"-wal"]);
     NSDate *stamp = (m2 && (!m1 || [m2 compare:m1] == NSOrderedDescending)) ? m2 : m1;
     NSString *today = LocalDateString(NSDate.date);
@@ -2391,6 +2533,10 @@ static NSString *HashedMessageID(NSString *messageID) {
     // so deliberately don't fetch them.
     NSDate *weekStart = [NSCalendar.currentCalendar dateByAddingUnit:NSCalendarUnitDay value:-6
                                                               toDate:StartOfLocalDay(NSDate.date) options:0];
+    NSString *weekSQL = [NSString stringWithFormat:@"select count(*) from threads where updated_at >= %lld;",
+                         (long long)weekStart.timeIntervalSince1970];
+    _sessionsWeek = [[[RunSQLite(path, weekSQL) stringByTrimmingCharactersInSet:
+                       NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@"\n"].firstObject longLongValue];
     NSString *modelsSQL = [NSString stringWithFormat:
         @"select coalesce(nullif(model,''),'unknown'), count(*) from threads "
          "where updated_at >= %lld group by 1 order by 2 desc limit 5;",
@@ -2438,13 +2584,17 @@ static NSString *HashedMessageID(NSString *messageID) {
     u.weekTokens = week;
     u.weekTokensAll = weekAll;
     u.todaySessions = _sessionsToday;
+    u.weekSessions = _sessionsWeek;
     u.lastActivity = _lastActivity;
     if (u.models.count) u.topModel = u.models.firstObject[@"name"];
 
     // Read drift from the newest snapshot as it arrived, not from the merged view.
     NSString *drift = CodexSchemaDriftReason(_limitsNewest);
-    u.limitWindows = CodexLimitWindows(_limits, now);
-    NSDictionary *pick = PickLimitWindow(_limits, now);
+    u.limitWindows = CodexBucketWindows(_buckets, now);
+    NSDictionary *pick = PickCodexBucketWindow(_buckets, now);
+    u.billingNote = CodexBillingNote(_buckets, now);
+    NSMutableSet *bucketsShown = [NSMutableSet set];
+    for (NSDictionary *w in u.limitWindows) if (w[@"bucket"]) [bucketsShown addObject:w[@"bucket"]];
     if (pick) {
         u.limitStatusAvailable = YES;
         u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
@@ -2454,9 +2604,13 @@ static NSString *HashedMessageID(NSString *messageID) {
             u.resetText = ResetTextFromDate(u.resetAt);
         }
         NSString *plan = [pick[@"plan"] isKindOfClass:NSString.class] ? pick[@"plan"] : nil;
-        u.statusReason = plan.length
-            ? [NSString stringWithFormat:@"%@ window · %@ plan", pick[@"window"], plan]
+        // Name the bucket only when more than one is on show; with a single bucket the
+        // window name says it all, as it always did.
+        NSString *window = bucketsShown.count > 1
+            ? [NSString stringWithFormat:@"%@ window · %@ bucket", pick[@"window"], pick[@"bucketLabel"]]
             : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
+        u.statusReason = plan.length ? [NSString stringWithFormat:@"%@ · %@ plan", window, plan] : window;
+        if (u.billingNote.length) u.statusReason = [u.statusReason stringByAppendingFormat:@" · %@", u.billingNote];
         u.statusSource = @"~/.codex session logs";
         // A window carried forward from an earlier snapshot is as old as its own
         // observation, not as old as the latest snapshot — and that makes it stale,
@@ -2468,11 +2622,17 @@ static NSString *HashedMessageID(NSString *messageID) {
     }
     // With no gauge left, "the payload changed shape" beats "the windows have reset":
     // both are true, but only one tells the user why no new number is coming.
-    else u.statusReason = drift ?: CodexLimitStatusReason(_limits, _limitsTs, now);
+    else u.statusReason = drift ?: CodexBucketsStatusReason(_buckets, now);
 
     // Context, never the gauge: a zero credit balance is normal while the plan window
-    // still has room. See CodexCreditsStatus.
-    NSDictionary *credits = CodexCreditsStatus(_limits);
+    // still has room. See CodexCreditsStatus. Credits are account-level; read them from
+    // whichever bucket reported them last.
+    NSDictionary *credits = CodexCreditsStatus(CodexNewestBucketLimits(_buckets));
+    for (NSString *bucketID in _buckets) {
+        if (credits) break;
+        NSDictionary *entry = _buckets[bucketID];
+        credits = CodexCreditsStatus([entry[@"limits"] isKindOfClass:NSDictionary.class] ? entry[@"limits"] : nil);
+    }
     if (credits[@"description"]) u.extraUsage = credits[@"description"];
     // Say it even while a carried-forward window still reads, or the cause hides behind
     // up to a week of apparently-healthy rows. limitRefreshError is exactly "why the
@@ -2484,18 +2644,24 @@ static NSString *HashedMessageID(NSString *messageID) {
                       _limitsTs.length ? _limitsTs : @"never seen"]];
     if (drift.length) [parts addObject:drift];
     BOOL anyCurrent = NO, anyUsable = NO;
-    for (NSString *key in @[@"primary", @"secondary"]) {
-        NSDictionary *w = [_limits[key] isKindOfClass:NSDictionary.class] ? _limits[key] : nil;
-        if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
-        anyUsable = YES;
-        double resets = [w[@"resets_at"] doubleValue];
-        BOOL expired = resets > 0 && resets <= now;
-        if (!expired) anyCurrent = YES;
-        long mins = [w[@"window_minutes"] longValue];
-        [parts addObject:[NSString stringWithFormat:@"%@ reset %@%@",
-            mins == 10080 ? @"weekly" : mins == 300 ? @"5h" : @"window",
-            FmtEpochDayClock(resets), expired ? @" (expired)" : @""]];
+    for (NSString *bucketID in [_buckets.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSDictionary *entry = _buckets[bucketID];
+        NSDictionary *limits = [entry[@"limits"] isKindOfClass:NSDictionary.class] ? entry[@"limits"] : nil;
+        for (NSString *key in @[@"primary", @"secondary"]) {
+            NSDictionary *w = [limits[key] isKindOfClass:NSDictionary.class] ? limits[key] : nil;
+            if (![w[@"used_percent"] isKindOfClass:NSNumber.class]) continue;
+            anyUsable = YES;
+            double resets = [w[@"resets_at"] isKindOfClass:NSNumber.class] ? [w[@"resets_at"] doubleValue] : 0;
+            BOOL expired = resets > 0 && resets <= now;
+            if (!expired) anyCurrent = YES;
+            long mins = [w[@"window_minutes"] isKindOfClass:NSNumber.class] ? [w[@"window_minutes"] longValue] : 0;
+            [parts addObject:[NSString stringWithFormat:@"%@ %@ %.0f%% used · reset %@%@", bucketID,
+                mins == 10080 ? @"weekly" : mins == 300 ? @"5h" : @"window",
+                [w[@"used_percent"] doubleValue], FmtEpochDayClock(resets), expired ? @" (expired)" : @""]];
+        }
     }
+    NSString *newestBucket = CodexNewestBucketID(_buckets);
+    if (newestBucket.length) [parts addObject:[@"newest bucket " stringByAppendingString:newestBucket]];
     if (anyUsable && !anyCurrent) [parts addObject:@"all expired"];
     if (_codexTotalsIncomplete) [parts addObject:[NSString stringWithFormat:@"indexing %.1f%%",
         _codexTotalBytes ? 100.0 * _codexDoneBytes / _codexTotalBytes : 0.0]];
@@ -2536,7 +2702,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     // Mid-catch-up another pass follows immediately, so coalesce. The pass that lands the
     // backlog (and every steady-state pass) flushes.
     if (_needsImmediateRescan) [self savePersistentStateCoalesced];
-    else [self savePersistentStateIfNeeded];
+    else [self flushPersistentState];
     return usage;
 }
 
@@ -3243,13 +3409,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSString *catchUpStatus = self->_aiReader.catchUpStatus;
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
+            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
              u.name, u.available, u.limitStatusAvailable, u.limitStale,
              u.todayTokens, u.todayTokensAll, u.weekTokens, u.weekTokensAll,
              u.todaySessions, u.weekSessions, u.todayMessages, u.todayToolCalls,
              u.remainingFraction, u.resetText, u.statusText, u.statusReason,
              u.statusSource, u.extraUsage, u.limitWindows, u.models, u.lastActivity,
-             u.limitUpdatedAt, u.limitRefreshError];
+             u.limitUpdatedAt, u.limitRefreshError, u.billingNote];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_aiLoading = NO;
             BOOL rerun = self->_aiRefreshPending;
@@ -3387,7 +3553,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         AIUsage *lowest = [self lowestAIStatus];
         [parts addObject:lowest ? [NSString stringWithFormat:@"AI, %@ %d percent remaining%@", lowest.name,
                                     (int)lround(lowest.remainingFraction * 100),
-                                    lowest.limitStale ? @", cached; refresh failed" : @""]
+                                    // A carried-forward Codex window is cached without any
+                                    // refresh having failed; only say so when one did.
+                                    !lowest.limitStale ? @""
+                                        : lowest.limitRefreshError.length ? @", cached; refresh failed"
+                                        : @", cached"]
                                 : @"AI limit status unavailable"];
     }
     if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
@@ -3815,7 +3985,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (phrase.length) return phrase;
     NSString *reset = u.resetText ?: @"";
     if (!reset.length || [reset isEqualToString:@"Not exposed locally"] ||
-        [reset isEqualToString:@"Not provided"])
+        [reset isEqualToString:@"Not provided"] || [reset isEqualToString:@"Not started"])
         return nil;
     return [NSString stringWithFormat:@"Resets %@", reset];
 }
@@ -3843,6 +4013,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // Overage has no reset to report — the paid budget is not a window that rolls over.
     NSString *lead = u.overageActive ? nil : [self compactResetText:u];
     if (!lead.length) lead = u.statusReason;
+    // "No credits" changes what the reader does next (requests will be refused, not
+    // merely slowed), so it earns its place beside the reset even on the one-line row.
+    else if ([u.billingNote containsString:@"none available"]) lead = [lead stringByAppendingString:@" · no credits"];
     if (lead.length)
         return note.length ? [NSString stringWithFormat:@"%@ · %@", lead, note] : lead;
     if (!u.available) return @"No local state";
@@ -3891,14 +4064,41 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // clock time only — the countdown would double the width to repeat what the clock says.
 - (NSString *)windowsResetSummary:(NSArray<NSDictionary *> *)windows {
     NSDate *now = NSDate.date;
+    NSMutableSet *buckets = [NSMutableSet set];
+    for (NSDictionary *w in windows) if (w[@"bucket"]) [buckets addObject:w[@"bucket"]];
     NSMutableArray *parts = [NSMutableArray array];
+    BOOL anyFresh = NO;
     for (NSDictionary *w in windows) {
+        if ([w[@"fresh"] boolValue]) anyFresh = YES;
         NSNumber *resets = w[@"resetsAt"];
         if (![resets isKindOfClass:NSNumber.class]) continue;
         NSString *t = ResetClockText([NSDate dateWithTimeIntervalSince1970:resets.doubleValue], now);
-        if (t.length) [parts addObject:[NSString stringWithFormat:@"%@ %@", w[@"window"], t]];
+        if (!t.length) continue;
+        // With several buckets the window name alone is ambiguous ("weekly" twice).
+        NSString *name = buckets.count > 1 && w[@"bucketLabel"]
+            ? [NSString stringWithFormat:@"%@ %@", w[@"bucketLabel"], w[@"window"]] : w[@"window"];
+        [parts addObject:[NSString stringWithFormat:@"%@ %@", name, t]];
     }
-    return parts.count ? [@"Resets — " stringByAppendingString:[parts componentsJoinedByString:@" · "]] : @"";
+    if (parts.count) return [@"Resets — " stringByAppendingString:[parts componentsJoinedByString:@" · "]];
+    return anyFresh ? @"Nothing used yet · each window starts on first use" : @"";
+}
+
+// A secondary line that may run to two lines instead of truncating: the resets line
+// carries one clock per window, and three windows do not fit 288pt.
+- (NSTextField *)wrappedNote:(NSString *)s color:(NSColor *)color width:(CGFloat)width pad:(CGFloat)pad
+                          at:(CGFloat)y lines:(NSInteger *)lines {
+    NSFont *font = [NSFont systemFontOfSize:10.5];
+    CGFloat inner = width - 2*pad;
+    NSInteger n = [s sizeWithAttributes:@{NSFontAttributeName: font}].width > inner ? 2 : 1;
+    NSTextField *field = [self text:s font:font color:color at:NSMakeRect(pad, y, inner, 14 * n)
+                              align:NSTextAlignmentLeft];
+    if (n > 1) {
+        field.lineBreakMode = NSLineBreakByWordWrapping;
+        field.maximumNumberOfLines = n;
+        field.cell.truncatesLastVisibleLine = YES;
+    }
+    if (lines) *lines = n;
+    return field;
 }
 
 // One popover AI card. With two or more current limit windows it draws the dual meter
@@ -3914,18 +4114,34 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [root addSubview:[self text:(u.name ?: @"AI") font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
                           color:nil at:NSMakeRect(pad, y, inner, 15) align:NSTextAlignmentLeft]];
     y += 19;
+    NSMutableSet *buckets = [NSMutableSet set];
+    for (NSDictionary *w in windows) if (w[@"bucket"]) [buckets addObject:w[@"bucket"]];
     for (NSDictionary *w in windows) {
         double frac = [w[@"remainingFraction"] doubleValue];
         NSString *right = [NSString stringWithFormat:@"%d%% left", (int)lround(frac * 100)];
-        [root addSubview:[self compactSignalRow:(w[@"window"] ?: @"window") right:right fraction:frac
+        NSString *title = w[@"window"] ?: @"window";
+        // Several Codex buckets each have a "weekly": name the bucket beside the window.
+        if (buckets.count > 1 && [w[@"bucketLabel"] isKindOfClass:NSString.class])
+            title = [NSString stringWithFormat:@"%@ · %@", title, w[@"bucketLabel"]];
+        [root addSubview:[self compactSignalRow:title right:right fraction:frac
                                           color:[self windowColor:frac] width:width pad:pad at:y]];
         y += 28;
     }
     NSString *resets = [self windowsResetSummary:windows];
     if (resets.length) {
-        [root addSubview:[self text:resets font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                              at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
-        y += 16;
+        NSInteger lines = 1;
+        [root addSubview:[self wrappedNote:resets color:NSColor.secondaryLabelColor width:width pad:pad at:y lines:&lines]];
+        y += 14 * lines + 2;
+    }
+    if (u.billingNote.length) {
+        // Where requests bill now, when that is not the window on show. "None available"
+        // means refusals, not slowdowns, so it takes the warning colour.
+        BOOL refusing = [u.billingNote containsString:@"none available"];
+        NSInteger lines = 1;
+        [root addSubview:[self wrappedNote:u.billingNote
+                                     color:refusing ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor
+                                     width:width pad:pad at:y lines:&lines]];
+        y += 14 * lines + 2;
     }
     NSString *staleness = [self aiStalenessNote:u capitalized:YES];
     if (staleness.length) {
@@ -4291,7 +4507,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSMenuItem *lidAwake = [m addItemWithTitle:@"Stay awake with lid closed"
                                         action:@selector(toggleStayAwake:) keyEquivalent:@""];
     lidAwake.target = self;
-    lidAwake.state = SleepDisabledNow() ? NSControlStateValueOn : NSControlStateValueOff;
+    NSNumber *sleepState = SleepDisabledState();
+    lidAwake.state = !sleepState ? NSControlStateValueMixed
+                   : sleepState.boolValue ? NSControlStateValueOn : NSControlStateValueOff;
+    if (!sleepState) lidAwake.title = @"Stay awake with lid closed (state unknown)";
     [m addItem:NSMenuItem.separatorItem];
 
     NSMenuItem *privacyTitle = [m addItemWithTitle:@"AI & privacy" action:nil keyEquivalent:@""];
@@ -4378,7 +4597,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
         alert.messageText = @"Read Claude transcript usage counters?";
-        alert.informativeText = @"Claude transcript files contain conversation records. Glancebar scans them locally and never sends transcript contents over the network. Its mode-0600 local index stores only file offsets/identity, daily token totals, timestamps, and opaque message hashes—not prompts or responses.";
+        alert.informativeText = @"Claude transcript files contain conversation records. Glancebar scans them locally and never sends transcript contents over the network. Its mode-0600 local index stores only file offsets/identity, daily token and activity totals (per model), timestamps, and opaque per-message hashes—not prompts or responses. The same file also keeps the last account usage response when that toggle is on, never a token.";
         [alert addButtonWithTitle:@"Enable Local Scan"];
         [alert addButtonWithTitle:@"Cancel"];
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
@@ -4392,7 +4611,16 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // is the single source of truth — SleepDisabled persists in the system power plist across
 // reboots, and reading it live keeps the checkmark accurate however it was last changed.
 - (void)toggleStayAwake:(id)s {
-    BOOL enabling = !SleepDisabledNow();
+    NSNumber *current = SleepDisabledState();
+    if (!current) {
+        // Flipping blind could turn the setting ON when the user meant OFF.
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Couldn’t read the current sleep setting";
+        alert.informativeText = @"pmset -g did not answer, so Glancebar can’t tell whether the Mac is already set to stay awake. Try again, or check with `pmset -g | grep SleepDisabled`.";
+        [alert runModal];
+        return;
+    }
+    BOOL enabling = !current.boolValue;
     if (enabling) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
@@ -4782,15 +5010,21 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                             to:root y:&y width:kDetailW];
         [self addDetailKey:@"Remaining" value:[self aiPercentText:u] to:root y:&y width:kDetailW];
         [self addDetailKey:@"Reset" value:[self aiResetDetailText:u] to:root y:&y width:kDetailW];
-        if (u.limitWindows.count >= 2)
-            for (NSDictionary *w in u.limitWindows) {
-                NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
-                NSString *reset = resets ? ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]) : nil;
-                int pct = (int)lround([w[@"remainingFraction"] doubleValue] * 100);
-                NSString *val = reset.length ? [NSString stringWithFormat:@"%d%% left · resets %@", pct, reset]
-                                             : [NSString stringWithFormat:@"%d%% left", pct];
-                [self addDetailKey:w[@"window"] value:val to:root y:&y width:kDetailW];
-            }
+        NSMutableSet *bucketsListed = [NSMutableSet set];
+        for (NSDictionary *w in u.limitWindows) if (w[@"bucket"]) [bucketsListed addObject:w[@"bucket"]];
+        for (NSDictionary *w in u.limitWindows) {
+            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
+            NSString *reset = resets ? ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]) : nil;
+            int pct = (int)lround([w[@"remainingFraction"] doubleValue] * 100);
+            NSString *val = reset.length ? [NSString stringWithFormat:@"%d%% left · resets %@", pct, reset]
+                          : [w[@"fresh"] boolValue] ? [NSString stringWithFormat:@"%d%% left · not started", pct]
+                          : [NSString stringWithFormat:@"%d%% left", pct];
+            NSString *key = bucketsListed.count > 1 && [w[@"bucketLabel"] isKindOfClass:NSString.class]
+                ? [NSString stringWithFormat:@"%@ (%@)", w[@"window"], w[@"bucketLabel"]] : w[@"window"];
+            [self addDetailKey:key value:val to:root y:&y width:kDetailW];
+        }
+        if (u.billingNote.length)
+            [self addDetailKey:@"Billing" value:u.billingNote to:root y:&y width:kDetailW];
         [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
                                                                    : (u.statusReason ?: @"No limit status source")
                         to:root y:&y width:kDetailW];
@@ -4859,7 +5093,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
         if (u.models.count) {
             // Keyed by provider: Claude gaining a Models section must not rename Codex's rows.
-            [self addDetailHeading:@"Models"
+            [self addDetailHeading:@"Models · 7 days"
                                key:[NSString stringWithFormat:@"local-history.%@.models", providerKey]
                                 to:root y:&y width:kDetailW];
             for (NSDictionary *model in u.models) {
@@ -5212,6 +5446,10 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
             @"sevenDayFreshTokens": @(item.weekTokens),
             @"sevenDayAllTokens": @(item.weekTokensAll),
             @"todaySessions": @(item.todaySessions),
+            @"sevenDaySessions": @(item.weekSessions),
+            @"todayMessages": @(item.todayMessages),
+            @"todayToolCalls": @(item.todayToolCalls),
+            @"billingNote": JSONValue(item.billingNote),
             @"windows": item.limitWindows ?: @[],
             @"models": item.models ?: @[],
             @"lastActivity": JSONValue(ISODateString(item.lastActivity)),
@@ -5367,10 +5605,15 @@ static void PrintHumanDump(NSDictionary *snapshot) {
                reason.length ? " · " : "", UTF8(reason));
         for (NSDictionary *window in provider[@"windows"]) {
             NSString *windowReset = window[@"resetsAt"] ? ResetTextFromDate(
-                [NSDate dateWithTimeIntervalSince1970:[window[@"resetsAt"] doubleValue]]) : @"not provided";
-            printf("          %-8s %d%% left · resets %s\n", UTF8(window[@"window"]),
+                [NSDate dateWithTimeIntervalSince1970:[window[@"resetsAt"] doubleValue]])
+                : [window[@"fresh"] boolValue] ? @"not started" : @"not provided";
+            NSString *name = [window[@"bucketLabel"] isKindOfClass:NSString.class]
+                ? [NSString stringWithFormat:@"%@ (%@)", window[@"window"], window[@"bucketLabel"]] : window[@"window"];
+            printf("          %-18s %d%% left · resets %s\n", UTF8(name),
                    (int)lround([window[@"remainingFraction"] doubleValue] * 100), UTF8(windowReset));
         }
+        if (provider[@"billingNote"] != NSNull.null)
+            printf("          billing: %s\n", UTF8(provider[@"billingNote"]));
         if (provider[@"diagnostics"] != NSNull.null)
             printf("          why: %s\n", UTF8(provider[@"diagnostics"]));
     }
@@ -5408,7 +5651,7 @@ static void PrintUsage(FILE *stream) {
         "  --dump     Print a local machine and AI status snapshot.\n"
         "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
         "  --strict   Exit 2 when any sampled source is partial/unavailable.\n"
-        "  --online   Permit the already-opted-in Claude account request.\n",
+        "  --online   Permit the already-opted-in Claude and Cursor account requests.\n",
         UTF8(GBVersion));
 }
 

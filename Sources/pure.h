@@ -45,17 +45,25 @@ NSArray<NSDictionary *> *ParseHogs(NSString *topOutput, int topN,
 NSDictionary *ParseTokenCountLine(NSString *line);
 
 // Buckets parsed events into per-local-day totals, merged over existingDays.
-// Returns @{@"days": @{@"yyyy-MM-dd": @{@"t": total, @"f": fresh}}, and when any event
-// carried limits, @"latestLimits": rate_limits dict, @"latestTs": its ISO timestamp}.
+// Each day is @{@"t": total, @"f": fresh, @"n": events, @"c": tool calls (when any),
+//   @"m": @{model: fresh} (when events name a model)} — see MergeDayCounts.
+// Returns @{@"days": {...}}, and when any event carried limits: @"latestLimits" (the
+// legacy cross-bucket merge), @"latestTs", @"buckets" (per-limit_id map, see
+// FoldCodexSnapshotIntoBuckets), @"newestLimits" (the newest snapshot verbatim, for the
+// drift check) and @"newestTs".
 NSDictionary *AccumulateTokenEvents(NSDictionary<NSString *, NSDictionary *> *existingDays,
                                     NSArray<NSDictionary *> *events, NSTimeZone *tz);
+// Sums two per-day counter dicts (t/f/n/c and the per-model map m). Either may be nil.
+NSDictionary *MergeDayCounts(NSDictionary *a, NSDictionary *b);
 
 // Parses one Claude Code transcript line (~/.claude/projects/**/*.jsonl). Returns nil
 // unless it is an assistant message carrying usage. Anthropic semantics: input_tokens
 // is already non-cached, so fresh = input + output and the all-inclusive total adds
-// cache_creation + cache_read. Shape:
+// cache_creation + cache_read. `usage.iterations[]` restates the same numbers and is
+// ignored. Shape:
 // @{@"ts": ISO-8601 string, @"tokens": @(all-inclusive), @"fresh": @(input+output),
-//   @"id": message id when present (for duplicate-line dedupe)}
+//   @"id": message id when present (for duplicate-line dedupe),
+//   @"model": model id when present, @"tools": @(tool_use content blocks) when any}
 NSDictionary *ParseClaudeUsageLine(NSString *line);
 
 // Picks the most constrained, still-current window from a Codex rate_limits dict
@@ -113,13 +121,21 @@ NSDictionary *CodexCreditsStatus(NSDictionary *rateLimits);
 NSString *CodexSchemaDriftReason(NSDictionary *rateLimits);
 
 // Picks the most constrained, still-current window from Anthropic's OAuth usage
-// response (window dicts like five_hour/seven_day carrying utilization + resets_at).
-// Anthropic defines utilization as a percentage (so 1.0 means 1%, not 100%); resets_at
-// may be ISO-8601 or epoch. Unknown and reset-less placeholder windows are excluded.
-// Returns nil when nothing is current, else the same shape as PickLimitWindow.
+// response. Since 2026-09 the response carries a `limits` array (kind session /
+// weekly_all / weekly_scoped with `percent`, `resets_at`, `is_active`, and a model scope
+// naming the scoped weekly, e.g. "Fable"); the legacy five_hour/seven_day/seven_day_opus
+// dicts (utilization + resets_at) are read only when the array is absent or unreadable.
+// Anthropic reports utilization/percent as a PERCENTAGE (1.0 means 1%, not 100%);
+// resets_at may be ISO-8601 or epoch. Returns nil when nothing is current, else the same
+// shape as PickLimitWindow (plus @"kind"/@"active" from the array, and @"fresh": @YES for
+// an unused window — see ClaudeLimitWindows).
 NSDictionary *PickClaudeLimitWindow(NSDictionary *usage, double nowEpoch);
-// ALL still-current Claude limit windows (5-hour→weekly→weekly Opus; weekly Sonnet is
-// never surfaced). Obsolete/reset-less/unknown windows and extra_usage are excluded.
+// ALL still-current Claude limit windows in source order (5-hour→weekly→scoped weeklies;
+// legacy weekly Sonnet is never surfaced). Obsolete windows and extra_usage are excluded.
+// A reset-less window with nothing used is a FRESH window (100% left, starts on first
+// use) and is surfaced only when every readable window is fresh — the state a new week
+// begins in, which used to read as "no current limit window". Otherwise reset-less
+// entries are placeholders (an unused model-scoped weekly) and stay hidden.
 NSArray<NSDictionary *> *ClaudeLimitWindows(NSDictionary *usage, double nowEpoch);
 
 // Elapsed known Claude windows only (same keys/labels as ClaudeLimitWindows). Used when
@@ -147,9 +163,11 @@ NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double now
 NSDictionary *PickCursorStaleLimitWindow(NSDictionary *usage, double nowEpoch);
 NSString *CursorLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, double nowEpoch);
 
-// Reads Anthropic's extra_usage credit budget. Returns nil when absent/disabled, else
+// Reads Anthropic's extra_usage credit budget. Returns nil when absent, else
 // @{@"description": display string, @"statusReason": short status,
-//   @"overageActive": @(YES when usage is at/over the paid limit)}.
+//   @"overageActive": @(YES when usage is at/over the paid limit)}. A disabled budget
+// returns only a description ("Off · out of credits") so Details can say why the
+// account has no overage to fall back on; it carries no statusReason and no overage.
 NSDictionary *ClaudeExtraUsageStatus(NSDictionary *usage);
 
 // --- AI status line ---
@@ -199,6 +217,38 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput);
 // were ever seen, and an explicit stale message when every usable window has already
 // reset (dated from the snapshot's ISO-8601 timestamp when parseable).
 NSString *CodexLimitStatusReason(NSDictionary *rateLimits, NSString *limitsTs, double nowEpoch);
+
+// --- Codex limit buckets ---
+// Codex meters several allowances at once, each under its own `limit_id`, and one
+// session's snapshots alternate between them turn by turn: "codex" (the plan allowance),
+// "codex_<name>" side buckets, and "premium" once requests bill to credits. Folding them
+// into one rate_limits dict let whichever bucket reported LAST stand in for all of them:
+// on 2026-09-07 an untouched side bucket (0% used, newest by seconds) hid a plan weekly
+// window at 99% used, and the app read "100% left" while the plan was spent until
+// Saturday. Buckets are therefore kept apart and only compared, never blended.
+//
+// A bucket map is @{limit_id: @{@"limits": merged rate_limits, @"ts": newest ISO ts}}.
+// Within a bucket MergeCodexRateLimits' rules still apply (the window pair moves
+// together, is stamped, and expires on its own resets_at).
+NSString *CodexLimitBucketID(NSDictionary *rateLimits);          // limit_id, "codex" when absent
+NSString *CodexBucketLabel(NSString *bucketID);                  // "plan" / "credits" / "<name>"
+NSDictionary *FoldCodexSnapshotIntoBuckets(NSDictionary *buckets, NSDictionary *snapshot, NSString *ts);
+NSDictionary *MergeCodexLimitBuckets(NSDictionary *a, NSDictionary *b);   // order-independent union
+NSString *CodexNewestBucketID(NSDictionary *buckets);            // the bucket requests bill to now
+NSDictionary *CodexNewestBucketLimits(NSDictionary *buckets);
+// Every still-current window across buckets, each tagged @"bucket" and @"bucketLabel".
+// The bucket with the least room comes first (ties: the newer snapshot), primary before
+// secondary within a bucket — the order the dual meter draws them in.
+NSArray<NSDictionary *> *CodexBucketWindows(NSDictionary *buckets, double nowEpoch);
+// The most constrained current window across buckets: never grant room one bucket
+// reports while another says the allowance is spent. Same shape as PickLimitWindow
+// plus @"bucket"/@"bucketLabel".
+NSDictionary *PickCodexBucketWindow(NSDictionary *buckets, double nowEpoch);
+// CodexLimitStatusReason across buckets: nil while any bucket has a current window.
+NSString *CodexBucketsStatusReason(NSDictionary *buckets, double nowEpoch);
+// Says where requests bill when that is not the bucket whose window is shown —
+// "Requests now bill to credits · none available" — else nil.
+NSString *CodexBillingNote(NSDictionary *buckets, double nowEpoch);
 
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
