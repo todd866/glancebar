@@ -23,6 +23,7 @@ jobs:
           # `zsh -n a b` syntax-checks only `a`; `b` becomes a positional parameter.
           zsh -n build.sh
           zsh -n tests.sh
+          zsh -n Tests/make_fixture_home.sh
 
       - name: Run tests with sanitizers
         env:
@@ -70,6 +71,40 @@ jobs:
             build/Glancebar.app/Contents/MacOS/Glancebar --dump --json --strict \
             > /dev/null && strict_rc=0 || strict_rc=$?
           test "$strict_rc" = 2 || { echo "expected --strict exit 2 on a partial dump, got $strict_rc"; exit 1; }
+
+      - name: Verify the JSON contract against a determined fixture
+        run: |
+          FIXTURE="$(Tests/make_fixture_home.sh "$RUNNER_TEMP/glancebar-fixture")"
+          GLANCEBAR_HOME="$FIXTURE" GLANCEBAR_ALLOW_ACCOUNT=0 \
+            build/Glancebar.app/Contents/MacOS/Glancebar --dump --json \
+            > "$RUNNER_TEMP/glancebar-fixture.json"
+          # An empty home only proves the envelope. This asserts the numbers a user reads:
+          # the spent plan bucket governs, the untouched side bucket does not, and the
+          # Claude limits[] array yields all three windows including the model-scoped one.
+          ruby -rjson -e '
+            j = JSON.parse(File.read(ARGV[0]))
+            ai = j["ai"]
+            codex = ai["providers"].find { |p| p["name"] == "Codex" }
+            fail "codex missing"        unless codex
+            fail "codex gauge"          unless codex["remainingPercent"].between?(0.5, 1.5)
+            fail "codex windows"        unless codex["windows"].length == 3
+            gov = codex["windows"].first
+            fail "governing bucket"     unless gov["bucket"] == "codex" && gov["bucketLabel"] == "plan"
+            fail "governing window"     unless gov["window"] == "weekly"
+            fail "billing note"         unless codex["billingNote"].to_s.include?("none available")
+            fail "codex tokens"         unless codex["todayFreshTokens"] > 0
+            claude = ai["providers"].find { |p| p["name"] == "Claude" }
+            fail "claude windows"       unless claude["windows"].map { |w| w["window"] } ==
+                                               ["5-hour", "weekly", "weekly Fable"]
+            fail "claude gauge"         unless claude["remainingPercent"].round == 25
+            fail "claude stale"         unless claude["limitStale"] == true
+            fail "extra usage"          unless claude["extraUsage"].to_s.start_with?("Off")
+            fail "status complete"      unless j["status"] == "complete"
+            fail "partial sources"      unless j["partialSources"].empty?
+          ' "$RUNNER_TEMP/glancebar-fixture.json"
+          # A determined fixture is complete, so --strict must succeed here.
+          GLANCEBAR_HOME="$FIXTURE" GLANCEBAR_ALLOW_ACCOUNT=0 \
+            build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json > /dev/null
 
       - name: Verify bundle
         run: |

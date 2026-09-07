@@ -250,6 +250,11 @@ NSString *CodexBucketsStatusReason(NSDictionary *buckets, double nowEpoch);
 // "Requests now bill to credits · none available" — else nil.
 NSString *CodexBillingNote(NSDictionary *buckets, double nowEpoch);
 
+// The human name for an executable path: its basename, unless that is a bare version
+// number — Claude Code's native install runs `.../claude/versions/2.1.261`, and "2.1.261"
+// is no name — in which case the first component above it that reads as one.
+NSString *ProcessNameFromPath(NSString *executablePath);
+
 // Parse `ps -axo pid=,pcpu=,rss=,comm=` output into grouped top CPU and memory apps.
 // bytesForPid (optional) supplies a per-pid physical footprint; when nil or returning 0
 // the row falls back to RSS*1024 (which double-counts shared pages across helpers). Shape:
@@ -292,10 +297,14 @@ typedef struct {
     double lastCountedAt; // epoch of the last counted decision (rate-limits the streak)
 } BarTierState;
 
-// Hysteresis: shrink the moment the current tier doesn't fit (small margin);
-// expand one tier per decision, only after kBarExpandTicks consecutive decisions
-// where the wider tier fit with kBarExpandMarginPt of slack — transient menu bar
-// churn (AirPods connect, Now Playing) can shrink us but cannot bounce us.
+// Hysteresis: shrink only when the current tier no longer fits at all (an item that
+// is on the bar already fits — a neighbour packed against its left edge leaves exactly
+// zero slack, and that is the normal Control Centre layout, not a squeeze); the tier we
+// shrink TO must fit with kBarShrinkMarginPt of slack. Expand one tier per decision,
+// only after kBarExpandTicks consecutive decisions where the wider tier fit with
+// kBarExpandMarginPt of slack — transient menu bar churn (AirPods connect, Now Playing)
+// can shrink us but cannot bounce us.
+extern const double kBarFitTolerancePt;   // 1 — compositor rounding on the measured span
 extern const double kBarShrinkMarginPt;   // 4
 extern const double kBarExpandMarginPt;   // 8
 extern const int    kBarExpandTicks;      // 2
@@ -313,3 +322,12 @@ extern const double kBarExpandMinIntervalSec;   // 10
 // nowEpoch: monotonic-ish wall clock used only to rate-limit streak counting.
 BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
                            const double widths[3], BOOL evicted, double nowEpoch);
+
+// Eviction is a fall FROM the bar, so the net arms only after the item has been seen
+// there — except that an item launched into an already-crowded bar is never seen at
+// all, and would hold its (invisible) full tier for the whole session. After
+// kBarEvictionGraceSec without a sighting, "not on the bar" counts as evicted: the
+// glyph is drawn, Control Centre places it, and measurement-gated expansion takes it
+// back up within a couple of ticks if there was room after all.
+extern const double kBarEvictionGraceSec;   // 30
+BOOL BarEvictionSuspected(BOOL seenOnBar, BOOL onBar, double sinceCreatedSec);

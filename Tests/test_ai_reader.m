@@ -828,6 +828,190 @@ int main(void) {
                   @"upgrade: a pre-schema transcript record is re-indexed once, without double counting");
         }
 
+        // The whole account path — credential read, throttle, fetch, error handling —
+        // driven through the injectable seams, so no Keychain, sqlite or network is touched.
+        {
+            NSString *aHome = [root stringByAppendingPathComponent:@"home-account"];
+            NSString *aSupport = [root stringByAppendingPathComponent:@"support-account"];
+            [fm createDirectoryAtPath:aHome withIntermediateDirectories:YES attributes:nil error:nil];
+            double base = NSDate.date.timeIntervalSince1970;
+            NSDictionary *(^usageBody)(double, double) = ^(double fivePct, double weeklyPct) {
+                return @{@"limits": @[
+                    @{@"kind": @"session", @"percent": @(fivePct), @"resets_at": @(base + 3600), @"is_active": @YES},
+                    @{@"kind": @"weekly_all", @"percent": @(weeklyPct), @"resets_at": @(base + 86400), @"is_active": @NO}]};
+            };
+
+            // 1. A live credential and a good response: one fetch, gauge from the body.
+            __block NSUInteger credentialReads = 0, fetches = 0;
+            AIReader *live = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            live.claudeCredentialReader = ^NSDictionary *{
+                credentialReads++;
+                return @{@"token": @"tok-live", @"expiresAt": @(base + 3600)};
+            };
+            live.claudeUsageFetcher = ^NSDictionary *(NSString *token) {
+                fetches++;
+                check([token isEqual:@"tok-live"], @"account: the fetch gets the credential's token");
+                return usageBody(40, 10);
+            };
+            live.useClaudeAccount = YES;
+            live.allowClaudeAccountFetch = YES;
+            AIUsage *fetched = UsageNamed([live read], @"Claude");
+            check(fetches == 1 && credentialReads == 1, @"account: one credential read and one fetch");
+            check(fetched.limitStatusAvailable && fabs(fetched.remainingFraction - 0.60) < 0.001,
+                  @"account: the gauge comes from the fetched body");
+            check(!fetched.limitStale && [fetched.statusSource isEqual:@"Anthropic usage API (opt-in)"],
+                  @"account: a fresh fetch is not stale");
+            // 2. The throttle holds for the poll interval, and the cached token is reused.
+            UsageNamed([live read], @"Claude");
+            check(fetches == 1 && credentialReads == 1, @"account: the 15-minute throttle blocks the next read");
+            check([[NSString stringWithContentsOfFile:[aSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"]
+                                             encoding:NSUTF8StringEncoding error:nil] rangeOfString:@"tok-live"].location == NSNotFound,
+                  @"account: the token never reaches the state file");
+
+            // 3. An expired credential: no fetch, and the row says what the user must do.
+            AIReader *expired = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            __block NSUInteger expiredFetches = 0;
+            expired.claudeCredentialReader = ^NSDictionary *{ return @{@"token": @"tok-old", @"expiresAt": @(base - 60)}; };
+            expired.claudeUsageFetcher = ^NSDictionary *(NSString *__unused token) { expiredFetches++; return usageBody(0, 0); };
+            expired.useClaudeAccount = YES;
+            expired.allowClaudeAccountFetch = YES;
+            [expired setValue:nil forKey:@"claudeUsageJSON"];
+            [expired setValue:@0 forKey:@"claudeLastSuccessAt"];
+            [expired setValue:@0 forKey:@"claudeNextFetch"];
+            AIUsage *expiredUsage = UsageNamed([expired read], @"Claude");
+            check(expiredFetches == 0, @"account: an expired token is never sent");
+            check([expiredUsage.statusReason containsString:@"open Claude Code to refresh it"],
+                  @"account: the row names the action, not an open-ended wait");
+            check([expiredUsage.limitRefreshError containsString:@"expired"],
+                  @"account: the refresh error survives to Details");
+
+            // 4. A cached body plus a failing refresh: the old gauge stays, marked stale
+            //    and dated, and a 429 pushes the next attempt past the standard throttle.
+            AIReader *failing = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            failing.claudeCredentialReader = ^NSDictionary *{ return @{@"token": @"tok", @"expiresAt": @(base + 3600)}; };
+            failing.claudeUsageFetcher = ^NSDictionary *(NSString *__unused token) {
+                return @{@"_glancebarFetchError": @YES, @"statusCode": @429, @"rateLimited": @YES,
+                         @"retryAfter": @1800, @"message": @"Too Many Requests"};
+            };
+            failing.useClaudeAccount = YES;
+            failing.allowClaudeAccountFetch = YES;
+            [failing setValue:usageBody(40, 10) forKey:@"claudeUsageJSON"];
+            [failing setValue:@(base - 7200) forKey:@"claudeLastSuccessAt"];
+            [failing setValue:@0 forKey:@"claudeNextFetch"];
+            AIUsage *failed = UsageNamed([failing read], @"Claude");
+            check(fabs(failed.remainingFraction - 0.60) < 0.001, @"account: a failed refresh keeps the last good gauge");
+            check(failed.limitStale && [failed.statusReason hasPrefix:@"Cached limit · Usage API rate-limited"],
+                  @"account: the failure is named beside the cached figure");
+            check([failed.statusReason containsString:@"as of"], @"account: a cached figure says when it was taken");
+            check([[failing valueForKey:@"claudeNextFetch"] doubleValue] >= base + 1700,
+                  @"account: a 429's Retry-After defers the next attempt");
+
+            // 5. A 401 drops the cached token so the next attempt re-reads the credential.
+            __block NSUInteger reReads = 0;
+            AIReader *revoked = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            revoked.claudeCredentialReader = ^NSDictionary *{
+                reReads++;
+                return @{@"token": @"tok", @"expiresAt": @(base + 3600)};
+            };
+            revoked.claudeUsageFetcher = ^NSDictionary *(NSString *__unused token) {
+                return @{@"_glancebarFetchError": @YES, @"statusCode": @401, @"rateLimited": @NO,
+                         @"retryAfter": @0, @"message": @"Unauthorized"};
+            };
+            revoked.useClaudeAccount = YES;
+            revoked.allowClaudeAccountFetch = YES;
+            [revoked setValue:@0 forKey:@"claudeNextFetch"];
+            [revoked read];
+            check(reReads == 1 && [revoked valueForKey:@"claudeAccessToken"] == nil,
+                  @"account: a 401 drops the cached token");
+
+            // 6. Cursor runs the same path through its own seams.
+            NSString *cursorDir = [aHome stringByAppendingPathComponent:@"Library/Application Support/Cursor/User/globalStorage"];
+            [fm createDirectoryAtPath:cursorDir withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"" writeToFile:[cursorDir stringByAppendingPathComponent:@"state.vscdb"] atomically:YES
+                    encoding:NSUTF8StringEncoding error:nil];
+            AIReader *cursor = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            __block NSUInteger cursorFetches = 0;
+            cursor.cursorTokenReader = ^NSString *(NSString *__unused home) { return @"cursor-tok"; };
+            cursor.cursorUsageFetcher = ^NSDictionary *(NSString *__unused token) {
+                cursorFetches++;
+                return @{@"billingCycleEnd": @((base + 86400) * 1000),
+                         @"planUsage": @{@"totalSpend": @2500, @"limit": @10000, @"totalPercentUsed": @25.0}};
+            };
+            cursor.useCursorAccount = YES;
+            cursor.allowCursorAccountFetch = YES;
+            [cursor setValue:nil forKey:@"cursorUsageJSON"];
+            [cursor setValue:@0 forKey:@"cursorNextFetch"];
+            AIUsage *cursorUsage = UsageNamed([cursor read], @"Cursor");
+            check(cursorFetches == 1 && cursorUsage.limitStatusAvailable,
+                  @"account: Cursor fetches through its own seam and gets a gauge");
+            check(fabs(cursorUsage.remainingFraction - 0.75) < 0.001, @"account: Cursor plan spend drives the gauge");
+            check([cursorUsage.statusSource isEqual:@"Cursor usage API (opt-in)"], @"account: Cursor names its own source");
+        }
+
+        // Two processes share the state file: a fresher account response written by one
+        // (the CLI's --dump --online) must be adopted by the other, not overwritten.
+        {
+            NSString *sHome = [root stringByAppendingPathComponent:@"home-shared"];
+            NSString *sSupport = [root stringByAppendingPathComponent:@"support-shared"];
+            [fm createDirectoryAtPath:sHome withIntermediateDirectories:YES attributes:nil error:nil];
+            double base = NSDate.date.timeIntervalSince1970;
+            NSDictionary *(^body)(double) = ^(double pct) {
+                return @{@"limits": @[@{@"kind": @"weekly_all", @"percent": @(pct), @"resets_at": @(base + 86400)}]};
+            };
+            AIReader *gui = [[AIReader alloc] initWithHomeDirectory:sHome applicationSupportDirectory:sSupport];
+            gui.useClaudeAccount = YES;
+            gui.allowClaudeAccountFetch = NO;
+            [gui setValue:body(10) forKey:@"claudeUsageJSON"];
+            [gui setValue:@(base - 7200) forKey:@"claudeLastSuccessAt"];
+            [gui setValue:@YES forKey:@"stateDirty"];   // stand in for the fetch that would have set it
+            AIUsage *old = UsageNamed([gui read], @"Claude");
+            check(fabs(old.remainingFraction - 0.90) < 0.001, @"shared: the GUI starts on its own two-hour-old cache");
+
+            AIReader *cli = [[AIReader alloc] initWithHomeDirectory:sHome applicationSupportDirectory:sSupport];
+            cli.useClaudeAccount = YES;
+            cli.allowClaudeAccountFetch = NO;
+            [cli setValue:body(80) forKey:@"claudeUsageJSON"];
+            [cli setValue:@(base - 5) forKey:@"claudeLastSuccessAt"];
+            [cli setValue:@YES forKey:@"stateDirty"];
+            [cli read];   // writes the fresher response to the shared file
+            // The GUI's own copy is older; only an mtime change makes it look again.
+            [[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [NSDate dateWithTimeIntervalSinceNow:1]}
+                                             ofItemAtPath:[sSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"]
+                                                    error:nil];
+
+            AIUsage *adopted = UsageNamed([gui read], @"Claude");
+            check(fabs(adopted.remainingFraction - 0.20) < 0.001,
+                  @"shared: the GUI adopts the fresher on-disk response instead of overwriting it");
+            NSDictionary *onDisk = [NSJSONSerialization JSONObjectWithData:
+                [NSData dataWithContentsOfFile:[sSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"]]
+                                                                    options:0 error:nil];
+            check([onDisk[@"claudeUsageJSON"][@"limits"][0][@"percent"] doubleValue] == 80,
+                  @"shared: the fresher response survives the next save");
+        }
+
+        // Withdrawing transcript consent purges the index immediately, without a read().
+        {
+            NSString *pHome = [root stringByAppendingPathComponent:@"home-consent"];
+            NSString *pSupport = [root stringByAppendingPathComponent:@"support-consent"];
+            NSString *pProj = [pHome stringByAppendingPathComponent:@".claude/projects/p"];
+            [fm createDirectoryAtPath:pProj withIntermediateDirectories:YES attributes:nil error:nil];
+            NSMutableData *transcript = [NSMutableData data];
+            for (NSUInteger i = 0; i < 10; i++)
+                AppendClaudeEvent(transcript, [NSString stringWithFormat:@"c-%lu", (unsigned long)i], 5);
+            [transcript writeToFile:[pProj stringByAppendingPathComponent:@"t.jsonl"] atomically:NO];
+            AIReader *consenting = [[AIReader alloc] initWithHomeDirectory:pHome applicationSupportDirectory:pSupport];
+            consenting.allowClaudeTranscripts = YES;
+            [consenting readUntilCaughtUpWithTimeLimit:5.0];
+            NSString *consentState = [pSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
+            check([[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:consentState]
+                                                   options:0 error:nil][@"claudeFiles"] count] > 0,
+                  @"consent: the index exists while consent is given");
+            [consenting purgeClaudeTranscriptIndex];   // the toggle's direct call — no read()
+            check([[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:consentState]
+                                                   options:0 error:nil][@"claudeFiles"] count] == 0,
+                  @"consent: withdrawing purges the index on the spot, with no later read");
+        }
+
         // Toggle-off clears the persisted account usage fields.
         restored.useClaudeAccount = NO;
         restored.useCursorAccount = NO;

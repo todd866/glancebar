@@ -19,8 +19,11 @@ Developer account, a `Developer ID Application` certificate, and notary credenti
      ./build.sh
    ```
 
-   `build.sh` never discovers or chooses an identity automatically. Without the
-   environment variable it uses an ad-hoc signature intended for local builds.
+   Signing selection, in order: `GLANCEBAR_CODESIGN_IDENTITY` (fails loudly if it is not
+   installed), `GLANCEBAR_ADHOC=1`, an installed `Developer ID Application` identity
+   (picked automatically so a plain `./build.sh` is stable), the `Glancebar Self-Signed`
+   certificate, then ad-hoc. For a release always pass the identity explicitly, and pass
+   `GLANCEBAR_ADHOC=1` on a shared machine where the auto-pick would be wrong.
 
 3. Verify the candidate before packaging it:
 

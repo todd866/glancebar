@@ -853,7 +853,7 @@ NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
                  @"status": @"Keychain token unavailable; retrying later"};
     if (expiresAtEpoch > 0 && expiresAtEpoch <= nowEpoch)
         return @{@"ok": @NO, @"retryDelay": @300.0,
-                 @"status": @"Claude Code token expired; waiting for it to refresh"};
+                 @"status": @"Claude Code token expired · open Claude Code to refresh it"};
     return @{@"ok": @YES, @"token": token, @"expiresAt": @(expiresAtEpoch)};
 }
 
@@ -930,10 +930,8 @@ static NSString *Trimmed(NSString *s) {
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
-// The executable's basename, unless that is a bare version number: Claude Code's native
-// install runs ~/.local/share/claude/versions/2.1.261, and "2.1.261" is no name. Walk
-// back past version-shaped and structural components to the first real one ("claude").
-static NSString *FallbackProcessName(NSString *command) {
+// See pure.h. Walks back past version-shaped and structural path components.
+NSString *ProcessNameFromPath(NSString *command) {
     NSString *trimmed = Trimmed(command);
     static NSRegularExpression *versionLike;
     static dispatch_once_t once;
@@ -992,7 +990,7 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
         NSString *command = [[parts subarrayWithRange:NSMakeRange(3, parts.count - 3)] componentsJoinedByString:@" "];
 
         NSString *group = groupForPid(pid);
-        if (!group.length) group = FallbackProcessName(command);
+        if (!group.length) group = ProcessNameFromPath(command);
         if (!group.length) continue;
 
         NSMutableDictionary *g = groups[group];
@@ -1002,7 +1000,7 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
         }
         g[@"cpu"] = @([g[@"cpu"] doubleValue] + cpu);
         g[@"bytes"] = @([g[@"bytes"] unsignedLongLongValue] + bytes);
-        if (command.length) [g[@"commands"] addObject:FallbackProcessName(command)];
+        if (command.length) [g[@"commands"] addObject:ProcessNameFromPath(command)];
     }
     return @{@"cpu": RowsSortedBy(groups, @"cpu", topN),
              @"memory": RowsSortedBy(groups, @"bytes", topN)};
@@ -1051,13 +1049,24 @@ double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
         if (spanRight <= leftBoundary || span.x >= rightEdge) continue;
         // Status items grow left. The current right edge already accounts for every
         // item to our right; only the closest obstacle on our left limits expansion.
-        if (spanRight <= own.x + 1.0)
-            obstacleRight = MAX(obstacleRight, spanRight);
+        // A left neighbour that reaches INTO our span (below the self threshold) is
+        // still that obstacle — dropping it as neither self nor neighbour would report
+        // room that is already taken.
+        if (span.x < own.x)
+            obstacleRight = MAX(obstacleRight, MIN(spanRight, ownRight));
     }
     return MIN(rightEdge - leftBoundary, MAX(0.0, ownRight - obstacleRight));
 }
 
+BOOL BarEvictionSuspected(BOOL seenOnBar, BOOL onBar, double sinceCreatedSec) {
+    if (onBar) return NO;
+    if (seenOnBar) return YES;
+    return sinceCreatedSec >= kBarEvictionGraceSec;
+}
+
+const double kBarFitTolerancePt = 1;
 const double kBarShrinkMarginPt = 4;
+const double kBarEvictionGraceSec = 30;
 const double kBarExpandMarginPt = 8;
 const int    kBarExpandTicks    = 2;
 const double kBarExpandMinIntervalSec = 10;
@@ -1070,9 +1079,13 @@ BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
                        .expandStreak = 0, .lastCountedAt = 0 };
     if (evicted) { s.tier = BarTierGlyph; return s; }
     if (capacityPt < 0) return s;
-    if (widths[s.tier] + kBarShrinkMarginPt > capacityPt) {
-        // Widest tier that fits with margin; the glyph is the floor — Glancebar
-        // never voluntarily hides, even if macOS may still evict the glyph.
+    // Shrink only when the current tier genuinely no longer fits. A neighbour packed
+    // against our left edge (Control Centre lays hosts edge to edge) measures exactly
+    // our own width, and the old "+ margin" test read that as a squeeze — one shrink
+    // per tick down to the glyph, and no way back up, on a bar that had never changed.
+    if (widths[s.tier] > capacityPt + kBarFitTolerancePt) {
+        // Widest narrower tier that fits with margin; the glyph is the floor —
+        // Glancebar never voluntarily hides, even if macOS may still evict the glyph.
         while (s.tier < BarTierGlyph && widths[s.tier] + kBarShrinkMarginPt > capacityPt)
             s.tier++;
         return s;

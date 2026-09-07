@@ -7,7 +7,7 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 <p align="center">
-  <img src="docs/screenshot.png?v=24ce5cff" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
+  <img src="docs/screenshot.png?v=1ce2dc47" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
 </p>
 
 ## Overview
@@ -28,13 +28,16 @@ opt-in) `/usr/bin/security`.
 ## Features
 
 - **Storage** — every volume (internal + external/NTFS) with Finder-accurate free space
-  (purgeable counts as free); gauges turn orange past 85%, red past 95%.
+  (purgeable counts as free, and Details says how much of the figure that is); gauges
+  turn orange past 85%, red past 95%.
 - **Battery** — "3:14 until 20%" (not a bare percentage), sampled energy impact grouped
   by app/process with raw process names and plain-English context, live draw in watts,
   and battery health / cycle count.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
-  popover shows the lead signals, Details keeps the longer lists.
+  popover shows the lead signals, Details keeps the longer lists. Memory and swap are
+  reported in binary units and by Activity Monitor's own "used" formula, so the figures
+  match the tool you would check them against.
 - **AI status** — Codex's official remaining-quota percentage and reset time from its
   own session logs, kept apart per allowance bucket so a spent plan window is never
   hidden behind an untouched side bucket, plus where requests bill once the plan is
@@ -105,7 +108,9 @@ build/Glancebar.app/Contents/MacOS/Glancebar --dump --json          # schemaVers
 build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json # exit 2 if any source is partial
 ```
 
-`--help` and `--version` are available for scripts. JSON is written by itself to
+`--dump` also prints how old a cached limit figure is, matching the popover's rule
+(anything older than the 15-minute poll interval says its age). `--help` and `--version`
+are available for scripts. JSON is written by itself to
 stdout; unknown options are usage errors. `--online` permits the Claude and Cursor
 account requests only for integrations already enabled in Glancebar, and honours the
 same 15-minute throttle as the app (a cached response younger than that is reused).
@@ -120,7 +125,11 @@ stale account refresh is reported as `ai.account` and is strict-partial.
 ## How It Works
 
 - **Disk** — `mountedVolumeURLs` (hidden volumes skipped), preferring the Finder-style
-  "important usage" free-space figure.
+  "important usage" free-space figure. That figure counts purgeable data (caches, staged
+  updates, local snapshots) as free, which is what Finder shows and what you actually get
+  back; when it is more than 1% of the volume, Details names the purgeable share so the
+  headline is not mistaken for physically free bytes. `--dump --json` carries both
+  (`availableBytes`, `physicalAvailableBytes`, `purgeableBytes`).
 - **Battery** — the IORegistry `AppleSmartBattery` entry (charge, charging state, raw mAh
   capacity, amperage, voltage, cycle count, smoothed time-to-empty). The menu bar updates
   instantly on plug/unplug via an `IOPSNotification`, otherwise every 15s.
@@ -134,7 +143,10 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   window is open.
 - **System pressure** — CPU from Mach processor tick deltas; memory pressure from
   `kern.memorystatus_vm_pressure_level` (the kernel's own verdict); swap from
-  `vm.swapusage`. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
+  `vm.swapusage`. "Used" is Activity Monitor's formula — app memory (anonymous pages
+  less purgeable ones) plus wired plus compressed — and memory/swap print in binary
+  units (GiB shown as GB, as Activity Monitor does) while volumes stay decimal like
+  Finder. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
   and measured by physical footprint (what Activity Monitor shows), grouped under parent
   apps where possible.
 - **Stay awake with lid closed** — an opt-in Options toggle flips the system `SleepDisabled`
@@ -242,7 +254,8 @@ stale account refresh is reported as `ai.account` and is strict-partial.
 
   App signing does not change this credential-access behavior: `/usr/bin/security` is
   the process Keychain evaluates. Signing is still required for normal macOS distribution,
-  but Glancebar never auto-selects an installed identity. See
+  and `build.sh` prefers an installed Developer ID automatically (pass `GLANCEBAR_ADHOC=1`
+  to stop it). See
   [`docs/RELEASING.md`](docs/RELEASING.md) for the explicit signing and notarization flow.
 
 The time estimator, sampled-energy-impact grouping, process-stat grouping, rate-limit
@@ -278,7 +291,11 @@ popover stays one click away at every width. It re-expands automatically after
 the space has stayed free for a while; only modest headroom is required, so
 removing one neighboring icon can
 restore the display without letting a transient AirPods connection make it flap.
-Hover the item for the full summary at any width.
+Hover the item for the full summary at any width. Control Centre packs status items edge
+to edge, so an item that is on the bar already fits: Glancebar narrows only when a
+neighbour genuinely overlaps it, not merely because there is no slack beside it. An item
+that was never placed at all — launching into a bar with no room — falls to the glyph
+after 30 seconds rather than staying invisible, and grows back once space is measured.
 
 ## Credits
 

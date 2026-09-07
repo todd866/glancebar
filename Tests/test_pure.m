@@ -70,6 +70,12 @@ int main(void) {
             @"  201 12.0 1000 /Users/x/.local/share/claude/versions/2.1.261\n  202  3.0  500 /usr/bin/top\n  203  1.0  500 node\n", 5,
             ^NSString *(pid_t __unused pid) { return nil; }, nil);
         check([versioned[@"cpu"][0][@"name"] isEqual:@"claude"], @"naming: a version-number basename yields the tool's name");
+        check([ProcessNameFromPath(@"/Users/x/.local/share/claude/versions/2.1.261") isEqual:@"claude"] &&
+              [ProcessNameFromPath(@"/opt/homebrew/Cellar/node/v22.3.0/bin/node") isEqual:@"node"] &&
+              [ProcessNameFromPath(@"/usr/libexec/sysmond") isEqual:@"sysmond"] &&
+              [ProcessNameFromPath(@"/x/tool/1.2/bin/2.0") isEqual:@"tool"] &&
+              [ProcessNameFromPath(@"2.1.261") isEqual:@"2.1.261"],
+              @"naming: version-shaped and structural components are walked past, never everything");
         check([versioned[@"cpu"][1][@"name"] isEqual:@"top"] && [versioned[@"cpu"][2][@"name"] isEqual:@"node"],
               @"naming: ordinary basenames are unchanged");
 
@@ -586,7 +592,7 @@ int main(void) {
         NSDictionary *kcExpired = ClaudeKeychainOutcome(YES, @"tok", 999, 1000);
         check(![kcExpired[@"ok"] boolValue], @"expired token ⇒ not ok");
         check([kcExpired[@"retryDelay"] doubleValue] == 300, @"expired token retries in 5 min, not 1h");
-        check([kcExpired[@"status"] isEqual:@"Claude Code token expired; waiting for it to refresh"],
+        check([kcExpired[@"status"] isEqual:@"Claude Code token expired · open Claude Code to refresh it"],
               @"expired token names the real condition");
         NSDictionary *kcOk = ClaudeKeychainOutcome(YES, @"tok", 5000, 1000);
         check([kcOk[@"ok"] boolValue] && [kcOk[@"token"] isEqual:@"tok"], @"future expiry ⇒ usable token");
@@ -739,6 +745,36 @@ int main(void) {
         check(!GUIRequiresLaunchServicesRelaunch(@"com.iantodd.glancebar", nil),
               @"launch guard: malformed bundle identity is handled by the caller");
 
+        // --- Bar: an abutting left neighbour is the normal layout, not a squeeze ---
+        {
+            // Control Centre lays hosts edge to edge: neighbour 1023..1063, self 1063..1191.
+            const BarWindowSpan packed[] = { {1023, 40}, {1063, 128}, {1191, 38} };
+            double cap = BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1063, 128}, packed, 3);
+            check(fabs(cap - 128) < 0.001, @"packed: capacity is exactly our own span");
+            const double OCC[3] = {128, 51, 38};
+            BarTierState held = ChooseBarTier((BarTierState){BarTierFull, 0, 0}, cap, OCC, NO, 100);
+            check(held.tier == BarTierFull, @"packed: an item that is on the bar already fits — no shrink");
+            // One point of compositor rounding either way must not shrink us either.
+            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, 127.2, OCC, NO, 100).tier == BarTierFull,
+                  @"packed: sub-point rounding is tolerated");
+            // A neighbour that has actually moved INTO our span is a real squeeze.
+            const BarWindowSpan squeezed[] = { {1023, 46}, {1063, 128}, {1191, 38} };
+            double squeezedCap = BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1063, 128}, squeezed, 3);
+            check(fabs(squeezedCap - 122) < 0.001, @"packed: a 6pt overlap is an obstacle, not ignored");
+            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, squeezedCap, OCC, NO, 100).tier == BarTierCompact,
+                  @"packed: a real overlap shrinks to the widest tier that fits with margin");
+            // And the fallback tier must itself fit with margin.
+            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, 52, OCC, NO, 100).tier == BarTierGlyph,
+                  @"packed: shrink skips a tier that would fit without margin");
+        }
+
+        // --- BarEvictionSuspected: arm-after-seen, with a launch grace ---
+        check(!BarEvictionSuspected(NO, NO, 5), @"eviction: an unseen item inside the grace is not evicted");
+        check(BarEvictionSuspected(NO, NO, kBarEvictionGraceSec), @"eviction: never seen after the grace counts as evicted");
+        check(BarEvictionSuspected(YES, NO, 0), @"eviction: a fall from the bar is eviction at once");
+        check(!BarEvictionSuspected(YES, YES, 1000) && !BarEvictionSuspected(NO, YES, 1000),
+              @"eviction: on the bar is never evicted");
+
         // --- ChooseBarTier ---
         {
             // Tahoe renders app status items in Control Centre-owned host windows, so
@@ -821,8 +857,12 @@ int main(void) {
             const double LIVE_OCCUPIED_W[3] = {131, 51, 35};
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 130, LIVE_OCCUPIED_W, NO, t);
+            check(s.tier == BarTierFull,
+                  @"tier: a one-point compositor overlap on a 131pt host is rounding, not a squeeze");
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, 126, LIVE_OCCUPIED_W, NO, t);
             check(s.tier == BarTierCompact,
-                  @"tier: shell chrome selects Compact before the Full host is evicted");
+                  @"tier: a real squeeze on the Full host selects Compact before it is evicted");
             s = (BarTierState){BarTierCompact, 0, 0};
             s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);
             s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);

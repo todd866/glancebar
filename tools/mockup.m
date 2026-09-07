@@ -177,17 +177,22 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     };
     // Claude stays private/off by default. Codex exposes both current windows from
     // its local session state, matching the production dual-meter presentation.
-    ai(@"Claude", @"—", @"Account access off · transcript totals off", -1, NSColor.tertiaryLabelColor);
+    // The subtitles mirror what the app itself renders: for a disabled Claude account
+    // that is the statusReason set in -claudeUsage (main.m, "Claude account access is
+    // off"), which -aiStatusSubtext shows verbatim when there is no reset to report.
+    ai(@"Claude", @"—", @"Claude account access is off", -1, NSColor.tertiaryLabelColor);
     [card addSubview:L(@"Codex", [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
                        NSMakeRect(kPad, y, inner, 15), NSTextAlignmentLeft)];
     y += 19;
+    // Mirrors -compactSignalRow: in main.m — title left, figure right, and the gauge
+    // spanning the full row width underneath, not inline between them.
     void (^limit)(NSString *, NSString *, double, NSColor *) = ^(NSString *name, NSString *right, double frac, NSColor *color){
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 28)];
-        [row addSubview:L(name, [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium], nil,
-                          NSMakeRect(kPad, 11, 72, 15), NSTextAlignmentLeft)];
-        [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold], color,
-                          NSMakeRect(kW-kPad-76, 11, 76, 15), NSTextAlignmentRight)];
-        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad+80, 15, inner-164, 6)];
+        [row addSubview:L(name, [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], nil,
+                          NSMakeRect(kPad, 11, inner-82-8, 15), NSTextAlignmentLeft)];
+        [row addSubview:L(right, [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
+                          NSColor.secondaryLabelColor, NSMakeRect(kW-kPad-82, 11, 82, 15), NSTextAlignmentRight)];
+        Gauge *g=[[Gauge alloc] initWithFrame:NSMakeRect(kPad, 3, inner, 4)];
         g.fraction=frac; g.color=color; [row addSubview:g]; [card addSubview:row]; y += 28;
     };
     limit(@"5-hour", @"27% left", 0.27, NSColor.systemOrangeColor);

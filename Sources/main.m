@@ -30,16 +30,22 @@ static NSString *GBHomeDirectory(void) {
 
 @interface Volume : NSObject
 @property (copy) NSString *path, *name;
-@property long long total, available;
+@property long long total, available, physicalAvailable;
 @property BOOL isInternal;
 @end
 @implementation Volume
 - (long long)used { return MAX(0LL, self.total - self.available); }
+// Finder-style "available" counts purgeable data (caches, staged updates, local
+// snapshots) as free; this is how much of that figure macOS would first have to thin.
+- (long long)purgeable { return MAX(0LL, self.available - self.physicalAvailable); }
 - (double)fraction { return self.total > 0 ? (double)self.used / self.total : 0; }
 @end
 
-static NSString *FmtBytes(long long b) {
+static NSString *FmtBytes(long long b) {   // volumes: decimal, as Finder shows them
     return [NSByteCountFormatter stringFromByteCount:b countStyle:NSByteCountFormatterCountStyleFile];
+}
+static NSString *FmtMemBytes(long long b) {   // memory, swap, footprints: binary, as Activity Monitor and top show them
+    return [NSByteCountFormatter stringFromByteCount:b countStyle:NSByteCountFormatterCountStyleMemory];
 }
 
 static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
@@ -53,6 +59,7 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
                                                error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
     // APFS reports purgeable space in the "important usage" figure, which can exceed
     // total capacity; clamp so used/free/fraction stay self-consistent.
+    long long physical = MAX(0LL, MIN(avail, total.longLongValue));
     if (important.longLongValue > 0) avail = important.longLongValue;
     // Network and transient volumes can briefly report -1 or a free-space figure larger
     // than their capacity. Clamp every source, not just the APFS "important" value.
@@ -63,6 +70,7 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
     vol.name = name.length ? name : [NSFileManager.defaultManager displayNameAtPath:vol.path];
     if (!vol.name.length) vol.name = vol.path;
     vol.total = total.longLongValue; vol.available = avail;
+    vol.physicalAvailable = MIN(physical, avail);
     vol.isInternal = [v[NSURLVolumeIsInternalKey] boolValue] || [vol.path isEqualToString:@"/"];
     return vol;
 }
@@ -82,6 +90,7 @@ static Volume *RootVolumeFallback(void) {
     vol.name = displayName.length ? displayName : @"Macintosh HD";
     vol.total = (long long)s.f_blocks * (long long)s.f_bsize;
     vol.available = (long long)s.f_bavail * (long long)s.f_bsize;
+    vol.physicalAvailable = vol.available;
     vol.isInternal = YES;
     return vol;
 }
@@ -155,7 +164,9 @@ static NSString *AppGroupForPid(pid_t pid) {
     NSString *p = [NSString stringWithUTF8String:path];
     if (!p) return nil;   // executable path was not valid UTF-8
     NSRange app = [p rangeOfString:@".app/"];
-    if (app.location == NSNotFound) return nil;
+    // Not inside a bundle: the executable path still names it better than `top`'s
+    // command column does, which prints a bare version number for Claude Code.
+    if (app.location == NSNotFound) return ProcessNameFromPath(p);
     NSString *bundle = [p substringToIndex:app.location + 4];
     NSString *name = [NSFileManager.defaultManager displayNameAtPath:bundle];
     if ([name hasSuffix:@".app"]) name = [name substringToIndex:name.length - 4];
@@ -193,14 +204,22 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
 
 // Reads the live SleepDisabled system power setting (no admin needed — a plain IOKit read
 // surfaced by `pmset -g`). YES = the Mac is currently kept awake with the lid closed.
-// nil when pmset could not be read — callers must not mistake that for "normal sleep",
-// or the toggle would offer to ENABLE staying awake on a Mac that already is.
-static NSNumber *SleepDisabledState(void) {
+// nil when the setting could not be read — callers must not mistake that for "normal
+// sleep", or the toggle would offer to ENABLE staying awake on a Mac that already is.
+static NSNumber *SleepDisabledStateViaTool(void) {
     NSString *out = RunTaskOutput(@"/usr/bin/pmset", @[@"-g"]);
     return out.length ? ParseSleepDisabled(out) : nil;
 }
-static BOOL SleepDisabledNow(void) {
-    return SleepDisabledState().boolValue;
+// The system power plist is world-readable and carries the same key pmset prints, in a
+// few milliseconds and with no child process — safe on the main thread. pmset is the
+// fallback for a plist that has never had the key written.
+static NSNumber *SleepDisabledState(void) {
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:@"/Library/Preferences/com.apple.PowerManagement.plist"];
+    NSDictionary *settings = [plist[@"SystemPowerSettings"] isKindOfClass:NSDictionary.class]
+        ? plist[@"SystemPowerSettings"] : nil;
+    id value = settings[@"SleepDisabled"];
+    if ([value isKindOfClass:NSNumber.class]) return @([value boolValue]);
+    return SleepDisabledStateViaTool();
 }
 
 // Applies `pmset -a disablesleep <0|1>` through an osascript administrator prompt: macOS
@@ -404,7 +423,12 @@ static SystemState ReadSystemState(CPUCounters *previous) {
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
         if (host_page_size(HostPort(), &pageSize) == KERN_SUCCESS &&
             host_statistics64(HostPort(), HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS) {
-            uint64_t usedPages = (uint64_t)vm.active_count + vm.wire_count + vm.compressor_page_count;
+            // Activity Monitor's "Memory Used": app memory (anonymous pages less the
+            // purgeable ones) + wired + compressed. Counting every active page instead
+            // read 3.5 GB low on 2026-09-07; inactive anonymous pages are still in use.
+            uint64_t anonymous = vm.internal_page_count > vm.purgeable_count
+                ? (uint64_t)vm.internal_page_count - vm.purgeable_count : 0;
+            uint64_t usedPages = anonymous + vm.wire_count + vm.compressor_page_count;
             uint64_t used = usedPages * (uint64_t)pageSize;
             if (used > memTotal) used = memTotal;
             s.memTotal = memTotal;
@@ -465,13 +489,13 @@ static NSString *CPUStatusText(SystemState s) {
 static NSString *MemoryStatusText(SystemState s) {
     if (!s.memValid) return @"Memory unknown";
     return [NSString stringWithFormat:@"Memory pressure %@ · %@ available",
-            MemoryPressureLevel(s), FmtBytes(s.memAvailable)];
+            MemoryPressureLevel(s), FmtMemBytes(s.memAvailable)];
 }
 
 static NSString *SwapStatusText(SystemState s) {
     if (!s.swapValid) return @"Swap unknown";
     if (s.swapUsed == 0) return @"Swap none";   // NSByteCountFormatter renders 0 as "Zero KB"
-    return [NSString stringWithFormat:@"Swap %@", FmtBytes(s.swapUsed)];
+    return [NSString stringWithFormat:@"Swap %@", FmtMemBytes(s.swapUsed)];
 }
 
 static NSString *SystemSummaryText(SystemState s) {
@@ -885,97 +909,33 @@ static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
     return @{@"token": token ?: @"", @"expiresAt": @(expiresAt)};    // expiry judged by the caller
 }
 
-@interface GBAnthropicSessionDelegate : NSObject <NSURLSessionTaskDelegate>
+// Authorization headers must never follow a provider-controlled redirect. A same-host
+// HTTPS redirect is acceptable; every other destination is refused.
+@interface GBPinnedHostSessionDelegate : NSObject <NSURLSessionTaskDelegate>
+@property (copy) NSString *host;
 @end
-@implementation GBAnthropicSessionDelegate
+@implementation GBPinnedHostSessionDelegate
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
         willPerformHTTPRedirection:(NSHTTPURLResponse *)response
                          newRequest:(NSURLRequest *)request
                   completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
-    // Authorization headers must never follow a provider-controlled redirect. A future
-    // same-host HTTPS redirect is acceptable; every other destination is refused.
     NSURL *url = request.URL;
     BOOL sameTrustedHost = [url.scheme.lowercaseString isEqualToString:@"https"] &&
-                           [url.host.lowercaseString isEqualToString:@"api.anthropic.com"];
+                           [url.host.lowercaseString isEqualToString:self.host];
     completionHandler(sameTrustedHost ? request : nil);
 }
 @end
+
+static NSDictionary *FetchResult(NSData *data, NSHTTPURLResponse *http, NSError *err, NSString *fallbackMessage);
+static NSDictionary *HTTPJSON(NSString *token, NSString *method, NSString *urlString, NSString *host,
+                              NSDictionary *headers, NSData *body, NSString *timeoutMessage);
 
 // One GET to Anthropic's OAuth usage endpoint — the same data Claude Code's /usage
 // shows. Synchronous by design: callers run on the AI queue, never the main thread.
 static NSDictionary *FetchClaudeUsageJSON(NSString *token) {
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-        [NSURL URLWithString:@"https://api.anthropic.com/api/oauth/usage"]];
-    req.timeoutInterval = 10;
-    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
-    [req setValue:@"oauth-2025-04-20" forHTTPHeaderField:@"anthropic-beta"];
-    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
-
-    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
-    cfg.URLCache = nil;
-    cfg.HTTPCookieStorage = nil;
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    cfg.HTTPShouldSetCookies = NO;
-    GBAnthropicSessionDelegate *delegate = [GBAnthropicSessionDelegate new];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:delegate delegateQueue:nil];
-
-    dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    __block NSDictionary *json = nil;
-    __block BOOL completed = NO;
-    __block NSInteger statusCode = 0;
-    __block NSTimeInterval retryAfter = 0;
-    __block NSString *errorMessage = nil;
-    [[session dataTaskWithRequest:req
-        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            NSHTTPURLResponse *http = [resp isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)resp : nil;
-            statusCode = http.statusCode;
-            retryAfter = [http.allHeaderFields[@"Retry-After"] doubleValue];
-            if (!err && http.statusCode == 200 && data.length) {
-                id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                if ([obj isKindOfClass:NSDictionary.class]) json = obj;
-            } else {
-                if (data.length) {
-                    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                    NSDictionary *dict = [obj isKindOfClass:NSDictionary.class] ? obj : nil;
-                    NSDictionary *error = [dict[@"error"] isKindOfClass:NSDictionary.class] ? dict[@"error"] : nil;
-                    NSString *message = [error[@"message"] isKindOfClass:NSString.class] ? error[@"message"] : nil;
-                    if (message.length) errorMessage = message;
-                }
-                if (!errorMessage.length && err.localizedDescription.length) errorMessage = err.localizedDescription;
-            }
-            completed = YES;
-            [session finishTasksAndInvalidate];
-            dispatch_semaphore_signal(done);
-        }] resume];
-    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
-    if (!completed) [session invalidateAndCancel];
-    if (!json) {
-        NSString *message = errorMessage.length ? errorMessage
-            : statusCode > 0 ? [NSHTTPURLResponse localizedStringForStatusCode:statusCode]
-            : @"Claude usage API request timed out";
-        return @{@"_glancebarFetchError": @YES,
-                 @"statusCode": @(statusCode),
-                 @"rateLimited": @(statusCode == 429),
-                 @"retryAfter": @(retryAfter),
-                 @"message": message};
-    }
-    return json;
+    return HTTPJSON(token, @"GET", @"https://api.anthropic.com/api/oauth/usage", @"api.anthropic.com",
+                    @{@"anthropic-beta": @"oauth-2025-04-20"}, nil, @"Claude usage API request timed out");
 }
-
-@interface GBCursorSessionDelegate : NSObject <NSURLSessionTaskDelegate>
-@end
-@implementation GBCursorSessionDelegate
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
-        willPerformHTTPRedirection:(NSHTTPURLResponse *)response
-                         newRequest:(NSURLRequest *)request
-                  completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
-    NSURL *url = request.URL;
-    BOOL sameTrustedHost = [url.scheme.lowercaseString isEqualToString:@"https"] &&
-                           [url.host.lowercaseString isEqualToString:@"api2.cursor.sh"];
-    completionHandler(sameTrustedHost ? request : nil);
-}
-@end
 
 // Opt-in only: Cursor stores the signed-in session JWT in its VS Code state DB (not the
 // Keychain). Returns the access token string, or nil when the DB/item is missing.
@@ -1001,8 +961,8 @@ static NSString *CursorAccessTokenFromStateDB(NSString *homeDirectory) {
     return token.length ? token : nil;
 }
 
-static NSDictionary *CursorFetchResult(NSData *data, NSHTTPURLResponse *http, NSError *err,
-                                       NSString *fallbackMessage) {
+static NSDictionary *FetchResult(NSData *data, NSHTTPURLResponse *http, NSError *err,
+                                 NSString *fallbackMessage) {
     NSInteger statusCode = http.statusCode;
     NSTimeInterval retryAfter = [http.allHeaderFields[@"Retry-After"] doubleValue];
     if (!err && statusCode == 200 && data.length) {
@@ -1030,8 +990,10 @@ static NSDictionary *CursorFetchResult(NSData *data, NSHTTPURLResponse *http, NS
              @"message": errorMessage};
 }
 
-static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString *urlString,
-                                    NSDictionary *headers, NSData *body) {
+// One bounded JSON request with a bearer token, pinned to `host` across redirects.
+// Synchronous by design: callers run on the AI queue, never the main thread.
+static NSDictionary *HTTPJSON(NSString *token, NSString *method, NSString *urlString, NSString *host,
+                              NSDictionary *headers, NSData *body, NSString *timeoutMessage) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     req.HTTPMethod = method;
     req.timeoutInterval = 10;
@@ -1046,7 +1008,8 @@ static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString 
     cfg.HTTPCookieStorage = nil;
     cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     cfg.HTTPShouldSetCookies = NO;
-    GBCursorSessionDelegate *delegate = [GBCursorSessionDelegate new];
+    GBPinnedHostSessionDelegate *delegate = [GBPinnedHostSessionDelegate new];
+    delegate.host = host;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:delegate delegateQueue:nil];
 
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -1056,7 +1019,7 @@ static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString 
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             NSHTTPURLResponse *http = [resp isKindOfClass:NSHTTPURLResponse.class]
                 ? (NSHTTPURLResponse *)resp : nil;
-            json = CursorFetchResult(data, http, err, @"Cursor usage API request timed out");
+            json = FetchResult(data, http, err, timeoutMessage);
             completed = YES;
             [session finishTasksAndInvalidate];
             dispatch_semaphore_signal(done);
@@ -1068,7 +1031,7 @@ static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString 
                  @"statusCode": @0,
                  @"rateLimited": @NO,
                  @"retryAfter": @0,
-                 @"message": @"Cursor usage API request timed out"};
+                 @"message": timeoutMessage};
     }
     return json;
 }
@@ -1078,15 +1041,16 @@ static NSDictionary *CursorHTTPJSON(NSString *token, NSString *method, NSString 
 static NSDictionary *FetchCursorUsageJSON(NSString *token) {
     double now = NSDate.date.timeIntervalSince1970;
     NSData *emptyBody = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *period = CursorHTTPJSON(
+    NSDictionary *period = HTTPJSON(
         token, @"POST",
-        @"https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+        @"https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage", @"api2.cursor.sh",
         @{@"Content-Type": @"application/json", @"Connect-Protocol-Version": @"1"},
-        emptyBody);
+        emptyBody, @"Cursor usage API request timed out");
     if (![period[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(period, now))
         return period;
 
-    NSDictionary *auth = CursorHTTPJSON(token, @"GET", @"https://api2.cursor.sh/auth/usage", nil, nil);
+    NSDictionary *auth = HTTPJSON(token, @"GET", @"https://api2.cursor.sh/auth/usage", @"api2.cursor.sh",
+                                  nil, nil, @"Cursor usage API request timed out");
     if (![auth[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(auth, now))
         return auth;
     // Keep a successful-but-empty period body over a transport error so diagnostics stay useful.
@@ -1122,6 +1086,13 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 @property (readonly) BOOL totalsIncomplete;
 @property (readonly) double catchUpProgress;
 @property (readonly, copy) NSString *catchUpStatus;
+// Seams for the parts that touch the Keychain, Cursor's state DB and the network,
+// so the whole account path can run in a test without any of them. Defaults are the
+// real readers/fetchers; replace them before the first read.
+@property (copy) NSDictionary *(^claudeCredentialReader)(void);          // @{token, expiresAt} or nil
+@property (copy) NSDictionary *(^claudeUsageFetcher)(NSString *token);
+@property (copy) NSString *(^cursorTokenReader)(NSString *homeDirectory);
+@property (copy) NSDictionary *(^cursorUsageFetcher)(NSString *token);
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory;
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory
            applicationSupportDirectory:(NSString *)applicationSupportDirectory;
@@ -1132,6 +1103,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 // consent from the menu must not wait for one. Call on _aiQueue.
 - (void)forgetClaudeAccountCredentials;
 - (void)forgetCursorAccountCredentials;
+- (void)purgeClaudeTranscriptIndex;
 // Writes out any state a catch-up pass left coalesced. Call on _aiQueue before quitting.
 - (void)flushPersistentState;
 @end
@@ -1201,14 +1173,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     BOOL _stateMustPersist;
     double _lastStateWrite;
     NSUInteger _stateWrites;   // diagnostic: how many times the state file was rewritten
-}
-
-- (instancetype)init {
-    NSString *base = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
-                                                          NSUserDomainMask, YES).firstObject;
-    NSString *fallback = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
-    NSString *support = [(base ?: fallback) stringByAppendingPathComponent:@"Glancebar"];
-    return [self initWithHomeDirectory:NSHomeDirectory() applicationSupportDirectory:support];
+    NSDate *_stateFileSeen;    // mtime of the state file as last read or written by us
 }
 
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory {
@@ -1231,17 +1196,59 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         _days = [NSMutableDictionary dictionary];
         _claudeDays = [NSMutableDictionary dictionary];
         _lastStatusReasons = [NSMutableDictionary dictionary];
+        _claudeCredentialReader = ^NSDictionary *{ return ClaudeAccessTokenFromKeychain(); };
+        _claudeUsageFetcher = ^NSDictionary *(NSString *token){ return FetchClaudeUsageJSON(token); };
+        _cursorTokenReader = ^NSString *(NSString *home){ return CursorAccessTokenFromStateDB(home); };
+        _cursorUsageFetcher = ^NSDictionary *(NSString *token){ return FetchCursorUsageJSON(token); };
         [self loadPersistentState];
     }
     return self;
 }
 
+// The GUI and `--dump --online` share one state file, and each process holds its own
+// copy of the account responses. Whenever the file has changed under us, adopt any
+// FRESHER account response it carries instead of overwriting it with our older one on
+// the next save — the CLI's fetch then shows in the running app within a tick.
+- (void)adoptNewerAccountCachesFromDisk {
+    NSDate *mtime = FileMTime(_statePath);
+    if (!mtime || (_stateFileSeen && [mtime compare:_stateFileSeen] != NSOrderedDescending)) return;
+    _stateFileSeen = mtime;
+    NSDictionary *root = JSONDictionaryAtPath(_statePath);
+    if ([root[@"version"] integerValue] != 2) return;
+    NSDictionary *claude = [root[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class] ? root[@"claudeUsageJSON"] : nil;
+    NSDate *claudeAt = DateFromStatusString([root[@"claudeUsageFetchedAt"] isKindOfClass:NSString.class] ? root[@"claudeUsageFetchedAt"] : nil);
+    if (self.useClaudeAccount && claude && claudeAt && claudeAt.timeIntervalSince1970 > _claudeLastSuccessAt + 1) {
+        _claudeUsageJSON = claude;
+        _claudeLastSuccessAt = claudeAt.timeIntervalSince1970;
+        _claudeNextFetch = MAX(_claudeNextFetch, _claudeLastSuccessAt + kAccountPollInterval);
+        _claudeAccountStatus = nil;
+        _claudeUsageCacheAbandoned = NO;
+        GBLog("claude cache: adopted a newer on-disk response");
+    }
+    NSDictionary *cursor = [root[@"cursorUsageJSON"] isKindOfClass:NSDictionary.class] ? root[@"cursorUsageJSON"] : nil;
+    NSDate *cursorAt = DateFromStatusString([root[@"cursorUsageFetchedAt"] isKindOfClass:NSString.class] ? root[@"cursorUsageFetchedAt"] : nil);
+    if (self.useCursorAccount && cursor && cursorAt && cursorAt.timeIntervalSince1970 > _cursorLastSuccessAt + 1) {
+        _cursorUsageJSON = cursor;
+        _cursorLastSuccessAt = cursorAt.timeIntervalSince1970;
+        _cursorNextFetch = MAX(_cursorNextFetch, _cursorLastSuccessAt + kAccountPollInterval);
+        _cursorAccountStatus = nil;
+        _cursorUsageCacheAbandoned = NO;
+        GBLog("cursor cache: adopted a newer on-disk response");
+    }
+}
+
 - (void)loadPersistentState {
+    _stateFileSeen = FileMTime(_statePath);
     NSData *data = [NSData dataWithContentsOfFile:_statePath options:0 error:nil];
     NSDictionary *root = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
     if (![root isKindOfClass:NSDictionary.class] || [root[@"version"] integerValue] != 2) return;
     NSString *timeZone = [root[@"timeZone"] isKindOfClass:NSString.class] ? root[@"timeZone"] : nil;
-    if (timeZone.length && ![timeZone isEqualToString:NSTimeZone.localTimeZone.name]) return;
+    // Day totals were bucketed in the zone the index was built in. Rebuilding them for a
+    // new zone means re-reading the corpus (15 GB of Codex rollouts in the 8-day window),
+    // which is far worse than day boundaries a few hours off for a week of travel. Keep
+    // the index; new events bucket in the current zone and the old days age out.
+    if (timeZone.length && ![timeZone isEqualToString:NSTimeZone.localTimeZone.name])
+        GBLog("state: time zone changed since the index was built; keeping it");
     NSDictionary *codex = [root[@"codexFiles"] isKindOfClass:NSDictionary.class] ? root[@"codexFiles"] : nil;
     NSDictionary *claude = [root[@"claudeFiles"] isKindOfClass:NSDictionary.class] ? root[@"claudeFiles"] : nil;
     for (NSString *key in codex) {
@@ -1389,6 +1396,7 @@ static const double kAIStateWriteInterval = 2.0;
         return;
     }
     [fm setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:_statePath error:nil];
+    _stateFileSeen = FileMTime(_statePath);
     _stateDirty = NO;
     _stateMustPersist = NO;
     _lastStateWrite = now;
@@ -2075,7 +2083,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     // Track latency so a future Keychain/ACL behavior change is diagnosable without ever
     // logging the credential or its contents.
     double readStart = CFAbsoluteTimeGetCurrent();
-    NSDictionary *cred = ClaudeAccessTokenFromKeychain();
+    NSDictionary *cred = self.claudeCredentialReader();
     double readMs = (CFAbsoluteTimeGetCurrent() - readStart) * 1000.0;
     NSDictionary *outcome = ClaudeKeychainOutcome(cred != nil, cred[@"token"],
                                                   [cred[@"expiresAt"] doubleValue], now);
@@ -2095,21 +2103,162 @@ static NSString *HashedMessageID(NSString *messageID) {
     return _claudeAccessToken;
 }
 
-- (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
+// Shared by both accounts. Pointers address the provider's own ivars, so each keeps its
+// state (and the tests' KVC keys) exactly as before.
+- (void)rememberFetchError:(NSDictionary *)fetch now:(double)now
+                     token:(NSString *__strong *)token expiresAt:(double *)expiresAt
+                 nextFetch:(double *)nextFetch status:(NSString *__strong *)status {
     BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
     double retry = [fetch[@"retryAfter"] doubleValue];
     NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
     if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue])) {
-        _claudeAccessToken = nil;        // revoked; re-read the Keychain next attempt
-        _claudeAccessTokenExpiresAt = 0;
+        *token = nil;   // revoked; re-read the credential next attempt
+        if (expiresAt) *expiresAt = 0;
     }
     if (rateLimited) {
-        _claudeNextFetch = now + RateLimitRetryDelay(retry);
-        _claudeAccountStatus = @"Usage API rate-limited; retrying later";
+        *nextFetch = now + RateLimitRetryDelay(retry);
+        *status = @"Usage API rate-limited; retrying later";
     } else {
-        _claudeAccountStatus = message.length ? [@"Usage API: " stringByAppendingString:message]
-                                              : @"Usage API unavailable";
+        *status = message.length ? [@"Usage API: " stringByAppendingString:message] : @"Usage API unavailable";
     }
+}
+
+- (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
+    [self rememberFetchError:fetch now:now token:&_claudeAccessToken expiresAt:&_claudeAccessTokenExpiresAt
+                   nextFetch:&_claudeNextFetch status:&_claudeAccountStatus];
+}
+
+static NSString *ISOStringFromEpoch(double epoch) {
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+    return [iso stringFromDate:[NSDate dateWithTimeIntervalSince1970:epoch]];
+}
+
+// One account's fetch-if-due step: the throttle, the token, the request, and what to
+// remember about the outcome. Shared by Claude and Cursor.
+- (void)refreshAccountNamed:(const char *)label
+                        use:(BOOL)use allow:(BOOL)allow now:(double)now
+                  usageJSON:(NSDictionary *__strong *)usageJSON
+              lastSuccessAt:(double *)lastSuccessAt nextFetch:(double *)nextFetch
+              accountStatus:(NSString *__strong *)accountStatus
+             fetchedThisRun:(BOOL *)fetchedThisRun cacheAbandoned:(BOOL *)cacheAbandoned
+                 skipReason:(NSString *__strong *)skipReason
+                      token:(NSString *(^)(void))tokenForNow
+                    fetcher:(NSDictionary *(^)(NSString *))fetcher
+                    onError:(void (^)(NSDictionary *))onError {
+    if (ShouldFetchClaudeAccount(use, allow, *usageJSON != nil, (*accountStatus).length > 0, now, *nextFetch)) {
+        *nextFetch = now + kAccountPollInterval;   // the endpoints rate-limit readily
+        *skipReason = nil;
+        NSString *token = tokenForNow();
+        NSDictionary *fetch = token ? fetcher(token) : nil;
+        if ([fetch[@"_glancebarFetchError"] boolValue]) {
+            onError(fetch);
+            GBLog("%{public}s fetch: failed http=%ld rateLimited=%d", label,
+                  (long)[fetch[@"statusCode"] integerValue], [fetch[@"rateLimited"] boolValue]);
+        } else if (fetch && !fetch[@"error"]) {
+            *usageJSON = fetch;
+            *accountStatus = nil;
+            *lastSuccessAt = now;
+            *fetchedThisRun = YES;
+            *cacheAbandoned = NO;
+            _stateDirty = _stateMustPersist = YES;
+            [self savePersistentStateForcingWrite:YES];
+            GBLog("%{public}s fetch: ok", label);
+        } else if (token.length) {
+            *accountStatus = @"Usage API unavailable";
+            GBLog("%{public}s fetch: unusable response", label);
+        }
+    } else {
+        NSString *skip = !allow ? @"hidden" : @"throttled";
+        if (![skip isEqualToString:*skipReason]) {
+            GBLog("%{public}s fetch: skipped (%{public}@)", label, skip);
+            *skipReason = skip;
+        }
+    }
+}
+
+typedef NSArray<NSDictionary *> *(*GBWindowsFn)(NSDictionary *, double);
+typedef NSDictionary *(*GBPickFn)(NSDictionary *, double);
+typedef NSString *(*GBReasonFn)(NSDictionary *, NSString *, double);
+typedef struct {
+    GBWindowsFn liveWindows, staleWindows;
+    GBPickFn pickLive, pickStale;
+    GBReasonFn reason;
+} GBAccountFunctions;
+
+// The gauge, windows, staleness and status strings for one account response. Shared by
+// Claude and Cursor; the provider supplies its pure functions and its wording.
+- (void)applyAccountResponse:(NSDictionary *)usage to:(AIUsage *)u functions:(GBAccountFunctions)fns
+               lastSuccessAt:(double)lastSuccessAt accountStatus:(NSString *)accountStatus
+              fetchedThisRun:(BOOL)fetchedThisRun allowFetch:(BOOL)allowFetch
+                  windowNoun:(NSString *)noun accountName:(NSString *)accountName
+                  sourceLive:(NSString *)sourceLive sourceCached:(NSString *)sourceCached
+              middleFallback:(NSString *)middleFallback
+           unavailableReason:(NSString *)unavailable pausedReason:(NSString *)paused {
+    double now = NSDate.date.timeIntervalSince1970;
+    u.limitWindows = fns.liveWindows(usage, now);
+    NSDictionary *pick = fns.pickLive(usage, now);
+    BOOL usingStaleWindows = NO;
+    if (!pick) {
+        NSArray *staleWindows = fns.staleWindows(usage, now);
+        pick = fns.pickStale(usage, now);
+        if (pick) {
+            u.limitWindows = staleWindows;
+            usingStaleWindows = YES;
+        }
+    }
+    NSString *fetchedAtISO = lastSuccessAt > 0 ? ISOStringFromEpoch(lastSuccessAt) : nil;
+    if (pick) {
+        u.limitStatusAvailable = YES;
+        u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
+        u.limitUpdatedAt = lastSuccessAt > 0 ? [NSDate dateWithTimeIntervalSince1970:lastSuccessAt] : nil;
+        NSNumber *resets = pick[@"resetsAt"];
+        if (resets) {
+            u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
+            u.resetText = ResetTextFromDate(u.resetAt);
+        }
+        BOOL fresh = [pick[@"fresh"] boolValue];
+        if (fresh) {
+            // A window nobody has used yet has no reset to count down to; its clock
+            // starts on the first request. Say that instead of inventing a time.
+            u.resetText = @"Not started";
+            u.resetAt = nil;
+        }
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        [parts addObject:noun.length ? [NSString stringWithFormat:@"%@ %@", pick[@"window"], noun] : pick[@"window"]];
+        if (fresh) [parts addObject:@"nothing used yet"];
+        [parts addObject:accountName];
+        NSString *window = [parts componentsJoinedByString:@" · "];
+        BOOL diskRestoredOnly = !fetchedThisRun && usage != nil;
+        if (usingStaleWindows || diskRestoredOnly || accountStatus.length) u.limitStale = YES;
+        NSString *asOf = AsOfTextFromEpoch(lastSuccessAt);
+        if (accountStatus.length) {
+            u.statusReason = asOf
+                ? [NSString stringWithFormat:@"Cached limit · %@ · %@ · %@", accountStatus, window, asOf]
+                : [NSString stringWithFormat:@"Cached limit · %@ · %@", accountStatus, window];
+            u.statusSource = sourceCached;
+        } else if (usingStaleWindows) {
+            u.statusReason = fns.reason(usage, fetchedAtISO, now) ?: window;
+            u.statusSource = sourceCached;
+        } else if (diskRestoredOnly) {
+            u.statusReason = asOf
+                ? [NSString stringWithFormat:@"Cached limit · %@ · %@", window, asOf]
+                : [@"Cached limit · " stringByAppendingString:window];
+            u.statusSource = sourceCached;
+        } else {
+            u.statusReason = window;
+            u.statusSource = sourceLive;
+        }
+    } else {
+        NSString *fallback = fns.reason(usage, fetchedAtISO, now)
+            ?: (usage ? @"Account response has no current limit window"
+                : allowFetch ? unavailable : paused);
+        u.statusReason = accountStatus ?: (middleFallback ?: fallback);
+        if (allowFetch) u.limitRefreshError = accountStatus ?: fallback;
+    }
+    if (u.limitStatusAvailable && !u.limitUpdatedAt && lastSuccessAt > 0)
+        u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:lastSuccessAt];
+    if (accountStatus.length) u.limitRefreshError = accountStatus;
 }
 
 - (AIUsage *)claudeUsage {
@@ -2146,125 +2295,33 @@ static NSString *HashedMessageID(NSString *messageID) {
             if (_claudeLastActivity) u.lastActivity = _claudeLastActivity;
         }
     } else {
-        // Withdrawn consent: the transcript index (message-ID hashes, per-day totals) must
-        // leave the disk on this pass, not whenever a later one happens to run.
-        if (_claudeFiles.count || _claudeDays.count) _stateDirty = _stateMustPersist = YES;
-        [_claudeFiles removeAllObjects];
-        [_claudeDays removeAllObjects];
-        _claudeInventory = nil;
-        _claudeInventoryValidUntil = 0;
-        _claudeTotalBytes = _claudeDoneBytes = 0;
-        _claudeTotalsIncomplete = _claudeBlocked = NO;
+        [self purgeClaudeTranscriptIndex];
         if (u.statusText.length)
             u.statusText = [u.statusText stringByAppendingString:@" · transcript totals off"];
     }
 
     if (self.useClaudeAccount) {
         double now = NSDate.date.timeIntervalSince1970;
-        if (ShouldFetchClaudeAccount(self.useClaudeAccount, self.allowClaudeAccountFetch,
-                                     _claudeUsageJSON != nil, _claudeAccountStatus.length > 0,
-                                     now, _claudeNextFetch)) {
-            _claudeNextFetch = now + kAccountPollInterval;   // the endpoint rate-limits readily
-            _claudeFetchSkipReason = nil;
-            NSString *token = [self claudeAccessTokenForNow:now];
-            NSDictionary *fetch = token ? FetchClaudeUsageJSON(token) : nil;
-            if ([fetch[@"_glancebarFetchError"] boolValue]) {
-                [self rememberClaudeFetchError:fetch now:now];
-                GBLog("claude fetch: failed http=%ld rateLimited=%d",
-                      (long)[fetch[@"statusCode"] integerValue], [fetch[@"rateLimited"] boolValue]);
-            } else if (fetch && !fetch[@"error"]) {
-                _claudeUsageJSON = fetch;
-                _claudeAccountStatus = nil;
-                _claudeLastSuccessAt = now;
-                _claudeFetchedThisRun = YES;
-                _claudeUsageCacheAbandoned = NO;
-                _stateDirty = _stateMustPersist = YES;
-                [self savePersistentStateForcingWrite:YES];
-                GBLog("claude fetch: ok");
-            } else if (token.length) {
-                _claudeAccountStatus = @"Usage API unavailable";
-                GBLog("claude fetch: unusable response");
-            }
-        } else {
-            NSString *skip = !self.allowClaudeAccountFetch ? @"hidden" : @"throttled";
-            if (![skip isEqualToString:_claudeFetchSkipReason]) {
-                GBLog("claude fetch: skipped (%{public}@)", skip);
-                _claudeFetchSkipReason = skip;
-            }
-        }
+        [self refreshAccountNamed:"claude" use:self.useClaudeAccount allow:self.allowClaudeAccountFetch now:now
+                        usageJSON:&_claudeUsageJSON lastSuccessAt:&_claudeLastSuccessAt nextFetch:&_claudeNextFetch
+                    accountStatus:&_claudeAccountStatus fetchedThisRun:&_claudeFetchedThisRun
+                   cacheAbandoned:&_claudeUsageCacheAbandoned skipReason:&_claudeFetchSkipReason
+                            token:^NSString *{ return [self claudeAccessTokenForNow:now]; }
+                          fetcher:^NSDictionary *(NSString *token){ return self.claudeUsageFetcher(token); }
+                          onError:^(NSDictionary *fetch){ [self rememberClaudeFetchError:fetch now:now]; }];
         NSDictionary *extraStatus = ClaudeExtraUsageStatus(_claudeUsageJSON);
         if (extraStatus[@"description"]) u.extraUsage = extraStatus[@"description"];
-
-        double nowForWindows = NSDate.date.timeIntervalSince1970;
-        u.limitWindows = ClaudeLimitWindows(_claudeUsageJSON, nowForWindows);
-        NSDictionary *pick = PickClaudeLimitWindow(_claudeUsageJSON, nowForWindows);
-        BOOL usingStaleWindows = NO;
-        if (!pick) {
-            NSArray *staleWindows = ClaudeStaleLimitWindows(_claudeUsageJSON, nowForWindows);
-            pick = PickClaudeStaleLimitWindow(_claudeUsageJSON, nowForWindows);
-            if (pick) {
-                u.limitWindows = staleWindows;
-                usingStaleWindows = YES;
-            }
-        }
-        NSString *fetchedAtISO = nil;
-        if (_claudeLastSuccessAt > 0) {
-            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
-            iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
-            fetchedAtISO = [iso stringFromDate:[NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt]];
-        }
-        if (pick) {
-            u.limitStatusAvailable = YES;
-            u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
-            u.limitUpdatedAt = _claudeLastSuccessAt > 0
-                ? [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt] : nil;
-            NSNumber *resets = pick[@"resetsAt"];
-            if (resets) {
-                u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
-                u.resetText = ResetTextFromDate(u.resetAt);
-            }
-            BOOL fresh = [pick[@"fresh"] boolValue];
-            if (fresh) {
-                // A window nobody has used yet has no reset to count down to; its clock
-                // starts on the first request. Say that instead of inventing a time.
-                u.resetText = @"Not started";
-                u.resetAt = nil;
-            }
-            NSString *window = fresh
-                ? [NSString stringWithFormat:@"%@ window · nothing used yet · your Claude account", pick[@"window"]]
-                : [NSString stringWithFormat:@"%@ window · your Claude account", pick[@"window"]];
-            BOOL diskRestoredOnly = !_claudeFetchedThisRun && _claudeUsageJSON != nil;
-            if (usingStaleWindows || diskRestoredOnly || _claudeAccountStatus.length)
-                u.limitStale = YES;
-            NSString *asOf = AsOfTextFromEpoch(_claudeLastSuccessAt);
-            if (_claudeAccountStatus.length) {
-                u.statusReason = asOf
-                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@ · %@",
-                       _claudeAccountStatus, window, asOf]
-                    : [NSString stringWithFormat:@"Cached limit · %@ · %@",
-                       _claudeAccountStatus, window];
-                u.statusSource = @"Cached Anthropic usage API response (opt-in)";
-            } else if (usingStaleWindows) {
-                u.statusReason = ClaudeLimitStatusReason(_claudeUsageJSON, fetchedAtISO, nowForWindows)
-                    ?: window;
-                u.statusSource = @"Cached Anthropic usage API response (opt-in)";
-            } else if (diskRestoredOnly) {
-                u.statusReason = asOf
-                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@", window, asOf]
-                    : [@"Cached limit · " stringByAppendingString:window];
-                u.statusSource = @"Cached Anthropic usage API response (opt-in)";
-            } else {
-                u.statusReason = window;
-                u.statusSource = @"Anthropic usage API (opt-in)";
-            }
-        } else {
-            NSString *fallback = ClaudeLimitStatusReason(_claudeUsageJSON, fetchedAtISO, nowForWindows)
-                ?: (_claudeUsageJSON ? @"Account response has no current limit window"
-                    : self.allowClaudeAccountFetch ? @"Claude account status unavailable"
-                    : @"Claude account refresh paused until visible");
-            u.statusReason = _claudeAccountStatus ?: (extraStatus[@"statusReason"] ?: fallback);
-            if (self.allowClaudeAccountFetch) u.limitRefreshError = _claudeAccountStatus ?: fallback;
-        }
+        GBAccountFunctions fns = { ClaudeLimitWindows, ClaudeStaleLimitWindows,
+                                   PickClaudeLimitWindow, PickClaudeStaleLimitWindow, ClaudeLimitStatusReason };
+        [self applyAccountResponse:_claudeUsageJSON to:u functions:fns
+                     lastSuccessAt:_claudeLastSuccessAt accountStatus:_claudeAccountStatus
+                    fetchedThisRun:_claudeFetchedThisRun allowFetch:self.allowClaudeAccountFetch
+                        windowNoun:@"window" accountName:@"your Claude account"
+                        sourceLive:@"Anthropic usage API (opt-in)"
+                      sourceCached:@"Cached Anthropic usage API response (opt-in)"
+                    middleFallback:extraStatus[@"statusReason"]
+                 unavailableReason:@"Claude account status unavailable"
+                      pausedReason:@"Claude account refresh paused until visible"];
         if ([extraStatus[@"overageActive"] boolValue]) {
             u.limitStatusAvailable = YES;
             u.remainingFraction = 0;
@@ -2283,8 +2340,7 @@ static NSString *HashedMessageID(NSString *messageID) {
             }
         }
         if (u.limitStatusAvailable && !u.limitUpdatedAt && _claudeLastSuccessAt > 0)
-            u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt];
-        if (_claudeAccountStatus.length) u.limitRefreshError = _claudeAccountStatus;
+            u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:_claudeLastSuccessAt];   // overage path
         u.diagnostics = [NSString stringWithFormat:@"usage JSON %@ · next fetch %@ · keychain %@",
             _claudeUsageJSON ? @"cached" : @"none",
             FmtEpochClock(_claudeNextFetch),
@@ -2299,6 +2355,26 @@ static NSString *HashedMessageID(NSString *messageID) {
         u.diagnostics = @"account status not requested";
     }
     return u;
+}
+
+// Withdrawn consent: the transcript index (message-ID hashes, per-day totals) must leave
+// the disk NOW — the toggle calls this directly, because no read() runs while every AI
+// surface is hidden and "on the next pass" may mean never.
+- (void)purgeClaudeTranscriptIndex {
+    BOOL hadIndex = _claudeFiles.count || _claudeDays.count;
+    [_claudeFiles removeAllObjects];
+    [_claudeDays removeAllObjects];
+    _claudeInventory = nil;
+    _claudeInventoryValidUntil = 0;
+    _claudeTotalBytes = _claudeDoneBytes = 0;
+    _claudeTotalsIncomplete = _claudeBlocked = NO;
+    _claudeModels = @[];
+    _claudeSessionsToday = _claudeSessionsWeek = _claudeMessagesToday = _claudeToolsToday = 0;
+    _claudeLastActivity = nil;
+    if (hadIndex) {
+        _stateDirty = _stateMustPersist = YES;
+        [self savePersistentStateForcingWrite:YES];
+    }
 }
 
 - (void)forgetClaudeAccountCredentials {
@@ -2324,7 +2400,7 @@ static NSString *HashedMessageID(NSString *messageID) {
         return nil;
     }
     double readStart = CFAbsoluteTimeGetCurrent();
-    NSString *token = CursorAccessTokenFromStateDB(_homeDirectory);
+    NSString *token = self.cursorTokenReader(_homeDirectory);
     double readMs = (CFAbsoluteTimeGetCurrent() - readStart) * 1000.0;
     if (!token.length) {
         _cursorAccessToken = nil;
@@ -2340,19 +2416,8 @@ static NSString *HashedMessageID(NSString *messageID) {
 }
 
 - (void)rememberCursorFetchError:(NSDictionary *)fetch now:(double)now {
-    BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
-    double retry = [fetch[@"retryAfter"] doubleValue];
-    NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
-    if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue])) {
-        _cursorAccessToken = nil;   // revoked/expired; re-read state.vscdb next attempt
-    }
-    if (rateLimited) {
-        _cursorNextFetch = now + RateLimitRetryDelay(retry);
-        _cursorAccountStatus = @"Usage API rate-limited; retrying later";
-    } else {
-        _cursorAccountStatus = message.length ? [@"Usage API: " stringByAppendingString:message]
-                                              : @"Usage API unavailable";
-    }
+    [self rememberFetchError:fetch now:now token:&_cursorAccessToken expiresAt:NULL
+                   nextFetch:&_cursorNextFetch status:&_cursorAccountStatus];
 }
 
 - (AIUsage *)cursorUsage {
@@ -2367,104 +2432,28 @@ static NSString *HashedMessageID(NSString *messageID) {
 
     if (self.useCursorAccount) {
         double now = NSDate.date.timeIntervalSince1970;
-        // Same visibility/throttle gate as Claude: reuse the pure decision.
-        if (ShouldFetchClaudeAccount(self.useCursorAccount, self.allowCursorAccountFetch,
-                                     _cursorUsageJSON != nil, _cursorAccountStatus.length > 0,
-                                     now, _cursorNextFetch)) {
-            _cursorNextFetch = now + kAccountPollInterval;
-            _cursorFetchSkipReason = nil;
-            NSString *token = [self cursorAccessTokenForNow:now];
-            NSDictionary *fetch = token ? FetchCursorUsageJSON(token) : nil;
-            if ([fetch[@"_glancebarFetchError"] boolValue]) {
-                [self rememberCursorFetchError:fetch now:now];
-                GBLog("cursor fetch: failed http=%ld rateLimited=%d",
-                      (long)[fetch[@"statusCode"] integerValue], [fetch[@"rateLimited"] boolValue]);
-            } else if (fetch && !fetch[@"error"]) {
-                _cursorUsageJSON = fetch;
-                _cursorAccountStatus = nil;
-                _cursorLastSuccessAt = now;
-                _cursorFetchedThisRun = YES;
-                _cursorUsageCacheAbandoned = NO;
-                _stateDirty = _stateMustPersist = YES;
-                [self savePersistentStateForcingWrite:YES];
-                GBLog("cursor fetch: ok");
-            } else if (token.length) {
-                _cursorAccountStatus = @"Usage API unavailable";
-                GBLog("cursor fetch: unusable response");
-            }
-        } else {
-            NSString *skip = !self.allowCursorAccountFetch ? @"cursor-hidden" : @"cursor-throttled";
-            if (![skip isEqualToString:_cursorFetchSkipReason]) {
-                GBLog("cursor fetch: skipped (%{public}@)", skip);
-                _cursorFetchSkipReason = skip;
-            }
-        }
-
-        u.limitWindows = CursorLimitWindows(_cursorUsageJSON, now);
-        NSDictionary *pick = PickCursorLimitWindow(_cursorUsageJSON, now);
-        BOOL usingStaleWindows = NO;
-        if (!pick) {
-            NSArray *staleWindows = CursorStaleLimitWindows(_cursorUsageJSON, now);
-            pick = PickCursorStaleLimitWindow(_cursorUsageJSON, now);
-            if (pick) {
-                u.limitWindows = staleWindows;
-                usingStaleWindows = YES;
-            }
-        }
-        NSString *fetchedAtISO = nil;
-        if (_cursorLastSuccessAt > 0) {
-            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
-            iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
-            fetchedAtISO = [iso stringFromDate:[NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt]];
-        }
-        if (pick) {
+        [self refreshAccountNamed:"cursor" use:self.useCursorAccount allow:self.allowCursorAccountFetch now:now
+                        usageJSON:&_cursorUsageJSON lastSuccessAt:&_cursorLastSuccessAt nextFetch:&_cursorNextFetch
+                    accountStatus:&_cursorAccountStatus fetchedThisRun:&_cursorFetchedThisRun
+                   cacheAbandoned:&_cursorUsageCacheAbandoned skipReason:&_cursorFetchSkipReason
+                            token:^NSString *{ return [self cursorAccessTokenForNow:now]; }
+                          fetcher:^NSDictionary *(NSString *token){ return self.cursorUsageFetcher(token); }
+                          onError:^(NSDictionary *fetch){ [self rememberCursorFetchError:fetch now:now]; }];
+        GBAccountFunctions fns = { CursorLimitWindows, CursorStaleLimitWindows,
+                                   PickCursorLimitWindow, PickCursorStaleLimitWindow, CursorLimitStatusReason };
+        [self applyAccountResponse:_cursorUsageJSON to:u functions:fns
+                     lastSuccessAt:_cursorLastSuccessAt accountStatus:_cursorAccountStatus
+                    fetchedThisRun:_cursorFetchedThisRun allowFetch:self.allowCursorAccountFetch
+                        windowNoun:nil accountName:@"your Cursor account"
+                        sourceLive:@"Cursor usage API (opt-in)"
+                      sourceCached:@"Cached Cursor usage API response (opt-in)"
+                    middleFallback:nil
+                 unavailableReason:@"Cursor account status unavailable"
+                      pausedReason:@"Cursor account refresh paused until visible"];
+        if (u.limitStatusAvailable) {
             u.available = YES;
-            u.limitStatusAvailable = YES;
-            u.remainingFraction = [pick[@"remainingFraction"] doubleValue];
-            u.limitUpdatedAt = _cursorLastSuccessAt > 0
-                ? [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt] : nil;
-            NSNumber *resets = pick[@"resetsAt"];
-            if (resets) {
-                u.resetAt = [NSDate dateWithTimeIntervalSince1970:resets.doubleValue];
-                u.resetText = ResetTextFromDate(u.resetAt);
-            }
-            NSString *window = [NSString stringWithFormat:@"%@ · your Cursor account", pick[@"window"]];
-            BOOL diskRestoredOnly = !_cursorFetchedThisRun && _cursorUsageJSON != nil;
-            if (usingStaleWindows || diskRestoredOnly || _cursorAccountStatus.length)
-                u.limitStale = YES;
-            NSString *asOf = AsOfTextFromEpoch(_cursorLastSuccessAt);
-            if (_cursorAccountStatus.length) {
-                u.statusReason = asOf
-                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@ · %@",
-                       _cursorAccountStatus, window, asOf]
-                    : [NSString stringWithFormat:@"Cached limit · %@ · %@",
-                       _cursorAccountStatus, window];
-                u.statusSource = @"Cached Cursor usage API response (opt-in)";
-            } else if (usingStaleWindows) {
-                u.statusReason = CursorLimitStatusReason(_cursorUsageJSON, fetchedAtISO, now)
-                    ?: window;
-                u.statusSource = @"Cached Cursor usage API response (opt-in)";
-            } else if (diskRestoredOnly) {
-                u.statusReason = asOf
-                    ? [NSString stringWithFormat:@"Cached limit · %@ · %@", window, asOf]
-                    : [@"Cached limit · " stringByAppendingString:window];
-                u.statusSource = @"Cached Cursor usage API response (opt-in)";
-            } else {
-                u.statusReason = window;
-                u.statusSource = @"Cursor usage API (opt-in)";
-            }
             u.statusText = @"Limit status from Cursor account";
-        } else {
-            NSString *fallback = CursorLimitStatusReason(_cursorUsageJSON, fetchedAtISO, now)
-                ?: (_cursorUsageJSON ? @"Account response has no current limit window"
-                    : self.allowCursorAccountFetch ? @"Cursor account status unavailable"
-                    : @"Cursor account refresh paused until visible");
-            u.statusReason = _cursorAccountStatus ?: fallback;
-            if (self.allowCursorAccountFetch) u.limitRefreshError = _cursorAccountStatus ?: fallback;
         }
-        if (u.limitStatusAvailable && !u.limitUpdatedAt && _cursorLastSuccessAt > 0)
-            u.limitUpdatedAt = [NSDate dateWithTimeIntervalSince1970:_cursorLastSuccessAt];
-        if (_cursorAccountStatus.length) u.limitRefreshError = _cursorAccountStatus;
         u.diagnostics = [NSString stringWithFormat:@"usage JSON %@ · next fetch %@ · session %@",
             _cursorUsageJSON ? @"cached" : @"none",
             FmtEpochClock(_cursorNextFetch),
@@ -2676,6 +2665,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     _scanBytesRemaining = 16 * 1024 * 1024;
     _scanDeadline = CFAbsoluteTimeGetCurrent() + 0.35;
     _needsImmediateRescan = NO;
+    [self adoptNewerAccountCachesFromDisk];
     [self scanRollouts];
     if (self.allowClaudeTranscripts) [self scanClaudeTranscripts];
     NSMutableArray<AIUsage *> *usage = [NSMutableArray arrayWithObjects:
@@ -3123,8 +3113,9 @@ static NSArray<NSDictionary *> *BarLayout(NSArray<NSDictionary *> *segments, NSC
         NSString *text = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : @"";
         NSImage *customImage = [seg[@"image"] isKindOfClass:NSImage.class] ? seg[@"image"] : nil;
         NSImage *sym = customImage ?: (symbol.length ? TintedSymbol(symbol, var ? var.doubleValue : -1, pt, fg) : nil);
-        // When compact mode falls back to icons, empty text adds no leading space.
-        NSString *drawText = text.length ? [NSString stringWithFormat:@" %@", text] : @"";
+        // The space separates text from its icon; a text-only segment (compact battery
+        // percentage) gets none, or it sits 3.5pt off-centre inside its own host.
+        NSString *drawText = text.length ? (sym ? [@" " stringByAppendingString:text] : text) : @"";
         NSSize textSize = drawText.length ? [drawText sizeWithAttributes:@{NSFontAttributeName:font}] : NSZeroSize;
         CGFloat segW = (sym ? sym.size.width : 0) + textSize.width;
         if (draw.count) w += gap*2;
@@ -3189,6 +3180,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 - (void)refreshVolumesAsync;
 - (void)refreshAIUsageAsync;
 - (void)refreshLidAwakeAsync;
+- (void)refreshLidAwakeForced:(BOOL)force;
 - (void)updateBar;
 - (void)refreshVisibleSurfaces;
 - (NSDictionary *)focusSnapshotForWindow:(NSWindow *)window rootView:(NSView *)root;
@@ -3229,6 +3221,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
     BarTierState _barTier;             // adaptive bar width; zero-init = full tier
     BOOL _barWasOnBar;                 // arms the eviction net only after a real sighting
+    double _barCreatedAt;              // eviction grace for an item never sighted (crowded launch)
+    BOOL _barSwapPending;              // a differently sized image was just installed…
+    double _barFrameBeforeSwap;        // …and the host frame has not moved off this width yet
+    double _lidAwakeLastRead;
     double _barChromeWidth;            // shell padding around the rendered image (16pt live)
     BOOL _barChromeKnown;
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
@@ -3292,6 +3288,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSApp.mainMenu = mainMenu;
 
     _item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    _barCreatedAt = CFAbsoluteTimeGetCurrent();
     _item.button.target = self;
     _item.button.action = @selector(togglePopover:);
     // Re-render immediately when the menu bar flips light/dark (Light/Dark toggle, or a
@@ -3308,6 +3305,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
 
     [self refresh];
+    // The CPU figure needs two tick samples at least 2 s apart; take the second one now
+    // rather than leaving "estimating" on the bar until the 15 s timer first fires.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self refresh]; });
     // Diagnostic: GLANCEBAR_AUTOOPEN=1 opens the popover on launch (for screenshots).
     if (getenv("GLANCEBAR_AUTOOPEN"))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6*NSEC_PER_SEC)),
@@ -3452,11 +3453,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : -1;
 }
 
+// A cached figure whose window has since reset says nothing about now.
+static BOOL AIWindowElapsed(AIUsage *u) {
+    return u.limitStale && u.resetAt && u.resetAt.timeIntervalSinceNow <= 0;
+}
+
 - (AIUsage *)lowestAIStatus {
     AIUsage *lowest = nil;
     for (AIUsage *u in _aiUsage) {
         if (!u.limitStatusAvailable || u.remainingFraction < 0) continue;
-        if (!lowest || u.remainingFraction < lowest.remainingFraction) lowest = u;
+        // A still-current figure from any tool outranks an elapsed cached one, however
+        // low the elapsed one reads; among peers the least room wins.
+        BOOL elapsed = AIWindowElapsed(u), lowestElapsed = lowest ? AIWindowElapsed(lowest) : YES;
+        if (!lowest || (lowestElapsed && !elapsed) ||
+            (elapsed == lowestElapsed && u.remainingFraction < lowest.remainingFraction))
+            lowest = u;
     }
     return lowest;
 }
@@ -3521,9 +3532,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     }
     if (_barShowAI) {
         AIUsage *lowest = [self lowestAIStatus];
-        NSString *text = lowest ? [NSString stringWithFormat:@"AI %@", [self aiPercentText:lowest]] : @"AI ?";
+        // An elapsed cached window is drawn as unknown: its percentage is from before
+        // the reset, and live styling would claim otherwise.
+        BOOL elapsed = lowest && AIWindowElapsed(lowest);
+        NSString *text = !lowest ? @"AI ?" : elapsed ? @"AI —"
+                       : [NSString stringWithFormat:@"AI %@", [self aiPercentText:lowest]];
         [segments addObject:@{@"symbol": @"sparkles", @"text": text,
-                              @"color": lowest ? [self aiStatusColor:lowest] : NSColor.secondaryLabelColor}];
+                              @"color": lowest && !elapsed ? [self aiStatusColor:lowest] : NSColor.secondaryLabelColor}];
     }
     // The eye normally rides in the battery segment; if that segment is hidden or there's no
     // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
@@ -3551,14 +3566,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     }
     if (_barShowAI) {
         AIUsage *lowest = [self lowestAIStatus];
-        [parts addObject:lowest ? [NSString stringWithFormat:@"AI, %@ %d percent remaining%@", lowest.name,
+        [parts addObject:!lowest ? @"AI limit status unavailable"
+                       : AIWindowElapsed(lowest)
+                           ? [NSString stringWithFormat:@"AI, %@ cached figure whose window has since reset", lowest.name]
+                       : [NSString stringWithFormat:@"AI, %@ %d percent remaining%@", lowest.name,
                                     (int)lround(lowest.remainingFraction * 100),
                                     // A carried-forward Codex window is cached without any
                                     // refresh having failed; only say so when one did.
                                     !lowest.limitStale ? @""
                                         : lowest.limitRefreshError.length ? @", cached; refresh failed"
-                                        : @", cached"]
-                                : @"AI limit status unavailable"];
+                                        : @", cached"]];
     }
     if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
@@ -3712,9 +3729,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         // the currently installed image, not _barTier: Control Centre resizes the host
         // asynchronously after a tier change, so those two can briefly disagree.
         NSImage *installedImage = self->_item.button.image;
-        if (onBar && installedImage) {
-            double chrome = NSWidth(self->_item.button.window.frame) - installedImage.size.width;
-            if (isfinite(chrome) && chrome >= 0 && chrome <= 40) {
+        double hostFrameWidth = NSWidth(self->_item.button.window.frame);
+        // After a tier swap the host keeps its OLD width until Control Centre resizes it;
+        // measuring chrome against that frame credits the whole width difference to
+        // chrome (24pt for battery-only Full→Compact). Wait for the frame to move.
+        if (self->_barSwapPending && fabs(hostFrameWidth - self->_barFrameBeforeSwap) > 0.5)
+            self->_barSwapPending = NO;
+        if (onBar && installedImage && !self->_barSwapPending) {
+            double chrome = hostFrameWidth - installedImage.size.width;
+            if (isfinite(chrome) && chrome >= 0 && chrome <= 24) {
                 self->_barChromeWidth = chrome;
                 self->_barChromeKnown = YES;
             }
@@ -3723,7 +3746,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         double chrome = self->_barChromeKnown ? self->_barChromeWidth : 0;
         for (int t = 0; t < 3; t++) occupiedWidths[t] = widths[t] + chrome;
         if (onBar) self->_barWasOnBar = YES;
-        BOOL evicted = self->_barWasOnBar && !onBar;
+        BOOL evicted = BarEvictionSuspected(self->_barWasOnBar, onBar,
+                                            CFAbsoluteTimeGetCurrent() - self->_barCreatedAt);
         BarTierState chosen = ChooseBarTier(self->_barTier, capacity, occupiedWidths, evicted,
                                             CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
@@ -3733,7 +3757,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                   onBar, evicted,
                   self->_barTier.tier, chosen.tier, chosen.expandStreak);
         self->_barTier = chosen;
-        self->_item.button.image = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);
+        NSImage *next = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);
+        if (installedImage && fabs(next.size.width - installedImage.size.width) > 0.5) {
+            self->_barSwapPending = YES;
+            self->_barFrameBeforeSwap = hostFrameWidth;
+        }
+        self->_item.button.image = next;
     }];
     NSString *summary = [self barAccessibilityText];
     _item.button.toolTip = [@"Glancebar — " stringByAppendingString:summary];
@@ -3745,13 +3774,21 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // SleepDisabled is read through a `pmset -g` subprocess, so — like the AI usage read — it
 // must stay off the main thread (refresh fires every 15s and on IOPS bursts). Single-flight:
 // a tick arriving mid-read is skipped. Only redraws the bar when the cached value changes.
-- (void)refreshLidAwakeAsync {
+- (void)refreshLidAwakeAsync { [self refreshLidAwakeForced:NO]; }
+// Polled once a minute (other tools can flip the setting); forced right after our own
+// toggle, through pmset itself, so the eye follows the change without waiting.
+- (void)refreshLidAwakeForced:(BOOL)force {
     if (_lidAwakeReading) return;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (!force && _lidAwakeLastRead > 0 && now - _lidAwakeLastRead < 60) return;
     _lidAwakeReading = YES;
+    _lidAwakeLastRead = now;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        BOOL awake = SleepDisabledNow();
+        NSNumber *state = force ? SleepDisabledStateViaTool() : SleepDisabledState();
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_lidAwakeReading = NO;
+            if (!state) return;   // unknown: keep the last known reading
+            BOOL awake = state.boolValue;
             if (awake != self->_lidAwake) { self->_lidAwake = awake; [self updateBar]; }
         });
     });
@@ -4376,7 +4413,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             double frac = memTotal > 0 ? (double)bytes / (double)memTotal : 0;
             NSDictionary *info = ProcessDisplayInfo(h);
-            [root addSubview:[self compactSignalRow:info[@"title"] right:FmtBytes(bytes)
+            [root addSubview:[self compactSignalRow:info[@"title"] right:FmtMemBytes(bytes)
                                            fraction:(frac < 1.0 ? frac : 1.0)
                                               color:SystemPressureColor(MemoryPressureLevel(_sys))
                                               width:kW pad:kPad at:y]];
@@ -4603,6 +4640,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeTranscripts"];
+    if (!enabling) dispatch_async(_aiQueue, ^{
+        self->_aiReader.allowClaudeTranscripts = NO;
+        [self->_aiReader purgeClaudeTranscriptIndex];
+    });
     [self refresh];
 }
 // Keeps the Mac running with the lid closed by flipping the SleepDisabled system power
@@ -4637,7 +4678,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         SetSleepDisabledViaAdmin(enabling);
         // Re-read the true state (whether it applied or the user cancelled) and update the
         // bar eye promptly, rather than waiting up to 15s for the next refresh tick.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshLidAwakeAsync]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshLidAwakeForced:YES]; });
     });
 }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
@@ -4900,7 +4941,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             uint64_t total = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : bytes;
             double frac = total > 0 ? (double)bytes / (double)total : 0;
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Mem %@", FmtBytes(bytes)]
+            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Mem %@", FmtMemBytes(bytes)]
                                            fraction:(frac < 1.0 ? frac : 1.0)
                                               color:SystemPressureColor(MemoryPressureLevel(_sys))
                                               width:kDetailW pad:kDetailPad at:y]];
@@ -4937,6 +4978,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         y += 34;
         [self addDetailKey:@"Used" value:FmtBytes(volume.used) to:root y:&y width:kDetailW];
         [self addDetailKey:@"Available" value:FmtBytes(volume.available) to:root y:&y width:kDetailW];
+        if (volume.purgeable > volume.total / 100)   // worth a line only when it moves the number
+            [self addDetailKey:@"Purgeable"
+                         value:[NSString stringWithFormat:@"%@ of that · macOS thins it on demand, so Finder counts it as free",
+                                FmtBytes(volume.purgeable)]
+                            to:root y:&y width:kDetailW];
         [self addDetailKey:@"Capacity" value:FmtBytes(volume.total) to:root y:&y width:kDetailW];
         [self addDetailKey:@"Mount point" value:volume.path to:root y:&y width:kDetailW];
         NSButton *reveal = [NSButton buttonWithTitle:@"Reveal in Finder" target:self action:@selector(revealVolume:)];
@@ -5157,7 +5203,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         for (NSDictionary *h in _topMem) {
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             double frac = memTotal > 0 ? (double)bytes / (double)memTotal : 0;
-            [root addSubview:[self processMetricRow:h right:FmtBytes(bytes) fraction:(frac < 1.0 ? frac : 1.0)
+            [root addSubview:[self processMetricRow:h right:FmtMemBytes(bytes) fraction:(frac < 1.0 ? frac : 1.0)
                                               color:SystemPressureColor(MemoryPressureLevel(_sys))
                                               width:kDetailW pad:kDetailPad at:y]];
             y += 42;
@@ -5327,6 +5373,8 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
             @"totalBytes": @(volume.total),
             @"usedBytes": @(volume.used),
             @"availableBytes": @(volume.available),
+            @"physicalAvailableBytes": @(volume.physicalAvailable),
+            @"purgeableBytes": @(volume.purgeable),
             @"usedPercent": @(volume.fraction * 100.0)
         }];
     }
@@ -5565,10 +5613,10 @@ static void PrintHumanDump(NSDictionary *snapshot) {
         : [NSString stringWithFormat:@"CPU %d%%", (int)lround([system[@"cpuPercent"] doubleValue])];
     NSString *memory = system[@"memoryAvailableBytes"] == NSNull.null ? @"Memory unknown"
         : [NSString stringWithFormat:@"Memory pressure %@ · %@ available", system[@"memoryPressure"],
-           FmtBytes([system[@"memoryAvailableBytes"] longLongValue])];
+           FmtMemBytes([system[@"memoryAvailableBytes"] longLongValue])];
     NSString *swap = system[@"swapUsedBytes"] == NSNull.null ? @"Swap unknown"
         : [system[@"swapUsedBytes"] unsignedLongLongValue] == 0 ? @"Swap none"
-        : [NSString stringWithFormat:@"Swap %@", FmtBytes([system[@"swapUsedBytes"] longLongValue])];
+        : [NSString stringWithFormat:@"Swap %@", FmtMemBytes([system[@"swapUsedBytes"] longLongValue])];
     printf("system %s · %s · %s\n", UTF8(cpu), UTF8(memory), UTF8(swap));
     NSArray *topCPU = system[@"topCPU"], *topMemory = system[@"topMemory"];
     if (!topCPU.count && !topMemory.count) printf("top apps unavailable\n");
@@ -5580,7 +5628,7 @@ static void PrintHumanDump(NSDictionary *snapshot) {
     if (topMemory.count) {
         printf("top memory:\n");
         for (NSDictionary *row in topMemory)
-            printf("  %6s  %-18s %s\n", UTF8(FmtBytes([row[@"bytes"] longLongValue])),
+            printf("  %6s  %-18s %s\n", UTF8(FmtMemBytes([row[@"bytes"] longLongValue])),
                    UTF8(row[@"title"]), UTF8(row[@"detail"]));
     }
 
@@ -5599,10 +5647,22 @@ static void PrintHumanDump(NSDictionary *snapshot) {
         NSString *reset = provider[@"reset"] == NSNull.null ? @"reset unavailable"
             : [NSString stringWithFormat:@"resets %@", provider[@"reset"]];
         NSString *reason = provider[@"statusReason"] == NSNull.null ? @"" : provider[@"statusReason"];
-        printf("  %-7s %s · %s · today %s · 7d %s%s%s\n", UTF8(provider[@"name"]), UTF8(remaining), UTF8(reset),
+        // The JSON's staleness, in words: a cached figure older than the poll interval
+        // says its age, the same rule the popover row follows.
+        NSString *stale = @"";
+        NSDate *checked = provider[@"limitUpdatedAt"] != NSNull.null ? DateFromStatusString(provider[@"limitUpdatedAt"]) : nil;
+        if ([provider[@"limitStale"] boolValue]) {
+            NSTimeInterval age = checked ? -checked.timeIntervalSinceNow : -1;
+            if (!checked) stale = @" · cached";
+            else if (age >= kAccountPollInterval)
+                stale = age < 3600 ? [NSString stringWithFormat:@" · cached %.0fm ago", age / 60]
+                      : age < 86400 ? [NSString stringWithFormat:@" · cached %.0fh ago", age / 3600]
+                      : [NSString stringWithFormat:@" · cached %.0fd ago", age / 86400];
+        }
+        printf("  %-7s %s · %s · today %s · 7d %s%s%s%s\n", UTF8(provider[@"name"]), UTF8(remaining), UTF8(reset),
                UTF8(FmtTokenCount([provider[@"todayFreshTokens"] longLongValue])),
                UTF8(FmtTokenCount([provider[@"sevenDayFreshTokens"] longLongValue])),
-               reason.length ? " · " : "", UTF8(reason));
+               reason.length ? " · " : "", UTF8(reason), UTF8(stale));
         for (NSDictionary *window in provider[@"windows"]) {
             NSString *windowReset = window[@"resetsAt"] ? ResetTextFromDate(
                 [NSDate dateWithTimeIntervalSince1970:[window[@"resetsAt"] doubleValue]])
