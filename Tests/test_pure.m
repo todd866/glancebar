@@ -771,11 +771,15 @@ int main(void) {
         }
 
         // --- BarEvictionSuspected: arm-after-seen, with a launch grace ---
-        check(!BarEvictionSuspected(NO, NO, 5), @"eviction: an unseen item inside the grace is not evicted");
-        check(BarEvictionSuspected(NO, NO, kBarEvictionGraceSec), @"eviction: never seen after the grace counts as evicted");
-        check(BarEvictionSuspected(YES, NO, 0), @"eviction: a fall from the bar is eviction at once");
-        check(!BarEvictionSuspected(YES, YES, 1000) && !BarEvictionSuspected(NO, YES, 1000),
+        check(!BarEvictionSuspected(YES, NO, NO, 5), @"eviction: an unseen item inside the grace is not evicted");
+        check(BarEvictionSuspected(YES, NO, NO, kBarEvictionGraceSec), @"eviction: never seen after the grace counts as evicted");
+        check(BarEvictionSuspected(YES, YES, NO, 0), @"eviction: a fall from the bar is eviction at once");
+        check(!BarEvictionSuspected(YES, YES, YES, 1000) && !BarEvictionSuspected(YES, NO, YES, 1000),
               @"eviction: on the bar is never evicted");
+        // The clamshell trap: with the lid shut the window list reports none of our own
+        // windows, which reads exactly like eviction. Never conclude anything from it.
+        check(!BarEvictionSuspected(NO, NO, NO, 100000) && !BarEvictionSuspected(NO, YES, NO, 100000),
+              @"eviction: an unobservable bar is never judged evicted, however long it has been");
 
         // --- ChooseBarTier ---
         {

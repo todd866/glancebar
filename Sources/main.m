@@ -3617,6 +3617,19 @@ static double MeasuredBarCapacity(NSStatusItem *item) {
 // without moving it, so occlusion must not read as eviction. Measured against the
 // window's OWN screen — with several displays the item follows the active menu bar,
 // and comparing it to the primary's top edge would false-positive forever.
+// Whether the bar can be observed at all right now. With the lid closed and the panel
+// dark, CGWindowList reports none of this process's own windows — identical to having
+// been evicted — and no tier decision can be right or even matter, because nobody is
+// looking. Judge the display the item actually lives on, so a clamshell Mac driving an
+// external screen still measures normally.
+static BOOL BarDisplayObservable(NSStatusItem *item) {
+    NSScreen *screen = item.button.window.screen ?: NSScreen.mainScreen;
+    NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+    if (![number isKindOfClass:NSNumber.class]) return NO;
+    CGDirectDisplayID display = (CGDirectDisplayID)number.unsignedIntValue;
+    return CGDisplayIsActive(display) && !CGDisplayIsAsleep(display);
+}
+
 static BOOL BarItemOnBar(NSStatusItem *item) {
     NSWindow *win = item.button.window;
     NSScreen *screen = win.screen ?: NSScreen.screens.firstObject;
@@ -3721,7 +3734,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         // bar there is nothing to have been evicted from, so the safety net stays
         // disarmed — otherwise every launch can start at the glyph tier before Control
         // Centre has placed the host window we need for a real capacity measurement.
-        BOOL onBar = BarItemOnBar(self->_item);
+        // A sleeping display makes every input to this decision untrustworthy, so make
+        // no decision: hold the tier and re-measure when the display returns.
+        BOOL observable = BarDisplayObservable(self->_item);
+        BOOL onBar = observable && BarItemOnBar(self->_item);
         // Before the hosted item is actually on-bar, its app-side frame is not a valid
         // self-exclusion key. Hold the current tier until Control Centre places it.
         double capacity = onBar ? MeasuredBarCapacity(self->_item) : -1;
@@ -3748,15 +3764,19 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         double chrome = self->_barChromeKnown ? self->_barChromeWidth : 0;
         for (int t = 0; t < kBarTierCount; t++) occupiedWidths[t] = widths[t] + chrome;
         if (onBar) self->_barWasOnBar = YES;
-        BOOL evicted = BarEvictionSuspected(self->_barWasOnBar, onBar,
+        BOOL evicted = BarEvictionSuspected(observable, self->_barWasOnBar, onBar,
                                             CFAbsoluteTimeGetCurrent() - self->_barCreatedAt);
+        // The grace counts time the bar was actually observable: a Mac that spent the
+        // first minute of its session with the lid shut has not yet had a chance to be
+        // placed, and must not be judged as though it had.
+        if (!observable) self->_barCreatedAt = CFAbsoluteTimeGetCurrent();
         BarTierState chosen = ChooseBarTier(self->_barTier, capacity, occupiedWidths, evicted,
                                             CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
             NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f %.0f] occupied=[%.0f %.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d",
                   capacity, widths[0], widths[1], widths[2], widths[3],
                   occupiedWidths[0], occupiedWidths[1], occupiedWidths[2], occupiedWidths[3], chrome,
-                  onBar, evicted,
+                  observable ? onBar : -1, evicted,
                   self->_barTier.tier, chosen.tier, chosen.expandStreak);
         self->_barTier = chosen;
         NSImage *next = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);

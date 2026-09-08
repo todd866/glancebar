@@ -309,6 +309,9 @@ to edge, so an item that is on the bar already fits: Glancebar narrows only when
 neighbour genuinely overlaps it, not merely because there is no slack beside it. An item
 that was never placed at all — launching into a bar with no room — falls to the glyph
 after 30 seconds rather than staying invisible, and grows back once space is measured.
+None of this runs while the display is asleep: with the lid shut, the window list reports
+none of the app's own windows, which is indistinguishable from having been evicted, so
+Glancebar holds its width and re-measures when the display comes back.
 
 ## Credits
 

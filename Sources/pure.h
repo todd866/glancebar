@@ -336,5 +336,12 @@ BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
 // kBarEvictionGraceSec without a sighting, "not on the bar" counts as evicted: the
 // glyph is drawn, Control Centre places it, and measurement-gated expansion takes it
 // back up within a couple of ticks if there was room after all.
+//
+// barObservable is the whole safeguard on that inference. With the lid closed (or the
+// display otherwise asleep) the window list reports nothing for this process's own
+// windows, which is indistinguishable from having been evicted — and nobody can see the
+// bar anyway, so there is nothing to decide. Absence of evidence is not eviction: when
+// the bar cannot be observed this returns NO and the caller holds its tier until the
+// display comes back and a real measurement is possible.
 extern const double kBarEvictionGraceSec;   // 30
-BOOL BarEvictionSuspected(BOOL seenOnBar, BOOL onBar, double sinceCreatedSec);
+BOOL BarEvictionSuspected(BOOL barObservable, BOOL seenOnBar, BOOL onBar, double sinceCreatedSec);

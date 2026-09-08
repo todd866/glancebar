@@ -1058,7 +1058,8 @@ double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
     return MIN(rightEdge - leftBoundary, MAX(0.0, ownRight - obstacleRight));
 }
 
-BOOL BarEvictionSuspected(BOOL seenOnBar, BOOL onBar, double sinceCreatedSec) {
+BOOL BarEvictionSuspected(BOOL barObservable, BOOL seenOnBar, BOOL onBar, double sinceCreatedSec) {
+    if (!barObservable) return NO;   // cannot see the bar: know nothing, change nothing
     if (onBar) return NO;
     if (seenOnBar) return YES;
     return sinceCreatedSec >= kBarEvictionGraceSec;
