@@ -272,10 +272,17 @@ BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
                                       NSString *expectedBundleID);
 
 // --- Adaptive bar width ---
-// The menu bar item renders at one of three tiers; macOS evicts an item wholesale
-// when it cannot fit beside the notch, so Glancebar sizes itself to what exists.
-// Compact keeps the most useful configured reading rather than erasing all text.
-enum { BarTierFull = 0, BarTierCompact = 1, BarTierGlyph = 2 };
+// The menu bar item renders at one of four tiers; macOS evicts an item wholesale when
+// it cannot fit beside the notch, so Glancebar sizes itself to what exists. The rungs
+// give up as little as possible at each step: the icons go before any reading does, and
+// a single reading survives before the item becomes a bare glyph.
+//   Full     💾 61%  🔋 76%   every configured reading, with its meter icons
+//   Text     61%  76%         the same readings, no icons (~30% narrower)
+//   Compact  76%             the one reading marked compactPriority (battery percentage)
+//   Glyph    ⌾                identity only
+// The lid-awake eye is a safety reminder, not decoration: it survives every tier.
+enum { BarTierFull = 0, BarTierText = 1, BarTierCompact = 2, BarTierGlyph = 3 };
+#define kBarTierCount 4
 
 typedef struct {
     double x;
@@ -316,12 +323,12 @@ extern const double kBarExpandMinIntervalSec;   // 10
 
 // capacityPt: measured physical points the current status-item host may occupy while
 // growing left, < 0 = unmeasurable (hold tier). widths[]: this tick's physical host
-// width for each tier (rendered image plus shell chrome). evicted: the shell saw the
-// item's window parked off the bar — forces glyph regardless of the measurement,
-// which is by definition stale when eviction has already happened.
+// width for each tier (rendered image plus shell chrome), widest first. evicted: the
+// shell saw the item's window parked off the bar — forces glyph regardless of the
+// measurement, which is by definition stale when eviction has already happened.
 // nowEpoch: monotonic-ish wall clock used only to rate-limit streak counting.
 BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
-                           const double widths[3], BOOL evicted, double nowEpoch);
+                           const double widths[kBarTierCount], BOOL evicted, double nowEpoch);
 
 // Eviction is a fall FROM the bar, so the net arms only after the item has been seen
 // there — except that an item launched into an already-crowded bar is never seen at

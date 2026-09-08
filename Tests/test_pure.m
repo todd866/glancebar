@@ -751,7 +751,7 @@ int main(void) {
             const BarWindowSpan packed[] = { {1023, 40}, {1063, 128}, {1191, 38} };
             double cap = BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1063, 128}, packed, 3);
             check(fabs(cap - 128) < 0.001, @"packed: capacity is exactly our own span");
-            const double OCC[3] = {128, 51, 38};
+            const double OCC[kBarTierCount] = {128, 82, 51, 38};
             BarTierState held = ChooseBarTier((BarTierState){BarTierFull, 0, 0}, cap, OCC, NO, 100);
             check(held.tier == BarTierFull, @"packed: an item that is on the bar already fits — no shrink");
             // One point of compositor rounding either way must not shrink us either.
@@ -761,11 +761,13 @@ int main(void) {
             const BarWindowSpan squeezed[] = { {1023, 46}, {1063, 128}, {1191, 38} };
             double squeezedCap = BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1063, 128}, squeezed, 3);
             check(fabs(squeezedCap - 122) < 0.001, @"packed: a 6pt overlap is an obstacle, not ignored");
-            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, squeezedCap, OCC, NO, 100).tier == BarTierCompact,
-                  @"packed: a real overlap shrinks to the widest tier that fits with margin");
+            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, squeezedCap, OCC, NO, 100).tier == BarTierText,
+                  @"packed: a real overlap steps down one rung, keeping both readings");
             // And the fallback tier must itself fit with margin.
+            check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, 56, OCC, NO, 100).tier == BarTierCompact,
+                  @"packed: shrink lands on the widest rung that fits with margin (51+4<=56)");
             check(ChooseBarTier((BarTierState){BarTierFull, 0, 0}, 52, OCC, NO, 100).tier == BarTierGlyph,
-                  @"packed: shrink skips a tier that would fit without margin");
+                  @"packed: shrink skips a rung that would fit without margin (51+4>52)");
         }
 
         // --- BarEvictionSuspected: arm-after-seen, with a launch grace ---
@@ -842,32 +844,33 @@ int main(void) {
                                              fullHosts, 3) < 0,
                   @"capacity: stale own span outside the target display is unknown");
 
-            const double W[3] = {121, 55, 22};   // full, compact, glyph (points)
+            // full, text (readings without icons), compact (one reading), glyph — points.
+            const double W[kBarTierCount] = {121, 88, 55, 22};
             const double T = 10000;              // arbitrary epoch base for the clock
             double t = T;
             BarTierState s = {BarTierFull, 0, 0};
             // Plenty of room: stays full, no streak.
             s = ChooseBarTier(s, 200, W, NO, t);
             check(s.tier == BarTierFull && s.expandStreak == 0, @"tier: roomy gap holds full");
-            const double LIVE_W[3] = {115, 35, 19};
+            const double LIVE_W[kBarTierCount] = {115, 66, 35, 19};
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, fullCapacity, LIVE_W, NO, t);
             check(s.tier == BarTierFull,
                   @"tier: live Tahoe capacity keeps the two-meter Full bar");
-            const double LIVE_OCCUPIED_W[3] = {131, 51, 35};
+            const double LIVE_OCCUPIED_W[kBarTierCount] = {131, 82, 51, 35};
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 130, LIVE_OCCUPIED_W, NO, t);
             check(s.tier == BarTierFull,
                   @"tier: a one-point compositor overlap on a 131pt host is rounding, not a squeeze");
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 126, LIVE_OCCUPIED_W, NO, t);
-            check(s.tier == BarTierCompact,
-                  @"tier: a real squeeze on the Full host selects Compact before it is evicted");
-            s = (BarTierState){BarTierCompact, 0, 0};
+            check(s.tier == BarTierText,
+                  @"tier: a real squeeze gives up the icons first, not the readings");
+            s = (BarTierState){BarTierText, 0, 0};
             s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);
             s = ChooseBarTier(s, notchlessCapacity, LIVE_W, NO, t += 15);
             check(s.tier == BarTierFull,
-                  @"tier: a roomy notchless display recovers from Compact");
+                  @"tier: a roomy notchless display recovers from Text");
             // Gap collapses to 31 pt (the 2026-08-12 incident): straight to glyph.
             s = ChooseBarTier(s, 31, W, NO, t += 15);
             check(s.tier == BarTierGlyph, @"tier: 31pt gap shrinks past compact to glyph");
@@ -875,6 +878,10 @@ int main(void) {
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 60, W, NO, t += 15);
             check(s.tier == BarTierCompact, @"tier: 60pt gap fits compact (55+4<=60)");
+            // The point of the Text rung: a gap that kills Full still keeps both readings.
+            s = (BarTierState){BarTierFull, 0, 0};
+            s = ChooseBarTier(s, 95, W, NO, t += 15);
+            check(s.tier == BarTierText, @"tier: 95pt gap keeps every reading, minus the icons");
             // Nothing fits: glyph is the floor — never voluntarily hidden.
             s = (BarTierState){BarTierGlyph, 0, 0};
             s = ChooseBarTier(s, 10, W, NO, t += 15);
@@ -889,7 +896,7 @@ int main(void) {
             s = ChooseBarTier(s, 63, W, NO, t += 15);
             check(s.tier == BarTierGlyph && s.expandStreak == 1, @"tier: first slack tick only counts");
             s = ChooseBarTier(s, 63, W, NO, t += 15);
-            check(s.tier == BarTierCompact && s.expandStreak == 0, @"tier: second slack tick expands one tier");
+            check(s.tier == BarTierCompact && s.expandStreak == 0, @"tier: second slack tick expands one rung");
             // THE BURST GUARD: updateBar fires many times per second during IOPS bursts.
             // Qualifying decisions closer together than kBarExpandMinIntervalSec must not
             // count, or a 30-second promise collapses into milliseconds (observed live).
@@ -917,21 +924,24 @@ int main(void) {
             // restores Full after the normal two time-spaced confirmations.
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 100, W, NO, t += 15);
-            check(s.tier == BarTierCompact, @"tier: temporary pressure chooses compact");
+            check(s.tier == BarTierText,
+                  @"tier: temporary pressure now costs the icons, not a reading (88+4<=100)");
             s = ChooseBarTier(s, 130, W, NO, t += 15);
-            check(s.tier == BarTierCompact && s.expandStreak == 1,
-                  @"tier: restored one-icon gap starts full recovery");
+            check(s.tier == BarTierText && s.expandStreak == 1,
+                  @"tier: restored one-icon gap starts recovery");
             s = ChooseBarTier(s, 130, W, NO, t += 15);
             check(s.tier == BarTierFull, @"tier: restored one-icon gap returns to full");
-            // Full recovery from glyph remains one tier per step: glyph→compact→full.
+            // Recovery from glyph remains one rung per step: glyph→compact→text→full.
             s = (BarTierState){BarTierGlyph, 0, 0};
             for (int i = 0; i < 2; i++) s = ChooseBarTier(s, 500, W, NO, t += 15);
             check(s.tier == BarTierCompact, @"tier: recovery step 1 lands compact");
             for (int i = 0; i < 2; i++) s = ChooseBarTier(s, 500, W, NO, t += 15);
-            check(s.tier == BarTierFull, @"tier: recovery step 2 lands full");
+            check(s.tier == BarTierText, @"tier: recovery step 2 lands text");
+            for (int i = 0; i < 2; i++) s = ChooseBarTier(s, 500, W, NO, t += 15);
+            check(s.tier == BarTierFull, @"tier: recovery step 3 lands full");
             // A degenerate width vector (a tier that measures wider than the one below it)
             // must still terminate at a real tier, never spin or overrun the array.
-            const double DEGEN[3] = {18, 4, 22};
+            const double DEGEN[kBarTierCount] = {18, 4, 9, 22};
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 12, DEGEN, NO, t += 15);
             check(s.tier >= BarTierFull && s.tier <= BarTierGlyph, @"tier: degenerate widths stay in range");

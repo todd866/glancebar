@@ -3517,6 +3517,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                 // eye — an always-visible reminder of a setting that persists across reboots.
                 // The % stays: battery drain is exactly what you watch while it's forced awake.
                 seg[@"image"] = TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor);
+                seg[@"keepIcon"] = @YES;   // a reminder, not decoration: survives every tier
                 lidAwakeShown = YES;
             } else {
                 NSColor *fill = (_bat.percent <= 20 && !_bat.acConnected) ? BattBarColor(_bat.percent) : fg;
@@ -3544,7 +3545,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
     // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
     if (_lidAwake && !lidAwakeShown)
         [segments insertObject:@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor),
-                                 @"compactPriority": @YES} atIndex:0];
+                                 @"compactPriority": @YES, @"keepIcon": @YES} atIndex:0];
     return segments;
 }
 
@@ -3649,6 +3650,30 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 - (NSArray<NSDictionary *> *)barSegmentsForTier:(int)tier full:(NSArray<NSDictionary *> *)full {
     if (tier == BarTierFull) return full;
+    if (tier == BarTierText) {
+        // Give up the meter icons before giving up any reading: the numbers are what the
+        // item is for, and dropping the icons buys roughly a third of the width. A
+        // segment with no text of its own (the standalone lid-awake eye) keeps its icon,
+        // and so does any segment that asked to (`keepIcon`) — the eye is a reminder
+        // about a setting that persists across reboots, not decoration.
+        NSMutableArray *text = [NSMutableArray array];
+        for (NSDictionary *seg in full) {
+            NSString *label = [seg[@"text"] isKindOfClass:NSString.class] ? seg[@"text"] : nil;
+            BOOL keepIcon = [seg[@"keepIcon"] boolValue] || !label.length;
+            if (!label.length && !keepIcon) continue;
+            NSMutableDictionary *d = [seg mutableCopy];
+            if (!keepIcon) {
+                [d removeObjectForKey:@"image"];
+                [d removeObjectForKey:@"symbol"];
+                [d removeObjectForKey:@"var"];
+            }
+            [d removeObjectForKey:@"compactPriority"];
+            [d removeObjectForKey:@"compactTextOnly"];
+            [d removeObjectForKey:@"keepIcon"];
+            [text addObject:d];
+        }
+        if (text.count) return text;
+    }
     if (tier == BarTierCompact) {
         // Preserve one deliberately prioritised reading before falling all the way to
         // pictograms. On a MacBook that is battery percentage: it is more actionable
@@ -3704,13 +3729,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [_item.button.effectiveAppearance performAsCurrentDrawingAppearance:^{
         NSColor *fg = NSColor.controlTextColor;
         NSArray<NSDictionary *> *full = [self barSegments];
-        NSArray<NSDictionary *> *tierSegs[3] = {
+        NSArray<NSDictionary *> *tierSegs[kBarTierCount] = {
             full,
+            [self barSegmentsForTier:BarTierText full:full],
             [self barSegmentsForTier:BarTierCompact full:full],
             [self barSegmentsForTier:BarTierGlyph full:full],
         };
-        double widths[3]; NSArray<NSDictionary *> *draws[3];
-        for (int t = 0; t < 3; t++) {
+        double widths[kBarTierCount]; NSArray<NSDictionary *> *draws[kBarTierCount];
+        for (int t = 0; t < kBarTierCount; t++) {
             CGFloat w = 0;
             draws[t] = BarLayout(tierSegs[t], fg, &w);
             widths[t] = w;
@@ -3742,18 +3768,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                 self->_barChromeKnown = YES;
             }
         }
-        double occupiedWidths[3];
+        double occupiedWidths[kBarTierCount];
         double chrome = self->_barChromeKnown ? self->_barChromeWidth : 0;
-        for (int t = 0; t < 3; t++) occupiedWidths[t] = widths[t] + chrome;
+        for (int t = 0; t < kBarTierCount; t++) occupiedWidths[t] = widths[t] + chrome;
         if (onBar) self->_barWasOnBar = YES;
         BOOL evicted = BarEvictionSuspected(self->_barWasOnBar, onBar,
                                             CFAbsoluteTimeGetCurrent() - self->_barCreatedAt);
         BarTierState chosen = ChooseBarTier(self->_barTier, capacity, occupiedWidths, evicted,
                                             CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
-            NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f] occupied=[%.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d",
-                  capacity, widths[0], widths[1], widths[2],
-                  occupiedWidths[0], occupiedWidths[1], occupiedWidths[2], chrome,
+            NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f %.0f] occupied=[%.0f %.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d",
+                  capacity, widths[0], widths[1], widths[2], widths[3],
+                  occupiedWidths[0], occupiedWidths[1], occupiedWidths[2], occupiedWidths[3], chrome,
                   onBar, evicted,
                   self->_barTier.tier, chosen.tier, chosen.expandStreak);
         self->_barTier = chosen;

@@ -1072,7 +1072,7 @@ const int    kBarExpandTicks    = 2;
 const double kBarExpandMinIntervalSec = 10;
 
 BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
-                           const double widths[3], BOOL evicted, double nowEpoch) {
+                           const double widths[kBarTierCount], BOOL evicted, double nowEpoch) {
     // Every non-qualifying path resets the streak AND its clock, so the next
     // qualifying decision starts a fresh window and counts immediately.
     BarTierState s = { .tier = MIN(MAX(prev.tier, BarTierFull), BarTierGlyph),

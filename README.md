@@ -51,10 +51,11 @@ opt-in) `/usr/bin/security`.
   how old it is ("· cached 3h ago"); why the refresh failed is in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   system, and/or AI status.
-- **Never evicted** — on notched Macs the item automatically narrows (full →
-  compact battery percentage → single glyph) to fit the space the notch and system
-  items leave, and widens back when space returns; VoiceOver and the hover tooltip
-  always carry the full summary.
+- **Never evicted** — on notched Macs the item narrows one rung at a time to fit the
+  space the notch and system items leave, giving up as little as possible at each step:
+  every reading with its icons → the same readings without icons → the single most
+  useful reading → a bare glyph. It widens back when space returns, and VoiceOver and
+  the hover tooltip always carry the full summary at every width.
 - **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
   lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
   admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
@@ -283,11 +284,20 @@ glancebar/
 
 macOS hides a menu bar item wholesale when it no longer fits beside the notch —
 system items (AirPods, Now Playing, Weather) can crowd one out with no warning.
-Glancebar measures the space that actually exists and adapts: full display when
-there's room, a compact battery percentage when it tightens (configured meter
-icons when battery is disabled; the orange eye takes priority while *Stay awake
-with lid closed* is on), and a single gauge glyph when space is scarce. The
-popover stays one click away at every width. It re-expands automatically after
+Glancebar measures the space that actually exists and adapts, in rungs that cost as
+little as possible: the full display when there's room; then the same readings with the
+meter icons dropped, which is about a third narrower and still shows every number; then
+the single reading that matters most (battery percentage, or the configured meter icons
+when battery is disabled); then a bare gauge glyph. The orange eye outranks all of it
+while *Stay awake with lid closed* is on. The popover stays one click away at every
+width.
+
+No application can push another app's item aside — menu bar placement belongs to the
+system, and an app only chooses its own width — so if the strip is genuinely full,
+something has to give. Two things help. macOS squeezes out the item nearest the notch
+first, so ⌘-dragging Glancebar to the right of an item you care less about makes that
+one absorb the pressure instead. And hiding menu bar items you don't use (System
+Settings → Control Center) returns real space to everything that remains. It re-expands automatically after
 the space has stayed free for a while; only modest headroom is required, so
 removing one neighboring icon can
 restore the display without letting a transient AirPods connection make it flap.
