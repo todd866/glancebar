@@ -3268,6 +3268,12 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSString *defaultsDomain = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
     NSDictionary *persisted = [ud persistentDomainForName:defaultsDomain];
     if (!persisted[@"barShowBattery"] && !_bat.valid) _barShowBattery = NO;
+    // The AI segment is off by default for people who never enabled an AI source at all.
+    // Once someone has opted one in, keeping the reading out of the bar hides the very
+    // thing they asked Glancebar to watch — the panel is two clicks and a scroll away,
+    // and the section sits below Storage, Battery and System. An explicit choice always
+    // wins: toggling the segment writes the key, and this only fills in its absence.
+    if (!persisted[@"barShowAI"] && [self anyAISourceEnabled]) _barShowAI = YES;
     _ampHistory = [NSMutableArray array];
     _vols = @[];
     _aiUsage = @[];
@@ -3912,6 +3918,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self refresh];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    // When the panel is taller than the screen allows it scrolls, and an overlay scroller
+    // stays invisible until something scrolls it — so the sections below the fold (AI
+    // Status is the last one) look like they do not exist. Flash it on open only: the
+    // periodic rebuild would otherwise flash it every 15 seconds.
+    [_popoverScroll flashScrollers];
     // Accessory (LSUIElement) apps don't activate on their own, so the popover's window
     // never becomes key — and a transient popover with no key window to resign is never
     // dismissed when the user clicks another app. Activate on open so a click elsewhere
@@ -4634,7 +4645,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeAccount"];
-    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
+    if (enabling) [self showAIInBarUnlessChosenOtherwise];
+    else dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleCursorAccount:(id)s {
@@ -4650,7 +4662,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useCursorAccount"];
-    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetCursorAccountCredentials]; });
+    if (enabling) [self showAIInBarUnlessChosenOtherwise];
+    else dispatch_async(_aiQueue, ^{ [self->_aiReader forgetCursorAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleClaudeTranscripts:(id)s {
@@ -4666,7 +4679,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeTranscripts"];
-    if (!enabling) dispatch_async(_aiQueue, ^{
+    if (enabling) [self showAIInBarUnlessChosenOtherwise];
+    else dispatch_async(_aiQueue, ^{
         self->_aiReader.allowClaudeTranscripts = NO;
         [self->_aiReader purgeClaudeTranscriptIndex];
     });
@@ -4780,6 +4794,24 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     alert.informativeText = @"One native menu-bar item for machine and AI status. No third-party dependencies; no network access unless Claude account status is explicitly enabled.";
     [alert addButtonWithTitle:@"OK"];
     [alert runModal];
+}
+
+// YES when any AI source has been opted into: the Claude account, Claude transcripts,
+// or the Cursor account.
+- (BOOL)anyAISourceEnabled {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    return [ud boolForKey:@"useClaudeAccount"] || [ud boolForKey:@"useClaudeTranscripts"] ||
+           [ud boolForKey:@"useCursorAccount"];
+}
+
+// Enabling an AI source for the first time should put the reading where the app promises
+// it — in the bar — unless the user has already made an explicit choice about the segment.
+- (void)showAIInBarUnlessChosenOtherwise {
+    NSString *domain = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
+    NSDictionary *persisted = [NSUserDefaults.standardUserDefaults persistentDomainForName:domain];
+    if (persisted[@"barShowAI"] || !self.anyAISourceEnabled) return;
+    _barShowAI = YES;
+    [self updateBar];
 }
 
 - (void)saveBarOption:(NSString *)key value:(BOOL)value {

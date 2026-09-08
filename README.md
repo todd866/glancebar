@@ -50,7 +50,10 @@ opt-in) `/usr/bin/security`.
   comes back ("Resets Thu 21:00 · in 4d") — and a figure that couldn't be refreshed says
   how old it is ("· cached 3h ago"); why the refresh failed is in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
-  system, and/or AI status.
+  system, and/or AI status. The AI segment starts off, and switches itself on the first
+  time you enable any AI source (Claude account, Claude transcripts, or Cursor) — opting
+  into a source and then not seeing it is the one combination nobody wants. Turning the
+  segment off yourself is remembered and never overridden.
 - **Never evicted** — on notched Macs the item narrows one rung at a time to fit the
   space the notch and system items leave, giving up as little as possible at each step:
   every reading with its icons → the same readings without icons → the single most
