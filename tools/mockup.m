@@ -219,8 +219,8 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     y += kPad - 6;
     CGFloat cardH = y; card.frame = NSMakeRect(0,0,kW,cardH);
 
-    // pill: storage + battery + optional system + optional AI status
-    CGFloat pillW=262, pillH=24;
+    // pill: storage + battery + optional system (AI status is panel-only by design)
+    CGFloat pillW=200, pillH=24;
     Pill *pill=[[Pill alloc] initWithFrame:NSMakeRect(0,0,pillW,pillH)];
     pill.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     NSImageView *di=[NSImageView imageViewWithImage:DriveMeter(0.61, NSColor.whiteColor, NSColor.whiteColor)];
@@ -235,10 +235,6 @@ static NSImage *BatteryMeter(double frac, NSColor *fg, NSColor *fill) {
     ci.contentTintColor=NSColor.whiteColor; ci.frame=NSMakeRect(136,5,16,14); [pill addSubview:ci];
     [pill addSubview:L(@"38%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
                        NSMakeRect(154,4,38,16), NSTextAlignmentLeft)];
-    NSImageView *aii=[NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil]];
-    aii.contentTintColor=NSColor.whiteColor; aii.frame=NSMakeRect(192,5,16,14); [pill addSubview:aii];
-    [pill addSubview:L(@"AI 27%", [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular], NSColor.whiteColor,
-                       NSMakeRect(210,4,52,16), NSTextAlignmentLeft)];
 
     CGFloat margin=34, gap=10, W=kW+2*margin, H=pillH+gap+cardH+2*margin;
     Grad *canvas=[[Grad alloc] initWithFrame:NSMakeRect(0,0,W,H)];

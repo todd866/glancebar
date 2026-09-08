@@ -3214,7 +3214,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSUInteger _sampleGen;
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
-    BOOL _barShowDisk, _barShowBattery, _barShowSystem, _barShowAI;
+    BOOL _barShowDisk, _barShowBattery, _barShowSystem;
     BOOL _lidAwake, _lidAwakeReading;   // "stay awake with lid closed" state, read off-main
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
@@ -3255,7 +3255,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
-                           @"barShowSystem": @NO, @"barShowAI": @NO,
+                           @"barShowSystem": @NO,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                            @"useCursorAccount": @NO}];
     _bat = ReadBattery();
@@ -3264,16 +3264,9 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
     _barShowBattery = [ud boolForKey:@"barShowBattery"];
     _barShowSystem = [ud boolForKey:@"barShowSystem"];
-    _barShowAI = [ud boolForKey:@"barShowAI"];
     NSString *defaultsDomain = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
     NSDictionary *persisted = [ud persistentDomainForName:defaultsDomain];
     if (!persisted[@"barShowBattery"] && !_bat.valid) _barShowBattery = NO;
-    // The AI segment is off by default for people who never enabled an AI source at all.
-    // Once someone has opted one in, keeping the reading out of the bar hides the very
-    // thing they asked Glancebar to watch — the panel is two clicks and a scroll away,
-    // and the section sits below Storage, Battery and System. An explicit choice always
-    // wins: toggling the segment writes the key, and this only fills in its absence.
-    if (!persisted[@"barShowAI"] && [self anyAISourceEnabled]) _barShowAI = YES;
     _ampHistory = [NSMutableArray array];
     _vols = @[];
     _aiUsage = @[];
@@ -3384,9 +3377,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 // main thread (refresh fires every 15s and on IOPS bursts). Single-flight: a tick
 // that arrives mid-read is skipped; the next one catches up.
 - (void)refreshAIUsageAsync {
-    BOOL showAI = _barShowAI || _popover.isShown || _detailsWindow.isVisible;
+    BOOL showAI = _popover.isShown || _detailsWindow.isVisible;
     // Codex histories can be large. Do no transcript/database work while every AI surface
-    // is hidden; opening the popover or enabling the bar segment starts/resumes indexing.
+    // is hidden; opening the popover or the Details window starts/resumes indexing.
     if (!showAI) return;
     if (_aiLoading) { _aiRefreshPending = YES; return; }
     _aiLoading = YES;
@@ -3537,16 +3530,6 @@ static BOOL AIWindowElapsed(AIUsage *u) {
         NSString *text = _sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(_sys.cpu * 100)] : @"SYS";
         [segments addObject:@{@"symbol": @"cpu", @"text": text, @"color": SystemPressureColor(level)}];
     }
-    if (_barShowAI) {
-        AIUsage *lowest = [self lowestAIStatus];
-        // An elapsed cached window is drawn as unknown: its percentage is from before
-        // the reset, and live styling would claim otherwise.
-        BOOL elapsed = lowest && AIWindowElapsed(lowest);
-        NSString *text = !lowest ? @"AI ?" : elapsed ? @"AI —"
-                       : [NSString stringWithFormat:@"AI %@", [self aiPercentText:lowest]];
-        [segments addObject:@{@"symbol": @"sparkles", @"text": text,
-                              @"color": lowest && !elapsed ? [self aiStatusColor:lowest] : NSColor.secondaryLabelColor}];
-    }
     // The eye normally rides in the battery segment; if that segment is hidden or there's no
     // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
     if (_lidAwake && !lidAwakeShown)
@@ -3570,19 +3553,6 @@ static BOOL AIWindowElapsed(AIUsage *u) {
     if (_barShowSystem) {
         NSString *cpu = _sys.cpuValid ? [NSString stringWithFormat:@", CPU %d percent", (int)lround(_sys.cpu * 100)] : @"";
         [parts addObject:[NSString stringWithFormat:@"System pressure %@%@", SystemPressureLevel(_sys), cpu]];
-    }
-    if (_barShowAI) {
-        AIUsage *lowest = [self lowestAIStatus];
-        [parts addObject:!lowest ? @"AI limit status unavailable"
-                       : AIWindowElapsed(lowest)
-                           ? [NSString stringWithFormat:@"AI, %@ cached figure whose window has since reset", lowest.name]
-                       : [NSString stringWithFormat:@"AI, %@ %d percent remaining%@", lowest.name,
-                                    (int)lround(lowest.remainingFraction * 100),
-                                    // A carried-forward Codex window is cached without any
-                                    // refresh having failed; only say so when one did.
-                                    !lowest.limitStale ? @""
-                                        : lowest.limitRefreshError.length ? @", cached; refresh failed"
-                                        : @", cached"]];
     }
     if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
@@ -4564,8 +4534,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     battery.target = self; battery.state = _barShowBattery ? NSControlStateValueOn : NSControlStateValueOff;
     NSMenuItem *system = [m addItemWithTitle:@"Show system" action:@selector(toggleBarSystem:) keyEquivalent:@""];
     system.target = self; system.state = _barShowSystem ? NSControlStateValueOn : NSControlStateValueOff;
-    NSMenuItem *ai = [m addItemWithTitle:@"Show AI status" action:@selector(toggleBarAI:) keyEquivalent:@""];
-    ai.target = self; ai.state = _barShowAI ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
 
     NSMenuItem *w = [m addItemWithTitle:@"Show current draw" action:@selector(toggleWatts:) keyEquivalent:@""];
@@ -4645,8 +4613,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeAccount"];
-    if (enabling) [self showAIInBarUnlessChosenOtherwise];
-    else dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
+    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetClaudeAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleCursorAccount:(id)s {
@@ -4662,8 +4629,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useCursorAccount"];
-    if (enabling) [self showAIInBarUnlessChosenOtherwise];
-    else dispatch_async(_aiQueue, ^{ [self->_aiReader forgetCursorAccountCredentials]; });
+    if (!enabling) dispatch_async(_aiQueue, ^{ [self->_aiReader forgetCursorAccountCredentials]; });
     [self refresh];
 }
 - (void)toggleClaudeTranscripts:(id)s {
@@ -4679,8 +4645,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
     }
     [ud setBool:enabling forKey:@"useClaudeTranscripts"];
-    if (enabling) [self showAIInBarUnlessChosenOtherwise];
-    else dispatch_async(_aiQueue, ^{
+    if (!enabling) dispatch_async(_aiQueue, ^{
         self->_aiReader.allowClaudeTranscripts = NO;
         [self->_aiReader purgeClaudeTranscriptIndex];
     });
@@ -4796,24 +4761,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [alert runModal];
 }
 
-// YES when any AI source has been opted into: the Claude account, Claude transcripts,
-// or the Cursor account.
-- (BOOL)anyAISourceEnabled {
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    return [ud boolForKey:@"useClaudeAccount"] || [ud boolForKey:@"useClaudeTranscripts"] ||
-           [ud boolForKey:@"useCursorAccount"];
-}
-
-// Enabling an AI source for the first time should put the reading where the app promises
-// it — in the bar — unless the user has already made an explicit choice about the segment.
-- (void)showAIInBarUnlessChosenOtherwise {
-    NSString *domain = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
-    NSDictionary *persisted = [NSUserDefaults.standardUserDefaults persistentDomainForName:domain];
-    if (persisted[@"barShowAI"] || !self.anyAISourceEnabled) return;
-    _barShowAI = YES;
-    [self updateBar];
-}
-
 - (void)saveBarOption:(NSString *)key value:(BOOL)value {
     [NSUserDefaults.standardUserDefaults setBool:value forKey:key];
     [self updateBar];
@@ -4830,10 +4777,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (void)toggleBarSystem:(id)s {
     _barShowSystem = !_barShowSystem; [self saveBarOption:@"barShowSystem" value:_barShowSystem];
 }
-- (void)toggleBarAI:(id)s {
-    _barShowAI = !_barShowAI; [self saveBarOption:@"barShowAI" value:_barShowAI];
-}
-
 - (Volume *)primaryVolume {
     for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return v;
     return _vols.firstObject;
@@ -5511,7 +5454,7 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     };
 
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults registerDefaults:@{@"barShowAI": @NO, @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
+    [defaults registerDefaults:@{@"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                                  @"useCursorAccount": @NO}];
     BOOL accountEnabled = [defaults boolForKey:@"useClaudeAccount"];
     BOOL accountRequested = allowOnline && accountEnabled;
