@@ -74,6 +74,10 @@ jobs:
 
       - name: Verify the JSON contract against a determined fixture
         run: |
+          # The cached Claude response is consent-gated even for an offline dump.
+          # Set consent only on this disposable runner; never permit an account request.
+          defaults write com.iantodd.glancebar useClaudeAccount -bool true
+          trap 'defaults delete com.iantodd.glancebar useClaudeAccount' EXIT
           FIXTURE="$(Tests/make_fixture_home.sh "$RUNNER_TEMP/glancebar-fixture")"
           GLANCEBAR_HOME="$FIXTURE" GLANCEBAR_ALLOW_ACCOUNT=0 \
             build/Glancebar.app/Contents/MacOS/Glancebar --dump --json \
@@ -84,6 +88,8 @@ jobs:
           ruby -rjson -e '
             j = JSON.parse(File.read(ARGV[0]))
             ai = j["ai"]
+            fail "account consent"     unless ai["accountEnabled"] == true
+            fail "offline fixture"     unless ai["onlineAllowed"] == false && ai["accountRequested"] == false
             codex = ai["providers"].find { |p| p["name"] == "Codex" }
             fail "codex missing"        unless codex
             fail "codex gauge"          unless codex["remainingPercent"].between?(0.5, 1.5)
