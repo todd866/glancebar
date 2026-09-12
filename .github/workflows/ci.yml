@@ -105,12 +105,26 @@ jobs:
             fail "claude gauge"         unless claude["remainingPercent"].round == 25
             fail "claude stale"         unless claude["limitStale"] == true
             fail "extra usage"          unless claude["extraUsage"].to_s.start_with?("Off")
-            fail "status complete"      unless j["status"] == "complete"
-            fail "partial sources"      unless j["partialSources"].empty?
+            fail "ai available"         unless ai["available"] == true
+            fail "ai error"             unless ai["error"].nil?
+            fail "ai history"           unless ai["totalsIncomplete"] == false
+            partial = j["partialSources"]
+            fail "partial AI sources"   if partial.any? { |s| s == "ai" || s.start_with?("ai.") }
+            fail "status matches sources" unless j["status"] == (partial.empty? ? "complete" : "partial")
           ' "$RUNNER_TEMP/glancebar-fixture.json"
-          # A determined fixture is complete, so --strict must succeed here.
+          # Only AI data is fixtured. Runner hardware (e.g. no battery) can legitimately
+          # be partial; strict must agree with this dump without hiding an AI failure.
           GLANCEBAR_HOME="$FIXTURE" GLANCEBAR_ALLOW_ACCOUNT=0 \
-            build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json > /dev/null
+            build/Glancebar.app/Contents/MacOS/Glancebar --dump --strict --json \
+            > "$RUNNER_TEMP/glancebar-fixture-strict.json" && strict_rc=0 || strict_rc=$?
+          ruby -rjson -e '
+            j = JSON.parse(File.read(ARGV[0]))
+            partial = j["partialSources"]
+            fail "strict AI fixture" if partial.any? { |s| s == "ai" || s.start_with?("ai.") }
+            expected_status = partial.empty? ? "complete" : "partial"
+            fail "strict status" unless j["status"] == expected_status
+            fail "strict exit" unless ARGV[1].to_i == (partial.empty? ? 0 : 2)
+          ' "$RUNNER_TEMP/glancebar-fixture-strict.json" "$strict_rc"
 
       - name: Verify bundle
         run: |
