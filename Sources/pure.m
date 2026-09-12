@@ -1025,6 +1025,11 @@ BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
 
 #pragma mark - Adaptive bar width
 
+static int CompareBarSpans(const void *a, const void *b) {
+    double ax = ((const BarWindowSpan *)a)->x, bx = ((const BarWindowSpan *)b)->x;
+    return (ax > bx) - (ax < bx);
+}
+
 double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
                                   BarWindowSpan own,
                                   const BarWindowSpan *spans, size_t count) {
@@ -1035,27 +1040,44 @@ double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
         return -1;
 
     double ownRight = own.x + own.width;
-    double obstacleRight = leftBoundary;
+    BarWindowSpan *left = count ? calloc(count, sizeof(BarWindowSpan)) : NULL;
+    if (count && !left) return -1;
+    size_t leftCount = 0;
+    double intrusion = 0;
     for (size_t i = 0; i < count; i++) {
         BarWindowSpan span = spans[i];
         if (!isfinite(span.x) || !isfinite(span.width) || span.width <= 0) continue;
         double spanRight = span.x + span.width;
+        if (!isfinite(spanRight)) continue;
         // A substantial overlap identifies our visible Control Centre host or one of
         // its wrappers. A real neighbour may touch or round across our edge by a point;
         // do not erase that obstacle merely because the compositor rounded differently.
         double overlap = MIN(spanRight, ownRight) - MAX(span.x, own.x);
         double selfThreshold = MAX(2.0, MIN(span.width, own.width) * 0.5);
         if (overlap >= selfThreshold) continue;
-        if (spanRight <= leftBoundary || span.x >= rightEdge) continue;
-        // Status items grow left. The current right edge already accounts for every
-        // item to our right; only the closest obstacle on our left limits expansion.
-        // A left neighbour that reaches INTO our span (below the self threshold) is
-        // still that obstacle — dropping it as neither self nor neighbour would report
-        // room that is already taken.
-        if (span.x < own.x)
-            obstacleRight = MAX(obstacleRight, MIN(spanRight, ownRight));
+        if (spanRight <= leftBoundary || span.x >= own.x) continue;
+        intrusion = MAX(intrusion, spanRight - own.x);
+        double start = MAX(leftBoundary, span.x), end = MIN(ownRight, spanRight);
+        if (end > start) left[leftCount++] = (BarWindowSpan){start, end - start};
     }
-    return MIN(rightEdge - leftBoundary, MAX(0.0, ownRight - obstacleRight));
+    // The right edge stays anchored, but Control Centre moves the hosts to our left
+    // when our image grows. Subtract their occupied union, not the distance to the
+    // nearest neighbour: that distance is always zero for a packed row and used to
+    // trap a collapsed item forever. Unioning also avoids charging for host wrappers
+    // twice. Everything to our right is already accounted for by ownRight.
+    if (leftCount > 1) qsort(left, leftCount, sizeof(BarWindowSpan), CompareBarSpans);
+    double occupied = 0, coveredRight = leftBoundary;
+    for (size_t i = 0; i < leftCount; i++) {
+        double end = left[i].x + left[i].width;
+        occupied += MAX(0.0, end - MAX(coveredRight, left[i].x));
+        coveredRight = MAX(coveredRight, end);
+    }
+    free(left);
+    double capacity = ownRight - leftBoundary - occupied;
+    // Do not let distant free space conceal a currently overlapping neighbour.
+    // A one-point compositor overlap is rounding; a larger one is a real squeeze.
+    if (intrusion > kBarFitTolerancePt) capacity = MIN(capacity, own.width - intrusion);
+    return MIN(rightEdge - leftBoundary, MAX(0.0, capacity));
 }
 
 BOOL BarEvictionSuspected(BOOL barObservable, BOOL seenOnBar, BOOL onBar, double sinceCreatedSec) {

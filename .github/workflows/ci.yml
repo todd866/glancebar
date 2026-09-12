@@ -110,8 +110,9 @@ jobs:
         run: |
           codesign --verify --strict --verbose=2 build/Glancebar.app
           test "$(plutil -extract CFBundleShortVersionString raw -o - build/Glancebar.app/Contents/Info.plist)" = "1.1.0"
-          test "$(plutil -extract CFBundleVersion raw -o - build/Glancebar.app/Contents/Info.plist)" = "2"
+          test "$(plutil -extract CFBundleVersion raw -o - build/Glancebar.app/Contents/Info.plist)" = "3"
           test "$(build/Glancebar.app/Contents/MacOS/Glancebar --version)" = "Glancebar 1.1.0"
           test -f build/Glancebar.app/Contents/Resources/Glancebar.icns
-          # lipo takes the file first; `lipo -verify_arch a b FILE` reads FILE as an arch name.
-          lipo build/Glancebar.app/Contents/MacOS/Glancebar -verify_arch arm64 x86_64
+          # Verify separately: some lipo versions parse a second architecture as an input file.
+          lipo build/Glancebar.app/Contents/MacOS/Glancebar -verify_arch arm64
+          lipo build/Glancebar.app/Contents/MacOS/Glancebar -verify_arch x86_64

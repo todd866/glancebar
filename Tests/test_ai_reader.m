@@ -18,6 +18,15 @@ static void check(BOOL condition, NSString *message) {
     failures++;
 }
 
+static NSDictionary *BarWindowFixture(CGRect bounds, NSNumber *layer, NSInteger number) {
+    NSMutableDictionary *window = [@{
+        (__bridge NSString *)kCGWindowBounds: CFBridgingRelease(CGRectCreateDictionaryRepresentation(bounds)),
+        (__bridge NSString *)kCGWindowNumber: @(number),
+    } mutableCopy];
+    if (layer) window[(__bridge NSString *)kCGWindowLayer] = layer;
+    return window;
+}
+
 static AIUsage *UsageNamed(NSArray<AIUsage *> *usage, NSString *name) {
     for (AIUsage *item in usage) if ([item.name isEqualToString:name]) return item;
     return nil;
@@ -185,6 +194,82 @@ int main(void) {
         check(iconFallback.count == 1 && iconFallback[0][@"text"] == nil &&
               [iconFallback[0][@"symbol"] isEqual:@"externaldrive"],
               @"compact bar falls back to configured icons when no reading has priority");
+
+        // Exercise the real Quartz-window adapter as well as the pure span arithmetic.
+        // The visible Tahoe self host has a different ID from the app-side window.
+        {
+            CGRect display = CGRectMake(0, 0, 1470, 956);
+            NSNumber *statusLayer = @(CGWindowLevelForKey(kCGStatusWindowLevelKey));
+            NSNumber *menuLayer = @(CGWindowLevelForKey(kCGMainMenuWindowLevelKey));
+            NSDictionary *backdrop = BarWindowFixture(CGRectMake(0, 0, 1470, 24), menuLayer, 10);
+            NSArray *capturedRow = @[
+                backdrop,
+                BarWindowFixture(CGRectMake(1024, 0, 38, 24), statusLayer, 41),
+                BarWindowFixture(CGRectMake(1062, 0, 35, 24), statusLayer, 42),
+                BarWindowFixture(CGRectMake(1097, 0, 38, 24), statusLayer, 43),
+                BarWindowFixture(CGRectMake(1135, 0, 67, 24), statusLayer, 44),
+            ];
+            BarWindowSpan glyph = {1062, 35};
+            check(fabs(BarCapacityForWindows(capturedRow, display, 825, glyph, 77) - 234) < 0.001,
+                  @"bar adapter: captured status hosts share 234pt beside the full-width menu backdrop");
+            check(fabs(BarCapacityForWindows(@[backdrop], display, 825, glyph, 77) - 272) < 0.001,
+                  @"bar adapter: a full-display menu backdrop consumes no expansion room");
+            NSArray *withOwnWindow = [capturedRow arrayByAddingObject:
+                BarWindowFixture(CGRectMake(900, 0, 100, 24), statusLayer, 77)];
+            check(fabs(BarCapacityForWindows(withOwnWindow, display, 825, glyph, 77) - 234) < 0.001,
+                  @"bar adapter: the app-side own window ID cannot consume space a second time");
+
+            NSArray *notchlessHosts = @[
+                backdrop,
+                BarWindowFixture(CGRectMake(1000, 0, 50, 24), statusLayer, 42),
+                BarWindowFixture(CGRectMake(1050, 0, 38, 24), statusLayer, 43),
+            ];
+            BarWindowSpan notchlessOwn = {1000, 50};
+            NSArray *withMenus = [notchlessHosts arrayByAddingObject:
+                BarWindowFixture(CGRectMake(0, 0, 300, 24), menuLayer, 11)];
+            check(fabs(BarCapacityForWindows(withMenus, display, 0, notchlessOwn, 77) - 750) < 0.001,
+                  @"bar adapter: notchless application menus establish the fixed left boundary");
+            NSArray *intrudingMenus = [notchlessHosts arrayByAddingObject:
+                BarWindowFixture(CGRectMake(0, 0, 1010, 24), menuLayer, 11)];
+            double squeezed = BarCapacityForWindows(intrudingMenus, display, 0, notchlessOwn, 77);
+            check(fabs(squeezed - 40) < 0.001,
+                  @"bar adapter: menus intruding 10pt into the own host leave only 40pt");
+            const double occupiedWidths[kBarTierCount] = {131, 82, 50, 35};
+            check(ChooseBarTier((BarTierState){BarTierCompact, 0, 0}, squeezed,
+                                occupiedWidths, NO, 100).tier == BarTierGlyph,
+                  @"bar adapter: fixed-menu intrusion forces the narrower fitting tier");
+            NSArray *coveringMenus = [notchlessHosts arrayByAddingObject:
+                BarWindowFixture(CGRectMake(0, 0, 1100, 24), menuLayer, 11)];
+            check(BarCapacityForWindows(coveringMenus, display, 0, notchlessOwn, 77) == 0,
+                  @"bar adapter: menus covering the own host leave zero capacity");
+
+            NSArray *unknownLayer = @[
+                BarWindowFixture(CGRectMake(1024, 0, 38, 24), @(statusLayer.integerValue + 1), 41),
+                BarWindowFixture(CGRectMake(1062, 0, 35, 24), statusLayer, 42),
+            ];
+            check(fabs(BarCapacityForWindows(unknownLayer, display, 825, glyph, 77) - 35) < 0.001,
+                  @"bar adapter: an unknown layer is a fixed obstacle rather than a movable host");
+            NSArray *missingLayer = @[
+                BarWindowFixture(CGRectMake(1024, 0, 38, 24), nil, 41),
+            ];
+            check(BarCapacityForWindows(missingLayer, display, 825, glyph, 77) < 0,
+                  @"bar adapter: missing layer information leaves capacity unknown");
+            NSArray *offBand = [capturedRow arrayByAddingObjectsFromArray:@[
+                BarWindowFixture(CGRectMake(0, 100, 1040, 24), menuLayer, 51),
+                BarWindowFixture(CGRectMake(0, 0, 1040, 100), menuLayer, 52),
+            ]];
+            check(fabs(BarCapacityForWindows(offBand, display, 825, glyph, 77) - 234) < 0.001,
+                  @"bar adapter: windows outside the menu-bar band cannot reduce capacity");
+            NSArray *translatedRow = @[
+                BarWindowFixture(CGRectMake(-1470, -900, 1470, 24), menuLayer, 10),
+                BarWindowFixture(CGRectMake(-446, -900, 38, 24), statusLayer, 41),
+                BarWindowFixture(CGRectMake(-408, -900, 35, 24), statusLayer, 42),
+                BarWindowFixture(CGRectMake(-373, -900, 38, 24), statusLayer, 43),
+            ];
+            check(fabs(BarCapacityForWindows(translatedRow, CGRectMake(-1470, -900, 1470, 956),
+                                             -645, (BarWindowSpan){-408, 35}, 77) - 234) < 0.001,
+                  @"bar adapter: translated displays use their own top and horizontal coordinates");
+        }
 
         FlippedView *existingView = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, 200, 80)];
         NSTextField *existingLabel = [NSTextField labelWithString:@"CPU 10%"];

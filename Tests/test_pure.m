@@ -750,7 +750,7 @@ int main(void) {
             // Control Centre lays hosts edge to edge: neighbour 1023..1063, self 1063..1191.
             const BarWindowSpan packed[] = { {1023, 40}, {1063, 128}, {1191, 38} };
             double cap = BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1063, 128}, packed, 3);
-            check(fabs(cap - 128) < 0.001, @"packed: capacity is exactly our own span");
+            check(fabs(cap - 326) < 0.001, @"packed: capacity includes free space before the movable neighbour");
             const double OCC[kBarTierCount] = {128, 82, 51, 38};
             BarTierState held = ChooseBarTier((BarTierState){BarTierFull, 0, 0}, cap, OCC, NO, 100);
             check(held.tier == BarTierFull, @"packed: an item that is on the bar already fits — no shrink");
@@ -823,8 +823,8 @@ int main(void) {
             };
             check(fabs(BarCapacityFromWindowSpans(825, 1470,
                                                   (BarWindowSpan){939, 131},
-                                                  leftNeighbour, 3) - 130) < 0.001,
-                  @"capacity: rounded left neighbour limits growth instead of looking like self");
+                                                  leftNeighbour, 3) - 205) < 0.001,
+                  @"capacity: one-point neighbour overlap preserves pooled expansion room");
             check(fabs(BarCapacityFromWindowSpans(825, 1470,
                                                   (BarWindowSpan){939, 131},
                                                   NULL, 0) - 245) < 0.001,
@@ -833,20 +833,67 @@ int main(void) {
                                              NULL, 1) < 0,
                   @"capacity: nonzero span count requires a span array");
             const BarWindowSpan notchlessHosts[] = {
-                {0, 300},     // application menus to the left
                 {1000, 50},   // self
                 {1050, 38},
             };
             double notchlessCapacity = BarCapacityFromWindowSpans(
-                0, 1470, (BarWindowSpan){1000, 50}, notchlessHosts, 3);
+                300, 1470, (BarWindowSpan){1000, 50}, notchlessHosts, 2);
             check(fabs(notchlessCapacity - 750) < 0.001,
-                  @"capacity: notchless display grows from the nearest left obstacle");
+                  @"capacity: notchless display respects the fixed application-menu boundary");
             check(BarCapacityFromWindowSpans(825, 825, (BarWindowSpan){939, 131},
                                              fullHosts, 3) < 0,
                   @"capacity: invalid screen geometry is unknown");
             check(BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){800, 50},
                                              fullHosts, 3) < 0,
                   @"capacity: stale own span outside the target display is unknown");
+            check(BarCapacityFromWindowSpans(825, 1470, (BarWindowSpan){1440, 35},
+                                             fullHosts, 3) < 0,
+                  @"capacity: own span beyond the display right edge is unknown");
+            check(BarCapacityFromWindowSpans(NAN, 1470, (BarWindowSpan){939, 131},
+                                             fullHosts, 3) < 0,
+                  @"capacity: nonfinite fixed boundary is unknown");
+
+            // Captured collapsed layout: 199pt is free before the 38pt left host.
+            // Every host on the left can move as Glancebar recovers; its right edge
+            // and the occupied widths stay fixed throughout the redraws.
+            const BarWindowSpan liveGlyphHosts[] = {
+                {1024, 38}, {1062, 35}, {1097, 38}, {1135, 67},
+            };
+            double liveGlyphCapacity = BarCapacityFromWindowSpans(
+                825, 1470, (BarWindowSpan){1062, 35}, liveGlyphHosts, 4);
+            check(fabs(liveGlyphCapacity - 234) < 0.001,
+                  @"capacity: captured glyph layout recovers its 199pt of unused room");
+            check(fabs(BarCapacityFromWindowSpans(900, 1470,
+                                                  (BarWindowSpan){1062, 35},
+                                                  liveGlyphHosts, 4) - 159) < 0.001,
+                  @"capacity: pooled room never borrows space before the fixed boundary");
+            double crowdedCapacity = BarCapacityFromWindowSpans(
+                1024, 1470, (BarWindowSpan){1062, 35}, liveGlyphHosts, 4);
+            check(fabs(crowdedCapacity - 35) < 0.001,
+                  @"capacity: a packed row with no free space has only the existing glyph width");
+
+            const BarWindowSpan overlappingHosts[] = {
+                {1000, 62}, {900, 50}, {800, 45}, {1097, 38},
+                {875, 50}, {900, 50}, {1062, 35},
+            };
+            check(fabs(BarCapacityFromWindowSpans(825, 1470,
+                                                  (BarWindowSpan){1062, 35},
+                                                  overlappingHosts, 7) - 115) < 0.001,
+                  @"capacity: unsorted duplicate and overlapping hosts consume their clipped union once");
+            const BarWindowSpan irrelevantHosts[] = {
+                {700, 50}, {1500, 38}, {NAN, 38}, {900, -5}, {1062, 35},
+            };
+            check(fabs(BarCapacityFromWindowSpans(825, 1470,
+                                                  (BarWindowSpan){1062, 35},
+                                                  irrelevantHosts, 5) - 272) < 0.001,
+                  @"capacity: off-display and malformed neighbours do not consume room");
+            const BarWindowSpan translatedHosts[] = {
+                {-446, 38}, {-408, 35}, {-373, 38}, {-335, 67},
+            };
+            check(fabs(BarCapacityFromWindowSpans(-645, 0,
+                                                  (BarWindowSpan){-408, 35},
+                                                  translatedHosts, 4) - liveGlyphCapacity) < 0.001,
+                  @"capacity: a display at negative desktop coordinates has the same room");
 
             // full, text (readings without icons), compact (one reading), glyph — points.
             const double W[kBarTierCount] = {121, 88, 55, 22};
@@ -862,6 +909,30 @@ int main(void) {
             check(s.tier == BarTierFull,
                   @"tier: live Tahoe capacity keeps the two-meter Full bar");
             const double LIVE_OCCUPIED_W[kBarTierCount] = {131, 82, 51, 35};
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            const int recoveredTiers[] = {
+                BarTierGlyph, BarTierCompact, BarTierCompact,
+                BarTierText, BarTierText, BarTierFull,
+            };
+            for (int i = 0; i < 14; i++) {
+                double ownWidth = LIVE_OCCUPIED_W[s.tier];
+                BarWindowSpan own = {1097 - ownWidth, ownWidth};
+                const BarWindowSpan movingHosts[] = {
+                    {own.x - 38, 38}, own, {1097, 38}, {1135, 67},
+                };
+                double capacity = BarCapacityFromWindowSpans(825, 1470, own, movingHosts, 4);
+                check(fabs(capacity - liveGlyphCapacity) < 0.001,
+                      @"recovery: left-host movement preserves capacity after each redraw");
+                s = ChooseBarTier(s, capacity, LIVE_OCCUPIED_W, NO, t += 15);
+                int expected = i < 6 ? recoveredTiers[i] : BarTierFull;
+                check(s.tier == expected,
+                      @"recovery: captured glyph layout reaches Compact, Text, Full and stays Full");
+            }
+            s = (BarTierState){BarTierGlyph, 0, 0};
+            for (int i = 0; i < 6; i++)
+                s = ChooseBarTier(s, crowdedCapacity, LIVE_OCCUPIED_W, NO, t += 15);
+            check(s.tier == BarTierGlyph && s.expandStreak == 0,
+                  @"recovery: a genuinely crowded packed row refuses enlargement");
             s = (BarTierState){BarTierFull, 0, 0};
             s = ChooseBarTier(s, 130, LIVE_OCCUPIED_W, NO, t);
             check(s.tier == BarTierFull,

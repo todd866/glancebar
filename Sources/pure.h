@@ -289,11 +289,12 @@ typedef struct {
     double width;
 } BarWindowSpan;
 
-// Points our live item may occupy while growing left, bounded by the notch (or screen
-// edge) and the nearest window already to its left. Control Centre hosts app status
-// items on macOS 26, so the visible copy can have a different window number from the
-// app-side NSWindow. Exclude a substantially overlapping host span geometrically
-// instead of relying on window identity alone.
+// Points our live item may occupy as the status hosts to its left shift into free
+// space. leftBoundary is the notch/screen edge or the end of the fixed app menus;
+// spans contains only movable status hosts. Count overlapping/duplicate hosts once.
+// Control Centre's visible copy can have a different window number from the app-side
+// NSWindow, so exclude substantially overlapping self spans by geometry. A neighbour
+// actually intruding into our frame still limits capacity until the layout settles.
 double BarCapacityFromWindowSpans(double leftBoundary, double rightEdge,
                                   BarWindowSpan own,
                                   const BarWindowSpan *spans, size_t count);

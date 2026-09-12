@@ -6,7 +6,7 @@ Developer account, a `Developer ID Application` certificate, and notary credenti
 
 1. Start from a clean checkout and confirm `CFBundleShortVersionString` and
    `CFBundleVersion` in `Info.plist` are the intended release values. The marketing
-   version is `1.1.0` and the monotonically increasing build number is `2` for this
+   version is `1.1.0` and the monotonically increasing build number is `3` for this
    candidate.
 
 2. Run the sanitizer tests, then build Universal 2 with the hardened runtime, an

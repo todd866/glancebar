@@ -3288,6 +3288,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 
     _item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _barCreatedAt = CFAbsoluteTimeGetCurrent();
+    // Diagnostic launch: exercise real shell placement and recovery from the glyph.
+    const char *startCollapsed = getenv("GLANCEBAR_BAR_START_COLLAPSED");
+    if (getenv("GLANCEBAR_BAR_DEBUG") && startCollapsed && strcmp(startCollapsed, "1") == 0)
+        _barTier.tier = BarTierGlyph;
     _item.button.target = self;
     _item.button.action = @selector(togglePopover:);
     // Re-render immediately when the menu bar flips light/dark (Light/Dark toggle, or a
@@ -3559,8 +3563,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 }
 
 // A notched status strip grows left as far as the notch; on a notchless display it
-// grows toward the nearest app-menu/status window instead. Measuring from the live
-// item's right edge also works when another third-party item sits to its left.
+// grows toward the fixed app menus instead. Status hosts to our left can move into
+// that free space when we widen; they consume their width, not the whole gap.
 // Window bounds/PIDs from CGWindowList carry no TCC gate (names would; we read none)
 // and no network — consistent with the README's privacy stance.
 //
@@ -3569,6 +3573,49 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 // own current width as occupied space: Full measured 114pt against its own 115pt
 // image, collapsed to Compact, then expanded and repeated forever. Match the hosted
 // copy by horizontal geometry and measure the live slot's leftward growth capacity.
+static double BarCapacityForWindows(NSArray *list, CGRect displayBounds, double leftBoundary,
+                                     BarWindowSpan own, NSInteger ownWindowNumber) {
+    double rightEdge = CGRectGetMaxX(displayBounds);
+    double menuBarY = CGRectGetMinY(displayBounds);
+    double fixedBoundary = leftBoundary;
+    CGWindowLevel statusLevel = CGWindowLevelForKey(kCGStatusWindowLevelKey);
+    if (![list isKindOfClass:NSArray.class] || list.count == 0) return -1;
+    NSMutableData *spanData = [NSMutableData dataWithLength:list.count * sizeof(BarWindowSpan)];
+    BarWindowSpan *spans = spanData.mutableBytes;
+    size_t spanCount = 0;
+    for (NSDictionary *w in list) {
+        NSNumber *num = w[(__bridge NSString *)kCGWindowNumber];
+        if (num.integerValue == ownWindowNumber) continue;   // our own occupancy is ours to spend
+        CGRect b = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b)) continue;
+        // The item's own display's menu-bar band. Quartz coordinates put each
+        // display's top at CGDisplayBounds.minY, including vertically arranged screens.
+        if (fabs(b.origin.y - menuBarY) > 1 || b.size.height > 40) continue;
+        // Degenerate 1-px windows (several apps park them at the screen origin) are
+        // not status items and do not occupy bar space.
+        if (b.size.width < 8 || b.size.height <= 0) continue;
+        if (CGRectGetMaxX(b) <= leftBoundary || b.origin.x >= rightEdge) continue;
+        NSNumber *layer = w[(__bridge NSString *)kCGWindowLayer];
+        if (![layer isKindOfClass:NSNumber.class]) return -1;
+        if (layer.integerValue != statusLevel) {
+            // A full-display backdrop is not occupied app-menu space. Other windows
+            // on our left are fixed, including menus newly intruding into our frame.
+            BOOL backdrop = CGRectGetMinX(b) <= CGRectGetMinX(displayBounds) + 1 &&
+                            CGRectGetMaxX(b) >= rightEdge - 1;
+            if (!backdrop && CGRectGetMinX(b) < own.x)
+                fixedBoundary = MAX(fixedBoundary, CGRectGetMaxX(b));
+            continue;
+        }
+        spans[spanCount++] = (BarWindowSpan){b.origin.x, b.size.width};
+    }
+    // A fixed menu crossing own.x is known crowding, not stale display geometry.
+    // Measure the pooled region up to our left edge, then impose the fixed squeeze.
+    double boundary = MAX(leftBoundary, MIN(fixedBoundary, own.x));
+    double capacity = BarCapacityFromWindowSpans(boundary, rightEdge, own, spans, spanCount);
+    return capacity < 0 ? capacity : MIN(capacity, MAX(0.0, own.x + own.width - fixedBoundary));
+}
+
 static double MeasuredBarCapacity(NSStatusItem *item) {
     NSWindow *win = item.button.window;
     NSScreen *screen = win.screen ?: NSScreen.screens.firstObject;
@@ -3579,31 +3626,10 @@ static double MeasuredBarCapacity(NSStatusItem *item) {
     if (CGRectIsEmpty(displayBounds)) return -1;
     NSRect aux = screen.auxiliaryTopRightArea;
     double leftBoundary = NSWidth(aux) > 0 ? NSMinX(aux) : CGRectGetMinX(displayBounds);
-    double rightEdge = CGRectGetMaxX(displayBounds);
-    double menuBarY = CGRectGetMinY(displayBounds);
     NSArray *list = CFBridgingRelease(
         CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
-    if (![list isKindOfClass:NSArray.class] || list.count == 0) return -1;
-    NSMutableData *spanData = [NSMutableData dataWithLength:list.count * sizeof(BarWindowSpan)];
-    BarWindowSpan *spans = spanData.mutableBytes;
-    size_t spanCount = 0;
-    for (NSDictionary *w in list) {
-        NSNumber *num = w[(__bridge NSString *)kCGWindowNumber];
-        if (num.integerValue == win.windowNumber) continue;   // our own occupancy is ours to spend
-        CGRect b = CGRectZero;
-        if (!CGRectMakeWithDictionaryRepresentation(
-                (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &b)) continue;
-        // The item's own display's menu-bar band. Quartz coordinates put each
-        // display's top at CGDisplayBounds.minY, including vertically arranged screens.
-        if (fabs(b.origin.y - menuBarY) > 1 || b.size.height > 40) continue;
-        // Degenerate 1-px windows (several apps park them at the screen origin) are
-        // not status items and do not occupy bar space.
-        if (b.size.width < 8) continue;
-        if (CGRectGetMaxX(b) <= leftBoundary || b.origin.x >= rightEdge) continue;
-        spans[spanCount++] = (BarWindowSpan){b.origin.x, b.size.width};
-    }
     BarWindowSpan own = {NSMinX(win.frame), NSWidth(win.frame)};
-    return BarCapacityFromWindowSpans(leftBoundary, rightEdge, own, spans, spanCount);
+    return BarCapacityForWindows(list, displayBounds, leftBoundary, own, win.windowNumber);
 }
 
 // Is the item sitting in the menu bar right now? Stated positively, because the
@@ -3773,11 +3799,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         BarTierState chosen = ChooseBarTier(self->_barTier, capacity, occupiedWidths, evicted,
                                             CFAbsoluteTimeGetCurrent());
         if (getenv("GLANCEBAR_BAR_DEBUG"))
-            NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f %.0f] occupied=[%.0f %.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d",
+            NSLog(@"bar: capacity=%.0f image=[%.0f %.0f %.0f %.0f] occupied=[%.0f %.0f %.0f %.0f] chrome=%.0f onBar=%d evicted=%d tier %d→%d streak=%d host=[%.0f %.0f]",
                   capacity, widths[0], widths[1], widths[2], widths[3],
                   occupiedWidths[0], occupiedWidths[1], occupiedWidths[2], occupiedWidths[3], chrome,
                   observable ? onBar : -1, evicted,
-                  self->_barTier.tier, chosen.tier, chosen.expandStreak);
+                  self->_barTier.tier, chosen.tier, chosen.expandStreak,
+                  NSMinX(self->_item.button.window.frame), hostFrameWidth);
         self->_barTier = chosen;
         NSImage *next = BarImageFromLayout(draws[chosen.tier], widths[chosen.tier]);
         if (installedImage && fabs(next.size.width - installedImage.size.width) > 0.5) {

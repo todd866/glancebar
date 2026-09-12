@@ -59,6 +59,8 @@ opt-in) `/usr/bin/security`.
   every reading with its icons → the same readings without icons → the single most
   useful reading → a bare glyph. It widens back when space returns, and VoiceOver and
   the hover tooltip always carry the full summary at every width.
+  Recovery includes free space before neighboring status items, which macOS moves
+  left as Glancebar grows, so a packed row cannot trap it in the collapsed state.
 - **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
   lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
   admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
@@ -82,6 +84,12 @@ For GUI launches, use Finder, `open`, or Launch at Login. Do not run
 Control Centre can otherwise persistently attribute its menu-bar item to the
 terminal or parent app. Glancebar detects that launch path and relaunches itself
 through Launch Services before creating the item.
+
+For layout diagnostics, launch with `GLANCEBAR_BAR_DEBUG=1` to log measured capacity,
+tier widths, and host position. Also setting `GLANCEBAR_BAR_START_COLLAPSED=1` starts
+at the glyph to exercise automatic recovery; it only applies to that diagnostic
+launch and is not saved as a preference. Pass these through `open --env` when
+launching a stopped app so Launch Services still establishes its identity.
 
 The build uses `-Wall -Wextra -Werror`, the macOS hardened runtime, and both `arm64`
 and `x86_64` by default. Set `GLANCEBAR_ARCHS=native` if the local toolchain cannot
