@@ -51,12 +51,21 @@ int main(int argc, const char **argv) {
         probe.fable = 0.06; probe.opus = 0.8;
         if (!Red(MeterPixel(probe,3,4)) || !Green(MeterPixel(probe,40,4))) return Fail(__LINE__);
         probe.fable = 0.8; probe.opus = 0.06;
-        if (!Green(MeterPixel(probe,3,4)) || !Red(MeterPixel(probe,40,4))) return Fail(__LINE__);
+        if (!Red(MeterPixel(probe,3,4)) || !Red(MeterPixel(probe,40,4))) return Fail(__LINE__);
         probe.fable = 0;
-        if (!Green(MeterPixel(probe,3,4))) return Fail(__LINE__);
-        probe.fable = probe.opus = 0.5;
+        if (!Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
+        probe.fable = probe.opus = 0.8;
         NSColor *top = MeterPixel(probe,25,1), *bottom = MeterPixel(probe,25,6);
         if (!((Red(top) && Green(bottom)) || (Green(top) && Red(bottom)))) return Fail(__LINE__);
+        probe.fable = 0.06; probe.opus = 0.33;
+        NSColor *lowOpus = MeterPixel(probe,20,4);
+        __block NSColor *amber;
+        [probe.appearance performAsCurrentDrawingAppearance:^{
+            amber = [NSColor.systemOrangeColor colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
+        }];
+        if (fabs(lowOpus.redComponent-amber.redComponent)>0.03 ||
+            fabs(lowOpus.greenComponent-amber.greenComponent)>0.03 ||
+            fabs(lowOpus.blueComponent-amber.blueComponent)>0.03) return Fail(__LINE__);
         Controller *c = [Controller new];
         NSPopover *p = [NSPopover new];
         p.contentViewController = [NSViewController new];

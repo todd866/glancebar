@@ -2773,6 +2773,13 @@ static NSColor *BattBarColor(int pct) {
 }
 @end
 
+static NSColor *AIQuotaColor(double fraction) {
+    if (fraction <= 0.15) return NSColor.systemRedColor;
+    if (fraction <= 0.35) return NSColor.systemOrangeColor;
+    if (fraction <= 0.60) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
+    return NSColor.systemGreenColor;
+}
+
 // Two percentages on the same 0–100% scale, never stacked or added together.
 @interface ClaudeGauge : NSView
 @property (nonatomic) double fable, opus; // negative = not reported
@@ -2783,7 +2790,7 @@ static NSColor *BattBarColor(int pct) {
         _fable = _opus = -1;
         [self setAccessibilityElement:YES];
         self.accessibilityRole = NSAccessibilityImageRole;
-        self.accessibilityLabel = @"Claude quota remaining: red Fable, green Opus";
+        self.accessibilityLabel = @"Claude quota remaining: Fable and Opus";
         self.accessibilityIdentifier = @"popover.claude.meter";
     }
     return self;
@@ -2810,7 +2817,7 @@ static NSColor *BattBarColor(int pct) {
         NSRect fill = r; fill.size.width *= value;
         // Equal endpoints share the thickness so neither model disappears.
         if (_fable == _opus) { fill.size.height /= 2; if (fable) fill.origin.y += fill.size.height; }
-        [(fable ? NSColor.systemRedColor : NSColor.systemGreenColor) setFill]; NSRectFill(fill);
+        [(fable ? NSColor.systemRedColor : AIQuotaColor(value)) setFill]; NSRectFill(fill);
     }
     [NSGraphicsContext restoreGraphicsState];
 }
@@ -3529,10 +3536,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 }
 
 - (NSColor *)windowColor:(double)frac {
-    if (frac <= 0.15) return NSColor.systemRedColor;
-    if (frac <= 0.35) return NSColor.systemOrangeColor;
-    if (frac <= 0.60) return [NSColor.systemYellowColor colorWithAlphaComponent:0.9];
-    return NSColor.systemGreenColor;
+    return AIQuotaColor(frac);
 }
 
 - (NSColor *)aiStatusColor:(AIUsage *)u {
