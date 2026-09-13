@@ -71,8 +71,10 @@ opt-in) `/usr/bin/security`.
   opt-in *Stay awake with lid closed* toggle's standard admin prompt.
 
 The main popover shows the fullest drive, battery, overall system pressure, and one
-quota row per AI provider, with Fable (red) and Opus (coloured by remaining allowance) overlaid on one aligned Claude meter.
-Both fills start at zero; the shorter fill overlays the longer. When no separate
+quota row per AI provider. Claude normally overlays two full-height fills on the
+same scale. Within three percentage points it uses thin lanes: Fable above, Opus
+below. Each changes colour independently; both are green after a full reset.
+A subtle boundary keeps different endpoints visible when both have the same colour. When no separate
 Opus quota is reported, its fill uses the shared allowance (identified on hover). **All drives…** opens the complete Storage tab; **Details…**
 keeps process breakdowns, every quota window, and diagnostics available on demand.
 The Details button's tooltip includes the last refresh times.

@@ -2780,7 +2780,13 @@ static NSColor *AIQuotaColor(double fraction) {
     return NSColor.systemGreenColor;
 }
 
-// Two percentages on the same 0–100% scale, never stacked or added together.
+// Overlay distinct endpoints; use fixed lanes only when they are nearly equal.
+static BOOL ClaudeQuotasClose(double fable, double opus) {
+    return fable >= 0 && opus >= 0 && fabs(fable-opus) <= 0.030000001;
+}
+static NSColor *ClaudeQuotaColor(double fraction) {
+    return fraction > 0.35 ? NSColor.systemGreenColor : AIQuotaColor(fraction);
+}
 @interface ClaudeGauge : NSView
 @property (nonatomic) double fable, opus; // negative = not reported
 @end
@@ -2805,21 +2811,32 @@ static NSColor *AIQuotaColor(double fraction) {
 - (void)setOpus:(double)value { _opus = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
 - (void)drawRect:(NSRect)dirty {
     NSRect r = self.bounds;
-    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:r.size.height/2 yRadius:r.size.height/2];
-    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
-    [NSGraphicsContext saveGraphicsState]; [track addClip];
-    // Longer first, shorter on top: a near-empty Fable quota is a red sliver at left.
-    BOOL fableFirst = _fable > _opus;
+    BOOL lanes = ClaudeQuotasClose(_fable, _opus);
+    CGFloat laneHeight = MAX(0, (r.size.height-1)/2);
+    NSBezierPath *wholeTrack = [NSBezierPath bezierPathWithRoundedRect:r xRadius:r.size.height/2 yRadius:r.size.height/2];
+    if (!lanes) { [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [wholeTrack fill]; }
     for (int i=0; i<2; i++) {
-        BOOL fable = i == 0 ? fableFirst : !fableFirst;
+        // Draw longer first in overlay mode, but keep Fable above in lane mode.
+        BOOL fable = lanes ? i == 0 : (i == 0 ? _fable > _opus : _fable <= _opus);
         double value = fable ? _fable : _opus;
+        NSRect lane = lanes ? NSMakeRect(r.origin.x, r.origin.y + (fable ? laneHeight+1 : 0), r.size.width, laneHeight) : r;
+        CGFloat radius = lane.size.height/2;
+        NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:lane xRadius:radius yRadius:radius];
+        if (lanes) { [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill]; }
         if (value <= 0) continue;
-        NSRect fill = r; fill.size.width *= value;
-        // Equal endpoints share the thickness so neither model disappears.
-        if (_fable == _opus) { fill.size.height /= 2; if (fable) fill.origin.y += fill.size.height; }
-        [(fable ? NSColor.systemRedColor : AIQuotaColor(value)) setFill]; NSRectFill(fill);
+        [NSGraphicsContext saveGraphicsState]; [track addClip];
+        NSRect fill = lane; fill.size.width *= value;
+        [ClaudeQuotaColor(value) setFill]; NSRectFill(fill);
+        [NSGraphicsContext restoreGraphicsState];
     }
-    [NSGraphicsContext restoreGraphicsState];
+    // Two healthy quotas can share a colour; keep the shorter endpoint readable.
+    if (!lanes && _fable > 0 && _opus > 0 &&
+        [ClaudeQuotaColor(_fable) isEqual:ClaudeQuotaColor(_opus)]) {
+        [NSGraphicsContext saveGraphicsState]; [wholeTrack addClip];
+        [[NSColor.labelColor colorWithAlphaComponent:0.4] setFill];
+        NSRectFill(NSMakeRect(r.origin.x + MIN(_fable,_opus)*r.size.width - 0.5, r.origin.y, 1, r.size.height));
+        [NSGraphicsContext restoreGraphicsState];
+    }
 }
 @end
 
@@ -4254,15 +4271,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, source,
             clock.length ? [@"; resets " stringByAppendingString:clock] : @""]];
     }
-    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:@"\nBoth fills start at zero. Model allowances are capped by the shared limit."];
+    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:@"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the shared limit."];
     [row addSubview:meter];
     NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
     NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
-    NSTextField *value = [self text:[NSString stringWithFormat:@"%@/%@%% left",f,o]
+    NSTextField *value = [self text:[NSString stringWithFormat:@"%@/%@%%",f,o]
         font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:NSColor.secondaryLabelColor
         at:NSMakeRect(width-pad-rightW, 21, rightW, 15) align:NSTextAlignmentRight];
+    value.accessibilityIdentifier = @"popover.claude.value";
+    value.accessibilityLabel = @"Fable / Opus percent remaining";
     value.toolTip = meter.toolTip; [row addSubview:value];
-    NSString *caption = [@"Fable / Opus · " stringByAppendingString:[self aiStatusSubtext:u]];
+    NSString *legend = ClaudeQuotasClose(fable, opus) ? @"Fable ↑ / Opus ↓ · " : @"Fable / Opus · ";
+    NSString *caption = [legend stringByAppendingString:[self aiStatusSubtext:u]];
     NSTextField *note = [self text:caption font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
         at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
     note.toolTip = meter.toolTip; [row addSubview:note]; [root addSubview:row];

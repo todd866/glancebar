@@ -49,15 +49,21 @@ int main(int argc, const char **argv) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
         ClaudeGauge *probe = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(0,0,100,8)];
         probe.fable = 0.06; probe.opus = 0.8;
-        if (!Red(MeterPixel(probe,3,4)) || !Green(MeterPixel(probe,40,4))) return Fail(__LINE__);
+        if (!Red(MeterPixel(probe,3,1)) || !Green(MeterPixel(probe,40,1)) ||
+            !Green(MeterPixel(probe,40,6))) return Fail(__LINE__);
         probe.fable = 0.8; probe.opus = 0.06;
-        if (!Red(MeterPixel(probe,3,4)) || !Red(MeterPixel(probe,40,4))) return Fail(__LINE__);
+        if (!Green(MeterPixel(probe,40,4)) || !Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
         probe.fable = 0;
         if (!Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
-        probe.fable = probe.opus = 0.8;
-        NSColor *top = MeterPixel(probe,25,1), *bottom = MeterPixel(probe,25,6);
-        if (!((Red(top) && Green(bottom)) || (Green(top) && Red(bottom)))) return Fail(__LINE__);
-        probe.fable = 0.06; probe.opus = 0.33;
+        // A full reset and near-ties use lanes, with each endpoint independently visible.
+        probe.fable = probe.opus = 1;
+        if (!Green(MeterPixel(probe,90,1)) || !Green(MeterPixel(probe,90,6))) return Fail(__LINE__);
+        if (!ClaudeQuotasClose(.30,.33) || ClaudeQuotasClose(.30,.34) || ClaudeQuotasClose(-1,0)) return Fail(__LINE__);
+        probe.fable = .30; probe.opus = .32;
+        if (!Red(MeterPixel(probe,20,1)) || !Red(MeterPixel(probe,20,6))) return Fail(__LINE__);
+        // User example: full-height amber to 30%, green from there to 60%.
+        probe.fable = .30; probe.opus = .60;
+        if (!Green(MeterPixel(probe,45,1)) || !Green(MeterPixel(probe,45,6))) return Fail(__LINE__);
         NSColor *lowOpus = MeterPixel(probe,20,4);
         __block NSColor *amber;
         [probe.appearance performAsCurrentDrawingAppearance:^{
@@ -115,7 +121,7 @@ int main(int argc, const char **argv) {
         if (!FitsChildren(root)) return Fail(__LINE__);
         ClaudeGauge *meter = FindClaudeMeter(root);
         if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.33)>0.001 ||
-            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33% left")) return Fail(__LINE__);
+            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33%")) return Fail(__LINE__);
         if (!HasText(root, @"Macintosh HD")) return Fail(__LINE__);
         NSScrollView *storage = [c storageDetailsView];
         if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
@@ -151,6 +157,10 @@ int main(int argc, const char **argv) {
         if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 4 ||
             !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
+        claude.limitWindows = @[@{@"remainingFraction":@1, @"window":@"weekly Fable"},
+                               @{@"remainingFraction":@1, @"window":@"weekly Opus"}];
+        [c rebuildContent];
+        if (!HasText(p.contentViewController.view,@"100/100%") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
         claude.overageActive = YES;
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
