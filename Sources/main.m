@@ -2580,7 +2580,8 @@ typedef struct {
     // Read drift from the newest snapshot as it arrived, not from the merged view.
     NSString *drift = CodexSchemaDriftReason(_limitsNewest);
     u.limitWindows = CodexBucketWindows(_buckets, now);
-    NSDictionary *pick = PickCodexBucketWindow(_buckets, now);
+    NSDictionary *planBuckets = _buckets[@"codex"] ? @{@"codex": _buckets[@"codex"]} : @{};
+    NSDictionary *pick = PickCodexBucketWindow(planBuckets, now);
     u.billingNote = CodexBillingNote(_buckets, now);
     NSMutableSet *bucketsShown = [NSMutableSet set];
     for (NSDictionary *w in u.limitWindows) if (w[@"bucket"]) [bucketsShown addObject:w[@"bucket"]];
@@ -2611,7 +2612,7 @@ typedef struct {
     }
     // With no gauge left, "the payload changed shape" beats "the windows have reset":
     // both are true, but only one tells the user why no new number is coming.
-    else u.statusReason = drift ?: CodexBucketsStatusReason(_buckets, now);
+    else u.statusReason = drift ?: CodexBucketsStatusReason(planBuckets, now);
 
     // Context, never the gauge: a zero credit balance is normal while the plan window
     // still has room. See CodexCreditsStatus. Credits are account-level; read them from
@@ -2769,6 +2770,49 @@ static NSColor *BattBarColor(int pct) {
     NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*self.fraction);
     [(self.color ?: NSColor.controlAccentColor) setFill];
     [[NSBezierPath bezierPathWithRoundedRect:f xRadius:rad yRadius:rad] fill];
+}
+@end
+
+// Two percentages on the same 0–100% scale, never stacked or added together.
+@interface ClaudeGauge : NSView
+@property (nonatomic) double fable, opus; // negative = not reported
+@end
+@implementation ClaudeGauge
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        _fable = _opus = -1;
+        [self setAccessibilityElement:YES];
+        self.accessibilityRole = NSAccessibilityImageRole;
+        self.accessibilityLabel = @"Claude quota remaining: red Fable, green Opus";
+        self.accessibilityIdentifier = @"popover.claude.meter";
+    }
+    return self;
+}
+- (void)refreshValues {
+    NSString *f = _fable < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _fable*100];
+    NSString *o = _opus < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _opus*100];
+    self.accessibilityValue = [NSString stringWithFormat:@"Fable %@, Opus %@ remaining", f, o];
+    self.needsDisplay = YES;
+}
+- (void)setFable:(double)value { _fable = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)setOpus:(double)value { _opus = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds;
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:r.size.height/2 yRadius:r.size.height/2];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
+    [NSGraphicsContext saveGraphicsState]; [track addClip];
+    // Longer first, shorter on top: a near-empty Fable quota is a red sliver at left.
+    BOOL fableFirst = _fable > _opus;
+    for (int i=0; i<2; i++) {
+        BOOL fable = i == 0 ? fableFirst : !fableFirst;
+        double value = fable ? _fable : _opus;
+        if (value <= 0) continue;
+        NSRect fill = r; fill.size.width *= value;
+        // Equal endpoints share the thickness so neither model disappears.
+        if (_fable == _opus) { fill.size.height /= 2; if (fable) fill.origin.y += fill.size.height; }
+        [(fable ? NSColor.systemRedColor : NSColor.systemGreenColor) setFill]; NSRectFill(fill);
+    }
+    [NSGraphicsContext restoreGraphicsState];
 }
 @end
 
@@ -2949,6 +2993,9 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         NSImageView *old = (NSImageView *)existing, *new = (NSImageView *)fresh;
         old.image = new.image;
         old.contentTintColor = new.contentTintColor;
+    } else if ([existing isKindOfClass:ClaudeGauge.class]) {
+        ClaudeGauge *old = (ClaudeGauge *)existing, *new = (ClaudeGauge *)fresh;
+        old.fable = new.fable; old.opus = new.opus;
     } else if ([existing isKindOfClass:Gauge.class]) {
         Gauge *old = (Gauge *)existing, *new = (Gauge *)fresh;
         old.fraction = new.fraction;
@@ -3020,29 +3067,30 @@ static NSImage *DriveMeterIcon(double fraction, NSColor *fg, NSColor *fill) {
     NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
     [img lockFocus];
 
-    NSRect body = NSMakeRect(1.5, 3.0, 14.0, 9.0);
-    NSBezierPath *outer = [NSBezierPath bezierPathWithRoundedRect:body xRadius:2.2 yRadius:2.2];
-    [BarIconTrackColor(fg) setFill];
-    [outer fill];
+    // Keep the hard-drive silhouette, but put usage on a rectangular front face:
+    // equal changes in capacity now move a straight edge by equal distances.
+    NSBezierPath *top = [NSBezierPath bezierPath];
+    [top moveToPoint:NSMakePoint(1, 7.5)];
+    [top lineToPoint:NSMakePoint(3, 11.8)];
+    [top curveToPoint:NSMakePoint(4.2, 12.8) controlPoint1:NSMakePoint(3.2, 12.5) controlPoint2:NSMakePoint(3.5, 12.8)];
+    [top lineToPoint:NSMakePoint(12.8, 12.8)];
+    [top curveToPoint:NSMakePoint(14, 11.8) controlPoint1:NSMakePoint(13.5, 12.8) controlPoint2:NSMakePoint(13.8, 12.5)];
+    [top lineToPoint:NSMakePoint(16, 7.5)];
+    [top closePath];
+    [[fg colorWithAlphaComponent:0.12] setFill]; [top fill];
+    [fg setStroke]; top.lineWidth = 1.1; [top stroke];
 
-    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body, 1.2, 1.2) xRadius:1.2 yRadius:1.2];
-    [NSGraphicsContext saveGraphicsState];
-    [clip addClip];
+    NSBezierPath *front = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 1.5, 15, 6.3)
+                                                                  xRadius:1.1 yRadius:1.1];
+    [fg setStroke]; front.lineWidth = 1.1; [front stroke];
+    NSRect meter = NSMakeRect(2.6, 3.1, 11.8, 3.1);
+    [[fg colorWithAlphaComponent:0.12] setFill]; NSRectFill(meter);
     [(fill ?: fg) setFill];
-    NSRect fillRect = NSInsetRect(body, 1.2, 1.2);
-    fillRect.size.width *= fraction;
-    NSRectFill(fillRect);
-    [NSGraphicsContext restoreGraphicsState];
-
-    [fg setStroke];
-    outer.lineWidth = 1.2;
-    [outer stroke];
-    [[fg colorWithAlphaComponent:0.75] setStroke];
-    NSBezierPath *slot = [NSBezierPath bezierPath];
-    [slot moveToPoint:NSMakePoint(5.0, 5.0)];
-    [slot lineToPoint:NSMakePoint(12.0, 5.0)];
-    slot.lineWidth = 1.0;
-    [slot stroke];
+    meter.size.width *= fraction;
+    if (fraction > 0) NSRectFill(meter);
+    // The indicator belongs on the lid so it cannot obscure the usage meter.
+    [fg setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(11.4, 9.4, 1.2, 1.2)] fill];
 
     [img unlockFocus];
     img.template = NO;
@@ -4072,8 +4120,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // Falls back to whatever preformatted string the source supplied when there is no date
 // behind it (a status-file override may hand over free text).
 - (NSString *)compactResetText:(AIUsage *)u {
-    NSString *phrase = ResetPhrase(u.resetAt, NSDate.date);
-    if (phrase.length) return phrase;
+    NSString *clock = u.resetAt ? ResetClockText(u.resetAt, NSDate.date) : nil;
+    if (clock.length) return [@"Resets " stringByAppendingString:clock];
     NSString *reset = u.resetText ?: @"";
     if (!reset.length || [reset isEqualToString:@"Not exposed locally"] ||
         [reset isEqualToString:@"Not provided"] || [reset isEqualToString:@"Not started"])
@@ -4104,9 +4152,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // Overage has no reset to report — the paid budget is not a window that rolls over.
     NSString *lead = u.overageActive ? nil : [self compactResetText:u];
     if (!lead.length) lead = u.statusReason;
-    // "No credits" changes what the reader does next (requests will be refused, not
-    // merely slowed), so it earns its place beside the reset even on the one-line row.
-    else if ([u.billingNote containsString:@"none available"]) lead = [lead stringByAppendingString:@" · no credits"];
+    // Keep billing visible even when a carried-forward plan window has a reset.
+    if ([u.billingNote containsString:@"credits"]) {
+        NSString *billing = [u.billingNote containsString:@"none available"] ? @"No credits" : @"Using credits";
+        lead = lead.length ? [NSString stringWithFormat:@"%@ · %@", billing, lead] : billing;
+    }
     if (lead.length)
         return note.length ? [NSString stringWithFormat:@"%@ · %@", lead, note] : lead;
     if (!u.available) return @"No local state";
@@ -4123,7 +4173,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 }
 
 - (NSView *)aiStatusRow:(AIUsage *)u width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
-    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 44)];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
     CGFloat inner = width - 2*pad;
     CGFloat rightW = 70;
     CGFloat titleW = 74;
@@ -4132,116 +4182,87 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     BOOL hasGauge = u.limitStatusAvailable && u.remainingFraction >= 0;
     NSString *title = u.name ?: @"AI";
     [row addSubview:[self text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
-                          at:NSMakeRect(pad, 25, titleW, 15) align:NSTextAlignmentLeft]];
+                          at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
     // "left" makes the direction unambiguous — a bare "10%" reads as used just as
     // easily as remaining.
     NSString *rightText = hasGauge ? [[self aiPercentText:u] stringByAppendingString:@" left"] : @"—";
     [row addSubview:[self text:rightText font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
-                         color:[self aiStatusColor:u] at:NSMakeRect(width-pad-rightW, 23, rightW, 17) align:NSTextAlignmentRight]];
+                         color:[self aiStatusColor:u] at:NSMakeRect(width-pad-rightW, 19, rightW, 17) align:NSTextAlignmentRight]];
     if (hasGauge) {   // no gauge at all beats an empty gauge that implies "0% used"
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 28, MAX(20, barW), 7)];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20, barW), 7)];
         g.fraction = u.remainingFraction;
         g.color = [self aiStatusColor:u];
         g.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", title];
         [row addSubview:g];
     }
     [row addSubview:[self text:[self aiStatusSubtext:u] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                          at:NSMakeRect(pad, 7, inner, 14) align:NSTextAlignmentLeft]];
+                          at:NSMakeRect(pad, 3, inner, 14) align:NSTextAlignmentLeft]];
     return row;
 }
 
-// "Resets — 5-hour 3:10 pm · weekly Wed 9:00 am" from a window list (skips windows with
-// no reset). Each window is already named beside its own gauge, so this line carries the
-// clock time only — the countdown would double the width to repeat what the clock says.
-- (NSString *)windowsResetSummary:(NSArray<NSDictionary *> *)windows {
-    NSDate *now = NSDate.date;
-    NSMutableSet *buckets = [NSMutableSet set];
-    for (NSDictionary *w in windows) if (w[@"bucket"]) [buckets addObject:w[@"bucket"]];
-    NSMutableArray *parts = [NSMutableArray array];
-    BOOL anyFresh = NO;
-    for (NSDictionary *w in windows) {
-        if ([w[@"fresh"] boolValue]) anyFresh = YES;
-        NSNumber *resets = w[@"resetsAt"];
-        if (![resets isKindOfClass:NSNumber.class]) continue;
-        NSString *t = ResetClockText([NSDate dateWithTimeIntervalSince1970:resets.doubleValue], now);
-        if (!t.length) continue;
-        // With several buckets the window name alone is ambiguous ("weekly" twice).
-        NSString *name = buckets.count > 1 && w[@"bucketLabel"]
-            ? [NSString stringWithFormat:@"%@ %@", w[@"bucketLabel"], w[@"window"]] : w[@"window"];
-        [parts addObject:[NSString stringWithFormat:@"%@ %@", name, t]];
-    }
-    if (parts.count) return [@"Resets — " stringByAppendingString:[parts componentsJoinedByString:@" · "]];
-    return anyFresh ? @"Nothing used yet · each window starts on first use" : @"";
-}
-
-// A secondary line that may run to two lines instead of truncating: the resets line
-// carries one clock per window, and three windows do not fit 288pt.
-- (NSTextField *)wrappedNote:(NSString *)s color:(NSColor *)color width:(CGFloat)width pad:(CGFloat)pad
-                          at:(CGFloat)y lines:(NSInteger *)lines {
-    NSFont *font = [NSFont systemFontOfSize:10.5];
-    CGFloat inner = width - 2*pad;
-    NSInteger n = [s sizeWithAttributes:@{NSFontAttributeName: font}].width > inner ? 2 : 1;
-    NSTextField *field = [self text:s font:font color:color at:NSMakeRect(pad, y, inner, 14 * n)
-                              align:NSTextAlignmentLeft];
-    if (n > 1) {
-        field.lineBreakMode = NSLineBreakByWordWrapping;
-        field.maximumNumberOfLines = n;
-        field.cell.truncatesLastVisibleLine = YES;
-    }
-    if (lines) *lines = n;
-    return field;
-}
-
-// One popover AI card. With two or more current limit windows it draws the dual meter
-// (a labeled gauge per window + a combined resets line); otherwise the compact
-// single-line row, which also carries the overage / no-status fallbacks. Returns new y.
+// Claude's scoped allowances share one compact row; account-wide limits remain
+// explicit below it because neither model quota replaces the shared allowance.
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
-    NSArray<NSDictionary *> *windows = u.limitWindows;
-    if (u.overageActive || windows.count < 2) {
+    NSMutableDictionary<NSString *, NSDictionary *> *scoped = [NSMutableDictionary dictionary];
+    if ([u.name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable) {
+        for (NSDictionary *w in u.limitWindows) {
+            NSString *label = w[@"window"];
+            if (![label isKindOfClass:NSString.class] || ![label hasPrefix:@"weekly "]) continue;
+            // The tightest reported weekly constraint governs each model, never a sum.
+            for (NSString *model in @[@"Fable", @"Opus"]) {
+                if ([label rangeOfString:model options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+                if (!scoped[model] || [w[@"remainingFraction"] doubleValue] < [scoped[model][@"remainingFraction"] doubleValue])
+                    scoped[model] = w;
+            }
+        }
+    }
+    if (!scoped.count) {
         [root addSubview:[self aiStatusRow:u width:width pad:pad at:y]];
-        return y + 44;
+        return y + 40;
     }
-    CGFloat inner = width - 2*pad;
-    [root addSubview:[self text:(u.name ?: @"AI") font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
-                          color:nil at:NSMakeRect(pad, y, inner, 15) align:NSTextAlignmentLeft]];
-    y += 19;
-    NSMutableSet *buckets = [NSMutableSet set];
-    for (NSDictionary *w in windows) if (w[@"bucket"]) [buckets addObject:w[@"bucket"]];
-    for (NSDictionary *w in windows) {
-        double frac = [w[@"remainingFraction"] doubleValue];
-        NSString *right = [NSString stringWithFormat:@"%d%% left", (int)lround(frac * 100)];
-        NSString *title = w[@"window"] ?: @"window";
-        // Several Codex buckets each have a "weekly": name the bucket beside the window.
-        if (buckets.count > 1 && [w[@"bucketLabel"] isKindOfClass:NSString.class])
-            title = [NSString stringWithFormat:@"%@ · %@", title, w[@"bucketLabel"]];
-        [root addSubview:[self compactSignalRow:title right:right fraction:frac
-                                          color:[self windowColor:frac] width:width pad:pad at:y]];
-        y += 28;
+    NSDictionary *shared = nil;
+    for (NSDictionary *w in u.limitWindows) {
+        if (![w[@"window"] isEqual:@"weekly"] && ![w[@"window"] isEqual:@"5-hour"]) continue;
+        if (!shared || [w[@"remainingFraction"] doubleValue] < [shared[@"remainingFraction"] doubleValue]) shared = w;
     }
-    NSString *resets = [self windowsResetSummary:windows];
-    if (resets.length) {
-        NSInteger lines = 1;
-        [root addSubview:[self wrappedNote:resets color:NSColor.secondaryLabelColor width:width pad:pad at:y lines:&lines]];
-        y += 14 * lines + 2;
+    // Without a dedicated Opus window, the shared allowance is its displayed cap.
+    // Any model-specific quota is also constrained by that same shared allowance.
+    double fable = scoped[@"Fable"] ? [scoped[@"Fable"][@"remainingFraction"] doubleValue] : -1;
+    double opus = scoped[@"Opus"] ? [scoped[@"Opus"][@"remainingFraction"] doubleValue] : -1;
+    if (shared) {
+        double cap = [shared[@"remainingFraction"] doubleValue];
+        if (fable >= 0) fable = MIN(fable, cap);
+        opus = opus < 0 ? cap : MIN(opus, cap);
     }
-    if (u.billingNote.length) {
-        // Where requests bill now, when that is not the window on show. "None available"
-        // means refusals, not slowdowns, so it takes the warning colour.
-        BOOL refusing = [u.billingNote containsString:@"none available"];
-        NSInteger lines = 1;
-        [root addSubview:[self wrappedNote:u.billingNote
-                                     color:refusing ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor
-                                     width:width pad:pad at:y lines:&lines]];
-        y += 14 * lines + 2;
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
+    CGFloat inner = width-2*pad, titleW = 74, rightW = 70;
+    CGFloat barX = pad+titleW+8, barW = inner-titleW-rightW-18;
+    [row addSubview:[self text:@"Claude" font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+        color:nil at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
+    ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20,barW), 7)];
+    meter.fable = fable; meter.opus = opus;
+    NSMutableArray *sources = [NSMutableArray array];
+    for (NSString *model in @[@"Fable", @"Opus"]) {
+        NSDictionary *w = scoped[model] ?: ([model isEqual:@"Opus"] ? shared : nil);
+        NSString *source = scoped[model] ? w[@"window"] : w ? @"shared Claude allowance" : @"not reported";
+        NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, source,
+            clock.length ? [@"; resets " stringByAppendingString:clock] : @""]];
     }
-    NSString *staleness = [self aiStalenessNote:u capitalized:YES];
-    if (staleness.length) {
-        [root addSubview:[self text:staleness font:[NSFont systemFontOfSize:10.5]
-                              color:NSColor.systemOrangeColor
-                                 at:NSMakeRect(pad, y, inner, 14) align:NSTextAlignmentLeft]];
-        y += 16;
-    }
-    return y + 6;
+    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:@"\nBoth fills start at zero. Model allowances are capped by the shared limit."];
+    [row addSubview:meter];
+    NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
+    NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
+    NSTextField *value = [self text:[NSString stringWithFormat:@"%@/%@%% left",f,o]
+        font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:NSColor.secondaryLabelColor
+        at:NSMakeRect(width-pad-rightW, 21, rightW, 15) align:NSTextAlignmentRight];
+    value.toolTip = meter.toolTip; [row addSubview:value];
+    NSString *caption = [@"Fable / Opus · " stringByAppendingString:[self aiStatusSubtext:u]];
+    NSTextField *note = [self text:caption font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+        at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
+    note.toolTip = meter.toolTip; [row addSubview:note]; [root addSubview:row];
+    return y + 40;
 }
 
 - (NSString *)aiOverviewText {
@@ -4268,7 +4289,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     CGFloat y = kPad;
 
     // ---------- STORAGE ----------
-    [root addSubview:[self sectionHeader:@"Storage" at:y]]; y += 22;
+    [root addSubview:[self sectionHeader:@"Storage" at:y]]; y += 18;
     if (!_vols.count) {
         NSString *status = _volumesLoading ? @"Scanning mounted volumes…" : @"Storage information unavailable";
         NSTextField *statusField = [self text:status font:[NSFont systemFontOfSize:12]
@@ -4279,7 +4300,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [root addSubview:statusField];
         y += 24;
     }
-    for (Volume *v in _vols) {
+    // Lead with the fullest drive; the complete mounted-volume list lives in Details.
+    Volume *leadVolume = nil;
+    for (Volume *v in _vols) if (!leadVolume || v.fraction > leadVolume.fraction) leadVolume = v;
+    for (Volume *v in leadVolume ? @[leadVolume] : @[]) {
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
         CGFloat inner = kW - 2*kPad;
         NSImage *ic = [NSImage imageWithSystemSymbolName:(v.isInternal ? @"internaldrive" : @"externaldrive")
@@ -4311,25 +4335,31 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                             color:NSColor.secondaryLabelColor
                                                at:NSMakeRect(kPad, 4, inner, 14)
                                             align:NSTextAlignmentLeft];
+        if (_volumesUnavailable) {
+            capacityField.toolTip = capacityField.stringValue;
+            capacityField.stringValue = [NSString stringWithFormat:@"Cached %@ · scan unavailable",
+                _lastVolumeSuccess ? [self shortAgeForDate:_lastVolumeSuccess] : @"reading"];
+            capacityField.textColor = NSColor.systemOrangeColor;
+        }
         capacityField.accessibilityIdentifier = [volumeID stringByAppendingString:@".capacity"];
         [row addSubview:capacityField];
         [root addSubview:row]; y += 54;
     }
-    if (_volumesUnavailable && _vols.count) {
-        NSString *age = _lastVolumeSuccess
-            ? [NSString stringWithFormat:@"Using last storage reading (%@) · scan unavailable",
-               [self shortAgeForDate:_lastVolumeSuccess]]
-            : @"Using last storage reading · scan unavailable";
-        [root addSubview:[self text:age font:[NSFont systemFontOfSize:10.5]
-                              color:NSColor.systemOrangeColor at:NSMakeRect(kPad, y, kW-2*kPad, 14)
-                              align:NSTextAlignmentLeft]];
-        y += 18;
+    if (_vols.count > 1) {
+        NSButton *drives = [NSButton buttonWithTitle:[NSString stringWithFormat:@"All %lu drives…", (unsigned long)_vols.count]
+                                              target:self action:@selector(showStorageDetails:)];
+        drives.alignment = NSTextAlignmentLeft;
+        drives.bordered = NO; drives.font = [NSFont systemFontOfSize:12];
+        drives.contentTintColor = NSColor.secondaryLabelColor;
+        drives.frame = NSMakeRect(kPad-4, y, 130, 22);
+        drives.accessibilityIdentifier = @"popover.storage.details";
+        [root addSubview:drives]; y += 22;
     }
     y += 2;
-    [root addSubview:[self dividerAt:y]]; y += 13;
+    [root addSubview:[self dividerAt:y]]; y += 9;
 
     // ---------- BATTERY ----------
-    [root addSubview:[self sectionHeader:@"Battery" at:y]]; y += 22;
+    [root addSubview:[self sectionHeader:@"Battery" at:y]]; y += 18;
     if (_bat.valid) {
         NSString *big, *sub;
         if (_bat.acConnected) {
@@ -4368,26 +4398,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         y += 38;
     }
 
-    // The POWER column is a relative one-sample signal, not a percentage of battery drain.
-    [root addSubview:[self text:@"Sampled energy impact" font:[NSFont systemFontOfSize:11]
-                          color:NSColor.tertiaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
-    y += 18;
-    if (_hogs.count == 0) {
-        NSString *status = _hogsLoading ? @"measuring…" : (_hogsUnavailable ? @"Unavailable" : @"No active apps");
-        [root addSubview:[self text:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
-                               at:NSMakeRect(kPad, y, kW-2*kPad, 16) align:NSTextAlignmentLeft]]; y += 22;
-    } else {
-        double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
-        if (total <= 0) for (NSDictionary *h in _hogs) total += [h[@"impact"] doubleValue];
-        NSDictionary *h = _hogs.firstObject;
-        double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-        NSDictionary *info = ProcessDisplayInfo(h);
-        NSString *right = [NSString stringWithFormat:@"%d%% sample", (int)lround(share * 100)];
-        [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:share color:PressureColor(share)
-                                          width:kW pad:kPad at:y]];
-        y += 30;
-    }
-
     if (_bat.valid && ((_showWatts && _bat.voltage_mV > 0) || (_showHealth && _bat.designCap_mAh > 0))) {
         NSMutableArray<NSString *> *bits = [NSMutableArray array];
         if (_showWatts && _bat.voltage_mV > 0) {
@@ -4411,74 +4421,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
     // ---------- SYSTEM ----------
     y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 13;
-    [root addSubview:[self sectionHeader:@"System" at:y]]; y += 22;
+    [root addSubview:[self dividerAt:y]]; y += 9;
+    [root addSubview:[self sectionHeader:@"System" at:y]]; y += 18;
     NSString *sysLevel = SystemPressureLevel(_sys);
-    NSView *sys = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 64)];
+    NSView *sys = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 48)];
     CGFloat inner = kW - 2*kPad;
     [sys addSubview:[self text:[NSString stringWithFormat:@"%@ system pressure", sysLevel]
                           font:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold]
                          color:SystemPressureColor(sysLevel)
-                            at:NSMakeRect(kPad, 43, inner, 18) align:NSTextAlignmentLeft]];
+                            at:NSMakeRect(kPad, 29, inner, 18) align:NSTextAlignmentLeft]];
     NSTextField *systemSummary = [self text:SystemSummaryText(_sys) font:[NSFont systemFontOfSize:10.5]
-                                      color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 15, inner, 27)
+                                      color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 0, inner, 27)
                                       align:NSTextAlignmentLeft];
     systemSummary.lineBreakMode = NSLineBreakByWordWrapping;
     systemSummary.maximumNumberOfLines = 2;
     [sys addSubview:systemSummary];
-    Gauge *cpuGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 5, inner, 4)];
-    cpuGauge.fraction = _sys.cpuValid ? _sys.cpu : 0;
-    cpuGauge.color = _sys.cpuValid ? CPUColor(_sys.cpu) : NSColor.tertiaryLabelColor;
-    cpuGauge.metricLabel = @"Overall CPU utilization";
-    if (!_sys.cpuValid) [cpuGauge setAccessibilityElement:NO];
-    [sys addSubview:cpuGauge];
-    [root addSubview:sys]; y += 68;
-
-    if (_procStatsLoading) {
-        [root addSubview:[self text:@"measuring top apps…" font:[NSFont systemFontOfSize:12]
-                              color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, inner, 16) align:NSTextAlignmentLeft]];
-        y += 22;
-    } else if (_procStatsUnavailable) {
-        [root addSubview:[self text:@"Top apps unavailable" font:[NSFont systemFontOfSize:12]
-                              color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, inner, 16) align:NSTextAlignmentLeft]];
-        y += 22;
-    } else {
-        if (_topCPU.count) {
-            NSDictionary *h = _topCPU.firstObject;
-            double share = GroupCPUShare(h);
-            NSDictionary *info = ProcessDisplayInfo(h);
-            NSString *right = [NSString stringWithFormat:@"CPU %d%%", (int)lround(share * 100)];
-            [root addSubview:[self compactSignalRow:info[@"title"] right:right fraction:MIN(share, 1.0)
-                                              color:CPUColor(share) width:kW pad:kPad at:y]];
-            y += 30;
-            // ps cannot see kernel_task, which dominates exactly when throttling.
-            double rowShare = 0;
-            for (NSDictionary *row in _topCPU) rowShare += GroupCPUShare(row);
-            if (_sys.cpuValid && _sys.cpu >= 0.5 && _sys.cpu > 2.0 * rowShare) {
-                [root addSubview:[self text:@"Mostly system-level work (kernel)"
-                                       font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                                         at:NSMakeRect(kPad, y, inner, 13) align:NSTextAlignmentLeft]];
-                y += 18;
-            }
-        }
-        if (_topMem.count) {
-            uint64_t memTotal = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : [_topMem.firstObject[@"bytes"] unsignedLongLongValue];
-            NSDictionary *h = _topMem.firstObject;
-            uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
-            double frac = memTotal > 0 ? (double)bytes / (double)memTotal : 0;
-            NSDictionary *info = ProcessDisplayInfo(h);
-            [root addSubview:[self compactSignalRow:info[@"title"] right:FmtMemBytes(bytes)
-                                           fraction:(frac < 1.0 ? frac : 1.0)
-                                              color:SystemPressureColor(MemoryPressureLevel(_sys))
-                                              width:kW pad:kPad at:y]];
-            y += 30;
-        }
-    }
+    [root addSubview:sys]; y += 50;
 
     // ---------- AI STATUS ----------
     y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 13;
-    [root addSubview:[self sectionHeader:@"AI Status" at:y]]; y += 22;
+    [root addSubview:[self dividerAt:y]]; y += 9;
+    [root addSubview:[self sectionHeader:@"AI Status" at:y]]; y += 18;
     if (!_aiUsage.count) {
         [root addSubview:[self text:@"Limit status unavailable" font:[NSFont systemFontOfSize:12]
                               color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, inner, 16) align:NSTextAlignmentLeft]];
@@ -4492,23 +4455,17 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // ---------- fixed footer ----------
     // Keep navigation and freshness visible even when the metric document is
     // taller than the current display and needs to scroll.
-    y += 8;
+    y += 2;
     NSString *freshness = _aiTotalsIncomplete && _aiCatchUpStatus.length
         ? _aiCatchUpStatus
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
-    const CGFloat footerH = 54;
+    const CGFloat footerH = 34;
     // Fills windowBackgroundColor in drawRect: instead of freezing it into a CALayer CGColor,
     // so the footer follows a live Light/Dark switch like the panel above it.
     PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
-    NSTextField *freshnessField = [self text:freshness font:[NSFont systemFontOfSize:9.5]
-                                           color:NSColor.tertiaryLabelColor
-                                              at:NSMakeRect(kPad, 3, kW-2*kPad, 13)
-                                           align:NSTextAlignmentLeft];
-    freshnessField.accessibilityIdentifier = @"popover.freshness";
-    [footer addSubview:freshnessField];
-    [footer addSubview:[self dividerAt:20]];
-    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 27, kW, 24)];
+    [footer addSubview:[self dividerAt:0]];
+    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
     NSButton *opts = [NSButton buttonWithTitle:@"Options" target:self action:@selector(showOptions:)];
     opts.bordered = NO; opts.font = [NSFont systemFontOfSize:12]; opts.contentTintColor = NSColor.secondaryLabelColor;
     opts.frame = NSMakeRect(kPad-4, 0, 66, 22); opts.toolTip = @"Configure Glancebar";
@@ -4518,7 +4475,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSButton *details = [NSButton buttonWithTitle:@"Details…" target:self action:@selector(showDetails:)];
     details.bordered = NO; details.font = [NSFont systemFontOfSize:12];
     details.contentTintColor = NSColor.secondaryLabelColor;
-    details.frame = NSMakeRect(kPad+70, 0, 76, 22); details.toolTip = @"Open the detailed status window";
+    details.frame = NSMakeRect(kPad+70, 0, 76, 22); details.toolTip = [@"Open the detailed status window. " stringByAppendingString:freshness];
     details.accessibilityIdentifier = @"popover.details";
     [foot addSubview:details];
     NSButton *quit = [NSButton buttonWithTitle:@"Quit" target:NSApp action:@selector(terminate:)];
@@ -5321,6 +5278,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [fresh reflectScrolledClipView:fresh.contentView];
     }
     [self restoreFocus:focusSnapshot inView:_detailsWindow.contentView window:_detailsWindow];
+}
+
+- (void)showStorageDetails:(id)sender {
+    [self showDetails:sender];
+    for (NSView *view in _detailsWindow.contentView.subviews)
+        if ([view isKindOfClass:NSTabView.class]) [(NSTabView *)view selectTabViewItemWithIdentifier:@"storage"];
 }
 
 - (void)showDetails:(id)sender {

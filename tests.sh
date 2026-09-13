@@ -50,3 +50,9 @@ fi
     -o "$WORK_DIR/glancebar_ai_reader_tests"
 
 "$WORK_DIR/glancebar_ai_reader_tests"
+
+# Production AppKit layout, rendered without creating any visible windows.
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m tools/check-popover.m \
+    -framework Cocoa -framework IOKit -framework ServiceManagement \
+    -o "$WORK_DIR/glancebar_popover_tests"
+"$WORK_DIR/glancebar_popover_tests"

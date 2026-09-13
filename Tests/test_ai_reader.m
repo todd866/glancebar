@@ -771,6 +771,23 @@ int main(void) {
             check(codexB.resetAt && fabs(codexB.resetAt.timeIntervalSince1970 - (nowEpoch + 5 * 86400)) < 1,
                   @"buckets: the reset is the plan window's own");
 
+            // The main meter must never substitute a model-specific quota for the plan.
+            NSDictionary *savedBuckets = [bucketReader valueForKey:@"buckets"];
+            NSDictionary *planEntry = @{@"ts": @"2026-09-13T06:00:00Z", @"limits": @{
+                @"limit_id": @"codex", @"primary": @{@"used_percent": @10,
+                    @"window_minutes": @10080, @"resets_at": @(nowEpoch + 86400)}}};
+            NSDictionary *sparkEntry = @{@"ts": @"2026-09-13T06:01:00Z", @"limits": @{
+                @"limit_id": @"codex_bengalfox", @"primary": @{@"used_percent": @99,
+                    @"window_minutes": @300, @"resets_at": @(nowEpoch + 3600)}}};
+            [bucketReader setValue:@{@"codex": planEntry, @"codex_bengalfox": sparkEntry} forKey:@"buckets"];
+            AIUsage *planSummary = [bucketReader codexUsage];
+            check(planSummary.limitStatusAvailable && fabs(planSummary.remainingFraction - 0.90) < 0.001,
+                  @"compact meter: spent Spark does not replace the general plan allowance");
+            [bucketReader setValue:@{@"codex_bengalfox": sparkEntry} forKey:@"buckets"];
+            check(![bucketReader codexUsage].limitStatusAvailable,
+                  @"compact meter: Spark alone cannot imply available general plan quota");
+            [bucketReader setValue:savedBuckets forKey:@"buckets"];
+
             NSString *bState = [bSupport stringByAppendingPathComponent:@"ai-reader-state-v2.json"];
             NSDictionary *bRoot = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:bState]
                                                                    options:0 error:nil];

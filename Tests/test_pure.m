@@ -418,6 +418,8 @@ int main(void) {
 
             NSDictionary *b = FoldCodexSnapshotIntoBuckets(nil, plan, planTs);
             b = FoldCodexSnapshotIntoBuckets(b, fox, foxTs);
+            check(CodexBillingNote(b, now) == nil,
+                  @"buckets: a newer Spark observation does not imply request routing");
             b = FoldCodexSnapshotIntoBuckets(b, premium, premiumTs);
             check(b.count == 3, @"buckets: one entry per limit_id");
             NSDictionary *pick = PickCodexBucketWindow(b, now);

@@ -15,7 +15,7 @@
 Glancebar puts the numbers that ruin your day in one compact menu bar item
 (`💾 61%  🔋 76%` by default). Click it for a single native popover with **Storage**,
 **Battery**, **System**, and **AI Status** summaries: volume gauges, time until 20%,
-the leading battery/system culprits in plain English, and Claude/Codex limit gauges.
+battery and system summaries in plain English, and compact AI limit gauges.
 A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
 One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
@@ -35,7 +35,7 @@ opt-in) `/usr/bin/security`.
   and battery health / cycle count.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
-  popover shows the lead signals, Details keeps the longer lists. Memory and swap are
+  popover shows overall pressure; Details keeps the process breakdowns. Memory and swap are
   reported in binary units and by Activity Monitor's own "used" formula, so the figures
   match the tool you would check them against.
 - **AI status** — Codex's official remaining-quota percentage and reset time from its
@@ -69,6 +69,13 @@ opt-in) `/usr/bin/security`.
 - **Self-contained** — one binary, native AppKit, no runtime, no installer, no bundled
   helper, and no network requests unless you opt in. The only `sudo`-level action is the
   opt-in *Stay awake with lid closed* toggle's standard admin prompt.
+
+The main popover shows the fullest drive, battery, overall system pressure, and one
+quota row per AI provider, with Fable (red) and Opus (green) overlaid on one aligned Claude meter.
+Both fills start at zero; the shorter fill overlays the longer. When no separate
+Opus quota is reported, its fill uses the shared allowance (identified on hover). **All drives…** opens the complete Storage tab; **Details…**
+keeps process breakdowns, every quota window, and diagnostics available on demand.
+The Details button's tooltip includes the last refresh times.
 
 ## Build & Install
 
@@ -177,10 +184,10 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   bucket it was billed to — `codex` for the plan allowance, `codex_<name>` for side
   buckets, `premium` once requests bill to credits. Codex meters several buckets at
   once and one session's snapshots alternate between them, so Glancebar keeps each
-  bucket's windows apart and shows the most constrained window that is still current
-  across all of them (never the room one bucket reports while another says the plan is
-  spent). With more than one bucket on show, each row names its bucket ("weekly · plan",
-  "weekly · bengalfox"). Once an allowance is spent, Codex stops sending that bucket's
+  bucket's windows apart. The compact popover shows one governing allowance per
+  provider; Codex uses the general plan allowance, while Spark's separate allowance
+  stays in Details > AI. A newer Spark observation does not imply that requests
+  switched to Spark. Once an allowance is spent, Codex stops sending that bucket's
   windows — the next snapshots arrive under `premium` with `"primary": null` — so
   Glancebar carries the bucket's last window pair forward until its own `resets_at`
   passes, marks it cached, and keeps answering the question that matters: when the

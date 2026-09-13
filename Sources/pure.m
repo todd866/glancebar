@@ -1280,7 +1280,7 @@ NSString *CodexBillingNote(NSDictionary *buckets, double nowEpoch) {
     NSDictionary *pick = PickCodexBucketWindow(buckets, nowEpoch);
     if (!pick || [pick[@"bucket"] isEqualToString:newest]) return nil;
     if (![newest isEqualToString:@"premium"])
-        return [NSString stringWithFormat:@"Requests now under the %@ bucket", CodexBucketLabel(newest)];
+        return nil; // Observation order does not establish which model is handling requests.
     // Credits are one account-level meter, whichever bucket last reported them.
     NSDictionary *credits = CodexCreditsStatus(BucketLimits(buckets[newest]));
     for (NSString *bucketID in buckets) if (!credits) credits = CodexCreditsStatus(BucketLimits(buckets[bucketID]));
