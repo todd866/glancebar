@@ -570,10 +570,67 @@ int main(void) {
         }
 
         // --- RateLimitRetryDelay ---
-        check(RateLimitRetryDelay(0) == 900, @"no Retry-After ⇒ 900s floor");
-        check(RateLimitRetryDelay(600) == 900, @"short Retry-After ⇒ 900s floor");
-        check(RateLimitRetryDelay(2000) == 2000, @"reasonable Retry-After honored");
-        check(RateLimitRetryDelay(86400) == 3600, @"huge Retry-After capped at 3600s");
+        // The usage endpoint 429s transiently (one was observed with a clean fetch 3 min
+        // later), so a first miss retries in minutes, not a full poll interval.
+        check(RateLimitRetryDelay(0, 1) == 120, @"first 429 without Retry-After ⇒ 2-minute retry");
+        check(RateLimitRetryDelay(0, 2) == 240, @"second consecutive 429 doubles");
+        check(RateLimitRetryDelay(0, 3) == 480, @"third consecutive 429 doubles again");
+        check(RateLimitRetryDelay(0, 4) == 900 && RateLimitRetryDelay(0, 40) == 900,
+              @"blind backoff never exceeds the poll interval");
+        check(RateLimitRetryDelay(0, 0) == 120, @"a zero streak reads as the first miss");
+        check(RateLimitRetryDelay(30, 1) == 60, @"tiny Retry-After ⇒ 60s floor");
+        check(RateLimitRetryDelay(600, 1) == 600, @"Retry-After honored as given");
+        check(RateLimitRetryDelay(600, 5) == 600, @"Retry-After overrides the streak");
+        check(RateLimitRetryDelay(2000, 1) == 2000, @"reasonable Retry-After honored");
+        check(RateLimitRetryDelay(86400, 1) == 3600, @"huge Retry-After capped at 3600s");
+
+        // --- StaleSnapshotWarns ---
+        check(!StaleSnapshotWarns(0, 900) && !StaleSnapshotWarns(1799, 900), @"under two poll intervals: no warning");
+        check(StaleSnapshotWarns(1800, 900) && StaleSnapshotWarns(9 * 3600, 900), @"two poll intervals or older warns");
+        check(!StaleSnapshotWarns(-5, 900), @"a future timestamp never warns");
+
+        // --- ClaudeModelQuotas ---
+        {
+            NSDictionary *five = @{@"window": @"5-hour", @"kind": @"session", @"remainingFraction": @0.57, @"resetsAt": @9000000000};
+            NSDictionary *week = @{@"window": @"weekly", @"kind": @"weekly_all", @"remainingFraction": @0.80, @"resetsAt": @9000500000};
+            NSDictionary *fable = @{@"window": @"weekly Fable", @"kind": @"weekly_scoped", @"remainingFraction": @0.65, @"resetsAt": @9000500000};
+            NSDictionary *opus = @{@"window": @"weekly Opus", @"kind": @"weekly_scoped", @"remainingFraction": @0.30, @"resetsAt": @9000500000};
+
+            // The live shape on 2026-09-16: one scoped weekly named "Fable", no Opus window.
+            NSDictionary *q = ClaudeModelQuotas(@[five, week, fable]);
+            check(fabs([q[@"fable"] doubleValue] - 0.65) < 0.001, @"model quotas: Fable reads its scoped weekly");
+            check(fabs([q[@"opus"] doubleValue] - 0.65) < 0.001,
+                  @"model quotas: without an Opus window, Opus shares the Fable tier window (never the looser account weekly)");
+            check([q[@"opusWindow"] isEqual:fable] && [q[@"fableWindow"] isEqual:fable], @"model quotas: both name the Fable window as source");
+            check([q[@"opusShared"] boolValue] && ![q[@"fableShared"] boolValue], @"model quotas: the inherited window is flagged");
+            check(q[@"resetsAt"] && fabs([q[@"resetsAt"] doubleValue] - 9000500000) < 1, @"model quotas: the reset is the weekly one, not the 5-hour");
+
+            // The 5-hour window must never cap a weekly figure: 57% of a 5-hour window
+            // said nothing about the week, yet it used to render as "57/57%".
+            check(fabs([q[@"fable"] doubleValue] - 0.65) < 0.001 && fabs([q[@"opus"] doubleValue] - 0.65) < 0.001,
+                  @"model quotas: the 5-hour window does not cap the weekly row");
+
+            // A dedicated Opus window wins over the Fable tier window.
+            NSDictionary *both = ClaudeModelQuotas(@[five, week, fable, opus]);
+            check(fabs([both[@"opus"] doubleValue] - 0.30) < 0.001 && ![both[@"opusShared"] boolValue],
+                  @"model quotas: a real Opus window is used as-is");
+
+            // The account-wide weekly still caps a scoped figure (a model cannot have
+            // more of the week left than the account does).
+            NSDictionary *tightWeek = @{@"window": @"weekly", @"kind": @"weekly_all", @"remainingFraction": @0.10, @"resetsAt": @9000500000};
+            NSDictionary *capped = ClaudeModelQuotas(@[five, tightWeek, fable]);
+            check(fabs([capped[@"fable"] doubleValue] - 0.10) < 0.001 && fabs([capped[@"opus"] doubleValue] - 0.10) < 0.001,
+                  @"model quotas: the account weekly caps both models");
+
+            // No scoped windows at all: nothing to show (the account row stands alone).
+            check(ClaudeModelQuotas(@[five, week]) == nil, @"model quotas: nil without a scoped weekly");
+            check(ClaudeModelQuotas(nil) == nil && ClaudeModelQuotas(@[]) == nil, @"model quotas: nil for no windows");
+
+            // The tightest scoped window per model governs, never a sum.
+            NSDictionary *fable2 = @{@"window": @"weekly Fable (web)", @"kind": @"weekly_scoped", @"remainingFraction": @0.40, @"resetsAt": @9000500000};
+            check(fabs([ClaudeModelQuotas(@[week, fable, fable2])[@"fable"] doubleValue] - 0.40) < 0.001,
+                  @"model quotas: the tightest scoped window per model governs");
+        }
 
         // --- ShouldDropCachedTokenForStatus ---
         check(ShouldDropCachedTokenForStatus(401), @"401 drops the cached token");

@@ -1142,6 +1142,8 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     NSDate *_claudeLastActivity;
     NSDictionary *_claudeUsageJSON;             // last good OAuth usage response
     double _claudeNextFetch;                    // epoch; throttles the usage endpoint
+    NSUInteger _claudeRateLimitStreak;          // consecutive 429s; drives the blind backoff
+    NSUInteger _cursorRateLimitStreak;
     NSString *_claudeAccessToken;               // memory-only; never persisted by Glancebar
     double _claudeAccessTokenExpiresAt;
     double _claudeKeychainNextTry;
@@ -2107,7 +2109,8 @@ static NSString *HashedMessageID(NSString *messageID) {
 // state (and the tests' KVC keys) exactly as before.
 - (void)rememberFetchError:(NSDictionary *)fetch now:(double)now
                      token:(NSString *__strong *)token expiresAt:(double *)expiresAt
-                 nextFetch:(double *)nextFetch status:(NSString *__strong *)status {
+                 nextFetch:(double *)nextFetch status:(NSString *__strong *)status
+           rateLimitStreak:(NSUInteger *)streak {
     BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
     double retry = [fetch[@"retryAfter"] doubleValue];
     NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
@@ -2116,16 +2119,18 @@ static NSString *HashedMessageID(NSString *messageID) {
         if (expiresAt) *expiresAt = 0;
     }
     if (rateLimited) {
-        *nextFetch = now + RateLimitRetryDelay(retry);
-        *status = @"Usage API rate-limited; retrying later";
+        *streak += 1;
+        *nextFetch = now + RateLimitRetryDelay(retry, *streak);
+        *status = @"Usage API rate-limited; retrying shortly";
     } else {
+        *streak = 0;
         *status = message.length ? [@"Usage API: " stringByAppendingString:message] : @"Usage API unavailable";
     }
 }
 
 - (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
     [self rememberFetchError:fetch now:now token:&_claudeAccessToken expiresAt:&_claudeAccessTokenExpiresAt
-                   nextFetch:&_claudeNextFetch status:&_claudeAccountStatus];
+                   nextFetch:&_claudeNextFetch status:&_claudeAccountStatus rateLimitStreak:&_claudeRateLimitStreak];
 }
 
 static NSString *ISOStringFromEpoch(double epoch) {
@@ -2143,6 +2148,7 @@ static NSString *ISOStringFromEpoch(double epoch) {
               accountStatus:(NSString *__strong *)accountStatus
              fetchedThisRun:(BOOL *)fetchedThisRun cacheAbandoned:(BOOL *)cacheAbandoned
                  skipReason:(NSString *__strong *)skipReason
+            rateLimitStreak:(NSUInteger *)rateLimitStreak
                       token:(NSString *(^)(void))tokenForNow
                     fetcher:(NSDictionary *(^)(NSString *))fetcher
                     onError:(void (^)(NSDictionary *))onError {
@@ -2159,6 +2165,7 @@ static NSString *ISOStringFromEpoch(double epoch) {
             *usageJSON = fetch;
             *accountStatus = nil;
             *lastSuccessAt = now;
+            *rateLimitStreak = 0;
             *fetchedThisRun = YES;
             *cacheAbandoned = NO;
             _stateDirty = _stateMustPersist = YES;
@@ -2306,6 +2313,7 @@ typedef struct {
                         usageJSON:&_claudeUsageJSON lastSuccessAt:&_claudeLastSuccessAt nextFetch:&_claudeNextFetch
                     accountStatus:&_claudeAccountStatus fetchedThisRun:&_claudeFetchedThisRun
                    cacheAbandoned:&_claudeUsageCacheAbandoned skipReason:&_claudeFetchSkipReason
+                  rateLimitStreak:&_claudeRateLimitStreak
                             token:^NSString *{ return [self claudeAccessTokenForNow:now]; }
                           fetcher:^NSDictionary *(NSString *token){ return self.claudeUsageFetcher(token); }
                           onError:^(NSDictionary *fetch){ [self rememberClaudeFetchError:fetch now:now]; }];
@@ -2417,7 +2425,7 @@ typedef struct {
 
 - (void)rememberCursorFetchError:(NSDictionary *)fetch now:(double)now {
     [self rememberFetchError:fetch now:now token:&_cursorAccessToken expiresAt:NULL
-                   nextFetch:&_cursorNextFetch status:&_cursorAccountStatus];
+                   nextFetch:&_cursorNextFetch status:&_cursorAccountStatus rateLimitStreak:&_cursorRateLimitStreak];
 }
 
 - (AIUsage *)cursorUsage {
@@ -2436,6 +2444,7 @@ typedef struct {
                         usageJSON:&_cursorUsageJSON lastSuccessAt:&_cursorLastSuccessAt nextFetch:&_cursorNextFetch
                     accountStatus:&_cursorAccountStatus fetchedThisRun:&_cursorFetchedThisRun
                    cacheAbandoned:&_cursorUsageCacheAbandoned skipReason:&_cursorFetchSkipReason
+                  rateLimitStreak:&_cursorRateLimitStreak
                             token:^NSString *{ return [self cursorAccessTokenForNow:now]; }
                           fetcher:^NSDictionary *(NSString *token){ return self.cursorUsageFetcher(token); }
                           onError:^(NSDictionary *fetch){ [self rememberCursorFetchError:fetch now:now]; }];
@@ -2789,6 +2798,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 @interface ClaudeGauge : NSView
 @property (nonatomic) double fable, opus; // negative = not reported
+@property (nonatomic) BOOL stale;         // cached beyond two poll intervals: amber fills
 @end
 @implementation ClaudeGauge
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -2809,6 +2819,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 - (void)setFable:(double)value { _fable = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
 - (void)setOpus:(double)value { _opus = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)setStale:(BOOL)value { _stale = value; self.needsDisplay = YES; }
 - (void)drawRect:(NSRect)dirty {
     NSRect r = self.bounds;
     BOOL lanes = ClaudeQuotasClose(_fable, _opus);
@@ -2826,7 +2837,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
         if (value <= 0) continue;
         [NSGraphicsContext saveGraphicsState]; [track addClip];
         NSRect fill = lane; fill.size.width *= value;
-        [ClaudeQuotaColor(value) setFill]; NSRectFill(fill);
+        [(_stale ? NSColor.systemOrangeColor : ClaudeQuotaColor(value)) setFill]; NSRectFill(fill);
         [NSGraphicsContext restoreGraphicsState];
     }
     // Two healthy quotas can share a colour; keep the shorter endpoint readable.
@@ -3556,8 +3567,16 @@ static BOOL AIWindowElapsed(AIUsage *u) {
     return AIQuotaColor(frac);
 }
 
+// A cached figure older than two poll intervals is not one a refresh would reproduce:
+// the number turns amber so the reader does not act on it as current.
+- (BOOL)aiSnapshotStaleWarns:(AIUsage *)u {
+    if (!u.limitStale || !u.limitUpdatedAt) return NO;
+    return StaleSnapshotWarns(-u.limitUpdatedAt.timeIntervalSinceNow, kAccountPollInterval);
+}
+
 - (NSColor *)aiStatusColor:(AIUsage *)u {
     if (!u.limitStatusAvailable || u.remainingFraction < 0) return NSColor.tertiaryLabelColor;
+    if ([self aiSnapshotStaleWarns:u]) return NSColor.systemOrangeColor;
     return [self windowColor:u.remainingFraction];
 }
 
@@ -4221,71 +4240,73 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return row;
 }
 
-// Claude's scoped allowances share one compact row; account-wide limits remain
-// explicit below it because neither model quota replaces the shared allowance.
+// Claude's row: the gauge and the big number are the WEEKLY per-model allowances
+// (what the Claude app reports as the Fable / Opus week), and the 5-hour session
+// window is named in the caption with its own reset. The two clocks are never mixed:
+// capping the weekly figure by the 5-hour one once rendered "57/57%" against a Claude
+// app that said the week had 65% left. Account-wide windows stay explicit in Details.
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
-    NSMutableDictionary<NSString *, NSDictionary *> *scoped = [NSMutableDictionary dictionary];
-    if ([u.name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable) {
-        for (NSDictionary *w in u.limitWindows) {
-            NSString *label = w[@"window"];
-            if (![label isKindOfClass:NSString.class] || ![label hasPrefix:@"weekly "]) continue;
-            // The tightest reported weekly constraint governs each model, never a sum.
-            for (NSString *model in @[@"Fable", @"Opus"]) {
-                if ([label rangeOfString:model options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-                if (!scoped[model] || [w[@"remainingFraction"] doubleValue] < [scoped[model][@"remainingFraction"] doubleValue])
-                    scoped[model] = w;
-            }
-        }
-    }
-    if (!scoped.count) {
+    NSDictionary *quotas = [u.name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable
+        ? ClaudeModelQuotas(u.limitWindows) : nil;
+    if (!quotas) {
         [root addSubview:[self aiStatusRow:u width:width pad:pad at:y]];
         return y + 40;
     }
-    NSDictionary *shared = nil;
-    for (NSDictionary *w in u.limitWindows) {
-        if (![w[@"window"] isEqual:@"weekly"] && ![w[@"window"] isEqual:@"5-hour"]) continue;
-        if (!shared || [w[@"remainingFraction"] doubleValue] < [shared[@"remainingFraction"] doubleValue]) shared = w;
-    }
-    // Without a dedicated Opus window, the shared allowance is its displayed cap.
-    // Any model-specific quota is also constrained by that same shared allowance.
-    double fable = scoped[@"Fable"] ? [scoped[@"Fable"][@"remainingFraction"] doubleValue] : -1;
-    double opus = scoped[@"Opus"] ? [scoped[@"Opus"][@"remainingFraction"] doubleValue] : -1;
-    if (shared) {
-        double cap = [shared[@"remainingFraction"] doubleValue];
-        if (fable >= 0) fable = MIN(fable, cap);
-        opus = opus < 0 ? cap : MIN(opus, cap);
-    }
+    double fable = [quotas[@"fable"] doubleValue], opus = [quotas[@"opus"] doubleValue];
+    BOOL staleWarns = [self aiSnapshotStaleWarns:u];
+    NSColor *dim = staleWarns ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
     CGFloat inner = width-2*pad, titleW = 74, rightW = 70;
     CGFloat barX = pad+titleW+8, barW = inner-titleW-rightW-18;
     [row addSubview:[self text:@"Claude" font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
         color:nil at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
     ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20,barW), 7)];
-    meter.fable = fable; meter.opus = opus;
+    meter.fable = fable; meter.opus = opus; meter.stale = staleWarns;
     NSMutableArray *sources = [NSMutableArray array];
     for (NSString *model in @[@"Fable", @"Opus"]) {
-        NSDictionary *w = scoped[model] ?: ([model isEqual:@"Opus"] ? shared : nil);
-        NSString *source = scoped[model] ? w[@"window"] : w ? @"shared Claude allowance" : @"not reported";
-        NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
-            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, source,
-            clock.length ? [@"; resets " stringByAppendingString:clock] : @""]];
+        BOOL isFable = [model isEqual:@"Fable"];
+        NSDictionary *w = quotas[isFable ? @"fableWindow" : @"opusWindow"];
+        BOOL shared = [quotas[isFable ? @"fableShared" : @"opusShared"] boolValue];
+        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, w[@"window"],
+            shared ? @" (no window of its own; shares this one)" : @""]];
     }
-    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:@"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the shared limit."];
+    NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
+        ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+    if (weekClock.length) [sources addObject:[@"Week resets " stringByAppendingString:weekClock]];
+    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:
+        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window."];
     [row addSubview:meter];
     NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
     NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
     NSTextField *value = [self text:[NSString stringWithFormat:@"%@/%@%%",f,o]
-        font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:NSColor.secondaryLabelColor
+        font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:dim
         at:NSMakeRect(width-pad-rightW, 21, rightW, 15) align:NSTextAlignmentRight];
     value.accessibilityIdentifier = @"popover.claude.value";
-    value.accessibilityLabel = @"Fable / Opus percent remaining";
+    value.accessibilityLabel = @"Fable / Opus percent of the week remaining";
     value.toolTip = meter.toolTip; [row addSubview:value];
-    NSString *legend = ClaudeQuotasClose(fable, opus) ? @"Fable ↑ / Opus ↓ · " : @"Fable / Opus · ";
-    NSString *caption = [legend stringByAppendingString:[self aiStatusSubtext:u]];
-    NSTextField *note = [self text:caption font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-        at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
-    note.toolTip = meter.toolTip; [row addSubview:note]; [root addSubview:row];
+    // Caption: the model legend, then the 5-hour window (the nearer clock) when the
+    // account reports one, else the weekly reset; then the cache age when it matters.
+    NSMutableArray *parts = [NSMutableArray arrayWithObject:
+        ClaudeQuotasClose(fable, opus) ? @"Fable ↑ / Opus ↓ week" : @"Fable / Opus week"];
+    NSDictionary *session = nil;
+    for (NSDictionary *w in u.limitWindows)
+        if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) session = w;
+    if (session) {
+        NSString *clock = [session[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[session[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+        [parts addObject:[NSString stringWithFormat:@"5h %.0f%% left%@", [session[@"remainingFraction"] doubleValue] * 100,
+            clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+    } else if (weekClock.length) {
+        [parts addObject:[@"resets " stringByAppendingString:weekClock]];
+    } else {
+        NSString *reset = [self compactResetText:u];
+        if (reset.length) [parts addObject:reset];
+    }
+    NSString *note = [self aiStalenessNote:u capitalized:NO];
+    if (note.length) [parts addObject:note];
+    NSTextField *caption = [self text:[parts componentsJoinedByString:@" · "] font:[NSFont systemFontOfSize:10.5]
+        color:dim at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
+    caption.toolTip = meter.toolTip; [row addSubview:caption]; [root addSubview:row];
     return y + 40;
 }
 

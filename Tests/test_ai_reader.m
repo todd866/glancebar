@@ -1008,6 +1008,39 @@ int main(void) {
             check([[failing valueForKey:@"claudeNextFetch"] doubleValue] >= base + 1700,
                   @"account: a 429's Retry-After defers the next attempt");
 
+            // 4b. A 429 with no Retry-After retries within minutes, doubling while it
+            //     persists; a success clears the streak. (Observed 2026-09-16: the popover
+            //     opened to a 9-hour-old figure because one 429 cost a full poll interval.)
+            AIReader *blind = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];
+            __block BOOL blindOK = NO;
+            blind.claudeCredentialReader = ^NSDictionary *{ return @{@"token": @"tok", @"expiresAt": @(base + 3600)}; };
+            blind.claudeUsageFetcher = ^NSDictionary *(NSString *__unused token) {
+                if (blindOK) return usageBody(40, 10);
+                return @{@"_glancebarFetchError": @YES, @"statusCode": @429, @"rateLimited": @YES,
+                         @"retryAfter": @0, @"message": @"Too Many Requests"};
+            };
+            blind.useClaudeAccount = YES;
+            blind.allowClaudeAccountFetch = YES;
+            [blind setValue:usageBody(40, 10) forKey:@"claudeUsageJSON"];
+            [blind setValue:@(base - 7200) forKey:@"claudeLastSuccessAt"];
+            [blind setValue:@0 forKey:@"claudeNextFetch"];
+            [blind read];
+            double firstRetry = [[blind valueForKey:@"claudeNextFetch"] doubleValue] - NSDate.date.timeIntervalSince1970;
+            check(firstRetry > 100 && firstRetry <= 121, @"account: a blind 429 retries in about two minutes");
+            [blind setValue:@0 forKey:@"claudeNextFetch"];
+            [blind read];
+            double secondRetry = [[blind valueForKey:@"claudeNextFetch"] doubleValue] - NSDate.date.timeIntervalSince1970;
+            check(secondRetry > 220 && secondRetry <= 241, @"account: a second consecutive 429 doubles the wait");
+            blindOK = YES;
+            [blind setValue:@0 forKey:@"claudeNextFetch"];
+            AIUsage *recovered = UsageNamed([blind read], @"Claude");
+            check(!recovered.limitStale, @"account: the fetch after the 429s is live again");
+            [blind setValue:@0 forKey:@"claudeNextFetch"];
+            blindOK = NO;
+            [blind read];
+            double afterSuccess = [[blind valueForKey:@"claudeNextFetch"] doubleValue] - NSDate.date.timeIntervalSince1970;
+            check(afterSuccess > 100 && afterSuccess <= 121, @"account: a success resets the 429 streak");
+
             // 5. A 401 drops the cached token so the next attempt re-reads the credential.
             __block NSUInteger reReads = 0;
             AIReader *revoked = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:aSupport];

@@ -104,6 +104,7 @@ int main(int argc, const char **argv) {
                 @{@"remainingFraction":@1, @"window":@"5-hour", @"bucket":@"codex_bengalfox"},
                 @{@"remainingFraction":@1, @"window":@"weekly", @"bucket":@"codex_bengalfox"}];
             if ([name isEqual:@"Claude"]) u.limitWindows = @[
+                @{@"remainingFraction":@0.57, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 7200)},
                 @{@"remainingFraction":@0.33, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
                 @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
             if ([name isEqual:@"Codex"]) { u.limitStale = YES; u.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-3600]; }
@@ -120,8 +121,12 @@ int main(int argc, const char **argv) {
             HasText(root,@"bengalfox") || !HasText(root,@"cached")) return Fail(__LINE__);
         if (!FitsChildren(root)) return Fail(__LINE__);
         ClaudeGauge *meter = FindClaudeMeter(root);
-        if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.33)>0.001 ||
-            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33%")) return Fail(__LINE__);
+        // Opus has no window of its own, so it shares the Fable tier window (6%), and
+        // the account weekly (33%) only caps — it never stands in for a model figure.
+        if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.06)>0.001 ||
+            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/6%")) return Fail(__LINE__);
+        // The 5-hour window is a different clock: named in the caption, never a cap.
+        if (!HasText(root, @"5h 57% left")) return Fail(__LINE__);
         if (!HasText(root, @"Macintosh HD")) return Fail(__LINE__);
         NSScrollView *storage = [c storageDetailsView];
         if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
@@ -151,7 +156,7 @@ int main(int argc, const char **argv) {
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
         [c rebuildContent];
         ClaudeGauge *updated = FindClaudeMeter(p.contentViewController.view);
-        if (updated != meter || fabs(updated.fable-0.82)>0.001 || updated.opus != -1) return Fail(__LINE__);
+        if (updated != meter || fabs(updated.fable-0.82)>0.001 || fabs(updated.opus-0.82)>0.001) return Fail(__LINE__);
         claude.limitWindows = @[];
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 4 ||

@@ -190,9 +190,26 @@ NSString *ResetClockText(NSDate *resetAt, NSDate *now);
 BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSON,
                               BOOL hasAccountStatus, double nowEpoch, double nextFetchEpoch);
 
-// Seconds until the next account fetch after a 429: at least the standard 15-minute
-// throttle, but never trust a server-supplied Retry-After beyond an hour.
-double RateLimitRetryDelay(double retryAfterSeconds);
+// Seconds until the next account fetch after a 429. A server-supplied Retry-After is
+// honoured within [60, 3600]. Without one, the wait starts at two minutes and doubles
+// per consecutive 429 (streak = 1 for the first), never beyond the 15-minute poll
+// interval: the usage endpoint 429s transiently, and a single miss used to leave a
+// freshly opened popover on a figure hours old.
+double RateLimitRetryDelay(double retryAfterSeconds, NSUInteger consecutive429s);
+
+// A cached account snapshot older than two poll intervals is not a figure a refresh
+// would have reproduced; the row should say so in colour, not only in its caption.
+BOOL StaleSnapshotWarns(double ageSeconds, double pollIntervalSeconds);
+
+// The per-model weekly figures for the popover's Fable / Opus row, from
+// ClaudeLimitWindows output. Nil when no model-scoped weekly window is present.
+// Keys: fable, opus (remaining fractions, -1 when not reported); fableWindow,
+// opusWindow (the governing window dicts); fableShared, opusShared (YES when that model
+// has no window of its own and inherits the other model's tier window — Claude reports
+// one "Fable" window covering both top-tier models); resetsAt (the weekly reset, when
+// known). The account-wide weekly caps both figures; the 5-hour window never does —
+// it is a different clock and has its own row.
+NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows);
 
 // An auth failure means the cached access token is dead (e.g. Claude Code re-login
 // revoked it); drop it so the next attempt re-reads the Keychain.

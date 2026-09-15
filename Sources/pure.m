@@ -837,9 +837,57 @@ BOOL ShouldFetchClaudeAccount(BOOL useAccount, BOOL allowFetch, BOOL hasUsageJSO
     return !hasUsageJSON && !hasAccountStatus;
 }
 
-double RateLimitRetryDelay(double retryAfterSeconds) {
-    double capped = retryAfterSeconds > 3600 ? 3600 : retryAfterSeconds;
-    return capped < 900 ? 900 : capped;
+double RateLimitRetryDelay(double retryAfterSeconds, NSUInteger consecutive429s) {
+    if (retryAfterSeconds > 0) {
+        double capped = retryAfterSeconds > 3600 ? 3600 : retryAfterSeconds;
+        return capped < 60 ? 60 : capped;
+    }
+    NSUInteger streak = consecutive429s ? consecutive429s : 1;
+    double delay = 120;
+    for (NSUInteger i = 1; i < streak && delay < 900; i++) delay *= 2;
+    return delay > 900 ? 900 : delay;
+}
+
+BOOL StaleSnapshotWarns(double ageSeconds, double pollIntervalSeconds) {
+    return ageSeconds >= 2 * pollIntervalSeconds;
+}
+
+NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows) {
+    if (![windows isKindOfClass:NSArray.class]) return nil;
+    NSDictionary *fableWindow = nil, *opusWindow = nil, *weekly = nil;
+    for (NSDictionary *w in windows) {
+        if (![w isKindOfClass:NSDictionary.class]) continue;
+        NSString *label = [w[@"window"] isKindOfClass:NSString.class] ? w[@"window"] : nil;
+        if (!label) continue;
+        if ([label isEqualToString:@"weekly"]) { weekly = w; continue; }
+        if (![label hasPrefix:@"weekly "]) continue;
+        // The tightest reported weekly constraint governs each model, never a sum.
+        double remaining = [w[@"remainingFraction"] doubleValue];
+        if ([label rangeOfString:@"Fable" options:NSCaseInsensitiveSearch].location != NSNotFound &&
+            (!fableWindow || remaining < [fableWindow[@"remainingFraction"] doubleValue])) fableWindow = w;
+        if ([label rangeOfString:@"Opus" options:NSCaseInsensitiveSearch].location != NSNotFound &&
+            (!opusWindow || remaining < [opusWindow[@"remainingFraction"] doubleValue])) opusWindow = w;
+    }
+    if (!fableWindow && !opusWindow) return nil;
+    // Anthropic scopes one weekly window to the top tier and names it after Fable; the
+    // app it mirrors labels that figure "Fable and Opus". A model with no window of its
+    // own inherits the other's, which errs toward less room, never more.
+    BOOL fableShared = !fableWindow, opusShared = !opusWindow;
+    if (!fableWindow) fableWindow = opusWindow;
+    if (!opusWindow) opusWindow = fableWindow;
+    double fable = [fableWindow[@"remainingFraction"] doubleValue];
+    double opus = [opusWindow[@"remainingFraction"] doubleValue];
+    if (weekly) {   // a model cannot have more of the week left than the account does
+        double cap = [weekly[@"remainingFraction"] doubleValue];
+        if (fable > cap) fable = cap;
+        if (opus > cap) opus = cap;
+    }
+    NSMutableDictionary *out = [@{@"fable": @(fable), @"opus": @(opus),
+                                  @"fableWindow": fableWindow, @"opusWindow": opusWindow,
+                                  @"fableShared": @(fableShared), @"opusShared": @(opusShared)} mutableCopy];
+    id resets = fableWindow[@"resetsAt"] ?: opusWindow[@"resetsAt"] ?: weekly[@"resetsAt"];
+    if ([resets isKindOfClass:NSNumber.class]) out[@"resetsAt"] = resets;
+    return out;
 }
 
 BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode) {
