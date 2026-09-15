@@ -204,11 +204,12 @@ BOOL StaleSnapshotWarns(double ageSeconds, double pollIntervalSeconds);
 // The per-model weekly figures for the popover's Fable / Opus row, from
 // ClaudeLimitWindows output. Nil when no model-scoped weekly window is present.
 // Keys: fable, opus (remaining fractions, -1 when not reported); fableWindow,
-// opusWindow (the governing window dicts); fableShared, opusShared (YES when that model
-// has no window of its own and inherits the other model's tier window — Claude reports
-// one "Fable" window covering both top-tier models); resetsAt (the weekly reset, when
-// known). The account-wide weekly caps both figures; the 5-hour window never does —
-// it is a different clock and has its own row.
+// opusWindow (the governing window dicts, absent when nothing governs); fableShared,
+// opusShared (YES when that model has no window of its own and is governed by the
+// account-wide weekly instead — the Claude app shows "Current week (all models)" beside
+// "Current week (Fable)", and Opus falls under the former); resetsAt (the weekly reset,
+// when known). The account-wide weekly caps both figures; the 5-hour window never does —
+// it is a different clock and lives in the caption.
 NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows);
 
 // An auth failure means the cached access token is dead (e.g. Claude Code re-login

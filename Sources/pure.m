@@ -869,22 +869,23 @@ NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows) {
             (!opusWindow || remaining < [opusWindow[@"remainingFraction"] doubleValue])) opusWindow = w;
     }
     if (!fableWindow && !opusWindow) return nil;
-    // Anthropic scopes one weekly window to the top tier and names it after Fable; the
-    // app it mirrors labels that figure "Fable and Opus". A model with no window of its
-    // own inherits the other's, which errs toward less room, never more.
+    // A model with no scoped window of its own is governed by the account weekly — that
+    // is what the Claude app shows beside "Current week (Fable)": one all-models figure.
+    // Only a model's own window may be tighter than that.
     BOOL fableShared = !fableWindow, opusShared = !opusWindow;
-    if (!fableWindow) fableWindow = opusWindow;
-    if (!opusWindow) opusWindow = fableWindow;
-    double fable = [fableWindow[@"remainingFraction"] doubleValue];
-    double opus = [opusWindow[@"remainingFraction"] doubleValue];
+    if (!fableWindow) fableWindow = weekly;
+    if (!opusWindow) opusWindow = weekly;
+    double fable = fableWindow ? [fableWindow[@"remainingFraction"] doubleValue] : -1;
+    double opus = opusWindow ? [opusWindow[@"remainingFraction"] doubleValue] : -1;
     if (weekly) {   // a model cannot have more of the week left than the account does
         double cap = [weekly[@"remainingFraction"] doubleValue];
         if (fable > cap) fable = cap;
         if (opus > cap) opus = cap;
     }
     NSMutableDictionary *out = [@{@"fable": @(fable), @"opus": @(opus),
-                                  @"fableWindow": fableWindow, @"opusWindow": opusWindow,
                                   @"fableShared": @(fableShared), @"opusShared": @(opusShared)} mutableCopy];
+    if (fableWindow) out[@"fableWindow"] = fableWindow;
+    if (opusWindow) out[@"opusWindow"] = opusWindow;
     id resets = fableWindow[@"resetsAt"] ?: opusWindow[@"resetsAt"] ?: weekly[@"resetsAt"];
     if ([resets isKindOfClass:NSNumber.class]) out[@"resetsAt"] = resets;
     return out;

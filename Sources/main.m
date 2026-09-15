@@ -4240,8 +4240,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return row;
 }
 
-// Claude's row: the gauge and the big number are the WEEKLY per-model allowances
-// (what the Claude app reports as the Fable / Opus week), and the 5-hour session
+// Claude's row: the gauge and the big number are the WEEKLY allowances — Fable from its
+// scoped window, Opus from the account-wide weekly that governs it (the Claude app's
+// "Current week (Fable)" and "Current week (all models)") — and the 5-hour session
 // window is named in the caption with its own reset. The two clocks are never mixed:
 // capping the weekly figure by the 5-hour one once rendered "57/57%" against a Claude
 // app that said the week had 65% left. Account-wide windows stay explicit in Details.
@@ -4267,8 +4268,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         BOOL isFable = [model isEqual:@"Fable"];
         NSDictionary *w = quotas[isFable ? @"fableWindow" : @"opusWindow"];
         BOOL shared = [quotas[isFable ? @"fableShared" : @"opusShared"] boolValue];
-        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, w[@"window"],
-            shared ? @" (no window of its own; shares this one)" : @""]];
+        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, w ? w[@"window"] : @"not reported",
+            shared && w ? @" (no window of its own; the account weekly governs)" : @""]];
     }
     NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
         ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;

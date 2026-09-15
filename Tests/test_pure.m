@@ -597,20 +597,27 @@ int main(void) {
             NSDictionary *opus = @{@"window": @"weekly Opus", @"kind": @"weekly_scoped", @"remainingFraction": @0.30, @"resetsAt": @9000500000};
 
             // The live shape on 2026-09-16: one scoped weekly named "Fable", no Opus window.
+            // The Claude app shows week (all models) 80% and week (Fable) 65%; Opus is
+            // governed by the former.
             NSDictionary *q = ClaudeModelQuotas(@[five, week, fable]);
             check(fabs([q[@"fable"] doubleValue] - 0.65) < 0.001, @"model quotas: Fable reads its scoped weekly");
-            check(fabs([q[@"opus"] doubleValue] - 0.65) < 0.001,
-                  @"model quotas: without an Opus window, Opus shares the Fable tier window (never the looser account weekly)");
-            check([q[@"opusWindow"] isEqual:fable] && [q[@"fableWindow"] isEqual:fable], @"model quotas: both name the Fable window as source");
+            check(fabs([q[@"opus"] doubleValue] - 0.80) < 0.001,
+                  @"model quotas: without an Opus window, Opus reads the account weekly (never the 5-hour)");
+            check([q[@"opusWindow"] isEqual:week] && [q[@"fableWindow"] isEqual:fable], @"model quotas: each names its governing window");
             check([q[@"opusShared"] boolValue] && ![q[@"fableShared"] boolValue], @"model quotas: the inherited window is flagged");
             check(q[@"resetsAt"] && fabs([q[@"resetsAt"] doubleValue] - 9000500000) < 1, @"model quotas: the reset is the weekly one, not the 5-hour");
 
             // The 5-hour window must never cap a weekly figure: 57% of a 5-hour window
             // said nothing about the week, yet it used to render as "57/57%".
-            check(fabs([q[@"fable"] doubleValue] - 0.65) < 0.001 && fabs([q[@"opus"] doubleValue] - 0.65) < 0.001,
+            check(fabs([q[@"fable"] doubleValue] - 0.65) < 0.001 && fabs([q[@"opus"] doubleValue] - 0.80) < 0.001,
                   @"model quotas: the 5-hour window does not cap the weekly row");
 
-            // A dedicated Opus window wins over the Fable tier window.
+            // A scoped window with no account weekly beside it leaves the other model unreported.
+            NSDictionary *alone = ClaudeModelQuotas(@[fable]);
+            check(fabs([alone[@"fable"] doubleValue] - 0.65) < 0.001 && [alone[@"opus"] doubleValue] < 0 && !alone[@"opusWindow"],
+                  @"model quotas: no account weekly ⇒ Opus not reported");
+
+            // A dedicated Opus window wins over the account weekly.
             NSDictionary *both = ClaudeModelQuotas(@[five, week, fable, opus]);
             check(fabs([both[@"opus"] doubleValue] - 0.30) < 0.001 && ![both[@"opusShared"] boolValue],
                   @"model quotas: a real Opus window is used as-is");
