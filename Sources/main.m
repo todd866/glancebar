@@ -2835,15 +2835,14 @@ static NSColor *ClaudeQuotaColor(double fraction) {
         if (value <= 0) continue;
         [NSGraphicsContext saveGraphicsState]; [track addClip];
         NSRect fill = lane; fill.size.width *= value;
-        [ClaudeQuotaColor(value) setFill]; NSRectFill(fill);
-        [NSGraphicsContext restoreGraphicsState];
-    }
-    // Two healthy quotas can share a colour; keep the shorter endpoint readable.
-    if (!lanes && _fable > 0 && _opus > 0 &&
-        [ClaudeQuotaColor(_fable) isEqual:ClaudeQuotaColor(_opus)]) {
-        [NSGraphicsContext saveGraphicsState]; [wholeTrack addClip];
-        [[NSColor.labelColor colorWithAlphaComponent:0.4] setFill];
-        NSRectFill(NSMakeRect(r.origin.x + MIN(_fable,_opus)*r.size.width - 0.5, r.origin.y, 1, r.size.height));
+        NSColor *color = ClaudeQuotaColor(value);
+        // Overlay: the longer fill is drawn first. When both fills would share one colour
+        // the longer one is a lighter tint, so the solid part reads "both models have this
+        // much" and the tinted extension "only the larger one does" — a one-pixel divider
+        // was not legible.
+        if (!lanes && i == 0 && _fable > 0 && _opus > 0 && [color isEqual:ClaudeQuotaColor(MIN(_fable, _opus))])
+            color = [color colorWithAlphaComponent:0.4];
+        [color setFill]; NSRectFill(fill);
         [NSGraphicsContext restoreGraphicsState];
     }
 }
@@ -4275,7 +4274,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
     if (weekClock.length) [sources addObject:[@"Week resets " stringByAppendingString:weekClock]];
     meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:
-        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window. In the caption, \"5h 39% → 11:10\" is the 5-hour window and when it resets."];
+        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window. The caption names the 5-hour session window and when it resets."];
     [row addSubview:meter];
     NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
     NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
@@ -4285,28 +4284,44 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     value.accessibilityIdentifier = @"popover.claude.value";
     value.accessibilityLabel = @"Fable / Opus percent of the week remaining";
     value.toolTip = meter.toolTip; [row addSubview:value];
-    // Caption, one line that must fit 288pt: the bar legend, the 5-hour window (the
-    // nearer clock) when reported, else the weekly reset; then the cache age when it
-    // matters. Every token is kept short because the check-popover gate measures it.
-    NSMutableArray *parts = [NSMutableArray arrayWithObject:
-        ClaudeQuotasClose(fable, opus) ? @"Fable↑/Opus↓" : @"Fable/Opus"];
+    // Caption, one line, plain words: the bar legend, the 5-hour session window when
+    // reported (else the weekly reset), then the cache age when it matters. Written at
+    // the most explicit form that fits the row; each fallback drops words, never facts.
+    NSString *legend = ClaudeQuotasClose(fable, opus) ? @"Fable↑/Opus↓" : @"Fable/Opus";
     NSDictionary *session = nil;
     for (NSDictionary *w in u.limitWindows)
         if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) session = w;
+    NSString *middleLong = nil, *middleShort = nil, *middleTiny = nil;
     if (session) {
         NSString *clock = [session[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[session[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        [parts addObject:[NSString stringWithFormat:@"5h %.0f%%%@", [session[@"remainingFraction"] doubleValue] * 100,
-            clock.length ? [@" → " stringByAppendingString:clock] : @""]];   // "→" = resets at
+        double pct = [session[@"remainingFraction"] doubleValue] * 100;
+        middleLong = [NSString stringWithFormat:@"5-hour %.0f%% left%@", pct,
+                      clock.length ? [@", resets " stringByAppendingString:clock] : @""];
+        middleShort = [NSString stringWithFormat:@"5-hour %.0f%%%@", pct,
+                       clock.length ? [@" · resets " stringByAppendingString:clock] : @""];
+        middleTiny = [NSString stringWithFormat:@"5h %.0f%%%@", pct,
+                      clock.length ? [@" · resets " stringByAppendingString:clock] : @""];
     } else if (weekClock.length) {
-        [parts addObject:[@"week → " stringByAppendingString:weekClock]];
+        middleLong = [@"Week resets " stringByAppendingString:weekClock];
+        middleShort = [@"resets " stringByAppendingString:weekClock];
     } else {
-        NSString *reset = [self compactResetText:u];
-        if (reset.length) [parts addObject:reset];
+        middleLong = middleShort = [self compactResetText:u];
     }
+    if (!middleTiny) middleTiny = middleShort;
     NSString *note = [self aiStalenessNote:u capitalized:NO];
-    if (note.length) [parts addObject:[note stringByReplacingOccurrencesOfString:@" ago" withString:@""]];
-    NSTextField *caption = [self text:[parts componentsJoinedByString:@" · "] font:[NSFont systemFontOfSize:10.5]
+    NSString *noteShort = [note stringByReplacingOccurrencesOfString:@" ago" withString:@""];
+    NSFont *captionFont = [NSFont systemFontOfSize:10.5];
+    NSString *text = nil;
+    for (NSArray *variant in @[@[legend, middleLong ?: @"", note ?: @""],
+                               @[legend, middleShort ?: @"", note ?: @""],
+                               @[legend, middleShort ?: @"", noteShort ?: @""],
+                               @[legend, middleTiny ?: @"", noteShort ?: @""]]) {
+        NSArray *parts = [variant filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+        text = [parts componentsJoinedByString:@" · "];
+        if ([text sizeWithAttributes:@{NSFontAttributeName: captionFont}].width <= inner - 4) break;
+    }
+    NSTextField *caption = [self text:text font:captionFont
         color:staleWarns ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor
         at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
     caption.accessibilityIdentifier = @"popover.claude.caption";   // width-checked by tools/check-popover.m

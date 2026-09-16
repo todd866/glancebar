@@ -70,6 +70,17 @@ int main(int argc, const char **argv) {
         if (!ClaudeQuotasClose(.30,.33) || ClaudeQuotasClose(.30,.34) || ClaudeQuotasClose(-1,0)) return Fail(__LINE__);
         probe.fable = .30; probe.opus = .32;
         if (!Red(MeterPixel(probe,20,1)) || !Red(MeterPixel(probe,20,6))) return Fail(__LINE__);
+        // Two healthy quotas: solid green to the shorter (50%), a lighter green to 71%.
+        probe.fable = .50; probe.opus = .71;
+        {
+            NSColor *solid = MeterPixel(probe,30,4), *tint = MeterPixel(probe,62,4), *track = MeterPixel(probe,90,4);
+            if (!Green(solid) || !Green(tint) || Green(track)) return Fail(__LINE__);
+            // The offscreen bitmap has no backdrop, so "lighter" shows up as lower alpha
+            // (on screen it composites to a paler green over the track and window).
+            if (tint.alphaComponent > solid.alphaComponent - 0.3 &&
+                fabs(tint.greenComponent - solid.greenComponent) < 0.08 && fabs(tint.redComponent - solid.redComponent) < 0.08)
+                return Fail(__LINE__);   // the extension must be visibly lighter than the solid fill
+        }
         // User example: full-height amber to 30%, green from there to 60%.
         probe.fable = .30; probe.opus = .60;
         if (!Green(MeterPixel(probe,45,1)) || !Green(MeterPixel(probe,45,6))) return Fail(__LINE__);
@@ -135,13 +146,13 @@ int main(int argc, const char **argv) {
         if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.33)>0.001 ||
             meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33%")) return Fail(__LINE__);
         // The 5-hour window is a different clock: named in the caption, never a cap.
-        if (!HasText(root, @"5h 57% → ")) return Fail(__LINE__);
+        if (!HasText(root, @"5-hour 57% left, resets")) return Fail(__LINE__);
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
         // a 5-hour window with a weekday reset, and a cache-age note.
         AIUsage *longest = usage[0];
         longest.limitStale = YES; longest.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-10*3600];
         longest.limitWindows = @[
-            @{@"remainingFraction":@1, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 3*86400)},
+            @{@"remainingFraction":@1, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 4*3600)},
             @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
             @{@"remainingFraction":@1, @"window":@"weekly Fable"}];
         [c rebuildContent];
