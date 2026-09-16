@@ -2798,7 +2798,6 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 @interface ClaudeGauge : NSView
 @property (nonatomic) double fable, opus; // negative = not reported
-@property (nonatomic) BOOL stale;         // cached beyond two poll intervals: amber fills
 @end
 @implementation ClaudeGauge
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -2819,7 +2818,6 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 - (void)setFable:(double)value { _fable = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
 - (void)setOpus:(double)value { _opus = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
-- (void)setStale:(BOOL)value { _stale = value; self.needsDisplay = YES; }
 - (void)drawRect:(NSRect)dirty {
     NSRect r = self.bounds;
     BOOL lanes = ClaudeQuotasClose(_fable, _opus);
@@ -2837,7 +2835,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
         if (value <= 0) continue;
         [NSGraphicsContext saveGraphicsState]; [track addClip];
         NSRect fill = lane; fill.size.width *= value;
-        [(_stale ? NSColor.systemOrangeColor : ClaudeQuotaColor(value)) setFill]; NSRectFill(fill);
+        [ClaudeQuotaColor(value) setFill]; NSRectFill(fill);
         [NSGraphicsContext restoreGraphicsState];
     }
     // Two healthy quotas can share a colour; keep the shorter endpoint readable.
@@ -4254,15 +4252,17 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         return y + 40;
     }
     double fable = [quotas[@"fable"] doubleValue], opus = [quotas[@"opus"] doubleValue];
+    // Staleness is said in the caption, in amber; the fills and the number keep their
+    // quota colours so a cached figure still reads as a figure.
     BOOL staleWarns = [self aiSnapshotStaleWarns:u];
-    NSColor *dim = staleWarns ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    NSColor *dim = NSColor.secondaryLabelColor;
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
     CGFloat inner = width-2*pad, titleW = 74, rightW = 70;
     CGFloat barX = pad+titleW+8, barW = inner-titleW-rightW-18;
     [row addSubview:[self text:@"Claude" font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
         color:nil at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
     ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20,barW), 7)];
-    meter.fable = fable; meter.opus = opus; meter.stale = staleWarns;
+    meter.fable = fable; meter.opus = opus;
     NSMutableArray *sources = [NSMutableArray array];
     for (NSString *model in @[@"Fable", @"Opus"]) {
         BOOL isFable = [model isEqual:@"Fable"];
@@ -4275,7 +4275,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
     if (weekClock.length) [sources addObject:[@"Week resets " stringByAppendingString:weekClock]];
     meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:
-        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window."];
+        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window. In the caption, \"5h 39% → 11:10\" is the 5-hour window and when it resets."];
     [row addSubview:meter];
     NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
     NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
@@ -4285,28 +4285,31 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     value.accessibilityIdentifier = @"popover.claude.value";
     value.accessibilityLabel = @"Fable / Opus percent of the week remaining";
     value.toolTip = meter.toolTip; [row addSubview:value];
-    // Caption: the model legend, then the 5-hour window (the nearer clock) when the
-    // account reports one, else the weekly reset; then the cache age when it matters.
+    // Caption, one line that must fit 288pt: the bar legend, the 5-hour window (the
+    // nearer clock) when reported, else the weekly reset; then the cache age when it
+    // matters. Every token is kept short because the check-popover gate measures it.
     NSMutableArray *parts = [NSMutableArray arrayWithObject:
-        ClaudeQuotasClose(fable, opus) ? @"Fable ↑ / Opus ↓ week" : @"Fable / Opus week"];
+        ClaudeQuotasClose(fable, opus) ? @"Fable↑/Opus↓" : @"Fable/Opus"];
     NSDictionary *session = nil;
     for (NSDictionary *w in u.limitWindows)
         if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) session = w;
     if (session) {
         NSString *clock = [session[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[session[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        [parts addObject:[NSString stringWithFormat:@"5h %.0f%% left%@", [session[@"remainingFraction"] doubleValue] * 100,
-            clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+        [parts addObject:[NSString stringWithFormat:@"5h %.0f%%%@", [session[@"remainingFraction"] doubleValue] * 100,
+            clock.length ? [@" → " stringByAppendingString:clock] : @""]];   // "→" = resets at
     } else if (weekClock.length) {
-        [parts addObject:[@"resets " stringByAppendingString:weekClock]];
+        [parts addObject:[@"week → " stringByAppendingString:weekClock]];
     } else {
         NSString *reset = [self compactResetText:u];
         if (reset.length) [parts addObject:reset];
     }
     NSString *note = [self aiStalenessNote:u capitalized:NO];
-    if (note.length) [parts addObject:note];
+    if (note.length) [parts addObject:[note stringByReplacingOccurrencesOfString:@" ago" withString:@""]];
     NSTextField *caption = [self text:[parts componentsJoinedByString:@" · "] font:[NSFont systemFontOfSize:10.5]
-        color:dim at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
+        color:staleWarns ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor
+        at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
+    caption.accessibilityIdentifier = @"popover.claude.caption";   // width-checked by tools/check-popover.m
     caption.toolTip = meter.toolTip; [row addSubview:caption]; [root addSubview:row];
     return y + 40;
 }

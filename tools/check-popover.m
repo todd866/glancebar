@@ -23,6 +23,15 @@ static BOOL HasText(NSView *view, NSString *text) {
     for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
     return NO;
 }
+static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
+    if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
+        NSTextField *f = (NSTextField *)view;
+        fprintf(stderr, "caption %.0f/%.0fpt: %s\n",
+                [f.stringValue sizeWithAttributes:@{NSFontAttributeName:f.font}].width, f.bounds.size.width - 4,
+                f.stringValue.UTF8String);
+    }
+    for (NSView *child in view.subviews) DumpClaudeCaption(child);
+}
 static BOOL FitsChildren(NSView *view) {
     for (NSView *child in view.subviews) {
         if (!NSContainsRect(view.bounds, child.frame) || !FitsChildren(child)) return NO;
@@ -126,7 +135,25 @@ int main(int argc, const char **argv) {
         if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.33)>0.001 ||
             meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33%")) return Fail(__LINE__);
         // The 5-hour window is a different clock: named in the caption, never a cap.
-        if (!HasText(root, @"5h 57% left")) return Fail(__LINE__);
+        if (!HasText(root, @"5h 57% → ")) return Fail(__LINE__);
+        // The longest caption the row can produce must still fit: near-equal quotas (arrows),
+        // a 5-hour window with a weekday reset, and a cache-age note.
+        AIUsage *longest = usage[0];
+        longest.limitStale = YES; longest.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-10*3600];
+        longest.limitWindows = @[
+            @{@"remainingFraction":@1, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 3*86400)},
+            @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
+            @{@"remainingFraction":@1, @"window":@"weekly Fable"}];
+        [c rebuildContent];
+        if (!HasText(p.contentViewController.view, @"cached 10h") || !FitsChildren(p.contentViewController.view)) {
+            DumpClaudeCaption(p.contentViewController.view); return Fail(__LINE__);
+        }
+        longest.limitStale = NO; longest.limitUpdatedAt = nil;
+        longest.limitWindows = @[
+            @{@"remainingFraction":@0.57, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 7200)},
+            @{@"remainingFraction":@0.33, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
+            @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
+        [c rebuildContent];
         if (!HasText(root, @"Macintosh HD")) return Fail(__LINE__);
         NSScrollView *storage = [c storageDetailsView];
         if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
