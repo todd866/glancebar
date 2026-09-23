@@ -229,6 +229,10 @@ NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
 // absent (state unknown). Parses text only — no I/O. Writing the setting needs root and
 // lives in the app shell; reading it does not.
 NSNumber *ParseSleepDisabled(NSString *pmsetOutput);
+// The /etc/sudoers.d rule that lets `user` run exactly `pmset -a lowpowermode|disablesleep
+// 0|1` without a password (Glancebar gates each use behind Touch ID). nil for a user name
+// that is not plain [A-Za-z0-9_.-], so nothing unexpected can reach sudoers or the shell.
+NSString *PmsetSudoersRule(NSString *user);
 
 // The user-facing reason when PickLimitWindow shows no Codex gauge: nil when a window
 // is current (caller shows the gauge), "do not carry" only when no usable rate_limits

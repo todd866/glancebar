@@ -61,14 +61,24 @@ opt-in) `/usr/bin/security`.
   the hover tooltip always carry the full summary at every width.
   Recovery includes free space before neighboring status items, which macOS moves
   left as Glancebar grows, so a packed row cannot trap it in the collapsed state.
-- **Stay awake with lid closed** — an optional toggle that keeps the Mac running with the
+- **Keep Awake and Low Power** — the popover's footer holds the two controls you reach for.
+  *Keep Awake* does what `caffeinate` does (a no-password power assertion that stops idle
+  sleep; the display may still sleep) and ends when you switch it off or quit Glancebar; a
+  cup rides in the menu bar while it's on. *Low Power* flips macOS Low Power Mode for battery
+  and adapter alike. The first flip offers a one-time **Touch ID** setup: a sudoers rule
+  limited to `pmset -a lowpowermode 0|1` and `pmset -a disablesleep 0|1`, installed with your
+  password once; after that each change is confirmed with Touch ID (or your password when no
+  sensor is reachable). Decline it and every change uses the standard admin prompt. Everything else — menu-bar readings,
+  battery extras, AI integrations, Launch at Login — sits under **⋯ › Settings**.
+- **Stay awake with lid closed** — an optional Settings toggle that keeps the Mac running with the
   lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
   admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
   as an always-visible reminder, since the setting persists across restarts until you turn
   it off.
 - **Self-contained** — one binary, native AppKit, no runtime, no installer, no bundled
-  helper, and no network requests unless you opt in. The only `sudo`-level action is the
-  opt-in *Stay awake with lid closed* toggle's standard admin prompt.
+  helper, and no network requests unless you opt in. The only `sudo`-level actions are the
+  Low Power toggle and the opt-in *Stay awake with lid closed* toggle, each behind the
+  standard admin prompt.
 
 The main popover shows the fullest drive, battery, overall system pressure, and one
 quota row per AI provider. Claude normally overlays two full-height fills on the
@@ -118,7 +128,7 @@ locally with `./build.sh`. Do not remove quarantine from an app obtained from so
 else unless you have independently verified it. Maintainers can follow
 [`docs/RELEASING.md`](docs/RELEASING.md) to create a signed, notarized candidate.
 
-Launch at Login can be enabled during first run or from Glancebar's options. You can
+Launch at Login can be enabled during first run or from ⋯ › Settings. You can
 also manage it in **System Settings → General → Login Items**.
 
 The bundled executable also has a stable headless interface:
@@ -170,7 +180,7 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   Finder. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
   and measured by physical footprint (what Activity Monitor shows), grouped under parent
   apps where possible.
-- **Stay awake with lid closed** — an opt-in Options toggle flips the system `SleepDisabled`
+- **Stay awake with lid closed** — an opt-in Settings toggle flips the system `SleepDisabled`
   power setting by running `/usr/bin/pmset -a disablesleep 0|1` as root through Apple's
   `osascript` administrator prompt. Nothing privileged is installed—no LaunchDaemon, no
   bundled helper—`pmset` runs once, only when you flip the switch. This is the only reliable
@@ -228,7 +238,7 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   scoped to one model, named after it); a window nobody has used yet has no reset time
   and shows as 100% left, "not started", rather than as a missing gauge. Because only
   Claude Code refreshes its OAuth token, the gauge goes stale while Claude Code is idle
-  for longer than the token lives; the row then says how old the figure is. The options menu has an **opt-in**
+  for longer than the token lives; the row then says how old the figure is. The Settings menu has an **opt-in**
   "Claude account status via Keychain/API" toggle, off by default. Enabling it first presents
   an in-app confirmation that explains the trust boundary. If confirmed, Glancebar
   invokes Apple's signed `/usr/bin/security` tool to read the OAuth token Claude Code

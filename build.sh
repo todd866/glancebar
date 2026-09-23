@@ -59,7 +59,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -framework Cocoa \
     -framework CoreGraphics \
     -framework IOKit \
-    -framework ServiceManagement \
+    -framework ServiceManagement -framework LocalAuthentication \
     -o "$APP/Contents/MacOS/Glancebar"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"

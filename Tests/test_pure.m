@@ -782,6 +782,15 @@ int main(void) {
                   isEqual:@"Limit windows reset since last Cursor refresh"],
               @"cursor elapsed with no fetch timestamp is undated");
 
+        // --- PmsetSudoersRule: exactly four pmset commands, and only for a plain user name ---
+        check([PmsetSudoersRule(@"iantodd") isEqual:@"iantodd ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0, "
+               "/usr/bin/pmset -a lowpowermode 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"],
+              @"sudoers rule names the four pmset commands and nothing else");
+        check(PmsetSudoersRule(@"a'b") == nil && PmsetSudoersRule(@"a b") == nil && PmsetSudoersRule(@"") == nil &&
+              PmsetSudoersRule(@"-x") == nil && PmsetSudoersRule(@"x\nALL") == nil && PmsetSudoersRule(@"%admin") == nil,
+              @"sudoers rule refuses quotes, spaces, flags, newlines and groups");
+        check([PmsetSudoersRule(@"first.last_2-x") hasPrefix:@"first.last_2-x ALL="], @"sudoers rule keeps a dotted user name");
+
         // --- ParseSleepDisabled (`pmset -g` → lid-closed-awake state) ---
         check([ParseSleepDisabled(@" SleepDisabled\t\t0") isEqual:@NO], @"SleepDisabled 0 → NO");
         check([ParseSleepDisabled(@" SleepDisabled 1") isEqual:@YES], @"SleepDisabled 1 → YES");

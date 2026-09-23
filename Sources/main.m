@@ -4,6 +4,8 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
 #import <mach/mach.h>
@@ -222,18 +224,15 @@ static NSNumber *SleepDisabledState(void) {
     return SleepDisabledStateViaTool();
 }
 
-// Applies `pmset -a disablesleep <0|1>` through an osascript administrator prompt: macOS
+// Runs a root shell command through an osascript administrator prompt: macOS
 // shows its own authentication dialog and runs pmset as root just this once — no background
 // helper or LaunchDaemon is installed. Returns YES only if the change was applied (NO when
-// the user cancels the prompt or authorization fails). The command and prompt are fixed
-// literals with no interpolated user input, so there is no shell/AppleScript injection path.
-static BOOL SetSleepDisabledViaAdmin(BOOL enable) {
-    NSString *prompt = enable
-        ? @"Glancebar needs administrator access to keep this Mac awake with the lid closed."
-        : @"Glancebar needs administrator access to restore normal lid-close sleep.";
+// the user cancels the prompt or authorization fails). Commands and prompts are built only
+// from fixed literals (plus a validated user name) — never free input — and contain no
+// double quote or backslash, so nothing can break out of the AppleScript string.
+static BOOL SetPmsetShellViaAdmin(NSString *shell, NSString *prompt) {
     NSString *script = [NSString stringWithFormat:
-        @"do shell script \"/usr/bin/pmset -a disablesleep %d\" with prompt \"%@\" with administrator privileges",
-        enable ? 1 : 0, prompt];
+        @"do shell script \"%@\" with prompt \"%@\" with administrator privileges", shell, prompt];
     NSTask *t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
     t.arguments = @[@"-e", script];
@@ -242,6 +241,42 @@ static BOOL SetSleepDisabledViaAdmin(BOOL enable) {
     if (![t launchAndReturnError:NULL]) return NO;
     [t waitUntilExit];
     return t.terminationStatus == 0;
+}
+// Low Power Mode as the system is applying it right now (a plain in-process read, main-thread
+// safe). `-a` sets it for battery and adapter alike, so an "only on battery" choice made in
+// System Settings becomes plain on/off once toggled here.
+static BOOL LowPowerModeEnabled(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }
+
+// Touch ID for the pmset toggles. macOS's admin prompt only takes a typed password, and
+// Touch ID can't hand out root on its own, so the fast path is a one-time sudoers rule
+// (PmsetSudoersRule: exactly four pmset commands) plus a LocalAuthentication check before
+// each use — Touch ID, or the login password when no sensor is reachable (lid closed).
+// The rule, not the Touch ID check, is the security boundary: it is safe to leave open
+// because the worst it permits is toggling Low Power Mode or lid-close sleep.
+static NSString *const kPmsetSudoersPath = @"/etc/sudoers.d/glancebar";
+static BOOL PmsetTouchIDInstalled(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:kPmsetSudoersPath];
+}
+static BOOL RunPmsetViaSudo(NSString *setting, BOOL enable) {
+    return RunTaskOutput(@"/usr/bin/sudo", @[@"-n", @"/usr/bin/pmset", @"-a", setting, enable ? @"1" : @"0"]) != nil;
+}
+// Writes the rule from inside the root shell (never from a user-writable temp file a
+// same-user process could swap before root reads it), checks it with visudo, then moves
+// it into place; a rule that fails visudo never lands. The rule text is fixed apart from
+// a user name PmsetSudoersRule has restricted to [A-Za-z0-9_.-].
+static BOOL InstallPmsetTouchID(void) {
+    NSString *rule = PmsetSudoersRule(NSUserName());
+    if (!rule) return NO;
+    NSString *shell = [NSString stringWithFormat:
+        @"umask 377; f=/etc/sudoers.d/.glancebar-new; /bin/rm -f $f; "
+        @"{ echo '# Installed by Glancebar for Touch ID power toggles. Delete this file to revoke.'; echo '%@'; } > $f "
+        @"&& /usr/sbin/visudo -cqf $f && /bin/chmod 0440 $f && /usr/sbin/chown root:wheel $f "
+        @"&& /bin/mv -f $f %@ || { /bin/rm -f $f; exit 1; }", rule, kPmsetSudoersPath];
+    return SetPmsetShellViaAdmin(shell, @"Glancebar needs your password once to let Touch ID confirm Low Power and lid-sleep changes.");
+}
+static BOOL RemovePmsetTouchID(void) {
+    return SetPmsetShellViaAdmin([@"/bin/rm -f " stringByAppendingString:kPmsetSudoersPath],
+                                 @"Glancebar needs administrator access to remove its Touch ID rule.");
 }
 
 static NSArray<NSDictionary *> *SampleHogs(int topN) {
@@ -3296,6 +3331,9 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem;
     BOOL _lidAwake, _lidAwakeReading;   // "stay awake with lid closed" state, read off-main
+    IOPMAssertionID _keepAwakeAssertion;  // "Keep Awake": held while on, released on off/quit
+    BOOL _keepAwake;
+    NSButton *_keepAwakeButton, *_lowPowerButton;   // footer toggles; rebuilt with the popover
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
@@ -3379,6 +3417,11 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     // process, same as this controller.
     [_item.button addObserver:self forKeyPath:@"effectiveAppearance"
                       options:0 context:kBarAppearanceContext];
+    // Low Power Mode can change under us (System Settings, Control Center, pmset, the battery
+    // dropping low); keep the footer toggle honest.
+    [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification
+                                                    object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *n) { [self syncPowerButtons]; }];
 
     _popover = [NSPopover new];
     _popover.behavior = NSPopoverBehaviorTransient;
@@ -3589,6 +3632,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                               @"color": driveTextColor}];
     }
     BOOL lidAwakeShown = NO;
+    NSImage *awakeIcon = _lidAwake ? TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)
+                       : _keepAwake ? TintedSymbol(@"cup.and.saucer.fill", -1, 13, fg) : nil;
     if (_barShowBattery) {
         NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
         NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
@@ -3599,12 +3644,13 @@ static BOOL AIWindowElapsed(AIUsage *u) {
             seg[@"compactPriority"] = @YES;
             // In the ordinary case the number alone is the densest useful form. Keep the
             // orange eye when lid-awake is active: that safety reminder outranks width.
-            if (!_lidAwake) seg[@"compactTextOnly"] = @YES;
-            if (_lidAwake) {
+            if (!awakeIcon) seg[@"compactTextOnly"] = @YES;
+            if (awakeIcon) {
                 // "Stay awake with lid closed" is on: swap the battery glyph for an orange open
                 // eye — an always-visible reminder of a setting that persists across reboots.
                 // The % stays: battery drain is exactly what you watch while it's forced awake.
-                seg[@"image"] = TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor);
+                // Keep Awake shows a cup in the text colour instead: it ends with the app.
+                seg[@"image"] = awakeIcon;
                 seg[@"keepIcon"] = @YES;   // a reminder, not decoration: survives every tier
                 lidAwakeShown = YES;
             } else {
@@ -3621,8 +3667,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
     }
     // The eye normally rides in the battery segment; if that segment is hidden or there's no
     // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
-    if (_lidAwake && !lidAwakeShown)
-        [segments insertObject:@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor),
+    if (awakeIcon && !lidAwakeShown)
+        [segments insertObject:@{@"image": awakeIcon,
                                  @"compactPriority": @YES, @"keepIcon": @YES} atIndex:0];
     return segments;
 }
@@ -3644,6 +3690,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
         [parts addObject:[NSString stringWithFormat:@"System pressure %@%@", SystemPressureLevel(_sys), cpu]];
     }
     if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
+    else if (_keepAwake) [parts insertObject:@"keeping awake" atIndex:0];
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
 }
 
@@ -4109,6 +4156,29 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [v addSubview:heading];
     return v;
 }
+// The panel's two controls: a pill that is tinted while its setting is on. Push-on/push-off
+// so VoiceOver reports a toggle; the tint is set explicitly because a rounded bezel shows
+// no "on" state of its own.
+- (NSButton *)powerToggle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
+    NSButton *b = [NSButton buttonWithTitle:title target:self action:action];
+    [b setButtonType:NSButtonTypePushOnPushOff];
+    b.bezelStyle = NSBezelStylePush;
+    b.controlSize = NSControlSizeSmall;
+    b.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
+    b.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+    b.imagePosition = NSImageLeading;
+    b.imageHugsTitle = YES;
+    return b;
+}
+- (void)styleToggle:(NSButton *)b on:(BOOL)on tint:(NSColor *)tint {
+    b.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+    b.bezelColor = on ? tint : nil;
+    b.contentTintColor = on ? NSColor.labelColor : NSColor.secondaryLabelColor;
+}
+- (void)syncPowerButtons {
+    [self styleToggle:_keepAwakeButton on:_keepAwake tint:NSColor.systemBrownColor];
+    [self styleToggle:_lowPowerButton on:LowPowerModeEnabled() tint:NSColor.systemYellowColor];
+}
 - (NSBox *)dividerAt:(CGFloat)y {
     NSBox *b = [[NSBox alloc] initWithFrame:NSMakeRect(kPad, y, kW-2*kPad, 1)];
     b.boxType = NSBoxSeparator; return b;
@@ -4316,7 +4386,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     for (NSArray *variant in @[@[legend, middleLong ?: @"", note ?: @""],
                                @[legend, middleShort ?: @"", note ?: @""],
                                @[legend, middleShort ?: @"", noteShort ?: @""],
-                               @[legend, middleTiny ?: @"", noteShort ?: @""]]) {
+                               @[legend, middleTiny ?: @"", noteShort ?: @""],
+                               // A 5-hour reset is always within five hours, so after 7pm
+                               // "tomorrow" is the one word that can go without losing a fact.
+                               @[legend, [middleTiny stringByReplacingOccurrencesOfString:@"resets tomorrow "
+                                                                                 withString:@"resets "] ?: @"",
+                                 noteShort ?: @""]]) {
         NSArray *parts = [variant filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
         text = [parts componentsJoinedByString:@" · "];
         if ([text sizeWithAttributes:@{NSFontAttributeName: captionFont}].width <= inner - 4) break;
@@ -4530,23 +4605,29 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
     [footer addSubview:[self dividerAt:0]];
     NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
-    NSButton *opts = [NSButton buttonWithTitle:@"Options" target:self action:@selector(showOptions:)];
-    opts.bordered = NO; opts.font = [NSFont systemFontOfSize:12]; opts.contentTintColor = NSColor.secondaryLabelColor;
-    opts.frame = NSMakeRect(kPad-4, 0, 66, 22); opts.toolTip = @"Configure Glancebar";
-    opts.accessibilityIdentifier = @"popover.options";
-    [opts setAccessibilityHelp:@"Configure metrics, privacy, and startup behavior"];
-    [foot addSubview:opts];
-    NSButton *details = [NSButton buttonWithTitle:@"Details…" target:self action:@selector(showDetails:)];
-    details.bordered = NO; details.font = [NSFont systemFontOfSize:12];
-    details.contentTintColor = NSColor.secondaryLabelColor;
-    details.frame = NSMakeRect(kPad+70, 0, 76, 22); details.toolTip = [@"Open the detailed status window. " stringByAppendingString:freshness];
-    details.accessibilityIdentifier = @"popover.details";
-    [foot addSubview:details];
-    NSButton *quit = [NSButton buttonWithTitle:@"Quit" target:NSApp action:@selector(terminate:)];
-    quit.bordered = NO; quit.font = [NSFont systemFontOfSize:12]; quit.contentTintColor = NSColor.secondaryLabelColor;
-    quit.frame = NSMakeRect(kW-kPad-50, 0, 50, 22); quit.alignment = NSTextAlignmentRight;
-    quit.accessibilityIdentifier = @"popover.quit";
-    [foot addSubview:quit];
+    _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
+                                   action:@selector(toggleKeepAwake:)];
+    _keepAwakeButton.toolTip = @"Stop this Mac sleeping on its own while Glancebar runs, like caffeinate. The display can still sleep; closing the lid still sleeps the Mac.";
+    _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
+    _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"leaf.fill" action:@selector(toggleLowPowerMode:)];
+    _lowPowerButton.toolTip = @"System Low Power Mode. Changing it needs Touch ID or your administrator password.";
+    _lowPowerButton.accessibilityIdentifier = @"popover.lowPower";
+    [self syncPowerButtons];
+    CGFloat x = kPad - 2;
+    for (NSButton *b in @[_keepAwakeButton, _lowPowerButton]) {
+        [b sizeToFit];
+        b.frame = NSMakeRect(x, 1, b.frame.size.width + 6, 22);
+        [foot addSubview:b];
+        x = NSMaxX(b.frame) + 6;
+    }
+    NSButton *more = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"ellipsis.circle"
+                                                           accessibilityDescription:@"More"]
+                                        target:self action:@selector(showMenu:)];
+    more.bordered = NO; more.contentTintColor = NSColor.secondaryLabelColor;
+    more.frame = NSMakeRect(kW - kPad - 24, 0, 24, 24);
+    more.toolTip = [@"Details, settings and Quit. " stringByAppendingString:freshness];
+    more.accessibilityIdentifier = @"popover.more";
+    [foot addSubview:more];
     [footer addSubview:foot];
 
     root.frame = NSMakeRect(0, 0, kW, MAX(y, 1));
@@ -4592,77 +4673,67 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     }
 }
 
-- (void)showOptions:(NSButton *)sender {
+// One short menu off the footer's ⋯: the things you reach for, then everything that is
+// set once and left alone tucked into Settings.
+- (void)showMenu:(NSButton *)sender {
     NSMenu *m = [NSMenu new];
-    NSMenuItem *barTitle = [m addItemWithTitle:@"Menu bar" action:nil keyEquivalent:@""];
-    barTitle.enabled = NO;
-    NSMenuItem *disk = [m addItemWithTitle:@"Show storage" action:@selector(toggleBarDisk:) keyEquivalent:@""];
-    disk.target = self; disk.state = _barShowDisk ? NSControlStateValueOn : NSControlStateValueOff;
-    NSMenuItem *battery = [m addItemWithTitle:@"Show battery" action:@selector(toggleBarBattery:) keyEquivalent:@""];
-    battery.target = self; battery.state = _barShowBattery ? NSControlStateValueOn : NSControlStateValueOff;
-    NSMenuItem *system = [m addItemWithTitle:@"Show system" action:@selector(toggleBarSystem:) keyEquivalent:@""];
-    system.target = self; system.state = _barShowSystem ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *details = [m addItemWithTitle:@"Details…" action:@selector(showDetails:) keyEquivalent:@""];
+    details.target = self;
+    NSMenuItem *settings = [m addItemWithTitle:@"Settings" action:nil keyEquivalent:@""];
+    settings.submenu = [self settingsMenu];
     [m addItem:NSMenuItem.separatorItem];
+    NSMenuItem *about = [m addItemWithTitle:@"About Glancebar" action:@selector(showAbout:) keyEquivalent:@""];
+    about.target = self;
+    [m addItemWithTitle:@"Quit Glancebar" action:@selector(terminate:) keyEquivalent:@"q"].target = NSApp;
+    [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
+}
+- (void)addSection:(NSMenu *)m title:(NSString *)title {
+    if (m.numberOfItems) [m addItem:NSMenuItem.separatorItem];
+    if (@available(macOS 14.0, *)) { [m addItem:[NSMenuItem sectionHeaderWithTitle:title]]; return; }
+    [m addItemWithTitle:title action:nil keyEquivalent:@""].enabled = NO;
+}
+- (NSMenuItem *)settingsItem:(NSMenu *)m title:(NSString *)title action:(SEL)action on:(BOOL)on {
+    NSMenuItem *item = [m addItemWithTitle:title action:action keyEquivalent:@""];
+    item.target = self;
+    item.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+    return item;
+}
+- (NSMenu *)settingsMenu {
+    NSMenu *m = [NSMenu new];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [self addSection:m title:@"Menu bar"];
+    [self settingsItem:m title:@"Storage" action:@selector(toggleBarDisk:) on:_barShowDisk];
+    [self settingsItem:m title:@"Battery" action:@selector(toggleBarBattery:) on:_barShowBattery];
+    [self settingsItem:m title:@"System" action:@selector(toggleBarSystem:) on:_barShowSystem];
 
-    NSMenuItem *w = [m addItemWithTitle:@"Show current draw" action:@selector(toggleWatts:) keyEquivalent:@""];
-    w.target = self; w.state = _showWatts ? NSControlStateValueOn : NSControlStateValueOff;
-    w.enabled = _bat.valid;
-    NSMenuItem *h = [m addItemWithTitle:@"Show battery health" action:@selector(toggleHealth:) keyEquivalent:@""];
-    h.target = self; h.state = _showHealth ? NSControlStateValueOn : NSControlStateValueOff;
-    h.enabled = _bat.valid;
-    [m addItem:NSMenuItem.separatorItem];
-
+    [self addSection:m title:@"Battery"];
+    [self settingsItem:m title:@"Current draw" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
+    [self settingsItem:m title:@"Health" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
     // Reflects the live system setting, not a stored preference: it is global and other
     // tools can change it, so the checkmark must read the real state.
-    NSMenuItem *lidAwake = [m addItemWithTitle:@"Stay awake with lid closed"
-                                        action:@selector(toggleStayAwake:) keyEquivalent:@""];
-    lidAwake.target = self;
     NSNumber *sleepState = SleepDisabledState();
-    lidAwake.state = !sleepState ? NSControlStateValueMixed
-                   : sleepState.boolValue ? NSControlStateValueOn : NSControlStateValueOff;
-    if (!sleepState) lidAwake.title = @"Stay awake with lid closed (state unknown)";
-    [m addItem:NSMenuItem.separatorItem];
+    NSMenuItem *lidAwake = [self settingsItem:m title:@"Stay awake with lid closed…"
+                                       action:@selector(toggleStayAwake:) on:sleepState.boolValue];
+    if (!sleepState) { lidAwake.state = NSControlStateValueMixed; lidAwake.title = @"Stay awake with lid closed (state unknown)"; }
+    [self settingsItem:m title:@"Use Touch ID for Low Power & lid sleep" action:@selector(toggleTouchIDRule:)
+                    on:PmsetTouchIDInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
 
-    NSMenuItem *privacyTitle = [m addItemWithTitle:@"AI & privacy" action:nil keyEquivalent:@""];
-    privacyTitle.enabled = NO;
-    NSMenuItem *transcripts = [m addItemWithTitle:@"Claude transcript token totals"
-                                           action:@selector(toggleClaudeTranscripts:) keyEquivalent:@""];
-    transcripts.target = self;
-    transcripts.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeTranscripts"]
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    NSMenuItem *acct = [m addItemWithTitle:@"Claude account status via Keychain/API"
-                                    action:@selector(toggleClaudeAccount:) keyEquivalent:@""];
-    acct.target = self;
-    acct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useClaudeAccount"]
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    if (CursorServicePresent(GBHomeDirectory())) {
-        NSMenuItem *cursorAcct = [m addItemWithTitle:@"Cursor account status via local session/API"
-                                              action:@selector(toggleCursorAccount:) keyEquivalent:@""];
-        cursorAcct.target = self;
-        cursorAcct.state = [NSUserDefaults.standardUserDefaults boolForKey:@"useCursorAccount"]
-            ? NSControlStateValueOn : NSControlStateValueOff;
-    }
-    [m addItem:NSMenuItem.separatorItem];
+    [self addSection:m title:@"AI status"];
+    [self settingsItem:m title:@"Claude transcript token totals" action:@selector(toggleClaudeTranscripts:)
+                    on:[ud boolForKey:@"useClaudeTranscripts"]];
+    [self settingsItem:m title:@"Claude account via Keychain/API…" action:@selector(toggleClaudeAccount:)
+                    on:[ud boolForKey:@"useClaudeAccount"]];
+    if (CursorServicePresent(GBHomeDirectory()))
+        [self settingsItem:m title:@"Cursor account via local session/API…" action:@selector(toggleCursorAccount:)
+                        on:[ud boolForKey:@"useCursorAccount"]];
 
+    [m addItem:NSMenuItem.separatorItem];
     SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
-    NSMenuItem *login = [m addItemWithTitle:loginStatus == SMAppServiceStatusRequiresApproval
-                                            ? @"Launch at Login (approve in System Settings)"
-                                            : @"Launch at Login"
-                                      action:@selector(toggleLaunchAtLogin:) keyEquivalent:@""];
-    login.target = self;
-    login.state = loginStatus == SMAppServiceStatusEnabled ? NSControlStateValueOn
-                : loginStatus == SMAppServiceStatusRequiresApproval ? NSControlStateValueMixed
-                : NSControlStateValueOff;
-    NSMenuItem *refresh = [m addItemWithTitle:@"Refresh Now" action:@selector(refreshNow:) keyEquivalent:@"r"];
-    refresh.target = self;
-    [m addItem:NSMenuItem.separatorItem];
-    NSMenuItem *activity = [m addItemWithTitle:@"Open Activity Monitor…" action:@selector(openActivityMonitor:) keyEquivalent:@""];
-    activity.target = self;
-    NSMenuItem *diskUtility = [m addItemWithTitle:@"Open Disk Utility…" action:@selector(openDiskUtility:) keyEquivalent:@""];
-    diskUtility.target = self;
-    NSMenuItem *about = [m addItemWithTitle:@"About Glancebar…" action:@selector(showAbout:) keyEquivalent:@""];
-    about.target = self;
-    [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
+    NSMenuItem *login = [self settingsItem:m title:loginStatus == SMAppServiceStatusRequiresApproval
+                                                    ? @"Launch at Login (approve in System Settings)" : @"Launch at Login"
+                                    action:@selector(toggleLaunchAtLogin:) on:loginStatus == SMAppServiceStatusEnabled];
+    if (loginStatus == SMAppServiceStatusRequiresApproval) login.state = NSControlStateValueMixed;
+    return m;
 }
 
 // Explicit opt-in: `/usr/bin/security` performs an Apple-tool-authorized, normally silent
@@ -4739,7 +4810,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
         alert.messageText = @"Stay awake with the lid closed?";
-        alert.informativeText = @"Glancebar will ask macOS for your administrator password to run pmset, which keeps this Mac running when the lid is closed (the display sleeps but the system stays awake). While it’s on, the Mac won’t sleep on its own at all. This setting persists across restarts until you turn it back off, so switch it off when you’re done—otherwise a closed Mac can keep running and overheat in a bag. No background helper is installed; Glancebar runs pmset only when you flip this switch.";
+        alert.informativeText = @"Glancebar will ask you to confirm with Touch ID or your administrator password to run pmset, which keeps this Mac running when the lid is closed (the display sleeps but the system stays awake). While it’s on, the Mac won’t sleep on its own at all. This setting persists across restarts until you turn it back off, so switch it off when you’re done—otherwise a closed Mac can keep running and overheat in a bag. No background helper is installed; Glancebar runs pmset only when you flip this switch.";
         [alert addButtonWithTitle:@"Continue"];
         [alert addButtonWithTitle:@"Cancel"];
         [NSApp activateIgnoringOtherApps:YES];
@@ -4747,13 +4818,86 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     }
     // Run the (modal) admin prompt off the main thread so the app stays responsive; the
     // menu re-reads the live state on next open, so a cancel or failure needs no rollback.
+    // Re-read the true state (whether it applied or the user cancelled) and update the
+    // bar eye promptly, rather than waiting up to 15s for the next refresh tick.
+    [self applyPmset:@"disablesleep" on:enabling
+            reason:enabling ? @"keep this Mac awake with the lid closed" : @"restore normal lid-close sleep"
+              then:^{ [self refreshLidAwakeForced:YES]; }];
+}
+// Flips system Low Power Mode from the footer toggle. Like the lid toggle, the live system
+// state is the only truth: nothing is stored, and a cancelled admin prompt just re-reads
+// it so the toggle snaps back.
+- (void)toggleLowPowerMode:(id)s {
+    BOOL enabling = !LowPowerModeEnabled();
+    [self syncPowerButtons];   // undo the click's own flip until the system confirms
+    [self applyPmset:@"lowpowermode" on:enabling
+            reason:enabling ? @"turn on Low Power Mode" : @"turn off Low Power Mode"
+              then:^{ [self syncPowerButtons]; }];
+}
+// Applies one pmset flag, then runs `then` on the main queue whatever happened (callers
+// re-read live state, so a cancel needs no rollback). With the Touch ID rule installed:
+// Touch ID, then `sudo -n`. Without it: offer the one-time setup once, else the password prompt.
+- (void)applyPmset:(NSString *)setting on:(BOOL)on reason:(NSString *)reason then:(dispatch_block_t)then {
+    dispatch_block_t finish = ^{ dispatch_async(dispatch_get_main_queue(), then); };
+    NSString *adminPrompt = [NSString stringWithFormat:@"Glancebar needs administrator access to %@.", reason];
+    NSString *command = [NSString stringWithFormat:@"/usr/bin/pmset -a %@ %d", setting, on ? 1 : 0];
+    if (PmsetTouchIDInstalled()) {
+        [[LAContext new] evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:reason
+                                  reply:^(BOOL ok, __unused NSError *error) {
+            // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
+            if (ok && !RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
+            finish();
+        }];
+        return;
+    }
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (![ud boolForKey:@"pmsetTouchIDOffered"]) {
+        [ud setBool:YES forKey:@"pmsetTouchIDOffered"];
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Use Touch ID for Low Power and lid sleep?";
+        alert.informativeText = @"macOS’s administrator prompt only takes a typed password. Glancebar can instead add a small rule to /etc/sudoers.d that lets your account run just these four commands—pmset lowpowermode 0/1 and disablesleep 0/1—and then confirm each change with Touch ID. You’ll type your password once to install it. Remove it any time from ⋯ › Settings.";
+        [alert addButtonWithTitle:@"Set Up Touch ID"];
+        [alert addButtonWithTitle:@"Use Password"];
+        [NSApp activateIgnoringOtherApps:YES];
+        BOOL setUp = [alert runModal] == NSAlertFirstButtonReturn;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            // Just authenticated to install, so apply this first change without asking again.
+            if (!(setUp && InstallPmsetTouchID() && RunPmsetViaSudo(setting, on)))
+                SetPmsetShellViaAdmin(command, adminPrompt);
+            finish();
+        });
+        return;
+    }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        SetSleepDisabledViaAdmin(enabling);
-        // Re-read the true state (whether it applied or the user cancelled) and update the
-        // bar eye promptly, rather than waiting up to 15s for the next refresh tick.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshLidAwakeForced:YES]; });
+        SetPmsetShellViaAdmin(command, adminPrompt);
+        finish();
     });
 }
+- (void)toggleTouchIDRule:(id)s {
+    BOOL installed = PmsetTouchIDInstalled();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (installed) RemovePmsetTouchID(); else InstallPmsetTouchID();
+    });
+}
+// What `caffeinate` does: hold a PreventUserIdleSystemSleep assertion. Any process may
+// take one, so there is no password — and it dies with the process, so a forgotten
+// toggle can never outlive Glancebar the way the persistent lid setting can. Deliberately
+// not saved across launches for the same reason.
+- (void)setKeepAwake:(BOOL)on {
+    if (on == _keepAwake) return;
+    if (on) {
+        IOReturn r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
+            kIOPMAssertionLevelOn, CFSTR("Glancebar Keep Awake"), &_keepAwakeAssertion);
+        if (r != kIOReturnSuccess) { _keepAwakeAssertion = kIOPMNullAssertionID; on = NO; }
+    } else if (_keepAwakeAssertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(_keepAwakeAssertion);
+        _keepAwakeAssertion = kIOPMNullAssertionID;
+    }
+    _keepAwake = on;
+    [self syncPowerButtons];
+    [self updateBar];
+}
+- (void)toggleKeepAwake:(id)s { [self setKeepAwake:!_keepAwake]; }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
 
@@ -4790,35 +4934,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSAlert *alert = [NSAlert new];
     alert.alertStyle = NSAlertStyleInformational;
     alert.messageText = @"Glancebar is ready";
-    alert.informativeText = @"Glancebar now lives in your menu bar. Click its meters for storage, battery, system, and AI status. Options controls what appears and keeps Claude access off until you explicitly enable it. If the item is hidden by a MacBook notch, free one menu-bar slot in Control Center.";
+    alert.informativeText = @"Glancebar now lives in your menu bar. Click its meters for storage, battery, system, and AI status. Keep Awake and Low Power sit at the bottom of the panel; ⋯ › Settings controls what appears and keeps Claude access off until you explicitly enable it. If the item is hidden by a MacBook notch, free one menu-bar slot in Control Center.";
     [alert addButtonWithTitle:@"Got It"];
     [alert addButtonWithTitle:@"Launch at Login"];
     if ([alert runModal] == NSAlertSecondButtonReturn)
         [self setLaunchAtLoginEnabled:YES showErrors:YES];
-}
-
-- (void)refreshNow:(id)sender {
-    [self refresh];
-    if (_popover.isShown || _detailsWindow.isVisible) [self beginSampling];
-}
-
-- (void)openApplicationAtPath:(NSString *)path title:(NSString *)title {
-    NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
-    NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
-    [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:configuration
-                                     completionHandler:^(NSRunningApplication *__unused app, NSError *error) {
-        if (error) dispatch_async(dispatch_get_main_queue(), ^{ [self showError:error title:title]; });
-    }];
-}
-
-- (void)openActivityMonitor:(id)sender {
-    [self openApplicationAtPath:@"/System/Applications/Utilities/Activity Monitor.app"
-                          title:@"Couldn’t open Activity Monitor"];
-}
-
-- (void)openDiskUtility:(id)sender {
-    [self openApplicationAtPath:@"/System/Applications/Utilities/Disk Utility.app"
-                          title:@"Couldn’t open Disk Utility"];
 }
 
 - (void)showAbout:(id)sender {

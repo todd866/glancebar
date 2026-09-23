@@ -1066,6 +1066,19 @@ NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
     return nil;
 }
 
+NSString *PmsetSudoersRule(NSString *user) {
+    if (!user.length || [user hasPrefix:@"-"] || [user hasPrefix:@"."]) return nil;
+    NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"] invertedSet];
+    if ([user rangeOfCharacterFromSet:bad].location != NSNotFound) return nil;
+    NSMutableArray<NSString *> *commands = [NSMutableArray array];
+    for (NSString *setting in @[@"lowpowermode", @"disablesleep"])
+        for (NSString *value in @[@"0", @"1"])
+            [commands addObject:[NSString stringWithFormat:@"/usr/bin/pmset -a %@ %@", setting, value]];
+    return [NSString stringWithFormat:@"%@ ALL=(root) NOPASSWD: %@", user,
+            [commands componentsJoinedByString:@", "]];
+}
+
 BOOL GUIRequiresLaunchServicesRelaunch(NSString *runningBundleID,
                                       NSString *expectedBundleID) {
     return expectedBundleID.length > 0 &&

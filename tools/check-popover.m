@@ -32,6 +32,11 @@ static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failur
     }
     for (NSView *child in view.subviews) DumpClaudeCaption(child);
 }
+static NSView *FindIdentifier(NSView *view, NSString *identifier) {
+    if ([view.accessibilityIdentifier isEqual:identifier]) return view;
+    for (NSView *child in view.subviews) { NSView *hit = FindIdentifier(child, identifier); if (hit) return hit; }
+    return nil;
+}
 static BOOL FitsChildren(NSView *view) {
     for (NSView *child in view.subviews) {
         if (!NSContainsRect(view.bounds, child.frame) || !FitsChildren(child)) return NO;
@@ -140,6 +145,12 @@ int main(int argc, const char **argv) {
         if (FirstScrollView(root) || root.frame.size.height > 500 || CountGauges(root) != 5 ||
             HasText(root,@"bengalfox") || !HasText(root,@"cached")) return Fail(__LINE__);
         if (!FitsChildren(root)) return Fail(__LINE__);
+        // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
+        NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
+        NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
+        NSView *more = FindIdentifier(p.contentViewController.view, @"popover.more");
+        if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
+            !FitsChildren(keep.superview)) return Fail(__LINE__);
         ClaudeGauge *meter = FindClaudeMeter(root);
         // Opus has no window of its own, so the account weekly (33%) governs it, as the
         // Claude app's "Current week (all models)" does; the 5-hour window never caps either.
