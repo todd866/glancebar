@@ -2847,7 +2847,8 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 - (void)refreshValues {
     NSString *f = _fable < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _fable*100];
     NSString *o = _opus < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _opus*100];
-    self.accessibilityValue = [NSString stringWithFormat:@"Fable %@, Opus %@ remaining", f, o];
+    self.accessibilityValue = _fable < 0 ? [o stringByAppendingString:@" remaining"]   // single weekly figure
+        : [NSString stringWithFormat:@"Fable %@, Opus %@ remaining", f, o];
     self.needsDisplay = YES;
 }
 - (void)setFable:(double)value { _fable = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
@@ -4375,8 +4376,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [root addSubview:[self aiStatusRow:u width:width pad:pad at:y]];
         return y + 40;
     }
-    double fable = [quotas[@"fable"] doubleValue], opus = [quotas[@"opus"] doubleValue];
-    // Staleness is said in the caption, in amber; the fills and the number keep their
+    // One figure: the account's weekly allowance across all models (what Opus draws on).
+    // The per-model Fable window is left out at the user's call — it never binds in practice
+    // under Opus 5.5 — so the gauge gets no Fable value and draws a single full-height fill.
+    double week = [quotas[@"opus"] doubleValue];
+    // Staleness is said in the caption, in amber; the fill and the number keep their
     // quota colours so a cached figure still reads as a figure.
     BOOL staleWarns = [self aiSnapshotStaleWarns:u];
     NSColor *dim = NSColor.secondaryLabelColor;
@@ -4386,67 +4390,46 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [row addSubview:[self text:@"Claude" font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
         color:nil at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
     ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20,barW), 7)];
-    meter.fable = fable; meter.opus = opus;
-    NSMutableArray *sources = [NSMutableArray array];
-    for (NSString *model in @[@"Fable", @"Opus"]) {
-        BOOL isFable = [model isEqual:@"Fable"];
-        NSDictionary *w = quotas[isFable ? @"fableWindow" : @"opusWindow"];
-        BOOL shared = [quotas[isFable ? @"fableShared" : @"opusShared"] boolValue];
-        [sources addObject:[NSString stringWithFormat:@"%@: %@%@", model, w ? w[@"window"] : @"not reported",
-            shared && w ? @" (no window of its own; the account weekly governs)" : @""]];
-    }
+    meter.opus = week;
+    NSString *pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week*100];
+    meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
     NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
         ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-    if (weekClock.length) [sources addObject:[@"Week resets " stringByAppendingString:weekClock]];
-    meter.toolTip = [[sources componentsJoinedByString:@"\n"] stringByAppendingString:
-        @"\nBoth fills start at zero and use warning colours. Within 3 percentage points, Fable uses the upper lane and Opus the lower. Model allowances are capped by the account's weekly limit, never by the 5-hour window. The caption names the 5-hour session window and when it resets."];
+    NSMutableArray *tip = [NSMutableArray arrayWithObject:
+        [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
+    if (weekClock.length) [tip addObject:[@"Week resets " stringByAppendingString:weekClock]];
+    for (NSDictionary *w in u.limitWindows)
+        if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
+            NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
+                ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+            [tip addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
+                [w[@"remainingFraction"] doubleValue] * 100, clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+        }
+    meter.toolTip = [tip componentsJoinedByString:@"\n"];
     [row addSubview:meter];
-    NSString *f = fable < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",fable*100];
-    NSString *o = opus < 0 ? @"—" : [NSString stringWithFormat:@"%.0f",opus*100];
-    NSTextField *value = [self text:[NSString stringWithFormat:@"%@/%@%%",f,o]
+    NSTextField *value = [self text:pct
         font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:dim
         at:NSMakeRect(width-pad-rightW, 21, rightW, 15) align:NSTextAlignmentRight];
     value.accessibilityIdentifier = @"popover.claude.value";
-    value.accessibilityLabel = @"Fable / Opus percent of the week remaining";
+    value.accessibilityLabel = @"Percent of the week remaining, all models";
     value.toolTip = meter.toolTip; [row addSubview:value];
-    // Caption, one line, plain words: the bar legend, the 5-hour session window when
-    // reported (else the weekly reset), then the cache age when it matters. Written at
-    // the most explicit form that fits the row; each fallback drops words, never facts.
-    NSString *legend = ClaudeQuotasClose(fable, opus) ? @"Fable↑/Opus↓" : @"Fable/Opus";
-    NSDictionary *session = nil;
-    for (NSDictionary *w in u.limitWindows)
-        if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) session = w;
-    NSString *middleLong = nil, *middleShort = nil, *middleTiny = nil;
-    if (session) {
-        NSString *clock = [session[@"resetsAt"] isKindOfClass:NSNumber.class]
-            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[session[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        double pct = [session[@"remainingFraction"] doubleValue] * 100;
-        middleLong = [NSString stringWithFormat:@"5-hour %.0f%% left%@", pct,
-                      clock.length ? [@", resets " stringByAppendingString:clock] : @""];
-        middleShort = [NSString stringWithFormat:@"5-hour %.0f%%%@", pct,
-                       clock.length ? [@" · resets " stringByAppendingString:clock] : @""];
-        middleTiny = [NSString stringWithFormat:@"5h %.0f%%%@", pct,
-                      clock.length ? [@" · resets " stringByAppendingString:clock] : @""];
-    } else if (weekClock.length) {
+    // Caption, one line, plain words: when the WEEK resets (the one clock the user plans
+    // around — the 5-hour session window stays in the tooltip and Details), then the cache
+    // age when it matters. Each fallback drops words, never facts.
+    NSString *middleLong, *middleShort;
+    if (weekClock.length) {
         middleLong = [@"Week resets " stringByAppendingString:weekClock];
-        middleShort = [@"resets " stringByAppendingString:weekClock];
+        middleShort = [@"Resets " stringByAppendingString:weekClock];
     } else {
         middleLong = middleShort = [self compactResetText:u];
     }
-    if (!middleTiny) middleTiny = middleShort;
     NSString *note = [self aiStalenessNote:u capitalized:NO];
     NSString *noteShort = [note stringByReplacingOccurrencesOfString:@" ago" withString:@""];
     NSFont *captionFont = [NSFont systemFontOfSize:10.5];
     NSString *text = nil;
-    for (NSArray *variant in @[@[legend, middleLong ?: @"", note ?: @""],
-                               @[legend, middleShort ?: @"", note ?: @""],
-                               @[legend, middleShort ?: @"", noteShort ?: @""],
-                               @[legend, middleTiny ?: @"", noteShort ?: @""],
-                               // A 5-hour reset is always within five hours, so after 7pm
-                               // "tomorrow" is the one word that can go without losing a fact.
-                               @[legend, [middleTiny stringByReplacingOccurrencesOfString:@"resets tomorrow "
-                                                                                 withString:@"resets "] ?: @"",
-                                 noteShort ?: @""]]) {
+    for (NSArray *variant in @[@[middleLong ?: @"", note ?: @""],
+                               @[middleShort ?: @"", note ?: @""],
+                               @[middleShort ?: @"", noteShort ?: @""]]) {
         NSArray *parts = [variant filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
         text = [parts componentsJoinedByString:@" · "];
         if ([text sizeWithAttributes:@{NSFontAttributeName: captionFont}].width <= inner - 4) break;

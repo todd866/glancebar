@@ -152,19 +152,20 @@ int main(int argc, const char **argv) {
         if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
             !FitsChildren(keep.superview)) return Fail(__LINE__);
         ClaudeGauge *meter = FindClaudeMeter(root);
-        // Opus has no window of its own, so the account weekly (33%) governs it, as the
-        // Claude app's "Current week (all models)" does; the 5-hour window never caps either.
-        if (!meter || fabs(meter.fable-0.06)>0.001 || fabs(meter.opus-0.33)>0.001 ||
-            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"6/33%")) return Fail(__LINE__);
-        // The 5-hour window is a different clock: named in the caption, never a cap.
-        if (!HasText(root, @"5-hour 57% left, resets")) return Fail(__LINE__);
+        // One figure: the account weekly across all models (33%), as the Claude app's
+        // "Current week (all models)". No Fable figure, and the 5-hour window never caps it.
+        if (!meter || meter.fable >= 0 || fabs(meter.opus-0.33)>0.001 ||
+            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"33%") ||
+            HasText(root,@"Fable")) return Fail(__LINE__);
+        // The caption carries the WEEKLY reset; the 5-hour window is never a cap and never the caption.
+        if (!HasText(root, @"Week resets tomorrow") || HasText(root, @"5-hour")) return Fail(__LINE__);
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
-        // a 5-hour window with a weekday reset, and a cache-age note.
+        // a weekly reset named by weekday and date, and a cache-age note.
         AIUsage *longest = usage[0];
         longest.limitStale = YES; longest.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-10*3600];
         longest.limitWindows = @[
             @{@"remainingFraction":@1, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 4*3600)},
-            @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
+            @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 6.5*86400)},
             @{@"remainingFraction":@1, @"window":@"weekly Fable"}];
         [c rebuildContent];
         if (!HasText(p.contentViewController.view, @"cached 10h") || !FitsChildren(p.contentViewController.view)) {
@@ -205,7 +206,8 @@ int main(int argc, const char **argv) {
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
         [c rebuildContent];
         ClaudeGauge *updated = FindClaudeMeter(p.contentViewController.view);
-        if (updated != meter || fabs(updated.fable-0.82)>0.001 || updated.opus != -1) return Fail(__LINE__);
+        // Only a Fable window reported: no all-models weekly figure, so no fill at all (never Fable's).
+        if (updated != meter || updated.fable >= 0 || updated.opus != -1) return Fail(__LINE__);
         claude.limitWindows = @[];
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 4 ||
@@ -214,7 +216,8 @@ int main(int argc, const char **argv) {
         claude.limitWindows = @[@{@"remainingFraction":@1, @"window":@"weekly Fable"},
                                @{@"remainingFraction":@1, @"window":@"weekly Opus"}];
         [c rebuildContent];
-        if (!HasText(p.contentViewController.view,@"100/100%") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        if (!HasText(p.contentViewController.view,@"100%") || HasText(p.contentViewController.view,@"/100") ||
+            !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
         claude.overageActive = YES;
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
