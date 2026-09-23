@@ -4,7 +4,6 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
-#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
@@ -205,7 +204,7 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
 }
 
 // Reads the live SleepDisabled system power setting (no admin needed — a plain IOKit read
-// surfaced by `pmset -g`). YES = the Mac is currently kept awake with the lid closed.
+// surfaced by `pmset -g`). YES = Keep Awake is on (no idle or lid-close sleep).
 // nil when the setting could not be read — callers must not mistake that for "normal
 // sleep", or the toggle would offer to ENABLE staying awake on a Mac that already is.
 static NSNumber *SleepDisabledStateViaTool(void) {
@@ -2903,6 +2902,26 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 // (clipsToBounds itself is macOS 14+, and the deployment target is 13.0). As the full-size
 // root that is harmless, but any SHORT instance of this view must set wantsLayer, or its
 // fill will paint over whatever sits above it. See the popover footer.
+// A pill whose own fill carries its on/off state. A push button's bezelColor draws only
+// while its window is key, and the popover belongs to a background app that never
+// activates — so a tinted bezel never appeared there, and Keep Awake looked dead.
+@interface PillButton : NSButton
+@property (nonatomic, strong) NSColor *onColor;
+@end
+@implementation PillButton
+- (void)drawRect:(NSRect)dirtyRect {
+    BOOL on = self.state == NSControlStateValueOn;
+    CGFloat alpha = self.isHighlighted ? 0.16 : 0.08;
+    [(on ? self.onColor : [NSColor.labelColor colorWithAlphaComponent:alpha]) setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6] fill];
+    if (on && self.isHighlighted) {
+        [[NSColor.blackColor colorWithAlphaComponent:0.12] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6] fill];
+    }
+    [super drawRect:dirtyRect];
+}
+@end
+
 @interface PopoverRootView : FlippedView @end
 @implementation PopoverRootView
 - (void)drawRect:(NSRect)dirty {
@@ -3106,6 +3125,18 @@ static NSScrollView *FirstScrollView(NSView *root) {
 
 #pragma mark - bar image
 
+// Two glyphs drawn side by side as one image, centred vertically (Keep Awake + Low Power).
+static NSImage *GlyphPair(NSImage *a, NSImage *b) {
+    if (!a || !b) return a ?: b;
+    CGFloat gap = 3, h = MAX(a.size.height, b.size.height);
+    NSImage *out = [[NSImage alloc] initWithSize:NSMakeSize(a.size.width + gap + b.size.width, h)];
+    [out lockFocus];
+    [a drawInRect:NSMakeRect(0, (h - a.size.height) / 2, a.size.width, a.size.height)];
+    [b drawInRect:NSMakeRect(a.size.width + gap, (h - b.size.height) / 2, b.size.width, b.size.height)];
+    [out unlockFocus];
+    out.template = NO;
+    return out;
+}
 static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColor *color) {
     NSImage *img = varValue >= 0
         ? [NSImage imageWithSystemSymbolName:name variableValue:varValue accessibilityDescription:nil]
@@ -3330,9 +3361,9 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     BOOL _barShowDisk, _barShowBattery, _barShowSystem;
-    BOOL _lidAwake, _lidAwakeReading;   // "stay awake with lid closed" state, read off-main
-    IOPMAssertionID _keepAwakeAssertion;  // "Keep Awake": held while on, released on off/quit
-    BOOL _keepAwake;
+    // Keep Awake IS the system SleepDisabled setting (no idle or lid-close sleep), read off-main.
+    // One live state, so the bar's cup and the footer button can never disagree.
+    BOOL _lidAwake, _lidAwakeReading;
     NSButton *_keepAwakeButton, *_lowPowerButton;   // footer toggles; rebuilt with the popover
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
@@ -3359,6 +3390,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 // briefly and abandon it.
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;
+    // Keep Awake must not outlive the app that shows it. Only the Touch ID rule makes this
+    // possible without a prompt at quit; without it the setting persists (and says so).
+    NSNumber *awake = SleepDisabledState();
+    if (awake.boolValue && PmsetTouchIDInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
     if (!_aiQueue || !_aiReader) return;
     dispatch_semaphore_t flushed = dispatch_semaphore_create(0);
     dispatch_async(_aiQueue, ^{
@@ -3418,10 +3453,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     [_item.button addObserver:self forKeyPath:@"effectiveAppearance"
                       options:0 context:kBarAppearanceContext];
     // Low Power Mode can change under us (System Settings, Control Center, pmset, the battery
-    // dropping low); keep the footer toggle honest.
+    // dropping low); keep the footer toggle and the bar's yellow battery honest.
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification
                                                     object:nil queue:NSOperationQueue.mainQueue
-                                                usingBlock:^(__unused NSNotification *n) { [self syncPowerButtons]; }];
+                                                usingBlock:^(__unused NSNotification *n) { [self syncPowerButtons]; [self updateBar]; }];
 
     _popover = [NSPopover new];
     _popover.behavior = NSPopoverBehaviorTransient;
@@ -3632,29 +3667,31 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                               @"color": driveTextColor}];
     }
     BOOL lidAwakeShown = NO;
-    NSImage *awakeIcon = _lidAwake ? TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)
-                       : _keepAwake ? TintedSymbol(@"cup.and.saucer.fill", -1, 13, fg) : nil;
+    // Modes are shown by SHAPE, the same glyphs as the footer buttons: the cup for Keep
+    // Awake, the tortoise for Low Power (a yellow tint alone was too faint to read).
+    NSImage *awakeIcon = GlyphPair(_lidAwake ? TintedSymbol(@"cup.and.saucer.fill", -1, 13, fg) : nil,
+                                   LowPowerModeEnabled() ? TintedSymbol(@"tortoise.fill", -1, 13, fg) : nil);
     if (_barShowBattery) {
         NSString *text = _bat.valid ? [NSString stringWithFormat:@"%d%%", _bat.percent] : @"—";
-        NSColor *color = _bat.valid && _bat.percent <= 20 && !_bat.acConnected ? BattBarColor(_bat.percent) : fg;
+        BOOL lowBattery = _bat.valid && _bat.percent <= 20 && !_bat.acConnected;
+        NSColor *color = lowBattery ? BattBarColor(_bat.percent) : fg;
         NSMutableDictionary *seg = [@{@"text": text, @"color": color} mutableCopy];
         if (_bat.valid) {   // no battery (desktop Mac): text-only, no misleading empty glyph
             // The compact tier keeps exactly one high-value reading. Battery percentage
             // wins because macOS may have hidden its own percentage to make room for us.
             seg[@"compactPriority"] = @YES;
             // In the ordinary case the number alone is the densest useful form. Keep the
-            // orange eye when lid-awake is active: that safety reminder outranks width.
+            // mode glyphs when either mode is on: that reminder outranks width.
             if (!awakeIcon) seg[@"compactTextOnly"] = @YES;
             if (awakeIcon) {
-                // "Stay awake with lid closed" is on: swap the battery glyph for an orange open
-                // eye — an always-visible reminder of a setting that persists across reboots.
+                // A mode is on: swap the battery glyph for its glyph(s) — the footer buttons'
+                // icons — an always-visible reminder of settings that persist across reboots.
                 // The % stays: battery drain is exactly what you watch while it's forced awake.
-                // Keep Awake shows a cup in the text colour instead: it ends with the app.
                 seg[@"image"] = awakeIcon;
                 seg[@"keepIcon"] = @YES;   // a reminder, not decoration: survives every tier
                 lidAwakeShown = YES;
             } else {
-                NSColor *fill = (_bat.percent <= 20 && !_bat.acConnected) ? BattBarColor(_bat.percent) : fg;
+                NSColor *fill = lowBattery ? BattBarColor(_bat.percent) : fg;
                 seg[@"image"] = BatteryMeterIcon(_bat, fg, fill);
             }
         }
@@ -3665,8 +3702,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
         NSString *text = _sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(_sys.cpu * 100)] : @"SYS";
         [segments addObject:@{@"symbol": @"cpu", @"text": text, @"color": SystemPressureColor(level)}];
     }
-    // The eye normally rides in the battery segment; if that segment is hidden or there's no
-    // battery, still surface a standalone eye so an always-awake Mac never lacks its reminder.
+    // The cup normally rides in the battery segment; if that segment is hidden or there's no
+    // battery, still surface a standalone cup so an always-awake Mac never lacks its reminder.
     if (awakeIcon && !lidAwakeShown)
         [segments insertObject:@{@"image": awakeIcon,
                                  @"compactPriority": @YES, @"keepIcon": @YES} atIndex:0];
@@ -3689,8 +3726,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
         NSString *cpu = _sys.cpuValid ? [NSString stringWithFormat:@", CPU %d percent", (int)lround(_sys.cpu * 100)] : @"";
         [parts addObject:[NSString stringWithFormat:@"System pressure %@%@", SystemPressureLevel(_sys), cpu]];
     }
-    if (_lidAwake) [parts insertObject:@"keeping awake with lid closed" atIndex:0];
-    else if (_keepAwake) [parts insertObject:@"keeping awake" atIndex:0];
+    if (_lidAwake) [parts insertObject:@"Keep Awake on" atIndex:0];
+    if (LowPowerModeEnabled()) [parts insertObject:@"Low Power Mode" atIndex:0];
     return parts.count ? [parts componentsJoinedByString:@"; "] : @"Status";
 }
 
@@ -3800,8 +3837,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (tier == BarTierText) {
         // Give up the meter icons before giving up any reading: the numbers are what the
         // item is for, and dropping the icons buys roughly a third of the width. A
-        // segment with no text of its own (the standalone lid-awake eye) keeps its icon,
-        // and so does any segment that asked to (`keepIcon`) — the eye is a reminder
+        // segment with no text of its own (the standalone Keep Awake cup) keeps its icon,
+        // and so does any segment that asked to (`keepIcon`) — the cup is a reminder
         // about a setting that persists across reboots, not decoration.
         NSMutableArray *text = [NSMutableArray array];
         for (NSDictionary *seg in full) {
@@ -3858,10 +3895,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         }
         if (icons.count) return icons;
     }
-    // Glyph tier: identity mark — except the lid-awake eye takes over, so that
+    // Glyph tier: identity mark — except the Keep Awake cup takes over, so that
     // always-visible reminder survives every tier at zero extra width.
-    if (_lidAwake)
-        return @[@{@"image": TintedSymbol(@"eye.fill", -1, 13, NSColor.systemOrangeColor)}];
+    if (_lidAwake || LowPowerModeEnabled())
+        return @[@{@"image": TintedSymbol(_lidAwake ? @"cup.and.saucer.fill" : @"tortoise.fill", -1, 13,
+                                          NSColor.controlTextColor)}];
     return @[@{@"symbol": @"gauge.with.dots.needle.50percent"}];
 }
 
@@ -3957,7 +3995,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // a tick arriving mid-read is skipped. Only redraws the bar when the cached value changes.
 - (void)refreshLidAwakeAsync { [self refreshLidAwakeForced:NO]; }
 // Polled once a minute (other tools can flip the setting); forced right after our own
-// toggle, through pmset itself, so the eye follows the change without waiting.
+// toggle, through pmset itself, so the cup follows the change without waiting.
 - (void)refreshLidAwakeForced:(BOOL)force {
     if (_lidAwakeReading) return;
     double now = CFAbsoluteTimeGetCurrent();
@@ -3970,7 +4008,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             self->_lidAwakeReading = NO;
             if (!state) return;   // unknown: keep the last known reading
             BOOL awake = state.boolValue;
-            if (awake != self->_lidAwake) { self->_lidAwake = awake; [self updateBar]; }
+            if (awake != self->_lidAwake) { self->_lidAwake = awake; [self syncPowerButtons]; [self updateBar]; }
         });
     });
 }
@@ -4160,9 +4198,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // so VoiceOver reports a toggle; the tint is set explicitly because a rounded bezel shows
 // no "on" state of its own.
 - (NSButton *)powerToggle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
-    NSButton *b = [NSButton buttonWithTitle:title target:self action:action];
+    PillButton *b = [PillButton buttonWithTitle:title target:self action:action];
     [b setButtonType:NSButtonTypePushOnPushOff];
-    b.bezelStyle = NSBezelStylePush;
+    b.bordered = NO;   // PillButton draws the background itself
     b.controlSize = NSControlSizeSmall;
     b.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
     b.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
@@ -4170,14 +4208,31 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     b.imageHugsTitle = YES;
     return b;
 }
-- (void)styleToggle:(NSButton *)b on:(BOOL)on tint:(NSColor *)tint {
+// `ink` is the title/icon colour on the tint: dark on yellow, white on brown.
+- (void)styleToggle:(NSButton *)b on:(BOOL)on tint:(NSColor *)tint ink:(NSColor *)ink {
+    if (!b) return;   // popover not built yet (a Low Power change can arrive before first open)
     b.state = on ? NSControlStateValueOn : NSControlStateValueOff;
-    b.bezelColor = on ? tint : nil;
-    b.contentTintColor = on ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    if ([b isKindOfClass:PillButton.class]) ((PillButton *)b).onColor = tint;
+    NSColor *color = on ? ink : NSColor.secondaryLabelColor;
+    b.contentTintColor = color;
+    b.attributedTitle = [[NSAttributedString alloc] initWithString:b.title attributes:@{
+        NSFontAttributeName: b.font, NSForegroundColorAttributeName: color}];
+    b.needsDisplay = YES;
 }
+// The footer shows exactly what the menu bar shows, from the same live state: the cup
+// while Keep Awake is on, the yellow battery while Low Power is.
 - (void)syncPowerButtons {
-    [self styleToggle:_keepAwakeButton on:_keepAwake tint:NSColor.systemBrownColor];
-    [self styleToggle:_lowPowerButton on:LowPowerModeEnabled() tint:NSColor.systemYellowColor];
+    if (!_keepAwakeButton || !_lowPowerButton) return;   // popover not built yet
+    [self styleToggle:_keepAwakeButton on:_lidAwake tint:NSColor.systemBrownColor ink:NSColor.whiteColor];
+    [self styleToggle:_lowPowerButton on:LowPowerModeEnabled() tint:NSColor.systemYellowColor
+                  ink:[NSColor colorWithWhite:0.1 alpha:1]];
+    // Titles change width with state, so lay the pair out again.
+    CGFloat x = kPad - 2;
+    for (NSButton *b in @[_keepAwakeButton, _lowPowerButton]) {
+        [b sizeToFit];
+        b.frame = NSMakeRect(x, 1, b.frame.size.width + 16, 22);   // borderless: add the pill's padding
+        x = NSMaxX(b.frame) + 6;
+    }
 }
 - (NSBox *)dividerAt:(CGFloat)y {
     NSBox *b = [[NSBox alloc] initWithFrame:NSMakeRect(kPad, y, kW-2*kPad, 1)];
@@ -4607,19 +4662,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
-    _keepAwakeButton.toolTip = @"Stop this Mac sleeping on its own while Glancebar runs, like caffeinate. The display can still sleep; closing the lid still sleeps the Mac.";
+    _keepAwakeButton.toolTip = @"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar switches it off when it quits.";
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
-    _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"leaf.fill" action:@selector(toggleLowPowerMode:)];
+    _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"tortoise.fill" action:@selector(toggleLowPowerMode:)];
     _lowPowerButton.toolTip = @"System Low Power Mode. Changing it needs Touch ID or your administrator password.";
     _lowPowerButton.accessibilityIdentifier = @"popover.lowPower";
     [self syncPowerButtons];
-    CGFloat x = kPad - 2;
-    for (NSButton *b in @[_keepAwakeButton, _lowPowerButton]) {
-        [b sizeToFit];
-        b.frame = NSMakeRect(x, 1, b.frame.size.width + 6, 22);
-        [foot addSubview:b];
-        x = NSMaxX(b.frame) + 6;
-    }
+    [foot addSubview:_keepAwakeButton];
+    [foot addSubview:_lowPowerButton];
     NSButton *more = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"ellipsis.circle"
                                                            accessibilityDescription:@"More"]
                                         target:self action:@selector(showMenu:)];
@@ -4709,13 +4759,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self addSection:m title:@"Battery"];
     [self settingsItem:m title:@"Current draw" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
     [self settingsItem:m title:@"Health" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
-    // Reflects the live system setting, not a stored preference: it is global and other
-    // tools can change it, so the checkmark must read the real state.
-    NSNumber *sleepState = SleepDisabledState();
-    NSMenuItem *lidAwake = [self settingsItem:m title:@"Stay awake with lid closed…"
-                                       action:@selector(toggleStayAwake:) on:sleepState.boolValue];
-    if (!sleepState) { lidAwake.state = NSControlStateValueMixed; lidAwake.title = @"Stay awake with lid closed (state unknown)"; }
-    [self settingsItem:m title:@"Use Touch ID for Low Power & lid sleep" action:@selector(toggleTouchIDRule:)
+    [self settingsItem:m title:@"Use Touch ID for Keep Awake & Low Power" action:@selector(toggleTouchIDRule:)
                     on:PmsetTouchIDInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
 
     [self addSection:m title:@"AI status"];
@@ -4790,39 +4834,47 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     });
     [self refresh];
 }
-// Keeps the Mac running with the lid closed by flipping the SleepDisabled system power
-// setting via an admin prompt (chosen over caffeinate/IOPMAssertion, which only defeat
-// idle sleep — never clamshell/lid-close sleep). No preference is stored: the live setting
-// is the single source of truth — SleepDisabled persists in the system power plist across
-// reboots, and reading it live keeps the checkmark accurate however it was last changed.
-- (void)toggleStayAwake:(id)s {
+// Keep Awake flips the SleepDisabled system power setting: the only switch that also holds
+// a closed lid (a caffeinate-style IOPMAssertion defeats idle sleep only). Nothing is
+// stored — the live setting is the single source of truth, so the bar and the button
+// always agree however it was last changed. It survives a reboot on its own, which is why
+// Glancebar switches it off when it quits (applicationWillTerminate:).
+- (void)toggleKeepAwake:(id)s {
+    [self syncPowerButtons];   // undo the click's own flip until the system confirms
     NSNumber *current = SleepDisabledState();
     if (!current) {
         // Flipping blind could turn the setting ON when the user meant OFF.
         NSAlert *alert = [NSAlert new];
         alert.messageText = @"Couldn’t read the current sleep setting";
-        alert.informativeText = @"pmset -g did not answer, so Glancebar can’t tell whether the Mac is already set to stay awake. Try again, or check with `pmset -g | grep SleepDisabled`.";
+        alert.informativeText = @"pmset -g did not answer, so Glancebar can’t tell whether Keep Awake is already on. Try again, or check with `pmset -g | grep SleepDisabled`.";
         [alert runModal];
         return;
     }
     BOOL enabling = !current.boolValue;
-    if (enabling) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (enabling && ![ud boolForKey:@"keepAwakeExplained"]) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
-        alert.messageText = @"Stay awake with the lid closed?";
-        alert.informativeText = @"Glancebar will ask you to confirm with Touch ID or your administrator password to run pmset, which keeps this Mac running when the lid is closed (the display sleeps but the system stays awake). While it’s on, the Mac won’t sleep on its own at all. This setting persists across restarts until you turn it back off, so switch it off when you’re done—otherwise a closed Mac can keep running and overheat in a bag. No background helper is installed; Glancebar runs pmset only when you flip this switch.";
-        [alert addButtonWithTitle:@"Continue"];
+        alert.messageText = @"Keep this Mac awake?";
+        alert.informativeText = @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Glancebar switches it off when it quits; if it’s left on some other way, a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder.";
+        [alert addButtonWithTitle:@"Keep Awake"];
         [alert addButtonWithTitle:@"Cancel"];
         [NSApp activateIgnoringOtherApps:YES];
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
+        [ud setBool:YES forKey:@"keepAwakeExplained"];
     }
-    // Run the (modal) admin prompt off the main thread so the app stays responsive; the
-    // menu re-reads the live state on next open, so a cancel or failure needs no rollback.
-    // Re-read the true state (whether it applied or the user cancelled) and update the
-    // bar eye promptly, rather than waiting up to 15s for the next refresh tick.
     [self applyPmset:@"disablesleep" on:enabling
-            reason:enabling ? @"keep this Mac awake with the lid closed" : @"restore normal lid-close sleep"
-              then:^{ [self refreshLidAwakeForced:YES]; }];
+            reason:enabling ? @"keep this Mac awake" : @"let this Mac sleep again"
+              then:^{
+        // pmset rewrites the power plist before it exits, so this read is already current.
+        NSNumber *state = SleepDisabledState();
+        if (state && state.boolValue != self->_lidAwake) {
+            self->_lidAwake = state.boolValue;
+            [self syncPowerButtons];
+            [self updateBar];
+        }
+        [self refreshLidAwakeForced:YES];
+    }];
 }
 // Flips system Low Power Mode from the footer toggle. Like the lid toggle, the live system
 // state is the only truth: nothing is stored, and a cancelled admin prompt just re-reads
@@ -4879,25 +4931,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if (installed) RemovePmsetTouchID(); else InstallPmsetTouchID();
     });
 }
-// What `caffeinate` does: hold a PreventUserIdleSystemSleep assertion. Any process may
-// take one, so there is no password — and it dies with the process, so a forgotten
-// toggle can never outlive Glancebar the way the persistent lid setting can. Deliberately
-// not saved across launches for the same reason.
-- (void)setKeepAwake:(BOOL)on {
-    if (on == _keepAwake) return;
-    if (on) {
-        IOReturn r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
-            kIOPMAssertionLevelOn, CFSTR("Glancebar Keep Awake"), &_keepAwakeAssertion);
-        if (r != kIOReturnSuccess) { _keepAwakeAssertion = kIOPMNullAssertionID; on = NO; }
-    } else if (_keepAwakeAssertion != kIOPMNullAssertionID) {
-        IOPMAssertionRelease(_keepAwakeAssertion);
-        _keepAwakeAssertion = kIOPMNullAssertionID;
-    }
-    _keepAwake = on;
-    [self syncPowerButtons];
-    [self updateBar];
-}
-- (void)toggleKeepAwake:(id)s { [self setKeepAwake:!_keepAwake]; }
 - (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
 - (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
 

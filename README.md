@@ -19,9 +19,9 @@ battery and system summaries in plain English, and compact AI limit gauges.
 A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
 One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
-executables**. Nothing it displays needs admin rights; the one privileged action is the
-optional *Stay awake with lid closed* toggle, which asks for your administrator password
-to set `pmset` (no helper is installed—see below). Glancebar invokes standard macOS tools
+executables**. Nothing it displays needs admin rights; the privileged actions are the
+*Keep Awake* and *Low Power* switches, which set `pmset` after Touch ID or your
+administrator password (no helper is installed—see below). Glancebar invokes standard macOS tools
 such as `top`, `ps`, `sqlite3`, `pmset`, `osascript`, and (only after the Claude account
 opt-in) `/usr/bin/security`.
 
@@ -61,24 +61,21 @@ opt-in) `/usr/bin/security`.
   the hover tooltip always carry the full summary at every width.
   Recovery includes free space before neighboring status items, which macOS moves
   left as Glancebar grows, so a packed row cannot trap it in the collapsed state.
-- **Keep Awake and Low Power** — the popover's footer holds the two controls you reach for.
-  *Keep Awake* does what `caffeinate` does (a no-password power assertion that stops idle
-  sleep; the display may still sleep) and ends when you switch it off or quit Glancebar; a
-  cup rides in the menu bar while it's on. *Low Power* flips macOS Low Power Mode for battery
-  and adapter alike. The first flip offers a one-time **Touch ID** setup: a sudoers rule
-  limited to `pmset -a lowpowermode 0|1` and `pmset -a disablesleep 0|1`, installed with your
-  password once; after that each change is confirmed with Touch ID (or your password when no
-  sensor is reachable). Decline it and every change uses the standard admin prompt. Everything else — menu-bar readings,
-  battery extras, AI integrations, Launch at Login — sits under **⋯ › Settings**.
-- **Stay awake with lid closed** — an optional Settings toggle that keeps the Mac running with the
-  lid shut (clamshell sleep off) by setting `pmset disablesleep` behind a standard macOS
-  admin prompt—no bundled helper. While it's on, an orange eye replaces the battery glyph
-  as an always-visible reminder, since the setting persists across restarts until you turn
-  it off.
+- **Keep Awake and Low Power** — the popover's footer holds the two controls you reach for,
+  and they always match the menu bar because both read the same live system setting.
+  *Keep Awake* stops the Mac sleeping at all — idle or with the lid closed (the display
+  still sleeps) — by setting `pmset disablesleep`; a cup replaces the battery glyph while it's
+  on, and Glancebar switches it off when it quits. *Low Power* flips macOS Low Power Mode for
+  battery and adapter alike; the battery turns yellow while it's on, as macOS's own does.
+  The first flip offers a one-time **Touch ID** setup: a sudoers rule limited to
+  `pmset -a lowpowermode 0|1` and `pmset -a disablesleep 0|1`, installed with your password
+  once; after that each change is confirmed with Touch ID (or your password when no sensor
+  is reachable). Decline it and every change uses the standard admin prompt. Everything
+  else — menu-bar readings, battery extras, AI integrations, Launch at Login — sits under
+  **⋯ › Settings**.
 - **Self-contained** — one binary, native AppKit, no runtime, no installer, no bundled
   helper, and no network requests unless you opt in. The only `sudo`-level actions are the
-  Low Power toggle and the opt-in *Stay awake with lid closed* toggle, each behind the
-  standard admin prompt.
+  Keep Awake and Low Power switches, each behind Touch ID or the standard admin prompt.
 
 The main popover shows the fullest drive, battery, overall system pressure, and one
 quota row per AI provider. Claude normally overlays two full-height fills on the
@@ -180,15 +177,17 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   Finder. Top CPU/memory apps come from `ps`, normalized to the all-cores scale
   and measured by physical footprint (what Activity Monitor shows), grouped under parent
   apps where possible.
-- **Stay awake with lid closed** — an opt-in Settings toggle flips the system `SleepDisabled`
-  power setting by running `/usr/bin/pmset -a disablesleep 0|1` as root through Apple's
-  `osascript` administrator prompt. Nothing privileged is installed—no LaunchDaemon, no
-  bundled helper—`pmset` runs once, only when you flip the switch. This is the only reliable
-  way to defeat clamshell (lid-close) sleep; `caffeinate`/`IOPMAssertion` prevent idle sleep
-  only, never lid-close. `SleepDisabled` persists in the system power plist across restarts,
-  so the menu checkmark reflects the live setting (read via `pmset -g`) and, while it's on,
-  an orange `eye.fill` replaces the battery glyph in the menu bar as an always-visible
-  reminder to turn it back off (an awake Mac in a closed bag can overheat).
+- **Keep Awake** — the footer switch flips the system `SleepDisabled` power setting by
+  running `/usr/bin/pmset -a disablesleep 0|1` as root: through Apple's `osascript`
+  administrator prompt, or with `sudo -n` after Touch ID once the optional rule is installed.
+  No LaunchDaemon or helper is installed; the only privileged file is that opt-in rule
+  (`/etc/sudoers.d/glancebar`, limited to four `pmset` commands, removable from Settings).
+  This is the only reliable way to defeat clamshell (lid-close) sleep;
+  `caffeinate`/`IOPMAssertion` prevent idle sleep only, never lid-close. `SleepDisabled`
+  persists in the system power plist across restarts, so the button and the menu-bar cup
+  both read the live setting, and Glancebar turns it off when it quits (silently with the
+  Touch ID rule; without it the setting stays until you switch it off — an awake Mac in a
+  closed bag can overheat).
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
   turn in `~/.codex/sessions/**.jsonl` (and rotated
   `~/.codex/archived_sessions/**.jsonl`) records OpenAI's official rate-limit state
@@ -318,8 +317,8 @@ Glancebar measures the space that actually exists and adapts, in rungs that cost
 little as possible: the full display when there's room; then the same readings with the
 meter icons dropped, which is about a third narrower and still shows every number; then
 the single reading that matters most (battery percentage, or the configured meter icons
-when battery is disabled); then a bare gauge glyph. The orange eye outranks all of it
-while *Stay awake with lid closed* is on. The popover stays one click away at every
+when battery is disabled); then a bare gauge glyph. The Keep Awake cup outranks all of it
+while it is on. The popover stays one click away at every
 width.
 
 No application can push another app's item aside — menu bar placement belongs to the
