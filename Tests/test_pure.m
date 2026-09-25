@@ -1306,6 +1306,51 @@ int main(void) {
                   @"reset: beyond a week the clock text carries the date");
         }
 
+        // --- ChooseNewOutputDevice ---
+        // A device is @{uid, name, transport, outputChannels}. Selection is by uid.
+        // Only a device that newly has output channels and is a real external transport
+        // (Bluetooth, USB, HDMI/DisplayPort) is adopted.
+        {
+            NSDictionary *mac = @{@"uid": @"mac", @"name": @"MacBook Pro Speakers",
+                                  @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2};
+            NSDictionary *boseIn = @{@"uid": @"bose", @"name": @"Bose",
+                                     @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @0};
+            NSDictionary *boseOut = @{@"uid": @"bose", @"name": @"Bose",
+                                      @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2};
+            NSDictionary *boseOutEntry = @{@"uid": @"bose-out", @"name": @"Bose",
+                                           @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2};
+            check(ChooseNewOutputDevice(@[mac], @[mac, boseIn], YES) == nil,
+                  @"audio: Bluetooth input-only arrival does not switch");
+            check([ChooseNewOutputDevice(@[mac, boseIn], @[mac, boseIn, boseOutEntry], YES) isEqual:@"bose-out"],
+                  @"audio: Bluetooth output entry after the input entry is adopted");
+            check([ChooseNewOutputDevice(@[mac, boseIn], @[mac, boseOut], YES) isEqual:@"bose"],
+                  @"audio: the same Bluetooth uid gaining output channels is adopted");
+            NSDictionary *teams = @{@"uid": @"teams", @"name": @"Microsoft Teams Audio",
+                                    @"transport": @(GlanceAudioTransportVirtual), @"outputChannels": @2};
+            check(ChooseNewOutputDevice(@[mac], @[mac, teams], YES) == nil,
+                  @"audio: a new virtual device is not adopted");
+            check(ChooseNewOutputDevice(@[mac, boseOut], @[mac], YES) == nil,
+                  @"audio: a removed device does not switch");
+            check(ChooseNewOutputDevice(@[mac], @[mac, boseOut], NO) == nil,
+                  @"audio: toggle off does not switch");
+            NSDictionary *oldBose = @{@"uid": @"bose-old", @"name": @"Bose",
+                                      @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2};
+            NSDictionary *newBose = @{@"uid": @"bose-new", @"name": @"Bose",
+                                      @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2};
+            check([ChooseNewOutputDevice(@[mac, oldBose], @[mac, oldBose, newBose], YES) isEqual:@"bose-new"],
+                  @"audio: duplicate names follow the new uid");
+            check([AudioOutputMenuDevices(@[mac, teams, boseOut], @"mac") count] == 2,
+                  @"audio: virtual outputs stay off the menu unless they are the default");
+            NSArray *menu = AudioOutputMenuDevices(@[boseOut, teams], @"teams");
+            check(menu.count == 2 && [menu.lastObject[@"uid"] isEqual:@"teams"],
+                  @"audio: the current virtual default is listed last");
+            check([AudioOutputSymbol(GlanceAudioTransportBuiltIn) isEqual:@"speaker.wave.2.fill"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportBluetooth) isEqual:@"headphones"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportDisplay) isEqual:@"display"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportUSB) isEqual:@"speaker.wave.2"],
+                  @"audio: symbol follows transport");
+        }
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

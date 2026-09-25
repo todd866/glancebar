@@ -368,3 +368,29 @@ BarTierState ChooseBarTier(BarTierState prev, double capacityPt,
 // display comes back and a real measurement is possible.
 extern const double kBarEvictionGraceSec;   // 30
 BOOL BarEvictionSuspected(BOOL barObservable, BOOL seenOnBar, BOOL onBar, double sinceCreatedSec);
+
+// --- Sound output ---
+// Which newly appeared device, if any, should become the default output. Devices are
+// dictionaries @{@"uid", @"name", @"transport", @"outputChannels"}. A device counts as
+// new when this snapshot is the first in which it has output channels, so a Bluetooth
+// device that shows up input-only and then grows an output entry (same uid or a second
+// one) is still adopted. Only Bluetooth, USB, and HDMI/DisplayPort are real external
+// outputs; built-in, aggregate, and virtual devices never are. Nil selects nothing.
+typedef NS_ENUM(NSInteger, GlanceAudioTransport) {
+    GlanceAudioTransportOther = 0,
+    GlanceAudioTransportBuiltIn,
+    GlanceAudioTransportBluetooth,
+    GlanceAudioTransportUSB,
+    GlanceAudioTransportDisplay,     // HDMI or DisplayPort
+    GlanceAudioTransportAggregate,
+    GlanceAudioTransportVirtual,
+};
+NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
+                                NSArray<NSDictionary *> *current,
+                                BOOL switchToNewOutputs);
+// Output devices for the menu: aggregate/virtual entries are omitted unless one of them
+// is the current default, in which case that entry is placed last.
+NSArray<NSDictionary *> *AudioOutputMenuDevices(NSArray<NSDictionary *> *devices,
+                                                NSString *defaultUID);
+// SF Symbol for a transport: speaker, headphones, display, or a generic speaker.
+NSString *AudioOutputSymbol(GlanceAudioTransport transport);

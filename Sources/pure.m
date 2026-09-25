@@ -1353,3 +1353,64 @@ NSString *CodexBillingNote(NSDictionary *buckets, double nowEpoch) {
     return balance.length ? [NSString stringWithFormat:@"Requests now bill to credits · balance %@", balance]
                           : @"Requests now bill to credits";
 }
+
+static NSString *AudioUID(NSDictionary *device) {
+    id uid = device[@"uid"];
+    return [uid isKindOfClass:NSString.class] && [uid length] ? uid : nil;
+}
+static NSInteger AudioChannels(NSDictionary *device) {
+    id channels = device[@"outputChannels"];
+    return [channels respondsToSelector:@selector(integerValue)] ? [channels integerValue] : 0;
+}
+static BOOL AudioIsExternalOutput(NSDictionary *device) {
+    NSInteger transport = [device[@"transport"] integerValue];
+    if (AudioChannels(device) <= 0 || !AudioUID(device)) return NO;
+    return transport == GlanceAudioTransportBluetooth || transport == GlanceAudioTransportUSB ||
+           transport == GlanceAudioTransportDisplay;
+}
+static BOOL AudioIsVirtualOutput(NSDictionary *device) {
+    NSInteger transport = [device[@"transport"] integerValue];
+    return transport == GlanceAudioTransportAggregate || transport == GlanceAudioTransportVirtual;
+}
+
+NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
+                                NSArray<NSDictionary *> *current,
+                                BOOL switchToNewOutputs) {
+    if (!switchToNewOutputs) return nil;
+    NSMutableSet<NSString *> *alreadyOutput = [NSMutableSet set];
+    for (NSDictionary *device in previous) {
+        NSString *uid = AudioUID(device);
+        if (uid && AudioChannels(device) > 0) [alreadyOutput addObject:uid];
+    }
+    for (NSDictionary *device in current) {
+        NSString *uid = AudioUID(device);
+        if (!AudioIsExternalOutput(device) || [alreadyOutput containsObject:uid]) continue;
+        return uid;
+    }
+    return nil;
+}
+
+NSArray<NSDictionary *> *AudioOutputMenuDevices(NSArray<NSDictionary *> *devices,
+                                                NSString *defaultUID) {
+    NSMutableArray<NSDictionary *> *shown = [NSMutableArray array];
+    NSDictionary *currentVirtual = nil;
+    for (NSDictionary *device in devices) {
+        if (AudioChannels(device) <= 0 || !AudioUID(device)) continue;
+        if (AudioIsVirtualOutput(device)) {
+            if ([AudioUID(device) isEqual:defaultUID]) currentVirtual = device;
+            continue;
+        }
+        [shown addObject:device];
+    }
+    if (currentVirtual) [shown addObject:currentVirtual];
+    return shown;
+}
+
+NSString *AudioOutputSymbol(GlanceAudioTransport transport) {
+    switch (transport) {
+    case GlanceAudioTransportBuiltIn: return @"speaker.wave.2.fill";
+    case GlanceAudioTransportBluetooth: return @"headphones";
+    case GlanceAudioTransportDisplay: return @"display";
+    default: return @"speaker.wave.2";
+    }
+}
