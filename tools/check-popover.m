@@ -138,12 +138,23 @@ int main(int argc, const char **argv) {
         [c setValue:usage forKey:@"aiUsage"];
         [c setValue:NSDate.date forKey:@"lastMachineRefresh"];
         [c setValue:NSDate.date forKey:@"lastAIRefresh"];
+        [c setValue:@[@{@"uid": @"bose", @"name": @"Bose Flex SoundLink",
+                        @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2,
+                        @"dataSource": @""}] forKey:@"audioDevices"];
+        [c setValue:@"bose" forKey:@"defaultOutputUID"];
         [c rebuildContent];
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
-        if (FirstScrollView(root) || root.frame.size.height > 500 || CountGauges(root) != 5 ||
+        if (FirstScrollView(root) || root.frame.size.height > 570 || CountGauges(root) != 5 ||
             HasText(root,@"bengalfox") || !HasText(root,@"cached")) return Fail(__LINE__);
+        if (!HasText(root, @"SOUND") || !HasText(root, @"Bose Flex SoundLink") ||
+            !FindIdentifier(root, @"popover.music.play") || !FindIdentifier(root, @"popover.sound.chevron") ||
+            FindIdentifier(root, @"popover.sound.switch") ||
+            FindIdentifier(root, @"popover.music.previous")) return Fail(__LINE__);
+        NSTextField *soundName = (NSTextField *)FindIdentifier(root, @"popover.sound.name");
+        if (![soundName.stringValue isEqual:@"Bose Flex SoundLink"] ||
+            soundName.lineBreakMode == NSLineBreakByTruncatingTail) return Fail(__LINE__);
         if (!FitsChildren(root)) return Fail(__LINE__);
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");

@@ -392,5 +392,29 @@ NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
 // is the current default, in which case that entry is placed last.
 NSArray<NSDictionary *> *AudioOutputMenuDevices(NSArray<NSDictionary *> *devices,
                                                 NSString *defaultUID);
-// SF Symbol for a transport: speaker, headphones, display, or a generic speaker.
-NSString *AudioOutputSymbol(GlanceAudioTransport transport);
+// SF Symbol for an output. Headphones only when the name or CoreAudio data-source name
+// says so (AirPods, headphones, a headset, earbuds). A Bluetooth speaker such as
+// "Bose Flex SoundLink" stays a speaker; built-in speakers and a display keep their own.
+NSString *AudioOutputSymbol(GlanceAudioTransport transport, NSString *name, NSString *dataSource);
+
+// --- YouTube Music Liked, and the offline copy of it ---
+// Playlist length is unknown until a page says otherwise. 200 is the stand-in.
+extern const NSInteger kYouTubeLikedDefaultCount;
+// index clamped into 1..count. A non-positive count uses kYouTubeLikedDefaultCount.
+NSInteger ClampedPlaylistIndex(NSInteger index, NSInteger count);
+// Deterministic 1..count index from seed (0 is treated as 1). Same seed, same index.
+NSInteger PlaylistIndexForSeed(uint32_t seed, NSInteger count);
+// https://music.youtube.com/watch?list=LM&index=<clamped>. No network.
+NSString *YouTubeLikedMusicURL(uint32_t seed, NSInteger count);
+// "342", "1,234 songs", or the same with trailing whitespace. 0 when it is not a count.
+NSInteger ParsePlaylistCount(NSString *text);
+// Chrome's AppleScript error when View ▸ Developer ▸ Allow JavaScript from Apple Events is off.
+BOOL ChromeJavaScriptEventsDenied(NSString *errorText);
+
+// Fisher–Yates order of the input paths/names. Stable for a given seed. Nil and empty in → empty.
+NSArray<NSString *> *ShuffledTrackOrder(NSArray<NSString *> *names, uint32_t seed);
+// Keeps .m4a files (any case). Skips hidden basenames. Paths are preserved.
+NSArray<NSString *> *LikedMusicAudioFiles(NSArray<NSString *> *names);
+// "Artist - Title [id].m4a" → artist, title, trackID. Otherwise title is the basename
+// without an extension and artist/trackID are empty. Nil for a nil or empty name.
+NSDictionary *ParseLikedTrackFilename(NSString *filename);

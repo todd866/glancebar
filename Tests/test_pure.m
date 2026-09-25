@@ -1344,11 +1344,59 @@ int main(void) {
             NSArray *menu = AudioOutputMenuDevices(@[boseOut, teams], @"teams");
             check(menu.count == 2 && [menu.lastObject[@"uid"] isEqual:@"teams"],
                   @"audio: the current virtual default is listed last");
-            check([AudioOutputSymbol(GlanceAudioTransportBuiltIn) isEqual:@"speaker.wave.2.fill"] &&
-                  [AudioOutputSymbol(GlanceAudioTransportBluetooth) isEqual:@"headphones"] &&
-                  [AudioOutputSymbol(GlanceAudioTransportDisplay) isEqual:@"display"] &&
-                  [AudioOutputSymbol(GlanceAudioTransportUSB) isEqual:@"speaker.wave.2"],
-                  @"audio: symbol follows transport");
+            check([AudioOutputSymbol(GlanceAudioTransportBuiltIn, nil, nil) isEqual:@"speaker.wave.2.fill"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportBluetooth, @"Bose Flex SoundLink", nil) isEqual:@"speaker.wave.2"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportBluetooth, @"AirPods Pro", nil) isEqual:@"headphones"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportBluetooth, @"Sony Headphones", nil) isEqual:@"headphones"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportBuiltIn, @"MacBook Pro Speakers", @"Headphones") isEqual:@"headphones"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportDisplay, @"Studio Display", nil) isEqual:@"display"] &&
+                  [AudioOutputSymbol(GlanceAudioTransportUSB, @"USB Audio", nil) isEqual:@"speaker.wave.2"],
+                  @"audio: speaker unless the name or data source is headphones");
+        }
+
+        // --- YouTube Liked URL, count, offline filenames ---
+        {
+            check(kYouTubeLikedDefaultCount == 200, @"music: default playlist estimate is 200");
+            check(ClampedPlaylistIndex(0, 50) == 1 && ClampedPlaylistIndex(180, 50) == 50 &&
+                  ClampedPlaylistIndex(4, 50) == 4 && ClampedPlaylistIndex(3, 0) == 3,
+                  @"music: index clamps into 1..count, and a missing count uses 200");
+            check(ClampedPlaylistIndex(500, 0) == 200, @"music: an index past the default estimate clamps to 200");
+            NSInteger a = PlaylistIndexForSeed(42, 200);
+            NSInteger b = PlaylistIndexForSeed(42, 200);
+            check(a == b && a >= 1 && a <= 200, @"music: a seed picks one stable index inside the estimate");
+            check(PlaylistIndexForSeed(42, 10) <= 10, @"music: the seeded index respects a shorter count");
+            NSString *url = YouTubeLikedMusicURL(42, 200);
+            check([url hasPrefix:@"https://music.youtube.com/watch?list=LM&index="] &&
+                  [url hasSuffix:[NSString stringWithFormat:@"%ld", (long)a]],
+                  @"music: URL is Liked Music at the seeded index");
+            check(ParsePlaylistCount(@"1,234 songs") == 1234 && ParsePlaylistCount(@"200") == 200 &&
+                  ParsePlaylistCount(@"  42 songs\n") == 42 && ParsePlaylistCount(@"0 songs") == 0 &&
+                  ParsePlaylistCount(@"nope") == 0 && ParsePlaylistCount(nil) == 0,
+                  @"music: playlist count parses a page figure and rejects anything else");
+            check(ChromeJavaScriptEventsDenied(@"Executing JavaScript through AppleScript is turned off. Allow JavaScript from Apple Events") &&
+                  !ChromeJavaScriptEventsDenied(@"missing shuffle"),
+                  @"music: the Chrome JavaScript permission error is recognised");
+            NSArray *files = @[@"/tmp/a.mp3", @"/tmp/.skip.m4a", @"Artist - Title [abc_1].m4a",
+                               @"/Music/YouTube Liked/Other - Song [Zz9].M4A", @"note.txt"];
+            NSArray *kept = LikedMusicAudioFiles(files);
+            check(kept.count == 2 && [kept[0] isEqual:@"Artist - Title [abc_1].m4a"],
+                  @"music: only visible m4a files are offline tracks");
+            NSDictionary *parsed = ParseLikedTrackFilename(kept[0]);
+            check([parsed[@"artist"] isEqual:@"Artist"] && [parsed[@"title"] isEqual:@"Title"] &&
+                  [parsed[@"trackID"] isEqual:@"abc_1"],
+                  @"music: Artist - Title [id].m4a splits into artist, title, id");
+            NSDictionary *plain = ParseLikedTrackFilename(@"/Music/YouTube Liked/Loose name.m4a");
+            check([plain[@"artist"] isEqual:@""] && [plain[@"title"] isEqual:@"Loose name"] &&
+                  [plain[@"trackID"] isEqual:@""],
+                  @"music: a file without the pattern still yields a title");
+            NSArray *order = ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 7);
+            NSArray *again = ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 7);
+            check([order isEqual:again] && order.count == 5 &&
+                  [NSSet setWithArray:order].count == 5,
+                  @"music: shuffle order is a permutation and stable for a seed");
+            check(![ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 7)
+                    isEqual:ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 8)],
+                  @"music: a different seed changes the order");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

@@ -55,8 +55,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -isysroot "$SDKROOT" \
     -mmacosx-version-min=13.0 \
     "${ARCH_FLAGS[@]}" \
-    Sources/pure.m Sources/main.m \
+    Sources/pure.m Sources/nowplaying.m Sources/main.m \
     -framework Cocoa \
+    -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
     -framework CoreAudio \
     -framework CoreGraphics \
     -framework IOKit \

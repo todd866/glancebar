@@ -2,9 +2,13 @@
 // with storage, battery, system, and AI summaries plus a deeper details window.
 // Single-file Objective-C/AppKit. Zero dependencies, no sudo. Pure logic in pure.{h,m}.
 #import <Cocoa/Cocoa.h>
+#import <AVFoundation/AVFoundation.h>
 #import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
+#import <Network/Network.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
@@ -14,6 +18,7 @@
 #import <sys/sysctl.h>
 #import <os/log.h>
 #import "pure.h"
+#import "nowplaying.h"
 
 static NSString * const GBVersion = @"1.1.0";
 
@@ -2884,6 +2889,32 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 @end
 
+@interface SoundOutputRow : NSView
+@property (nonatomic, weak) id target;
+@property (nonatomic) SEL action;
+@end
+@implementation SoundOutputRow
+- (NSView *)hitTest:(NSPoint)point {
+    return NSPointInRect(point, self.bounds) ? self : nil;
+}
+- (void)mouseDown:(NSEvent *)event { (void)event; }
+- (void)sendAction {
+    if (!self.target || !self.action) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    [self.target performSelector:self.action withObject:self];
+#pragma clang diagnostic pop
+}
+- (void)mouseUp:(NSEvent *)event {
+    if (!NSPointInRect([self convertPoint:event.locationInWindow fromView:nil], self.bounds)) return;
+    [self sendAction];
+}
+- (BOOL)accessibilityPerformPress {
+    [self sendAction];
+    return YES;
+}
+@end
+
 @interface FlippedView : NSView
 // The section heading the next row belongs under, and the per-identifier occurrence counts
 // used to disambiguate genuine duplicates. Together these give a row a stable identity that
@@ -3367,6 +3398,17 @@ static GlanceAudioTransport GlanceTransport(UInt32 transport) {
     default: return GlanceAudioTransportOther;
     }
 }
+static NSString *AudioDataSourceName(AudioObjectID device) {
+    AudioObjectPropertyAddress addr = AudioAddr(kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeOutput);
+    UInt32 source = 0, size = sizeof(source);
+    if (AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, &source) != noErr) return @"";
+    CFStringRef name = NULL;
+    AudioValueTranslation translation = { &source, sizeof(source), &name, sizeof(name) };
+    size = sizeof(translation);
+    addr.mSelector = kAudioDevicePropertyDataSourceNameForIDCFString;
+    if (AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, &translation) != noErr || !name) return @"";
+    return (__bridge_transfer NSString *)name;
+}
 static int OutputChannelCount(AudioObjectID device) {
     AudioObjectPropertyAddress addr = AudioAddr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput);
     UInt32 size = 0;
@@ -3413,7 +3455,8 @@ static NSArray<NSDictionary *> *ReadAudioDevices(void) {
         NSString *name = AudioString(devices[i], kAudioObjectPropertyName) ?: @"Output";
         [rows addObject:@{
             @"uid": uid, @"name": name, @"transport": @(GlanceTransport(transport)),
-            @"outputChannels": @(OutputChannelCount(devices[i])), @"deviceID": @(devices[i])
+            @"outputChannels": @(OutputChannelCount(devices[i])), @"deviceID": @(devices[i]),
+            @"dataSource": AudioDataSourceName(devices[i]) ?: @""
         }];
     }
     free(devices);
@@ -3456,6 +3499,84 @@ static OSStatus AudioHardwareChanged(AudioObjectID object, UInt32 count,
         if (output) [controller audioDefaultChanged];
     });
     return noErr;
+}
+
+static NSString *AudioSymbolName(NSDictionary *device) {
+    return AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue],
+                             device[@"name"], device[@"dataSource"]);
+}
+static void PostSystemMediaKey(UInt32 keyCode) {
+    void (^post)(BOOL) = ^(BOOL up) {
+        NSEvent *event = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                             location:NSZeroPoint
+                                        modifierFlags:up ? 0xb00 : 0xa00
+                                            timestamp:0
+                                         windowNumber:0
+                                              context:nil
+                                              subtype:8
+                                                data1:((keyCode << 16) | ((up ? 0xBu : 0xAu) << 8))
+                                                data2:-1];
+        if (event.CGEvent) CGEventPost(kCGHIDEventTap, event.CGEvent);
+    };
+    post(NO);
+    post(YES);
+}
+static BOOL ChromeIsRunning(void) {
+    return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
+}
+static BOOL DefaultRouteReachable(void) {
+    struct sockaddr_in zero = {0};
+    zero.sin_len = sizeof(zero);
+    zero.sin_family = AF_INET;
+    SCNetworkReachabilityRef ref = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr *)&zero);
+    if (!ref) return NO;
+    SCNetworkReachabilityFlags flags = 0;
+    Boolean ok = SCNetworkReachabilityGetFlags(ref, &flags);
+    CFRelease(ref);
+    if (!ok) return NO;
+    return (flags & kSCNetworkReachabilityFlagsReachable) &&
+           !(flags & kSCNetworkReachabilityFlagsConnectionRequired);
+}
+static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+        task.arguments = @[@"-e", source ?: @""];
+        NSPipe *out = [NSPipe pipe], *err = [NSPipe pipe];
+        task.standardOutput = out;
+        task.standardError = err;
+        if (![task launchAndReturnError:NULL]) {
+            dispatch_async(dispatch_get_main_queue(), ^{ done(@"", @"osascript failed to launch", 1); });
+            return;
+        }
+        [task waitUntilExit];
+        NSString *output = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+        NSString *errorText = [[NSString alloc] initWithData:[err.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+        int status = task.terminationStatus;
+        dispatch_async(dispatch_get_main_queue(), ^{ done(output, errorText, status); });
+    });
+}
+static NSString *YouTubeMusicScript(void) {
+    return @"tell application \"Google Chrome\"\n"
+        "set js to \"(function(){function label(el){return ((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')).toLowerCase();}var buttons=document.querySelectorAll('button,[role=button],[role=switch]');var shuffle=null;for(var i=0;i<buttons.length;i++){var l=label(buttons[i]);if(l.indexOf('shuffle')!==-1){shuffle=buttons[i];break;}}var shuffleState='missing';if(shuffle){var sl=label(shuffle);var pressed=(shuffle.getAttribute('aria-pressed')||'').toLowerCase();var on=pressed==='true'||sl.indexOf('turn off shuffle')!==-1||sl.indexOf('shuffle on')!==-1||sl.indexOf('disable shuffle')!==-1;if(!on)shuffle.click();shuffleState='on';}function ws(c){return c===' '||c===String.fromCharCode(10)||c===String.fromCharCode(9);}function trim(s){s=s||'';while(s.length&&ws(s.charAt(0)))s=s.substring(1);while(s.length&&ws(s.charAt(s.length-1)))s=s.substring(0,s.length-1);return s;}function isCount(t){var low=t.toLowerCase();var sp=low.indexOf(' song');if(sp<1)return false;for(var i=0;i<sp;i++){var c=low.charAt(i);if(!((c>='0'&&c<='9')||c===','))return false;}var rest=low.substring(sp);return rest===' song'||rest===' songs';}var countText='';var nodes=document.querySelectorAll('yt-formatted-string, span');for(var j=0;j<nodes.length&&j<5000;j++){var t=trim(nodes[j].textContent||'');if(isCount(t)){countText=t;break;}}var play='';for(var k=0;k<buttons.length;k++){var pl=trim(label(buttons[k]));if(pl==='play'||pl==='pause'||pl.indexOf('play ')===0||pl.indexOf('pause ')===0){play=pl;break;}}return shuffleState+'|'+countText+'|'+play;})()\"\n"
+        "repeat with w in windows\n"
+        "repeat with t in tabs of w\n"
+        "if (URL of t) contains \"music.youtube.com\" then return execute javascript js in t\n"
+        "end repeat\n"
+        "end repeat\n"
+        "return \"\"\n"
+        "end tell";
+}
+static NSString *YouTubeTabScript(void) {
+    return @"tell application \"Google Chrome\"\n"
+        "set found to \"no\"\n"
+        "repeat with w in windows\n"
+        "repeat with t in tabs of w\n"
+        "if (URL of t) contains \"music.youtube.com\" then set found to \"yes\"\n"
+        "end repeat\n"
+        "end repeat\n"
+        "return found\n"
+        "end tell";
 }
 
 @implementation Controller {
@@ -3507,6 +3628,16 @@ static OSStatus AudioHardwareChanged(AudioObjectID object, UInt32 count,
     NSArray<NSDictionary *> *_audioPrevious;   // comparison baseline for auto-switch
     NSString *_defaultOutputUID;
     NSUInteger _audioSettleGen;
+    BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
+    BOOL _networkKnown, _networkOnline;
+    nw_path_monitor_t _pathMonitor;
+    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _musicHintVisible, _localMode, _localEmpty;
+    NSString *_localTitle, *_localArtist;
+    AVQueuePlayer *_localPlayer;
+    NSArray<NSURL *> *_localURLs;
+    NSInteger _localIndex;
+    NSUInteger _musicGen;
+    BOOL _remoteCommandsOn;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -3605,6 +3736,8 @@ static OSStatus AudioHardwareChanged(AudioObjectID object, UInt32 count,
     else if (!getenv("GLANCEBAR_SKIP_WELCOME"))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
+    _musicProbesEnabled = YES;
+    [self startNetworkMonitor];
     [self startAudioOutputWatch];
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
@@ -3655,44 +3788,389 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     _audioDevices = ReadAudioDevices();
     _defaultOutputUID = DefaultOutputUID(_audioDevices);
 }
-- (NSView *)soundOutputRowAt:(CGFloat)y {
+- (NSInteger)likedCountEstimate {
+    NSInteger count = [NSUserDefaults.standardUserDefaults integerForKey:@"youtubeLikedCount"];
+    return count > 0 ? count : kYouTubeLikedDefaultCount;
+}
+- (void)rememberLikedCount:(NSInteger)count {
+    if (count < 1) return;
+    [NSUserDefaults.standardUserDefaults setInteger:count forKey:@"youtubeLikedCount"];
+}
+- (void)startNetworkMonitor {
+    if (_pathMonitor || !_musicProbesEnabled) return;
+    nw_path_monitor_t monitor = nw_path_monitor_create();
+    _pathMonitor = monitor;
+    nw_path_monitor_set_queue(monitor, dispatch_get_main_queue());
+    nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+        BOOL online = nw_path_get_status(path) == nw_path_status_satisfied;
+        BOOL changed = !self->_networkKnown || online != self->_networkOnline;
+        self->_networkKnown = YES;
+        self->_networkOnline = online;
+        if (changed && self->_popover.isShown) [self rebuildContent];
+    });
+    nw_path_monitor_start(monitor);
+}
+- (BOOL)musicOffline {
+    if (!_musicProbesEnabled) return NO;
+    if (_localMode && !_ytTabOpen) return YES;
+    return _networkKnown && !_networkOnline;
+}
+- (NSArray<NSString *> *)offlineTrackPaths {
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
+    NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
+        includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *url in urls) if (url.path.length) [paths addObject:url.path];
+    return LikedMusicAudioFiles(paths);
+}
+- (void)publishNowPlaying {
+    if (!_localMode) return;
+    double elapsed = 0;
+    if (_localPlayer.currentTime.timescale != 0) elapsed = CMTimeGetSeconds(_localPlayer.currentTime);
+    if (!isfinite(elapsed) || elapsed < 0) elapsed = 0;
+    GlanceNowPlayingSet(_localTitle, _localArtist, _localPlayer.rate > 0 ? 1 : 0, elapsed);
+}
+- (void)enableRemoteCommands {
+    if (_remoteCommandsOn) return;
+    _remoteCommandsOn = YES;
+    GlanceRemoteCommandsEnable(self);
+}
+- (void)disableRemoteCommands {
+    if (!_remoteCommandsOn) return;
+    _remoteCommandsOn = NO;
+    GlanceRemoteCommandsDisable(self);
+}
+- (void)applyLocalItemURL:(NSURL *)url {
+    NSDictionary *parsed = ParseLikedTrackFilename(url.lastPathComponent);
+    _localTitle = parsed[@"title"] ?: @"";
+    _localArtist = parsed[@"artist"] ?: @"";
+    NSUInteger gen = ++_musicGen;
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+    [asset loadValuesAsynchronouslyForKeys:@[@"commonMetadata"] completionHandler:^{
+        NSString *title = nil, *artist = nil;
+        for (AVMetadataItem *item in asset.commonMetadata) {
+            if ([item.commonKey isEqual:AVMetadataCommonKeyTitle]) title = item.stringValue;
+            if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) artist = item.stringValue;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (gen != self->_musicGen) return;
+            if (title.length) self->_localTitle = title;
+            if (artist.length) self->_localArtist = artist;
+            [self publishNowPlaying];
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    }];
+}
+- (void)playLocalIndex:(NSInteger)index {
+    if (!_localURLs.count) return;
+    if (index < 0) index = (NSInteger)_localURLs.count - 1;
+    if (index >= (NSInteger)_localURLs.count) index = 0;
+    _localIndex = index;
+    NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
+    for (NSInteger i = index; i < (NSInteger)_localURLs.count; i++)
+        [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
+    if (_localPlayer) [_localPlayer pause];
+    _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
+    _localMode = YES;
+    _localEmpty = NO;
+    _playbackKnown = YES;
+    _playbackPlaying = YES;
+    [self applyLocalItemURL:_localURLs[index]];
+    [self enableRemoteCommands];
+    [_localPlayer play];
+    [self publishNowPlaying];
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)startOfflinePlayback {
+    if (!_musicProbesEnabled) return;
+    [self disableRemoteCommands];
+    NSArray<NSString *> *paths = [self offlineTrackPaths];
+    if (!paths.count) {
+        _localMode = NO;
+        _localEmpty = YES;
+        _localPlayer = nil;
+        _localTitle = nil;
+        _localArtist = nil;
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    _localEmpty = NO;
+    NSArray<NSString *> *order = ShuffledTrackOrder(paths, arc4random());
+    NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:order.count];
+    for (NSString *path in order) [urls addObject:[NSURL fileURLWithPath:path]];
+    _localURLs = urls;
+    [self playLocalIndex:0];
+}
+- (void)toggleLocalPlayback {
+    if (!_localPlayer) { [self startOfflinePlayback]; return; }
+    if (_localPlayer.rate > 0) {
+        [_localPlayer pause];
+        _playbackPlaying = NO;
+    } else {
+        [_localPlayer play];
+        _playbackPlaying = YES;
+    }
+    _playbackKnown = YES;
+    [self publishNowPlaying];
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)noteYouTubeScript:(NSString *)output errorText:(NSString *)errorText {
+    if (ChromeJavaScriptEventsDenied(errorText) || ChromeJavaScriptEventsDenied(output)) {
+        if (![NSUserDefaults.standardUserDefaults boolForKey:@"youtubeMusicJSHintShown"]) {
+            _musicHintVisible = YES;
+            [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"youtubeMusicJSHintShown"];
+            if (_popover.isShown) [self rebuildContent];
+        }
+        return;
+    }
+    NSArray<NSString *> *lines = [output componentsSeparatedByString:[output containsString:@"|"] ? @"|" : @"\n"];
+    NSInteger count = lines.count > 1 ? ParsePlaylistCount(lines[1]) : ParsePlaylistCount(output);
+    if (count > 0) [self rememberLikedCount:count];
+    if (lines.count > 2) {
+        NSString *play = lines[2].lowercaseString;
+        if ([play containsString:@"pause"]) { _playbackKnown = YES; _playbackPlaying = YES; }
+        else if ([play containsString:@"play"]) { _playbackKnown = YES; _playbackPlaying = NO; }
+    }
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)runYouTubeScriptAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self->_musicGen || !self->_musicProbesEnabled || !ChromeIsRunning()) return;
+        RunAppleScript(YouTubeMusicScript(), ^(NSString *output, NSString *errorText, int status) {
+            (void)status;
+            if (generation != self->_musicGen) return;
+            [self noteYouTubeScript:output errorText:errorText];
+        });
+    });
+}
+- (void)refreshYouTubeTab {
+    if (!_musicProbesEnabled) return;
+    if (!ChromeIsRunning()) {
+        if (_ytTabOpen) { _ytTabOpen = NO; if (_popover.isShown) [self rebuildContent]; }
+        return;
+    }
+    RunAppleScript(YouTubeTabScript(), ^(NSString *output, NSString *errorText, int status) {
+        (void)errorText; (void)status;
+        BOOL open = [output.lowercaseString containsString:@"yes"];
+        if (open == self->_ytTabOpen) return;
+        self->_ytTabOpen = open;
+        if (!open) { self->_playbackKnown = NO; }
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+- (void)startYouTubePlayback {
+    if (!_musicProbesEnabled) return;
+    NSString *urlString = YouTubeLikedMusicURL(arc4random(), [self likedCountEstimate]);
+    NSURL *url = [NSURL URLWithString:urlString];
+    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
+    if (!url || !chrome) { [self startOfflinePlayback]; return; }
+    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+    config.activates = NO;
+    NSUInteger generation = ++_musicGen;
+    [NSWorkspace.sharedWorkspace openURLs:@[url] withApplicationAtURL:chrome configuration:config
+                        completionHandler:^(NSRunningApplication *app, NSError *error) {
+        (void)app;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) { [self startOfflinePlayback]; return; }
+            self->_ytTabOpen = YES;
+            self->_localMode = NO;
+            self->_localEmpty = NO;
+            [self disableRemoteCommands];
+            self->_localPlayer = nil;
+            if (self->_popover.isShown) [self rebuildContent];
+            [self runYouTubeScriptAfter:2 generation:generation];
+            [self runYouTubeScriptAfter:6 generation:generation];
+            [self runYouTubeScriptAfter:12 generation:generation];
+        });
+    }];
+}
+- (NSInteger)remotePlay:(id)event {
+    (void)event; if (_localPlayer.rate == 0) [self toggleLocalPlayback];
+    return 0;
+}
+- (NSInteger)remotePause:(id)event {
+    (void)event; if (_localPlayer.rate > 0) [self toggleLocalPlayback];
+    return 0;
+}
+- (NSInteger)remoteToggle:(id)event {
+    (void)event; [self toggleLocalPlayback]; return 0;
+}
+- (NSInteger)remoteNext:(id)event {
+    (void)event; [self musicNext:nil]; return 0;
+}
+- (NSInteger)remotePrevious:(id)event {
+    (void)event; [self musicPrevious:nil]; return 0;
+}
+- (IBAction)musicPlay:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    if (_localMode) { [self toggleLocalPlayback]; return; }
+    if (_ytTabOpen) {
+        PostSystemMediaKey(NX_KEYTYPE_PLAY);
+        if (_playbackKnown) _playbackPlaying = !_playbackPlaying;
+        if (_popover.isShown) [self rebuildContent];
+        [self runYouTubeScriptAfter:0.4 generation:++_musicGen];
+        return;
+    }
+    BOOL online = _networkKnown ? _networkOnline : DefaultRouteReachable();
+    _networkKnown = YES;
+    _networkOnline = online;
+    if (!online) { [self startOfflinePlayback]; return; }
+    [self startYouTubePlayback];
+}
+- (IBAction)musicPrevious:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    if (_localMode) {
+        double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
+        if (seconds > 3) { [_localPlayer seekToTime:kCMTimeZero]; return; }
+        [self playLocalIndex:_localIndex - 1];
+        return;
+    }
+    if (_ytTabOpen) PostSystemMediaKey(NX_KEYTYPE_PREVIOUS);
+}
+- (IBAction)musicNext:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
+    if (_ytTabOpen) PostSystemMediaKey(NX_KEYTYPE_NEXT);
+}
+- (NSButton *)musicPill:(NSString *)title symbol:(NSString *)symbol action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
+    PillButton *button = [PillButton buttonWithTitle:title target:self action:action];
+    button.bordered = NO;
+    button.controlSize = NSControlSizeSmall;
+    button.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
+    NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+    if (!image) image = [NSImage imageWithSystemSymbolName:@"play.fill" accessibilityDescription:nil];
+    button.image = image;
+    button.imagePosition = title.length ? NSImageLeading : NSImageOnly;
+    button.imageHugsTitle = YES;
+    button.contentTintColor = NSColor.secondaryLabelColor;
+    button.accessibilityIdentifier = identifier;
+    button.accessibilityLabel = label;
+    [button sizeToFit];
+    CGFloat pad = title.length ? 16 : 10;
+    button.frame = NSMakeRect(0, 0, MAX(28, button.frame.size.width + pad), 22);
+    return button;
+}
+- (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
+    BOOL offline = [self musicOffline];
+    BOOL showTransport = _musicProbesEnabled && (_ytTabOpen || _localMode);
+    if (_musicProbesEnabled && offline && !_localMode) {
+        NSArray *tracks = [self offlineTrackPaths];
+        _localEmpty = tracks.count == 0;
+    }
+    if (_localTitle.length && _localMode) {
+        NSString *line = _localArtist.length ? [NSString stringWithFormat:@"%@ — %@", _localArtist, _localTitle] : _localTitle;
+        NSTextField *track = [self text:line font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+                                   color:nil at:NSMakeRect(kPad, y, kW - 2*kPad, 32) align:NSTextAlignmentLeft];
+        track.lineBreakMode = NSLineBreakByWordWrapping;
+        track.maximumNumberOfLines = 2;
+        track.accessibilityIdentifier = @"popover.music.track";
+        [root addSubview:track];
+        y += 34;
+    }
+    if (_localEmpty && offline && !_localMode) {
+        NSTextField *empty = [self text:@"No offline music" font:[NSFont systemFontOfSize:12]
+                                   color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, kW - 2*kPad, 16)
+                                   align:NSTextAlignmentLeft];
+        empty.accessibilityIdentifier = @"popover.music.empty";
+        [root addSubview:empty];
+        return y + 20;
+    }
+    NSString *symbol = @"play.fill", *title = @"Play music", *label = @"Play music";
+    if (showTransport) {
+        title = @"";
+        if (_localMode) { _playbackKnown = YES; _playbackPlaying = _localPlayer.rate > 0; }
+        if (_playbackKnown && _playbackPlaying) { symbol = @"pause.fill"; label = @"Pause"; }
+        else if (_playbackKnown) { symbol = @"play.fill"; label = @"Play"; }
+        else { symbol = @"playpause"; label = @"Play or pause"; }
+    }
+    CGFloat x = kPad;
+    if (showTransport) {
+        NSButton *prev = [self musicPill:@"" symbol:@"backward.fill" action:@selector(musicPrevious:) identifier:@"popover.music.previous" label:@"Previous track"];
+        prev.frame = NSMakeRect(x, y, prev.frame.size.width, 22);
+        [root addSubview:prev];
+        x = NSMaxX(prev.frame) + 6;
+    }
+    NSButton *play = [self musicPill:title symbol:symbol action:@selector(musicPlay:) identifier:@"popover.music.play" label:label];
+    play.frame = NSMakeRect(x, y, play.frame.size.width, 22);
+    [root addSubview:play];
+    x = NSMaxX(play.frame) + 6;
+    if (showTransport) {
+        NSButton *next = [self musicPill:@"" symbol:@"forward.fill" action:@selector(musicNext:) identifier:@"popover.music.next" label:@"Next track"];
+        next.frame = NSMakeRect(x, y, next.frame.size.width, 22);
+        [root addSubview:next];
+    }
+    y += 26;
+    if (_musicHintVisible) {
+        NSTextField *hint = [self text:@"Enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events for shuffle"
+                                  font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
+                                    at:NSMakeRect(kPad, y, kW - 2*kPad, 28) align:NSTextAlignmentLeft];
+        hint.lineBreakMode = NSLineBreakByWordWrapping;
+        hint.maximumNumberOfLines = 2;
+        hint.accessibilityIdentifier = @"popover.music.hint";
+        [root addSubview:hint];
+        y += 30;
+    }
+    return y;
+}
+- (CGFloat)soundNameHeight:(NSString *)name font:(NSFont *)font width:(CGFloat)width {
+    if (!name.length) return 16;
+    NSRect rect = [name boundingRectWithSize:NSMakeSize(width, 200) options:NSStringDrawingUsesLineFragmentOrigin
+                                  attributes:@{NSFontAttributeName: font}];
+    return ceil(NSHeight(rect));
+}
+- (NSView *)soundOutputRowAt:(CGFloat)y height:(CGFloat *)heightOut {
     [self ensureAudioDisplay];
     NSDictionary *current = nil;
     for (NSDictionary *row in _audioDevices)
         if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
     NSString *name = current[@"name"] ?: @"No output device";
-    GlanceAudioTransport transport = (GlanceAudioTransport)[current[@"transport"] integerValue];
-    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 18)];
-    NSImage *icon = [NSImage imageWithSystemSymbolName:AudioOutputSymbol(transport) accessibilityDescription:nil];
+    CGFloat iconW = 16, chevronW = 12, gap = 6;
+    CGFloat textX = kPad + iconW + gap;
+    CGFloat textW = kW - kPad - chevronW - gap - textX;
+    NSFont *font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    CGFloat textH = [self soundNameHeight:name font:font width:textW];
+    if (textH > 34) {
+        font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+        textH = [self soundNameHeight:name font:font width:textW];
+    }
+    BOOL shrinkMore = textH > 42;
+    if (shrinkMore) {
+        font = [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium];
+        textH = [self soundNameHeight:name font:font width:textW];
+    }
+    textH = MIN(MAX(16, textH), 48);
+    CGFloat rowH = MAX(22, textH + 4);
+    SoundOutputRow *row = [[SoundOutputRow alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
+    row.target = self;
+    row.action = @selector(showOutputMenu:);
+    row.accessibilityRole = NSAccessibilityButtonRole;
+    row.accessibilityIdentifier = @"popover.sound";
+    row.accessibilityLabel = [NSString stringWithFormat:@"Sound output, %@", name];
+    NSImage *icon = [NSImage imageWithSystemSymbolName:AudioSymbolName(current) accessibilityDescription:nil];
     NSImageView *image = [NSImageView imageViewWithImage:icon];
     image.contentTintColor = NSColor.secondaryLabelColor;
-    image.frame = NSMakeRect(kPad, 1, 16, 16);
+    image.frame = NSMakeRect(kPad, (rowH - 16) / 2, iconW, 16);
     [row addSubview:image];
-    [row addSubview:[self text:@"Sound" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
-                            color:nil at:NSMakeRect(kPad+20, 1, 52, 16) align:NSTextAlignmentLeft]];
-    NSButton *toggle = [NSButton checkboxWithTitle:@"Switch to new outputs" target:self action:@selector(toggleSwitchToNewOutputs:)];
-    toggle.font = [NSFont systemFontOfSize:11];
-    toggle.state = SwitchToNewOutputs() ? NSControlStateValueOn : NSControlStateValueOff;
-    [toggle sizeToFit];
-    CGFloat toggleW = MIN(toggle.frame.size.width, 168);
-    toggle.frame = NSMakeRect(kW-kPad-toggleW, 0, toggleW, 18);
-    toggle.accessibilityIdentifier = @"popover.sound.switch";
-    toggle.toolTip = @"When a Bluetooth, USB, or display output appears, use it.";
-    [row addSubview:toggle];
-    NSButton *pick = [NSButton buttonWithTitle:name target:self action:@selector(showOutputMenu:)];
-    pick.bordered = NO;
-    pick.font = [NSFont systemFontOfSize:12];
-    pick.alignment = NSTextAlignmentLeft;
-    pick.lineBreakMode = NSLineBreakByTruncatingTail;
-    pick.contentTintColor = NSColor.secondaryLabelColor;
-    pick.frame = NSMakeRect(kPad+76, 0, NSMinX(toggle.frame)-(kPad+76)-6, 18);
-    pick.accessibilityIdentifier = @"popover.sound";
-    pick.accessibilityLabel = [NSString stringWithFormat:@"Sound, %@", name];
-    pick.toolTip = name;
-    [row addSubview:pick];
+    NSTextField *label = [self text:name font:font color:nil at:NSMakeRect(textX, (rowH - textH) / 2, textW, textH) align:NSTextAlignmentLeft];
+    label.lineBreakMode = shrinkMore && textH >= 48 ? NSLineBreakByTruncatingTail : NSLineBreakByWordWrapping;
+    label.maximumNumberOfLines = 3;
+    label.cell.wraps = YES;
+    label.cell.truncatesLastVisibleLine = shrinkMore && textH >= 48;
+    label.accessibilityIdentifier = @"popover.sound.name";
+    [row addSubview:label];
+    NSImage *chevronImage = [NSImage imageWithSystemSymbolName:@"chevron.up.chevron.down" accessibilityDescription:nil];
+    NSImageView *chevron = [NSImageView imageViewWithImage:chevronImage];
+    chevron.contentTintColor = NSColor.tertiaryLabelColor;
+    chevron.frame = NSMakeRect(kW - kPad - chevronW, (rowH - 12) / 2, chevronW, 12);
+    chevron.accessibilityIdentifier = @"popover.sound.chevron";
+    [row addSubview:chevron];
+    if (heightOut) *heightOut = rowH;
     return row;
 }
-- (void)showOutputMenu:(NSButton *)sender {
+- (void)showOutputMenu:(NSView *)sender {
     [self ensureAudioDisplay];
     NSArray<NSDictionary *> *devices = ReadAudioDevices();
     _audioDevices = devices;
@@ -3708,8 +4186,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         item.target = self;
         item.representedObject = device[@"uid"];
         item.state = [device[@"uid"] isEqual:_defaultOutputUID] ? NSControlStateValueOn : NSControlStateValueOff;
-        item.image = [NSImage imageWithSystemSymbolName:AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue])
-                               accessibilityDescription:nil];
+        item.image = [NSImage imageWithSystemSymbolName:AudioSymbolName(device) accessibilityDescription:nil];
     }
     [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
 }
@@ -3724,8 +4201,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     }
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)toggleSwitchToNewOutputs:(NSButton *)sender {
-    [NSUserDefaults.standardUserDefaults setBool:sender.state == NSControlStateValueOn forKey:@"switchToNewOutputs"];
+- (void)toggleSwitchToNewOutputs:(id)sender {
+    (void)sender;
+    [NSUserDefaults.standardUserDefaults setBool:!SwitchToNewOutputs() forKey:@"switchToNewOutputs"];
 }
 
 - (void)refreshVolumesAsync {
@@ -4346,6 +4824,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self refresh];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    if (_musicProbesEnabled) [self refreshYouTubeTab];
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
     // stays invisible until something scrolls it — so the sections below the fold (AI
     // Status is the last one) look like they do not exist. Flash it on open only: the
@@ -4855,8 +5334,13 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [sys addSubview:systemSummary];
     [root addSubview:sys]; y += 50;
 
-    // Sound stays in the popover, on one line so the panel still fits the height check.
-    [root addSubview:[self soundOutputRowAt:y]]; y += 18;
+    // ---------- SOUND ----------
+    y += 4;
+    [root addSubview:[self dividerAt:y]]; y += 9;
+    [root addSubview:[self sectionHeader:@"Sound" at:y]]; y += 18;
+    CGFloat soundH = 0;
+    [root addSubview:[self soundOutputRowAt:y height:&soundH]]; y += soundH + 4;
+    y = [self addMusicControlsTo:root at:y];
 
     // ---------- AI STATUS ----------
     y += 4;
@@ -4957,6 +5441,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     details.target = self;
     NSMenuItem *settings = [m addItemWithTitle:@"Settings" action:nil keyEquivalent:@""];
     settings.submenu = [self settingsMenu];
+    NSMenuItem *switchOutputs = [m addItemWithTitle:@"Switch to new outputs" action:@selector(toggleSwitchToNewOutputs:) keyEquivalent:@""];
+    switchOutputs.target = self;
+    switchOutputs.state = SwitchToNewOutputs() ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSMenuItem *about = [m addItemWithTitle:@"About Glancebar" action:@selector(showAbout:) keyEquivalent:@""];
     about.target = self;

@@ -33,13 +33,23 @@ opt-in) `/usr/bin/security`.
 - **Battery** — "3:14 until 20%" (not a bare percentage), sampled energy impact grouped
   by app/process with raw process names and plain-English context, live draw in watts,
   and battery health / cycle count.
-- **Sound** — the popover names the current output device and lists the others (built-in
-  speaker, Bluetooth headphones, a display, or a generic speaker). Choosing one sets the
-  system output and the alert sound. **Switch to new outputs** (on by default) makes a
-  newly connected Bluetooth, USB, or HDMI/DisplayPort device the default, including a
-  Bluetooth speaker that appears as an input a moment before its output. Virtual devices
-  such as Microsoft Teams Audio stay off that list unless they are already the default.
-  Sound stays in the popover; it is not a menu bar segment.
+- **Sound** — its own section, like Storage and Battery. The row shows the current output
+  (a speaker for a Bluetooth speaker such as a SoundLink, headphones only for headphones
+  or AirPods, a display for HDMI) and the full device name, and opens the device menu.
+  Choosing one sets the system output and the alert sound. **Switch to new outputs**
+  (on by default, under ⋯) makes a newly connected Bluetooth, USB, or HDMI/DisplayPort
+  device the default, including a Bluetooth speaker that appears as an input a moment
+  before its output. Virtual devices such as Microsoft Teams Audio stay off that list
+  unless they are already the default. Sound is not a menu bar segment.
+- **Play music** — the Sound section plays your YouTube Music Liked Music, shuffled, from
+  a random song, in the signed-in Google Chrome profile and without bringing Chrome
+  forward. A later press pauses or resumes with the system media key when that tab is
+  already open; previous and next appear beside it. If Chrome is not set to allow
+  JavaScript from Apple Events, playback still starts at the random song and the popover
+  says so once. Offline, or if Chrome cannot open, the same buttons play the m4a files in
+  `~/Music/YouTube Liked/` through Glancebar’s own player, shuffled, with the track’s
+  title and artist. An empty folder says “No offline music”. Glancebar does not fetch
+  YouTube itself.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
   popover shows overall pressure; Details keeps the process breakdowns. Memory and swap are
@@ -307,6 +317,7 @@ static-analysis, Universal 2 build, bundle-version, architecture, and signing ch
 ```
 glancebar/
 ├── Sources/pure.{h,m}    # pure logic: estimators, grouping, rate limits, parsing
+├── Sources/nowplaying.m  # MediaPlayer wrappers (kept out of main.m; its headers break subscripting)
 ├── Sources/main.m        # readers, sampling, CLI, popover + details UI
 ├── Tests/                # unit/regression and incremental-reader integration tests
 ├── Resources/            # source PNG and packaged macOS app icon

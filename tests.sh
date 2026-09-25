@@ -43,8 +43,9 @@ fi
 
 # Stateful filesystem/incremental-reader coverage. The harness imports the private app
 # shell so it exercises the production AIReader without publishing a test-only API.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Tests/test_ai_reader.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m Tests/test_ai_reader.m \
     -framework Cocoa \
+    -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
     -framework CoreAudio \
     -framework IOKit \
     -framework ServiceManagement -framework LocalAuthentication \
@@ -53,7 +54,8 @@ fi
 "$WORK_DIR/glancebar_ai_reader_tests"
 
 # Production AppKit layout, rendered without creating any visible windows.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m tools/check-popover.m \
-    -framework Cocoa -framework CoreAudio -framework IOKit -framework ServiceManagement -framework LocalAuthentication \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m tools/check-popover.m \
+    -framework Cocoa -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
+    -framework CoreAudio -framework IOKit -framework ServiceManagement -framework LocalAuthentication \
     -o "$WORK_DIR/glancebar_popover_tests"
 "$WORK_DIR/glancebar_popover_tests"

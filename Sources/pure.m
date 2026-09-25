@@ -1406,11 +1406,120 @@ NSArray<NSDictionary *> *AudioOutputMenuDevices(NSArray<NSDictionary *> *devices
     return shown;
 }
 
-NSString *AudioOutputSymbol(GlanceAudioTransport transport) {
-    switch (transport) {
-    case GlanceAudioTransportBuiltIn: return @"speaker.wave.2.fill";
-    case GlanceAudioTransportBluetooth: return @"headphones";
-    case GlanceAudioTransportDisplay: return @"display";
-    default: return @"speaker.wave.2";
+static BOOL AudioTextIsHeadphones(NSString *text) {
+    if (![text isKindOfClass:NSString.class] || !text.length) return NO;
+    NSString *s = text.lowercaseString;
+    for (NSString *needle in @[@"airpod", @"headphone", @"headset", @"earbud", @"earphone"])
+        if ([s containsString:needle]) return YES;
+    return NO;
+}
+
+NSString *AudioOutputSymbol(GlanceAudioTransport transport, NSString *name, NSString *dataSource) {
+    if (transport == GlanceAudioTransportDisplay) return @"display";
+    if (AudioTextIsHeadphones(name) || AudioTextIsHeadphones(dataSource)) return @"headphones";
+    if (transport == GlanceAudioTransportBuiltIn) return @"speaker.wave.2.fill";
+    return @"speaker.wave.2";
+}
+
+const NSInteger kYouTubeLikedDefaultCount = 200;
+
+static NSInteger PlaylistBound(NSInteger count) {
+    if (count < 1) return kYouTubeLikedDefaultCount;
+    if (count > 100000) return 100000;
+    return count;
+}
+
+NSInteger ClampedPlaylistIndex(NSInteger index, NSInteger count) {
+    NSInteger n = PlaylistBound(count);
+    if (index < 1) return 1;
+    if (index > n) return n;
+    return index;
+}
+
+NSInteger PlaylistIndexForSeed(uint32_t seed, NSInteger count) {
+    NSInteger n = PlaylistBound(count);
+    uint32_t state = seed ? seed : 1u;
+    state = state * 1664525u + 1013904223u;
+    return ClampedPlaylistIndex((NSInteger)(state % (uint32_t)n) + 1, n);
+}
+
+NSString *YouTubeLikedMusicURL(uint32_t seed, NSInteger count) {
+    return [NSString stringWithFormat:@"https://music.youtube.com/watch?list=LM&index=%ld",
+            (long)PlaylistIndexForSeed(seed, count)];
+}
+
+NSInteger ParsePlaylistCount(NSString *text) {
+    if (![text isKindOfClass:NSString.class]) return 0;
+    NSString *s = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!s.length || s.length > 40) return 0;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"^(?:\\d{1,3}(?:,\\d{3})+|\\d{1,6})(?:\\s+songs?)?$"
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    if (![re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)]) return 0;
+    NSMutableString *digits = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= '0' && c <= '9') [digits appendFormat:@"%C", c];
+        else if (c == ',') continue;
+        else break;
     }
+    NSInteger value = digits.integerValue;
+    if (value < 1 || value > 100000) return 0;
+    return value;
+}
+
+BOOL ChromeJavaScriptEventsDenied(NSString *errorText) {
+    if (![errorText isKindOfClass:NSString.class] || !errorText.length) return NO;
+    NSString *s = errorText.lowercaseString;
+    return [s containsString:@"allow javascript from apple events"] ||
+           [s containsString:@"javascript through applescript"];
+}
+
+static uint32_t TrackRNG(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state;
+}
+
+NSArray<NSString *> *ShuffledTrackOrder(NSArray<NSString *> *names, uint32_t seed) {
+    if (![names isKindOfClass:NSArray.class] || !names.count) return @[];
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (id name in names) if ([name isKindOfClass:NSString.class]) [out addObject:name];
+    uint32_t state = seed ? seed : 1u;
+    for (NSInteger i = (NSInteger)out.count - 1; i > 0; i--) {
+        NSInteger j = (NSInteger)(TrackRNG(&state) % (uint32_t)(i + 1));
+        [out exchangeObjectAtIndex:(NSUInteger)i withObjectAtIndex:(NSUInteger)j];
+    }
+    return out;
+}
+
+NSArray<NSString *> *LikedMusicAudioFiles(NSArray<NSString *> *names) {
+    if (![names isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (id name in names) {
+        if (![name isKindOfClass:NSString.class]) continue;
+        NSString *base = [(NSString *)name lastPathComponent];
+        if (!base.length || [base hasPrefix:@"."]) continue;
+        if (![base.lowercaseString hasSuffix:@".m4a"]) continue;
+        [out addObject:name];
+    }
+    return out;
+}
+
+NSDictionary *ParseLikedTrackFilename(NSString *filename) {
+    if (![filename isKindOfClass:NSString.class] || !filename.length) return nil;
+    NSString *base = filename.lastPathComponent;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"^(.+?) - (.+) \\[([A-Za-z0-9_-]+)\\]\\.m4a$"
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:base options:0 range:NSMakeRange(0, base.length)];
+    if (match && match.numberOfRanges == 4) {
+        return @{
+            @"artist": [base substringWithRange:[match rangeAtIndex:1]],
+            @"title": [base substringWithRange:[match rangeAtIndex:2]],
+            @"trackID": [base substringWithRange:[match rangeAtIndex:3]],
+        };
+    }
+    NSString *title = base;
+    if ([title.lowercaseString hasSuffix:@".m4a"]) title = [title substringToIndex:title.length - 4];
+    return @{@"artist": @"", @"title": title, @"trackID": @""};
 }

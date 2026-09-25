@@ -33,7 +33,7 @@ jobs:
       - name: Run static analyzer
         run: |
           SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-          for source in Sources/pure.m Sources/main.m; do
+          for source in Sources/pure.m Sources/nowplaying.m Sources/main.m; do
             # -Werror does not promote analyzer diagnostics; without -analyzer-werror this
             # step prints its findings and still exits 0, so the gate never fails a build.
             xcrun clang --analyze -Xclang -analyzer-werror -fobjc-arc -Wall -Wextra -Werror \
