@@ -2,6 +2,7 @@
 // with storage, battery, system, and AI summaries plus a deeper details window.
 // Single-file Objective-C/AppKit. Zero dependencies, no sudo. Pure logic in pure.{h,m}.
 #import <Cocoa/Cocoa.h>
+#import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <LocalAuthentication/LocalAuthentication.h>
@@ -3333,7 +3334,129 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 - (NSDictionary *)focusSnapshotForWindow:(NSWindow *)window rootView:(NSView *)root;
 - (void)restoreFocus:(NSDictionary *)snapshot
              inView:(NSView *)root window:(NSWindow *)window;
+- (void)audioDevicesChanged;
+- (void)audioDefaultChanged;
 @end
+
+// CoreAudio property reads. Output streams are the output scope of kAudioDevicePropertyStreams;
+// a stream direction of 0 is output (AudioHardwareBase.h). Default output is
+// kAudioHardwarePropertyDefaultOutputDevice; alert sounds follow
+// kAudioHardwarePropertyDefaultSystemOutputDevice. Listeners are AudioObjectAddPropertyListener
+// on kAudioObjectSystemObject — no polling.
+// https://developer.apple.com/documentation/coreaudio/kaudiohardwarepropertydefaultoutputdevice
+static AudioObjectPropertyAddress AudioAddr(AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) {
+    return (AudioObjectPropertyAddress){ selector, scope, kAudioObjectPropertyElementMain };
+}
+static NSString *AudioString(AudioObjectID object, AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress addr = AudioAddr(selector, kAudioObjectPropertyScopeGlobal);
+    CFStringRef value = NULL;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(object, &addr, 0, NULL, &size, &value) != noErr || !value) return nil;
+    return (__bridge_transfer NSString *)value;
+}
+static GlanceAudioTransport GlanceTransport(UInt32 transport) {
+    switch (transport) {
+    case kAudioDeviceTransportTypeBuiltIn: return GlanceAudioTransportBuiltIn;
+    case kAudioDeviceTransportTypeBluetooth:
+    case kAudioDeviceTransportTypeBluetoothLE: return GlanceAudioTransportBluetooth;
+    case kAudioDeviceTransportTypeUSB: return GlanceAudioTransportUSB;
+    case kAudioDeviceTransportTypeHDMI:
+    case kAudioDeviceTransportTypeDisplayPort: return GlanceAudioTransportDisplay;
+    case kAudioDeviceTransportTypeAggregate: return GlanceAudioTransportAggregate;
+    case kAudioDeviceTransportTypeVirtual: return GlanceAudioTransportVirtual;
+    default: return GlanceAudioTransportOther;
+    }
+}
+static int OutputChannelCount(AudioObjectID device) {
+    AudioObjectPropertyAddress addr = AudioAddr(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput);
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &addr, 0, NULL, &size) != noErr || size < sizeof(AudioObjectID))
+        return 0;
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID *streams = calloc(count, sizeof(AudioObjectID));
+    if (!streams) return 0;
+    int channels = 0;
+    if (AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, streams) == noErr) {
+        for (UInt32 i = 0; i < count; i++) {
+            AudioStreamBasicDescription format = {0};
+            AudioObjectPropertyAddress formatAddr = AudioAddr(kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal);
+            UInt32 formatSize = sizeof(format);
+            if (AudioObjectGetPropertyData(streams[i], &formatAddr, 0, NULL, &formatSize, &format) == noErr &&
+                format.mChannelsPerFrame > 0)
+                channels += (int)format.mChannelsPerFrame;
+            else
+                channels += 1;
+        }
+    }
+    free(streams);
+    return channels;
+}
+static NSArray<NSDictionary *> *ReadAudioDevices(void) {
+    AudioObjectPropertyAddress addr = AudioAddr(kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal);
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr || !size)
+        return @[];
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID *devices = calloc(count, sizeof(AudioObjectID));
+    if (!devices) return @[];
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, devices) != noErr) {
+        free(devices);
+        return @[];
+    }
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray arrayWithCapacity:count];
+    for (UInt32 i = 0; i < count; i++) {
+        AudioObjectPropertyAddress transportAddr = AudioAddr(kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal);
+        UInt32 transport = 0, transportSize = sizeof(transport);
+        AudioObjectGetPropertyData(devices[i], &transportAddr, 0, NULL, &transportSize, &transport);
+        NSString *uid = AudioString(devices[i], kAudioDevicePropertyDeviceUID);
+        if (!uid.length) continue;
+        NSString *name = AudioString(devices[i], kAudioObjectPropertyName) ?: @"Output";
+        [rows addObject:@{
+            @"uid": uid, @"name": name, @"transport": @(GlanceTransport(transport)),
+            @"outputChannels": @(OutputChannelCount(devices[i])), @"deviceID": @(devices[i])
+        }];
+    }
+    free(devices);
+    return rows;
+}
+static NSString *DefaultOutputUID(NSArray<NSDictionary *> *devices) {
+    AudioObjectID device = kAudioObjectUnknown;
+    AudioObjectPropertyAddress addr = AudioAddr(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal);
+    UInt32 size = sizeof(device);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &device) != noErr || !device)
+        return nil;
+    for (NSDictionary *row in devices)
+        if ([row[@"deviceID"] unsignedIntValue] == device) return row[@"uid"];
+    return AudioString(device, kAudioDevicePropertyDeviceUID);
+}
+static void SetOutputDevice(AudioObjectID device) {
+    if (!device) return;
+    UInt32 size = sizeof(device);
+    AudioObjectPropertyAddress addr = AudioAddr(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal);
+    AudioObjectSetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, size, &device);
+    addr.mSelector = kAudioHardwarePropertyDefaultSystemOutputDevice;
+    AudioObjectSetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, size, &device);
+}
+static BOOL SwitchToNewOutputs(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud registerDefaults:@{@"switchToNewOutputs": @YES}];
+    return [ud boolForKey:@"switchToNewOutputs"];
+}
+static OSStatus AudioHardwareChanged(AudioObjectID object, UInt32 count,
+                                    const AudioObjectPropertyAddress *addresses, void *client) {
+    (void)object;
+    BOOL devices = NO, output = NO;
+    for (UInt32 i = 0; i < count; i++) {
+        if (addresses[i].mSelector == kAudioHardwarePropertyDevices) devices = YES;
+        if (addresses[i].mSelector == kAudioHardwarePropertyDefaultOutputDevice) output = YES;
+    }
+    Controller *controller = (__bridge Controller *)client;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (devices) [controller audioDevicesChanged];
+        if (output) [controller audioDefaultChanged];
+    });
+    return noErr;
+}
 
 @implementation Controller {
     NSStatusItem *_item;
@@ -3380,6 +3503,10 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
+    NSArray<NSDictionary *> *_audioDevices;    // last settled device set, including input-only
+    NSArray<NSDictionary *> *_audioPrevious;   // comparison baseline for auto-switch
+    NSString *_defaultOutputUID;
+    NSUInteger _audioSettleGen;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -3411,7 +3538,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
-                           @"useCursorAccount": @NO}];
+                           @"useCursorAccount": @NO, @"switchToNewOutputs": @YES}];
     _bat = ReadBattery();
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
@@ -3478,6 +3605,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
     else if (!getenv("GLANCEBAR_SKIP_WELCOME"))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
+    [self startAudioOutputWatch];
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
     if (src) {
@@ -3487,6 +3615,118 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
+
+- (void)startAudioOutputWatch {
+    _audioDevices = ReadAudioDevices();
+    _audioPrevious = _audioDevices;
+    _defaultOutputUID = DefaultOutputUID(_audioDevices);
+    AudioObjectPropertyAddress devices = AudioAddr(kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal);
+    AudioObjectPropertyAddress output = AudioAddr(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal);
+    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devices, AudioHardwareChanged, (__bridge void *)self);
+    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &output, AudioHardwareChanged, (__bridge void *)self);
+}
+- (void)audioDevicesChanged {
+    // Bluetooth often publishes an input-only entry, then the output a moment later.
+    // Wait until the list stops changing so that late output is still a new device.
+    NSUInteger generation = ++_audioSettleGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != self->_audioSettleGen) return;
+        NSArray<NSDictionary *> *now = ReadAudioDevices();
+        NSString *adopt = ChooseNewOutputDevice(self->_audioPrevious, now, SwitchToNewOutputs());
+        self->_audioPrevious = now;
+        self->_audioDevices = now;
+        if (adopt) {
+            for (NSDictionary *row in now) {
+                if ([row[@"uid"] isEqual:adopt]) { SetOutputDevice((AudioObjectID)[row[@"deviceID"] unsignedIntValue]); break; }
+            }
+        }
+        self->_defaultOutputUID = DefaultOutputUID(now);
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+- (void)audioDefaultChanged {
+    _defaultOutputUID = DefaultOutputUID(_audioDevices ?: ReadAudioDevices());
+    if (!_audioDevices) _audioDevices = ReadAudioDevices();
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)ensureAudioDisplay {
+    if (_audioDevices) return;
+    _audioDevices = ReadAudioDevices();
+    _defaultOutputUID = DefaultOutputUID(_audioDevices);
+}
+- (NSView *)soundOutputRowAt:(CGFloat)y {
+    [self ensureAudioDisplay];
+    NSDictionary *current = nil;
+    for (NSDictionary *row in _audioDevices)
+        if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
+    NSString *name = current[@"name"] ?: @"No output device";
+    GlanceAudioTransport transport = (GlanceAudioTransport)[current[@"transport"] integerValue];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 18)];
+    NSImage *icon = [NSImage imageWithSystemSymbolName:AudioOutputSymbol(transport) accessibilityDescription:nil];
+    NSImageView *image = [NSImageView imageViewWithImage:icon];
+    image.contentTintColor = NSColor.secondaryLabelColor;
+    image.frame = NSMakeRect(kPad, 1, 16, 16);
+    [row addSubview:image];
+    [row addSubview:[self text:@"Sound" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                            color:nil at:NSMakeRect(kPad+20, 1, 52, 16) align:NSTextAlignmentLeft]];
+    NSButton *toggle = [NSButton checkboxWithTitle:@"Switch to new outputs" target:self action:@selector(toggleSwitchToNewOutputs:)];
+    toggle.font = [NSFont systemFontOfSize:11];
+    toggle.state = SwitchToNewOutputs() ? NSControlStateValueOn : NSControlStateValueOff;
+    [toggle sizeToFit];
+    CGFloat toggleW = MIN(toggle.frame.size.width, 168);
+    toggle.frame = NSMakeRect(kW-kPad-toggleW, 0, toggleW, 18);
+    toggle.accessibilityIdentifier = @"popover.sound.switch";
+    toggle.toolTip = @"When a Bluetooth, USB, or display output appears, use it.";
+    [row addSubview:toggle];
+    NSButton *pick = [NSButton buttonWithTitle:name target:self action:@selector(showOutputMenu:)];
+    pick.bordered = NO;
+    pick.font = [NSFont systemFontOfSize:12];
+    pick.alignment = NSTextAlignmentLeft;
+    pick.lineBreakMode = NSLineBreakByTruncatingTail;
+    pick.contentTintColor = NSColor.secondaryLabelColor;
+    pick.frame = NSMakeRect(kPad+76, 0, NSMinX(toggle.frame)-(kPad+76)-6, 18);
+    pick.accessibilityIdentifier = @"popover.sound";
+    pick.accessibilityLabel = [NSString stringWithFormat:@"Sound, %@", name];
+    pick.toolTip = name;
+    [row addSubview:pick];
+    return row;
+}
+- (void)showOutputMenu:(NSButton *)sender {
+    [self ensureAudioDisplay];
+    NSArray<NSDictionary *> *devices = ReadAudioDevices();
+    _audioDevices = devices;
+    _defaultOutputUID = DefaultOutputUID(devices);
+    NSMenu *menu = [NSMenu new];
+    NSArray<NSDictionary *> *items = AudioOutputMenuDevices(devices, _defaultOutputUID);
+    if (!items.count) {
+        NSMenuItem *empty = [menu addItemWithTitle:@"No output devices" action:nil keyEquivalent:@""];
+        empty.enabled = NO;
+    }
+    for (NSDictionary *device in items) {
+        NSMenuItem *item = [menu addItemWithTitle:device[@"name"] ?: @"Output" action:@selector(chooseOutputDevice:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = device[@"uid"];
+        item.state = [device[@"uid"] isEqual:_defaultOutputUID] ? NSControlStateValueOn : NSControlStateValueOff;
+        item.image = [NSImage imageWithSystemSymbolName:AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue])
+                               accessibilityDescription:nil];
+    }
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
+}
+- (void)chooseOutputDevice:(NSMenuItem *)item {
+    NSString *uid = item.representedObject;
+    if (![uid isKindOfClass:NSString.class]) return;
+    for (NSDictionary *row in ReadAudioDevices()) {
+        if (![row[@"uid"] isEqual:uid]) continue;
+        SetOutputDevice((AudioObjectID)[row[@"deviceID"] unsignedIntValue]);
+        _defaultOutputUID = uid;
+        break;
+    }
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)toggleSwitchToNewOutputs:(NSButton *)sender {
+    [NSUserDefaults.standardUserDefaults setBool:sender.state == NSControlStateValueOn forKey:@"switchToNewOutputs"];
+}
 
 - (void)refreshVolumesAsync {
     if (_volumesLoading) return;
@@ -4614,6 +4854,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     systemSummary.maximumNumberOfLines = 2;
     [sys addSubview:systemSummary];
     [root addSubview:sys]; y += 50;
+
+    // Sound stays in the popover, on one line so the panel still fits the height check.
+    [root addSubview:[self soundOutputRowAt:y]]; y += 18;
 
     // ---------- AI STATUS ----------
     y += 4;

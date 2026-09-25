@@ -33,6 +33,13 @@ opt-in) `/usr/bin/security`.
 - **Battery** — "3:14 until 20%" (not a bare percentage), sampled energy impact grouped
   by app/process with raw process names and plain-English context, live draw in watts,
   and battery health / cycle count.
+- **Sound** — the popover names the current output device and lists the others (built-in
+  speaker, Bluetooth headphones, a display, or a generic speaker). Choosing one sets the
+  system output and the alert sound. **Switch to new outputs** (on by default) makes a
+  newly connected Bluetooth, USB, or HDMI/DisplayPort device the default, including a
+  Bluetooth speaker that appears as an input a moment before its output. Virtual devices
+  such as Microsoft Teams Audio stay off that list unless they are already the default.
+  Sound stays in the popover; it is not a menu bar segment.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
   popover shows overall pressure; Details keeps the process breakdowns. Memory and swap are
