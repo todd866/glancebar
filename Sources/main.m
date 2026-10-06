@@ -3786,6 +3786,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSUInteger _musicGen;
     BOOL _remoteCommandsOn;
     NSTimer *_ytProbeTimer;
+    NSTimer *_powerTickTimer;   // 1s battery/power refresh while a surface is visible
+    NSUInteger _powerTicks;
     CFAbsoluteTime _ytTabOpenedAt;
     NSArray<NSString *> *_offlineTracks;
     CFAbsoluteTime _offlineTracksAt;
@@ -5411,6 +5413,55 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [NSApp activateIgnoringOtherApps:YES];
     [self refreshAIUsageAsync];
     [self beginSampling];
+    [self startPowerTick];
+}
+
+// Power changes (charger plugged, load spikes, AlDente letting go) post no IOPS event, so
+// the 15s refresh showed stale watts. While the popover or Details is open, re-read the
+// battery every second — an IORegistry read, no subprocess — and update the readings in
+// place; a change of state (plugged, charging, percent) rebuilds the panel.
+- (void)startPowerTick {
+    if (_powerTickTimer) return;
+    _powerTickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(powerTick:)
+                                                     userInfo:nil repeats:YES];
+    _powerTickTimer.tolerance = 0.2;
+}
+- (void)stopPowerTick {
+    [_powerTickTimer invalidate];
+    _powerTickTimer = nil;
+}
+- (void)powerTick:(NSTimer *)timer {
+    (void)timer;
+    BOOL popover = _popover.isShown, details = _detailsWindow.isVisible;
+    if (!popover && !details) { [self stopPowerTick]; return; }
+    BatteryState fresh = ReadBattery();
+    if (!fresh.valid) return;
+    BOOL stateChanged = fresh.acConnected != _bat.acConnected || fresh.isCharging != _bat.isCharging ||
+                        fresh.percent != _bat.percent;
+    BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
+                        fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
+    _bat = fresh;
+    _powerTicks++;
+    if (stateChanged) {
+        if (popover) [self rebuildContent];
+        if (details) [self rebuildDetails];
+        [self updateBar];
+        return;
+    }
+    if (!powerChanged) return;
+    if (popover) {
+        NSView *root = _popover.contentViewController.view;
+        NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(root, @"popover.battery.datum");
+        if ([datum isKindOfClass:NSTextField.class]) {
+            datum.stringValue = [self batteryDatumText];
+            NSString *tip = [self batteryPopoverTip];
+            datum.toolTip = tip;
+            NSView *row = ViewWithAccessibilityIdentifier(root, @"popover.row.battery");
+            row.toolTip = tip; row.accessibilityLabel = tip;
+        }
+    }
+    // Details rows are rebuilt wholesale; every other second is live enough there.
+    if (details && _powerTicks % 2 == 0) [self rebuildDetails];
 }
 
 // Records when the popover last closed so togglePopover: can tell a real "open me" click
@@ -5421,6 +5472,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
     [self stopYouTubeProbeTimer];
     [self stopTrackTick];
+    if (!_detailsWindow.isVisible) [self stopPowerTick];
 }
 
 // Starts both process samplers, invalidating any still-in-flight results: top takes
@@ -8012,6 +8064,7 @@ static NSColor *HealthColor(double fraction) {
 
 - (void)showDetails:(id)sender {
     [self refresh];
+    [self startPowerTick];   // stops itself once neither the popover nor Details is visible
     BOOL didCreateWindow = (_detailsWindow == nil);
     if (!_detailsWindow) {
         _detailsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 520)
