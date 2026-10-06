@@ -249,7 +249,7 @@ NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,
 // lives in the app shell; reading it does not.
 NSNumber *ParseSleepDisabled(NSString *pmsetOutput);
 // The /etc/sudoers.d rule that lets `user` run exactly `pmset -a lowpowermode|disablesleep
-// 0|1` without a password (Glancebar gates each use behind Touch ID). nil for a user name
+// 0|1` without a password, so the switches need no prompt. nil for a user name
 // that is not plain [A-Za-z0-9_.-], so nothing unexpected can reach sudoers or the shell.
 NSString *PmsetSudoersRule(NSString *user);
 
@@ -492,8 +492,7 @@ double QuitPmsetBudgetRemaining(double elapsedSec);
 // sudoers rule; without the rule, quit leaves Keep Awake on.
 NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled);
 
-// A second click must not overlap an in-flight pmset (the LocalAuthentication reply
-// runs sudo/osascript off the main thread).
+// A second click must not overlap an in-flight pmset (sudo/osascript run off the main thread).
 BOOL ShouldStartPmset(BOOL inFlight);
 
 // Index of the boot volume (@YES), else 0 when the list is non-empty, else NSNotFound.

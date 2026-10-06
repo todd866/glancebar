@@ -20,8 +20,8 @@ A **Details…** window keeps the fuller lists behind tabs without crowding the 
 
 One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
 executables**. Nothing it displays needs admin rights; the privileged actions are the
-*Keep Awake* and *Low Power* switches, which set `pmset` after Touch ID or your
-administrator password (no helper is installed—see below). Glancebar invokes standard macOS tools
+*Keep Awake* and *Low Power* switches, which set `pmset` with one click once
+an optional rule is installed, or with your administrator password (no helper is installed—see below). Glancebar invokes standard macOS tools
 such as `top`, `ps`, `sqlite3`, `pmset`, `osascript`, and (only after the Claude account
 opt-in) `/usr/bin/security`.
 
@@ -88,15 +88,16 @@ opt-in) `/usr/bin/security`.
   still sleeps) — by setting `pmset disablesleep`; a cup replaces the battery glyph while it's
   on, and Glancebar switches it off when it quits. *Low Power* flips macOS Low Power Mode for
   battery and adapter alike; the battery turns yellow while it's on, as macOS's own does.
-  The first flip offers a one-time **Touch ID** setup: a sudoers rule limited to
+  The first flip offers a one-time **one-click** setup: a sudoers rule limited to
   `pmset -a lowpowermode 0|1` and `pmset -a disablesleep 0|1`, installed with your password
-  once; after that each change is confirmed with Touch ID (or your password when no sensor
-  is reachable). Decline it and every change uses the standard admin prompt. Everything
+  once; after that the switches change instantly, with no prompt. Any program running under
+  your account could use the same four commands, so the worst it allows is keeping the Mac
+  awake or toggling Low Power. Decline it and every change uses the standard admin prompt. Everything
   else — menu-bar readings, battery extras, AI integrations, Launch at Login — sits under
   **⋯ › Settings**.
 - **Self-contained** — one binary, native AppKit, no runtime, no installer, no bundled
   helper, and no network requests unless you opt in. The only `sudo`-level actions are the
-  Keep Awake and Low Power switches, each behind Touch ID or the standard admin prompt.
+  Keep Awake and Low Power switches, through the optional four-command rule or the standard admin prompt.
 
 The main popover shows the fullest drive, battery, overall system pressure, and one
 quota row per AI provider. Claude normally overlays two full-height fills on the
@@ -200,14 +201,14 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   apps where possible.
 - **Keep Awake** — the footer switch flips the system `SleepDisabled` power setting by
   running `/usr/bin/pmset -a disablesleep 0|1` as root: through Apple's `osascript`
-  administrator prompt, or with `sudo -n` after Touch ID once the optional rule is installed.
+  administrator prompt, or with `sudo -n` once the optional rule is installed.
   No LaunchDaemon or helper is installed; the only privileged file is that opt-in rule
   (`/etc/sudoers.d/glancebar`, limited to four `pmset` commands, removable from Settings).
   This is the only reliable way to defeat clamshell (lid-close) sleep;
   `caffeinate`/`IOPMAssertion` prevent idle sleep only, never lid-close. `SleepDisabled`
   persists in the system power plist across restarts, so the button and the menu-bar cup
   both read the live setting, and Glancebar turns it off when it quits (silently with the
-  Touch ID rule; without it the setting stays until you switch it off — an awake Mac in a
+  one-click rule; without it the setting stays until you switch it off — an awake Mac in a
   closed bag can overheat).
 - **AI status** — Codex's limit gauge comes straight from its own session logs: each
   turn in `~/.codex/sessions/**.jsonl` (and rotated

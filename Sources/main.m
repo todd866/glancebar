@@ -8,7 +8,6 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <Network/Network.h>
-#import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
 #import <mach/mach.h>
@@ -268,14 +267,13 @@ static BOOL SetPmsetShellViaAdmin(NSString *shell, NSString *prompt) {
 // System Settings becomes plain on/off once toggled here.
 static BOOL LowPowerModeEnabled(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }
 
-// Touch ID for the pmset toggles. macOS's admin prompt only takes a typed password, and
-// Touch ID can't hand out root on its own, so the fast path is a one-time sudoers rule
-// (PmsetSudoersRule: exactly four pmset commands) plus a LocalAuthentication check before
-// each use — Touch ID, or the login password when no sensor is reachable (lid closed).
-// The rule, not the Touch ID check, is the security boundary: it is safe to leave open
-// because the worst it permits is toggling Low Power Mode or lid-close sleep.
+// One-click pmset toggles. macOS's admin prompt only takes a typed password, so the fast
+// path is a one-time sudoers rule (PmsetSudoersRule: exactly four pmset commands). The
+// rule is the security boundary, and the worst it permits is toggling Low Power Mode or
+// lid-close sleep. A Touch ID check in front of it guarded nothing (any process of this
+// user can run the same `sudo -n`), so the switches no longer ask (2026-10-06).
 static NSString *const kPmsetSudoersPath = @"/etc/sudoers.d/glancebar";
-static BOOL PmsetTouchIDInstalled(void) {
+static BOOL PmsetRuleInstalled(void) {
     return [NSFileManager.defaultManager fileExistsAtPath:kPmsetSudoersPath];
 }
 static BOOL RunPmsetViaSudo(NSString *setting, BOOL enable) {
@@ -285,19 +283,19 @@ static BOOL RunPmsetViaSudo(NSString *setting, BOOL enable) {
 // same-user process could swap before root reads it), checks it with visudo, then moves
 // it into place; a rule that fails visudo never lands. The rule text is fixed apart from
 // a user name PmsetSudoersRule has restricted to [A-Za-z0-9_.-].
-static BOOL InstallPmsetTouchID(void) {
+static BOOL InstallPmsetRule(void) {
     NSString *rule = PmsetSudoersRule(NSUserName());
     if (!rule) return NO;
     NSString *shell = [NSString stringWithFormat:
         @"umask 377; f=/etc/sudoers.d/.glancebar-new; /bin/rm -f $f; "
-        @"{ echo '# Installed by Glancebar for Touch ID power toggles. Delete this file to revoke.'; echo '%@'; } > $f "
+        @"{ echo '# Installed by Glancebar for one-click power toggles. Delete this file to revoke.'; echo '%@'; } > $f "
         @"&& /usr/sbin/visudo -cqf $f && /bin/chmod 0440 $f && /usr/sbin/chown root:wheel $f "
         @"&& /bin/mv -f $f %@ || { /bin/rm -f $f; exit 1; }", rule, kPmsetSudoersPath];
-    return SetPmsetShellViaAdmin(shell, @"Glancebar needs your password once to let Touch ID confirm Low Power and lid-sleep changes.");
+    return SetPmsetShellViaAdmin(shell, @"Glancebar needs your password once so Keep Awake and Low Power can switch without asking again.");
 }
-static BOOL RemovePmsetTouchID(void) {
+static BOOL RemovePmsetRule(void) {
     return SetPmsetShellViaAdmin([@"/bin/rm -f " stringByAppendingString:kPmsetSudoersPath],
-                                 @"Glancebar needs administrator access to remove its Touch ID rule.");
+                                 @"Glancebar needs administrator access to remove its power-switch rule.");
 }
 
 static NSArray<NSDictionary *> *SampleHogs(int topN) {
@@ -3732,7 +3730,6 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     dispatch_queue_t _pmsetQueue;
     BOOL _pmsetInFlight;
     volatile BOOL _terminating;
-    LAContext *_pmsetContext;
     NSUInteger _volumeScanGen;
     CFAbsoluteTime _volumeAbandonedAt;
     NSString *_barCapacityKey;
@@ -3797,7 +3794,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
 // briefly and abandon it.
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;
-    // Keep Awake must not outlive the app when the Touch ID rule can clear it without a
+    // Keep Awake must not outlive the app when the sudoers rule can clear it without a
     // prompt. The plist read is cheap; its pmset fallback and the sudo each sit under the
     // 8s task watchdog. Stay synchronous — the process is quitting — but don't give them
     // the main thread for longer than the shared budget.
@@ -3806,7 +3803,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // Not behind the pmset queue: an apply waiting on a password dialog would eat the budget.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSNumber *awake = SleepDisabledState();
-        if (awake.boolValue && PmsetTouchIDInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
+        if (awake.boolValue && PmsetRuleInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
         dispatch_semaphore_signal(pmsetDone);
     });
     if (dispatch_semaphore_wait(pmsetDone, dispatch_time(DISPATCH_TIME_NOW,
@@ -5856,10 +5853,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
-    _keepAwakeButton.toolTip = KeepAwakeTooltip(PmsetTouchIDInstalled());
+    _keepAwakeButton.toolTip = KeepAwakeTooltip(PmsetRuleInstalled());
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
     _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"tortoise.fill" action:@selector(toggleLowPowerMode:)];
-    _lowPowerButton.toolTip = @"System Low Power Mode. Changing it needs Touch ID or your administrator password.";
+    _lowPowerButton.toolTip = @"System Low Power Mode.";
     _lowPowerButton.accessibilityIdentifier = @"popover.lowPower";
     [self syncPowerButtons];
     [foot addSubview:_keepAwakeButton];
@@ -5962,8 +5959,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self addSection:m title:@"Battery"];
     [self settingsItem:m title:@"Current draw" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
     [self settingsItem:m title:@"Health" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
-    [self settingsItem:m title:@"Use Touch ID for Keep Awake & Low Power" action:@selector(toggleTouchIDRule:)
-                    on:PmsetTouchIDInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
+    [self settingsItem:m title:@"Keep Awake & Low Power without a password" action:@selector(togglePmsetRule:)
+                    on:PmsetRuleInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
 
     [self addSection:m title:@"AI status"];
     [self settingsItem:m title:@"Claude transcript token totals" action:@selector(toggleClaudeTranscripts:)
@@ -6059,9 +6056,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
         alert.messageText = @"Keep this Mac awake?";
-        alert.informativeText = PmsetTouchIDInstalled()
-            ? @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Glancebar switches it off when it quits; if it’s left on some other way, a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder."
-            : @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Without the Touch ID rule, Glancebar leaves it on when it quits; a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder.";
+        alert.informativeText = PmsetRuleInstalled()
+            ? @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). Glancebar switches it off when it quits; if it’s left on some other way, a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder."
+            : @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). Without the one-click setup it needs your password, and Glancebar leaves it on when it quits; a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder.";
         [alert addButtonWithTitle:@"Keep Awake"];
         [alert addButtonWithTitle:@"Cancel"];
         [NSApp activateIgnoringOtherApps:YES];
@@ -6092,11 +6089,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
               then:^{ [self syncPowerButtons]; }];
 }
 // Applies one pmset flag, then runs `then` on the main queue whatever happened (callers
-// re-read live state, so a cancel needs no rollback). With the Touch ID rule installed:
-// Touch ID, then `sudo -n`. Without it: offer the one-time setup once, else the password prompt.
+// re-read live state, so a cancel needs no rollback). With the rule installed: `sudo -n`,
+// no prompt. Without it: offer the one-time setup once, else the password prompt.
 - (void)applyPmset:(NSString *)setting on:(BOOL)on reason:(NSString *)reason then:(dispatch_block_t)then {
-    // The LocalAuthentication reply runs sudo/osascript off the main thread. A second
-    // click, or quit, must not start another one until this attempt finishes.
+    // sudo/osascript run off the main thread. A second click, or quit, must not start
+    // another one until this attempt finishes.
     if (!ShouldStartPmset(_pmsetInFlight)) return;
     _pmsetInFlight = YES;
     dispatch_queue_t work = [self pmsetWorkQueue];
@@ -6108,36 +6105,28 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     };
     NSString *adminPrompt = [NSString stringWithFormat:@"Glancebar needs administrator access to %@.", reason];
     NSString *command = [NSString stringWithFormat:@"/usr/bin/pmset -a %@ %d", setting, on ? 1 : 0];
-    if (PmsetTouchIDInstalled()) {
-        // Held until the reply: a context released mid-prompt cancels it, and with the
-        // in-flight guard a reply that never comes would lock both toggles.
-        LAContext *context = [LAContext new];
-        _pmsetContext = context;
-        [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:reason
-                                  reply:^(BOOL ok, __unused NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_pmsetContext = nil; });
-            dispatch_async(work, ^{
-                if (self->_terminating) { finish(); return; }   // never enable as the app quits
-                // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
-                if (ok && !RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
-                finish();
-            });
-        }];
+    if (PmsetRuleInstalled()) {
+        dispatch_async(work, ^{
+            if (self->_terminating) { finish(); return; }   // never enable as the app quits
+            // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
+            if (!RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
+            finish();
+        });
         return;
     }
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     if (![ud boolForKey:@"pmsetTouchIDOffered"]) {
         [ud setBool:YES forKey:@"pmsetTouchIDOffered"];
         NSAlert *alert = [NSAlert new];
-        alert.messageText = @"Use Touch ID for Low Power and lid sleep?";
-        alert.informativeText = @"macOS’s administrator prompt only takes a typed password. Glancebar can instead add a small rule to /etc/sudoers.d that lets your account run just these four commands—pmset lowpowermode 0/1 and disablesleep 0/1—and then confirm each change with Touch ID. You’ll type your password once to install it. Remove it any time from ⋯ › Settings.";
-        [alert addButtonWithTitle:@"Set Up Touch ID"];
+        alert.messageText = @"Switch Low Power and Keep Awake without a password?";
+        alert.informativeText = @"macOS asks for your administrator password every time these change. Glancebar can instead add a small rule to /etc/sudoers.d that lets your account run just these four commands—pmset lowpowermode 0/1 and disablesleep 0/1—so the switches work with one click. You’ll type your password once to install it. Remove it any time from ⋯ › Settings.";
+        [alert addButtonWithTitle:@"Set Up One-Click"];
         [alert addButtonWithTitle:@"Use Password"];
         [NSApp activateIgnoringOtherApps:YES];
         BOOL setUp = [alert runModal] == NSAlertFirstButtonReturn;
         dispatch_async(work, ^{
             // Just authenticated to install, so apply this first change without asking again.
-            if (!(setUp && InstallPmsetTouchID() && RunPmsetViaSudo(setting, on)))
+            if (!(setUp && InstallPmsetRule() && RunPmsetViaSudo(setting, on)))
                 SetPmsetShellViaAdmin(command, adminPrompt);
             finish();
         });
@@ -6148,10 +6137,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         finish();
     });
 }
-- (void)toggleTouchIDRule:(id)s {
-    BOOL installed = PmsetTouchIDInstalled();
+- (void)togglePmsetRule:(id)s {
+    BOOL installed = PmsetRuleInstalled();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if (installed) RemovePmsetTouchID(); else InstallPmsetTouchID();
+        if (installed) RemovePmsetRule(); else InstallPmsetRule();
     });
 }
 - (void)toggleWatts:(id)s {

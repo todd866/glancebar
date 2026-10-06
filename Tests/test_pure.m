@@ -1585,9 +1585,9 @@ int main(void) {
               @"the quit pmset budget is 3s total and never negative");
         NSString *tooltipOn = KeepAwakeTooltip(YES);
         NSString *tooltipOff = KeepAwakeTooltip(NO);
-        check([tooltipOn isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar switches it off when it quits."],
+        check([tooltipOn isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Glancebar switches it off when it quits."],
               @"with the sudoers rule, the Keep Awake tooltip says quit switches it off");
-        check([tooltipOff isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar leaves it on when it quits."],
+        check([tooltipOff isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Glancebar leaves it on when it quits."],
               @"without the sudoers rule, the Keep Awake tooltip says quit leaves it on");
         check(![tooltipOff containsString:@"switches it off"],
               @"without the rule the tooltip does not promise to switch Keep Awake off");

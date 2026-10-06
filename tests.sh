@@ -48,7 +48,7 @@ fi
     -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
     -framework CoreAudio \
     -framework IOKit \
-    -framework ServiceManagement -framework LocalAuthentication \
+    -framework ServiceManagement \
     -o "$WORK_DIR/glancebar_ai_reader_tests"
 
 "$WORK_DIR/glancebar_ai_reader_tests"
@@ -56,6 +56,6 @@ fi
 # Production AppKit layout, rendered without creating any visible windows.
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m tools/check-popover.m \
     -framework Cocoa -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework IOKit -framework ServiceManagement -framework LocalAuthentication \
+    -framework CoreAudio -framework IOKit -framework ServiceManagement \
     -o "$WORK_DIR/glancebar_popover_tests"
 "$WORK_DIR/glancebar_popover_tests"

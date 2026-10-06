@@ -1741,7 +1741,7 @@ double QuitPmsetBudgetRemaining(double elapsedSec) {
 }
 
 NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled) {
-    NSString *base = @"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. ";
+    NSString *base = @"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. ";
     return [base stringByAppendingString:sudoersRuleInstalled
             ? @"Glancebar switches it off when it quits."
             : @"Glancebar leaves it on when it quits."];
