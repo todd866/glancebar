@@ -8,7 +8,6 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <Network/Network.h>
-#import <SystemConfiguration/SystemConfiguration.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
@@ -3614,19 +3613,6 @@ static void PostSystemMediaKey(UInt32 keyCode) {
 static BOOL ChromeIsRunning(void) {
     return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
 }
-static BOOL DefaultRouteReachable(void) {
-    struct sockaddr_in zero = {0};
-    zero.sin_len = sizeof(zero);
-    zero.sin_family = AF_INET;
-    SCNetworkReachabilityRef ref = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr *)&zero);
-    if (!ref) return NO;
-    SCNetworkReachabilityFlags flags = 0;
-    Boolean ok = SCNetworkReachabilityGetFlags(ref, &flags);
-    CFRelease(ref);
-    if (!ok) return NO;
-    return (flags & kSCNetworkReachabilityFlagsReachable) &&
-           !(flags & kSCNetworkReachabilityFlagsConnectionRequired);
-}
 static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [NSTask new];
@@ -3639,35 +3625,81 @@ static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSSt
             dispatch_async(dispatch_get_main_queue(), ^{ done(@"", @"osascript failed to launch", 1); });
             return;
         }
-        [task waitUntilExit];
+        // osascript has no deadline. A hung Chrome, or a permission dialog nobody answers,
+        // would block this queue forever; terminate at 10s and force-kill at 11s.
+        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:10];
         NSString *output = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
         NSString *errorText = [[NSString alloc] initWithData:[err.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+        [task waitUntilExit];
+        [watchdog disarm];
         int status = task.terminationStatus;
+        if (task.terminationReason != NSTaskTerminationReasonExit) {
+            if (!errorText.length) errorText = @"osascript timed out";
+            if (status == 0) status = 1;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{ done(output, errorText, status); });
     });
 }
-static NSString *YouTubeMusicScript(void) {
-    return @"tell application \"Google Chrome\"\n"
-        "set js to \"(function(){function label(el){return ((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')).toLowerCase();}var buttons=document.querySelectorAll('button,[role=button],[role=switch]');var shuffle=null;for(var i=0;i<buttons.length;i++){var l=label(buttons[i]);if(l.indexOf('shuffle')!==-1){shuffle=buttons[i];break;}}var shuffleState='missing';if(shuffle){var sl=label(shuffle);var pressed=(shuffle.getAttribute('aria-pressed')||'').toLowerCase();var on=pressed==='true'||sl.indexOf('turn off shuffle')!==-1||sl.indexOf('shuffle on')!==-1||sl.indexOf('disable shuffle')!==-1;if(!on)shuffle.click();shuffleState='on';}function ws(c){return c===' '||c===String.fromCharCode(10)||c===String.fromCharCode(9);}function trim(s){s=s||'';while(s.length&&ws(s.charAt(0)))s=s.substring(1);while(s.length&&ws(s.charAt(s.length-1)))s=s.substring(0,s.length-1);return s;}function isCount(t){var low=t.toLowerCase();var sp=low.indexOf(' song');if(sp<1)return false;for(var i=0;i<sp;i++){var c=low.charAt(i);if(!((c>='0'&&c<='9')||c===','))return false;}var rest=low.substring(sp);return rest===' song'||rest===' songs';}var countText='';var nodes=document.querySelectorAll('yt-formatted-string, span');for(var j=0;j<nodes.length&&j<5000;j++){var t=trim(nodes[j].textContent||'');if(isCount(t)){countText=t;break;}}var play='';for(var k=0;k<buttons.length;k++){var pl=trim(label(buttons[k]));if(pl==='play'||pl==='pause'||pl.indexOf('play ')===0||pl.indexOf('pause ')===0){play=pl;break;}}return shuffleState+'|'+countText+'|'+play;})()\"\n"
+// One round trip finds the music.youtube.com tab and runs the action there.
+// status only reads. start is the one place shuffle is forced on, and only when
+// Glancebar itself is starting playback. The JS stays inside one double-quoted
+// AppleScript string, so it cannot contain a double quote; fields come back
+// separated by ASCII 31 (YouTubeStatusSeparator) because titles contain '|'.
+static NSString *YouTubeControlScript(NSString *action) {
+    if (![action isEqual:@"start"] && ![action isEqual:@"playpause"] &&
+        ![action isEqual:@"next"] && ![action isEqual:@"previous"])
+        action = @"status";
+    NSString *js = [NSString stringWithFormat:
+        @"(function(){var action='%@';"
+        "function ws(c){return c===' '||c===String.fromCharCode(10)||c===String.fromCharCode(9)||c===String.fromCharCode(13);}"
+        "function trim(s){s=s||'';while(s.length&&ws(s.charAt(0)))s=s.substring(1);while(s.length&&ws(s.charAt(s.length-1)))s=s.substring(0,s.length-1);return s;}"
+        "function label(el){return ((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')).toLowerCase();}"
+        "var bar=document.querySelector('ytmusic-player-bar');"
+        "var video=document.querySelector('video');"
+        "if(action==='playpause'){"
+        "if(video){if(video.paused){var pr=video.play();if(pr&&pr.catch)pr.catch(function(){var fb=document.querySelector('#play-pause-button');if(fb)fb.click();});}else video.pause();}"
+        "else{var pb=document.querySelector('#play-pause-button');if(pb)pb.click();}"
+        "}else if(action==='next'){"
+        "var nx=bar&&bar.querySelector('.next-button');if(nx)nx.click();"
+        "}else if(action==='previous'){"
+        "var pv=bar&&bar.querySelector('.previous-button');if(pv)pv.click();"
+        "}else if(action==='start'){"
+        "var buttons=document.querySelectorAll('button,[role=button],[role=switch]');"
+        "var shuffle=null;"
+        "for(var i=0;i<buttons.length;i++){var l=label(buttons[i]);if(l.indexOf('shuffle')!==-1){shuffle=buttons[i];break;}}"
+        "if(shuffle){var sl=label(shuffle);var pressed=(shuffle.getAttribute('aria-pressed')||'').toLowerCase();var on=pressed==='true'||sl.indexOf('turn off shuffle')!==-1||sl.indexOf('shuffle on')!==-1||sl.indexOf('disable shuffle')!==-1;if(!on)shuffle.click();}"
+        "if(video){if(video.paused){var sp=video.play();if(sp&&sp.catch)sp.catch(function(){var fb=document.querySelector('#play-pause-button');if(fb)fb.click();});}}"
+        "else{var sb=document.querySelector('#play-pause-button');if(sb){var sbl=label(sb);if(sbl.indexOf('pause')===-1)sb.click();}}"
+        "}"
+        "var playing='unknown';"
+        "if(video)playing=video.paused?'paused':'playing';"
+        "var title='';var artist='';"
+        "var session=navigator.mediaSession;var md=session&&session.metadata;"
+        "if(md&&(md.title||md.artist)){title=md.title||'';artist=md.artist||'';}"
+        "else if(bar){var te=bar.querySelector('.title');var be=bar.querySelector('.byline');title=te?(te.textContent||''):'';artist=be?(be.textContent||''):'';}"
+        "var us=String.fromCharCode(31);"
+        "function scrub(s){return trim(s).split(us).join('');}"
+        "title=scrub(title);artist=scrub(artist);"
+        "function isCount(t){var low=t.toLowerCase();var sp=low.indexOf(' song');if(sp<1)return false;for(var ci=0;ci<sp;ci++){var ch=low.charAt(ci);if(!((ch>='0'&&ch<='9')||ch===','))return false;}var rest=low.substring(sp);return rest===' song'||rest===' songs';}"
+        "var countText='';"
+        "var nodes=action==='start'?document.querySelectorAll('yt-formatted-string, span'):[];"
+        "for(var j=0;j<nodes.length&&j<5000;j++){var ct=trim(nodes[j].textContent||'');if(isCount(ct)){countText=ct;break;}}"
+        "return 'yes'+us+playing+us+title+us+artist+us+countText;})()",
+        action];
+    return [NSString stringWithFormat:
+        @"tell application \"Google Chrome\"\n"
+        "set js to \"%@\"\n"
         "repeat with w in windows\n"
         "repeat with t in tabs of w\n"
         "if (URL of t) contains \"music.youtube.com\" then return execute javascript js in t\n"
         "end repeat\n"
         "end repeat\n"
         "return \"\"\n"
-        "end tell";
+        "end tell", js];
 }
-static NSString *YouTubeTabScript(void) {
-    return @"tell application \"Google Chrome\"\n"
-        "set found to \"no\"\n"
-        "repeat with w in windows\n"
-        "repeat with t in tabs of w\n"
-        "if (URL of t) contains \"music.youtube.com\" then set found to \"yes\"\n"
-        "end repeat\n"
-        "end repeat\n"
-        "return found\n"
-        "end tell";
-}
+static NSString *const kYouTubeJSNote = @"Enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events to control playback";
+static NSString *const kYouTubeAutomationNote = @"Allow Glancebar to control Chrome: System Settings ▸ Privacy & Security ▸ Automation";
+static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing offline music";
 
 @implementation Controller {
     NSStatusItem *_item;
@@ -3721,13 +3753,20 @@ static NSString *YouTubeTabScript(void) {
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
     BOOL _networkKnown, _networkOnline;
     nw_path_monitor_t _pathMonitor;
-    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _musicHintVisible, _localMode, _localEmpty;
-    NSString *_localTitle, *_localArtist;
+    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _localMode, _localEmpty;
+    BOOL _ytJSDenied, _ytStartPending, _ytStatusInFlight, _offlineTracksEntering;
+    NSString *_localTitle, *_localArtist, *_ytTitle, *_ytArtist, *_musicNote;
     AVQueuePlayer *_localPlayer;
     NSArray<NSURL *> *_localURLs;
+    NSArray<AVPlayerItem *> *_localObservedItems;
     NSInteger _localIndex;
     NSUInteger _musicGen;
     BOOL _remoteCommandsOn;
+    NSTimer *_ytProbeTimer;
+    CFAbsoluteTime _ytTabOpenedAt;
+    NSArray<NSString *> *_offlineTracks;
+    CFAbsoluteTime _offlineTracksAt;
+    BOOL _offlineTracksReady;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -3896,6 +3935,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         BOOL changed = !self->_networkKnown || online != self->_networkOnline;
         self->_networkKnown = YES;
         self->_networkOnline = online;
+        // Coming back online while the offline player is paused (or finished) has to
+        // leave local mode now, or the next Play press is stuck toggling silence.
+        if (changed && !online) self->_offlineTracksEntering = YES;
+        if (changed && online) [self yieldLocalMusicIfIdle];
         if (changed && self->_popover.isShown) [self rebuildContent];
     });
     nw_path_monitor_start(monitor);
@@ -3906,12 +3949,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     return _networkKnown && !_networkOnline;
 }
 - (NSArray<NSString *> *)offlineTrackPaths {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL entering = _offlineTracksEntering;
+    _offlineTracksEntering = NO;
+    NSTimeInterval age = _offlineTracksReady ? now - _offlineTracksAt : 0;
+    // Rebuilding the popover used to list the folder every time. Refresh on the way
+    // into offline playback, and otherwise at most once a minute.
+    if (!OfflineTrackListStale(_offlineTracksReady, entering, age)) return _offlineTracks ?: @[];
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
     NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
         includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     for (NSURL *url in urls) if (url.path.length) [paths addObject:url.path];
-    return LikedMusicAudioFiles(paths);
+    _offlineTracks = LikedMusicAudioFiles(paths);
+    _offlineTracksAt = CFAbsoluteTimeGetCurrent();
+    _offlineTracksReady = YES;
+    return _offlineTracks;
 }
 - (void)publishNowPlaying {
     if (!_localMode) return;
@@ -3943,13 +3996,46 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
             if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) artist = item.stringValue;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (gen != self->_musicGen) return;
+            if (gen != self->_musicGen || !self->_localMode) return;
             if (title.length) self->_localTitle = title;
             if (artist.length) self->_localArtist = artist;
             [self publishNowPlaying];
             if (self->_popover.isShown) [self rebuildContent];
         });
     }];
+}
+- (void)tearDownLocalPlayer {
+    for (AVPlayerItem *item in _localObservedItems)
+        [NSNotificationCenter.defaultCenter removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    _localObservedItems = nil;
+    [_localPlayer pause];
+    _localPlayer = nil;
+}
+// The queue advances by itself and never updates the index, so Next would jump
+// backwards and the label would stay on the finished song. At the end, wrap the
+// same shuffle and keep going; otherwise the button sits on pause over silence.
+- (void)localItemEnded:(NSNotification *)note {
+    AVPlayerItem *item = [note.object isKindOfClass:AVPlayerItem.class] ? note.object : nil;
+    if (!item) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self advanceAfterLocalItem:item]; });
+        return;
+    }
+    [self advanceAfterLocalItem:item];
+}
+- (void)advanceAfterLocalItem:(AVPlayerItem *)item {
+    if (!_localMode || !_localPlayer || ![_localObservedItems containsObject:item]) return;
+    NSInteger next = _localIndex + 1;
+    if (next < 0 || next >= (NSInteger)_localURLs.count) {
+        [self playLocalIndex:0];
+        return;
+    }
+    _localIndex = next;
+    _playbackKnown = YES;
+    _playbackPlaying = YES;
+    [self applyLocalItemURL:_localURLs[_localIndex]];
+    [self publishNowPlaying];
+    if (_popover.isShown) [self rebuildContent];
 }
 - (void)playLocalIndex:(NSInteger)index {
     if (!_localURLs.count) return;
@@ -3959,8 +4045,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
     for (NSInteger i = index; i < (NSInteger)_localURLs.count; i++)
         [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
-    if (_localPlayer) [_localPlayer pause];
+    [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
+    _localObservedItems = items;
+    for (AVPlayerItem *item in items)
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(localItemEnded:) name:AVPlayerItemDidPlayToEndTimeNotification object:item];
     _localMode = YES;
     _localEmpty = NO;
     _playbackKnown = YES;
@@ -3976,9 +4065,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self disableRemoteCommands];
     NSArray<NSString *> *paths = [self offlineTrackPaths];
     if (!paths.count) {
+        [self tearDownLocalPlayer];
         _localMode = NO;
         _localEmpty = YES;
-        _localPlayer = nil;
         _localTitle = nil;
         _localArtist = nil;
         if (_popover.isShown) [self rebuildContent];
@@ -4004,75 +4093,205 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)noteYouTubeScript:(NSString *)output errorText:(NSString *)errorText {
-    if (ChromeJavaScriptEventsDenied(errorText) || ChromeJavaScriptEventsDenied(output)) {
-        if (![NSUserDefaults.standardUserDefaults boolForKey:@"youtubeMusicJSHintShown"]) {
-            _musicHintVisible = YES;
-            [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"youtubeMusicJSHintShown"];
-            if (_popover.isShown) [self rebuildContent];
-        }
-        return;
-    }
-    NSArray<NSString *> *lines = [output componentsSeparatedByString:[output containsString:@"|"] ? @"|" : @"\n"];
-    NSInteger count = lines.count > 1 ? ParsePlaylistCount(lines[1]) : ParsePlaylistCount(output);
-    if (count > 0) [self rememberLikedCount:count];
-    if (lines.count > 2) {
-        NSString *play = lines[2].lowercaseString;
-        if ([play containsString:@"pause"]) { _playbackKnown = YES; _playbackPlaying = YES; }
-        else if ([play containsString:@"play"]) { _playbackKnown = YES; _playbackPlaying = NO; }
-    }
+- (void)yieldLocalMusicIfIdle {
+    BOOL playing = _localPlayer.rate > 0;
+    if (!YieldLocalMusic(_localMode, _networkKnown && _networkOnline, playing)) return;
+    [self tearDownLocalPlayer];
+    _localMode = NO;
+    _localTitle = nil;
+    _localArtist = nil;
+    _playbackKnown = NO;
+    _playbackPlaying = NO;
+    [self disableRemoteCommands];
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)runYouTubeScriptAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
+- (void)stopLocalForYouTube {
+    [self tearDownLocalPlayer];
+    _localMode = NO;
+    _localEmpty = NO;
+    _localTitle = nil;
+    _localArtist = nil;
+    _playbackKnown = NO;
+    _playbackPlaying = NO;
+    [self disableRemoteCommands];
+}
+- (void)beginChromeFallback {
+    _musicNote = kYouTubeChromeNote;
+    if (_localMode && _localPlayer.rate > 0) {
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    _offlineTracksEntering = YES;
+    [self startOfflinePlayback];
+}
+- (void)startYouTubeProbeTimer {
+    if (_ytProbeTimer) return;
+    _ytProbeTimer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(youTubeProbeTimerFired:) userInfo:nil repeats:YES];
+}
+- (void)stopYouTubeProbeTimer {
+    [_ytProbeTimer invalidate];
+    _ytProbeTimer = nil;
+}
+- (void)youTubeProbeTimerFired:(NSTimer *)timer {
+    (void)timer;
+    if (!_popover.isShown || !_ytTabOpen) { [self stopYouTubeProbeTimer]; return; }
+    if (_ytStatusInFlight) return;
+    [self runYouTubeStatusAfter:0 generation:_musicGen];
+}
+- (void)applyYouTubeStatus:(NSDictionary *)status updateTransport:(BOOL)updateTransport {
+    NSString *denied = [status[@"denied"] isKindOfClass:NSString.class] ? status[@"denied"] : @"";
+    // The hint follows the last script. A later success clears it; it is not a one-shot default.
+    if ([denied isEqual:@"javascript"]) {
+        _musicNote = kYouTubeJSNote;
+        _ytJSDenied = YES;
+        _ytTabOpen = YES;
+    } else if ([denied isEqual:@"automation"]) {
+        _musicNote = kYouTubeAutomationNote;
+        _ytJSDenied = NO;
+        [self stopYouTubeProbeTimer];
+    } else {
+        _ytJSDenied = NO;
+        if ([_musicNote isEqualToString:kYouTubeJSNote] || [_musicNote isEqualToString:kYouTubeAutomationNote])
+            _musicNote = nil;
+        BOOL tab = [status[@"tab"] boolValue];
+        if (tab) {
+            _ytTabOpen = YES;
+            if ([_musicNote isEqualToString:kYouTubeChromeNote]) _musicNote = nil;
+            if (updateTransport && [status[@"playing"] isKindOfClass:NSNumber.class]) {
+                _playbackKnown = YES;
+                _playbackPlaying = [status[@"playing"] boolValue];
+            }
+            // A command's own return can still be the pre-play title. Don't blank a label we have.
+            if ([status[@"title"] isKindOfClass:NSString.class] && (updateTransport || [status[@"title"] length] || !_ytTitle.length))
+                _ytTitle = status[@"title"];
+            if ([status[@"artist"] isKindOfClass:NSString.class] && (updateTransport || [status[@"artist"] length] || !_ytArtist.length))
+                _ytArtist = status[@"artist"];
+            NSInteger count = [status[@"count"] integerValue];
+            if (count > 0) [self rememberLikedCount:count];
+        } else {
+            _ytTabOpen = NO;
+            _playbackKnown = NO;
+            _playbackPlaying = NO;
+            _ytTitle = nil;
+            _ytArtist = nil;
+        }
+    }
+    // Automation denial has nothing to poll: another tell would just wait on the same dialog.
+    if ([denied isEqual:@"automation"] || !_popover.isShown || !_ytTabOpen) [self stopYouTubeProbeTimer];
+    else [self startYouTubeProbeTimer];
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)noteYouTubeScript:(NSString *)output errorText:(NSString *)errorText status:(int)status updateTransport:(BOOL)updateTransport {
+    NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+    // A timeout or a launch failure is not "no tab". Leave the last known state alone.
+    if ([parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0) return;
+    [self applyYouTubeStatus:parsed updateTransport:updateTransport];
+}
+- (void)runYouTubeStatusAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (generation != self->_musicGen || !self->_musicProbesEnabled || !ChromeIsRunning()) return;
-        RunAppleScript(YouTubeMusicScript(), ^(NSString *output, NSString *errorText, int status) {
-            (void)status;
+        if (generation != self->_musicGen || !self->_musicProbesEnabled) return;
+        if (!ChromeIsRunning()) {
+            if (self->_ytTabOpen) {
+                self->_ytTabOpen = NO;
+                self->_playbackKnown = NO;
+                [self stopYouTubeProbeTimer];
+                if (self->_popover.isShown) [self rebuildContent];
+            }
+            return;
+        }
+        // A tell application block launches Chrome when it is not running. Probes must not.
+        self->_ytStatusInFlight = YES;
+        RunAppleScript(YouTubeControlScript(@"status"), ^(NSString *output, NSString *errorText, int status) {
+            self->_ytStatusInFlight = NO;
             if (generation != self->_musicGen) return;
-            [self noteYouTubeScript:output errorText:errorText];
+            [self noteYouTubeScript:output errorText:errorText status:status updateTransport:YES];
         });
     });
 }
-- (void)refreshYouTubeTab {
-    if (!_musicProbesEnabled) return;
-    if (!ChromeIsRunning()) {
-        if (_ytTabOpen) { _ytTabOpen = NO; if (_popover.isShown) [self rebuildContent]; }
-        return;
-    }
-    RunAppleScript(YouTubeTabScript(), ^(NSString *output, NSString *errorText, int status) {
-        (void)errorText; (void)status;
-        BOOL open = [output.lowercaseString containsString:@"yes"];
-        if (open == self->_ytTabOpen) return;
-        self->_ytTabOpen = open;
-        if (!open) { self->_playbackKnown = NO; }
-        if (self->_popover.isShown) [self rebuildContent];
+// Retries only while the player bar is missing, so shuffle is clicked once the page is actually there.
+- (void)runYouTubeStartGeneration:(NSUInteger)generation delay:(NSTimeInterval)delay attemptsLeft:(NSInteger)attemptsLeft {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self->_musicGen || !self->_musicProbesEnabled || !ChromeIsRunning()) return;
+        RunAppleScript(YouTubeControlScript(@"start"), ^(NSString *output, NSString *errorText, int status) {
+            if (generation != self->_musicGen) return;
+            NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+            BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
+            if (!unanswered) [self applyYouTubeStatus:parsed updateTransport:YES];
+            if ([parsed[@"denied"] isEqual:@"javascript"]) {
+                PostSystemMediaKey(NX_KEYTYPE_PLAY);
+                return;
+            }
+            BOOL known = [parsed[@"playing"] isKindOfClass:NSNumber.class] || [parsed[@"title"] length] > 0 || [parsed[@"count"] integerValue] > 0;
+            BOOL ready = [parsed[@"tab"] boolValue] && [parsed[@"denied"] isEqual:@""] && known;
+            if (!ready && attemptsLeft > 0 && [parsed[@"denied"] isEqual:@""]) {
+                NSTimeInterval next = attemptsLeft >= 2 ? 4 : 6;
+                [self runYouTubeStartGeneration:generation delay:next attemptsLeft:attemptsLeft - 1];
+            } else if (ready) {
+                [self runYouTubeStatusAfter:0.3 generation:generation];
+            }
+        });
     });
 }
-- (void)startYouTubePlayback {
-    if (!_musicProbesEnabled) return;
+- (void)playExistingYouTubeTabGeneration:(NSUInteger)generation {
+    [self stopLocalForYouTube];
+    _ytTabOpen = YES;
+    if (_popover.isShown) [self rebuildContent];
+    [self runYouTubeStartGeneration:generation delay:0 attemptsLeft:2];
+}
+- (void)openYouTubeTab {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!YouTubeNewTabAllowed(now, _ytTabOpenedAt)) return;
+    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
     NSString *urlString = YouTubeLikedMusicURL(arc4random(), [self likedCountEstimate]);
     NSURL *url = [NSURL URLWithString:urlString];
-    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
-    if (!url || !chrome) { [self startOfflinePlayback]; return; }
+    if (!url || !chrome) { [self beginChromeFallback]; return; }
+    _ytTabOpenedAt = now;
+    NSUInteger generation = ++_musicGen;
     NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
     config.activates = NO;
-    NSUInteger generation = ++_musicGen;
     [NSWorkspace.sharedWorkspace openURLs:@[url] withApplicationAtURL:chrome configuration:config
                         completionHandler:^(NSRunningApplication *app, NSError *error) {
         (void)app;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (error) { [self startOfflinePlayback]; return; }
+            if (generation != self->_musicGen) return;
+            if (error) { [self beginChromeFallback]; return; }
+            if ([self->_musicNote isEqualToString:kYouTubeChromeNote]) self->_musicNote = nil;
+            [self stopLocalForYouTube];
             self->_ytTabOpen = YES;
-            self->_localMode = NO;
-            self->_localEmpty = NO;
-            [self disableRemoteCommands];
-            self->_localPlayer = nil;
             if (self->_popover.isShown) [self rebuildContent];
-            [self runYouTubeScriptAfter:2 generation:generation];
-            [self runYouTubeScriptAfter:6 generation:generation];
-            [self runYouTubeScriptAfter:12 generation:generation];
+            [self runYouTubeStartGeneration:generation delay:2 attemptsLeft:2];
         });
     }];
+}
+- (void)startYouTubePlayback {
+    if (!_musicProbesEnabled || _ytStartPending) return;
+    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
+    if (!chrome) { [self beginChromeFallback]; return; }
+    // Chrome is not running, so there is no tab to reuse. openURLs launches it.
+    if (!ChromeIsRunning()) { [self openYouTubeTab]; return; }
+    _ytStartPending = YES;
+    NSUInteger generation = ++_musicGen;
+    RunAppleScript(YouTubeControlScript(@"status"), ^(NSString *output, NSString *errorText, int status) {
+        self->_ytStartPending = NO;
+        if (generation != self->_musicGen) return;
+        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+        if ([parsed[@"denied"] isEqual:@"automation"]) {
+            [self applyYouTubeStatus:parsed updateTransport:YES];
+            [self openYouTubeTab];
+            return;
+        }
+        if ([parsed[@"tab"] boolValue]) {
+            if ([parsed[@"denied"] isEqual:@"javascript"]) {
+                [self applyYouTubeStatus:parsed updateTransport:YES];
+                PostSystemMediaKey(NX_KEYTYPE_PLAY);
+                return;
+            }
+            [self playExistingYouTubeTabGeneration:generation];
+            return;
+        }
+        if (status != 0) return;
+        [self openYouTubeTab];
+    });
 }
 - (NSInteger)remotePlay:(id)event {
     (void)event; if (_localPlayer.rate == 0) [self toggleLocalPlayback];
@@ -4091,21 +4310,42 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 - (NSInteger)remotePrevious:(id)event {
     (void)event; [self musicPrevious:nil]; return 0;
 }
+- (void)sendYouTubeCommand:(NSString *)action key:(UInt32)key {
+    if (!_musicProbesEnabled) return;
+    if (!ChromeIsRunning()) {
+        _ytTabOpen = NO;
+        _playbackKnown = NO;
+        [self stopYouTubeProbeTimer];
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    NSUInteger generation = ++_musicGen;
+    // The pill keeps the last probed icon until the follow-up read. play() is async,
+    // so the script's own return can still say paused.
+    if (_ytJSDenied) {
+        PostSystemMediaKey(key);
+        [self runYouTubeStatusAfter:0.3 generation:generation];
+        return;
+    }
+    RunAppleScript(YouTubeControlScript(action), ^(NSString *output, NSString *errorText, int status) {
+        if (generation != self->_musicGen) return;
+        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+        BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
+        if ([parsed[@"denied"] isEqual:@"javascript"]) {
+            [self applyYouTubeStatus:parsed updateTransport:NO];
+            PostSystemMediaKey(key);
+        } else if (!unanswered) {
+            [self applyYouTubeStatus:parsed updateTransport:NO];
+        }
+        [self runYouTubeStatusAfter:0.3 generation:generation];
+    });
+}
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
     if (_localMode) { [self toggleLocalPlayback]; return; }
-    if (_ytTabOpen) {
-        PostSystemMediaKey(NX_KEYTYPE_PLAY);
-        if (_playbackKnown) _playbackPlaying = !_playbackPlaying;
-        if (_popover.isShown) [self rebuildContent];
-        [self runYouTubeScriptAfter:0.4 generation:++_musicGen];
-        return;
-    }
-    BOOL online = _networkKnown ? _networkOnline : DefaultRouteReachable();
-    _networkKnown = YES;
-    _networkOnline = online;
-    if (!online) { [self startOfflinePlayback]; return; }
+    if (_ytTabOpen) { [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY]; return; }
+    if (_networkKnown && !_networkOnline) { [self startOfflinePlayback]; return; }
     [self startYouTubePlayback];
 }
 - (IBAction)musicPrevious:(id)sender {
@@ -4117,13 +4357,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         [self playLocalIndex:_localIndex - 1];
         return;
     }
-    if (_ytTabOpen) PostSystemMediaKey(NX_KEYTYPE_PREVIOUS);
+    if (_ytTabOpen) [self sendYouTubeCommand:@"previous" key:NX_KEYTYPE_PREVIOUS];
 }
 - (IBAction)musicNext:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
     if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
-    if (_ytTabOpen) PostSystemMediaKey(NX_KEYTYPE_NEXT);
+    if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
 }
 - (NSButton *)musicPill:(NSString *)title symbol:(NSString *)symbol action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
     PillButton *button = [PillButton buttonWithTitle:title target:self action:action];
@@ -4150,8 +4390,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         NSArray *tracks = [self offlineTrackPaths];
         _localEmpty = tracks.count == 0;
     }
-    if (_localTitle.length && _localMode) {
-        NSString *line = _localArtist.length ? [NSString stringWithFormat:@"%@ — %@", _localArtist, _localTitle] : _localTitle;
+    NSString *trackTitle = nil, *trackArtist = nil;
+    if (_localMode && _localTitle.length) {
+        trackTitle = _localTitle;
+        trackArtist = _localArtist;
+    } else if (!_localMode && _ytTabOpen && _ytTitle.length) {
+        trackTitle = _ytTitle;
+        trackArtist = _ytArtist;
+    }
+    if (trackTitle.length) {
+        NSString *line = trackArtist.length ? [NSString stringWithFormat:@"%@ — %@", trackArtist, trackTitle] : trackTitle;
         NSTextField *track = [self text:line font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
                                    color:nil at:NSMakeRect(kPad, y, kW - 2*kPad, 32) align:NSTextAlignmentLeft];
         track.lineBreakMode = NSLineBreakByWordWrapping;
@@ -4166,7 +4414,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                                    align:NSTextAlignmentLeft];
         empty.accessibilityIdentifier = @"popover.music.empty";
         [root addSubview:empty];
-        return y + 20;
+        return [self addMusicNoteTo:root at:y + 20];
     }
     NSString *symbol = @"play.fill", *title = @"Play music", *label = @"Play music";
     if (showTransport) {
@@ -4192,18 +4440,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
         next.frame = NSMakeRect(x, y, next.frame.size.width, 22);
         [root addSubview:next];
     }
-    y += 26;
-    if (_musicHintVisible) {
-        NSTextField *hint = [self text:@"Enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events for shuffle"
-                                  font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                                    at:NSMakeRect(kPad, y, kW - 2*kPad, 28) align:NSTextAlignmentLeft];
-        hint.lineBreakMode = NSLineBreakByWordWrapping;
-        hint.maximumNumberOfLines = 2;
-        hint.accessibilityIdentifier = @"popover.music.hint";
-        [root addSubview:hint];
-        y += 30;
-    }
-    return y;
+    return [self addMusicNoteTo:root at:y + 26];
+}
+- (CGFloat)addMusicNoteTo:(NSView *)root at:(CGFloat)y {
+    if (!_musicNote.length) return y;
+    NSFont *font = [NSFont systemFontOfSize:10.5];
+    CGFloat width = kW - 2 * kPad;
+    CGFloat textH = MIN(42, MAX(14, [self soundNameHeight:_musicNote font:font width:width]));
+    NSTextField *hint = [self text:_musicNote font:font color:NSColor.secondaryLabelColor
+                                at:NSMakeRect(kPad, y, width, textH) align:NSTextAlignmentLeft];
+    hint.lineBreakMode = NSLineBreakByWordWrapping;
+    hint.maximumNumberOfLines = 3;
+    hint.accessibilityIdentifier = @"popover.music.hint";
+    [root addSubview:hint];
+    return y + textH + 4;
 }
 - (CGFloat)soundNameHeight:(NSString *)name font:(NSFont *)font width:(CGFloat)width {
     if (!name.length) return 16;
@@ -4915,9 +5165,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     _popoverScroll = nil;
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
     [self refresh];
+    // Opening the panel is one of the two moments local mode can get out of the way.
+    if (_musicProbesEnabled) [self yieldLocalMusicIfIdle];
     [self rebuildContent];
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
-    if (_musicProbesEnabled) [self refreshYouTubeTab];
+    if (_musicProbesEnabled) [self runYouTubeStatusAfter:0 generation:_musicGen];
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
     // stays invisible until something scrolls it — so the sections below the fold (AI
     // Status is the last one) look like they do not exist. Flash it on open only: the
@@ -4937,6 +5189,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // outside click, second icon click, or Escape — which is exactly the set we want to guard.
 - (void)popoverWillClose:(NSNotification *)note {
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
+    [self stopYouTubeProbeTimer];
 }
 
 // Starts both process samplers, invalidating any still-in-flight results: top takes

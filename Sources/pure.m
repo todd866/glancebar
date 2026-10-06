@@ -1516,8 +1516,72 @@ NSInteger ParsePlaylistCount(NSString *text) {
 BOOL ChromeJavaScriptEventsDenied(NSString *errorText) {
     if (![errorText isKindOfClass:NSString.class] || !errorText.length) return NO;
     NSString *s = errorText.lowercaseString;
+    // Recent Chrome reports a profile with the setting off as a bare "Access not allowed"
+    // (-1723) on `execute javascript`, without naming the setting (seen 2026-10-06).
     return [s containsString:@"allow javascript from apple events"] ||
-           [s containsString:@"javascript through applescript"];
+           [s containsString:@"javascript through applescript"] ||
+           [s containsString:@"access not allowed"] || [s containsString:@"(-1723)"];
+}
+
+BOOL ChromeAutomationDenied(NSString *errorText) {
+    if (![errorText isKindOfClass:NSString.class] || !errorText.length) return NO;
+    NSString *s = errorText.lowercaseString;
+    return [s containsString:@"not authorized to send apple events"] || [s containsString:@"(-1743)"];
+}
+
+NSString *const YouTubeStatusSeparator = @"\x1f";
+
+static NSString *YouTubeStatusField(NSArray<NSString *> *fields, NSUInteger index) {
+    if (index >= fields.count) return @"";
+    NSString *field = fields[index];
+    if (![field isKindOfClass:NSString.class]) return @"";
+    return [field stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText) {
+    NSString *out = [output isKindOfClass:NSString.class] ? output : @"";
+    NSString *err = [errorText isKindOfClass:NSString.class] ? errorText : @"";
+    // A real status line always carries the separator, so a denial phrase inside a title
+    // is not Chrome's error. Text with no separator is osascript complaining.
+    BOOL looksLikeStatus = [out containsString:YouTubeStatusSeparator];
+    NSString *diagnostic = looksLikeStatus ? err : [err stringByAppendingString:out];
+    NSString *denied = @"";
+    if (ChromeAutomationDenied(diagnostic)) denied = @"automation";
+    else if (ChromeJavaScriptEventsDenied(diagnostic)) denied = @"javascript";
+
+    NSString *trimmed = [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSArray<NSString *> *fields = looksLikeStatus ? [trimmed componentsSeparatedByString:YouTubeStatusSeparator] : @[];
+    BOOL tab = [YouTubeStatusField(fields, 0) caseInsensitiveCompare:@"yes"] == NSOrderedSame;
+    id playing = [NSNull null];
+    NSString *state = YouTubeStatusField(fields, 1).lowercaseString;
+    if ([state isEqual:@"playing"]) playing = @YES;
+    else if ([state isEqual:@"paused"]) playing = @NO;
+    NSString *title = YouTubeStatusField(fields, 2);
+    NSString *artist = YouTubeStatusField(fields, 3);
+    NSInteger count = ParsePlaylistCount(YouTubeStatusField(fields, 4));
+    // JavaScript is refused only after a music tab was found and execute javascript ran.
+    // Automation is refused before any tab can be seen.
+    if ([denied isEqual:@"automation"]) {
+        tab = NO; playing = [NSNull null]; title = @""; artist = @""; count = 0;
+    } else if ([denied isEqual:@"javascript"]) {
+        tab = YES; playing = [NSNull null]; title = @""; artist = @""; count = 0;
+    }
+    return @{@"tab": @(tab), @"playing": playing, @"title": title, @"artist": artist,
+             @"count": @(count), @"denied": denied};
+}
+
+BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing) {
+    return localMode && networkOnline && !playing;
+}
+
+BOOL YouTubeNewTabAllowed(NSTimeInterval now, NSTimeInterval lastOpen) {
+    if (lastOpen <= 0) return YES;
+    return now - lastOpen >= 60;
+}
+
+BOOL OfflineTrackListStale(BOOL haveCache, BOOL enteringOffline, NSTimeInterval ageSeconds) {
+    if (!haveCache || enteringOffline) return YES;
+    return ageSeconds >= 60;
 }
 
 static uint32_t TrackRNG(uint32_t *state) {

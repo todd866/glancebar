@@ -1443,6 +1443,8 @@ int main(void) {
             check(ChromeJavaScriptEventsDenied(@"Executing JavaScript through AppleScript is turned off. Allow JavaScript from Apple Events") &&
                   !ChromeJavaScriptEventsDenied(@"missing shuffle"),
                   @"music: the Chrome JavaScript permission error is recognised");
+        check(ChromeJavaScriptEventsDenied(@"159:573: execution error: Can’t get \"(function(){})()\" in t. Access not allowed. (-1723)"),
+              @"music: Chrome's bare -1723 Access not allowed counts as the JavaScript setting");
             NSArray *files = @[@"/tmp/a.mp3", @"/tmp/.skip.m4a", @"Artist - Title [abc_1].m4a",
                                @"/Music/YouTube Liked/Other - Song [Zz9].M4A", @"note.txt"];
             NSArray *kept = LikedMusicAudioFiles(files);
@@ -1464,6 +1466,52 @@ int main(void) {
             check(![ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 7)
                     isEqual:ShuffledTrackOrder(@[@"a", @"b", @"c", @"d", @"e"], 8)],
                   @"music: a different seed changes the order");
+
+            check(YouTubeStatusSeparator.length == 1 && [YouTubeStatusSeparator characterAtIndex:0] == 31,
+                  @"music: status fields are split on the unit separator");
+            NSString *playingLine = [@[@"yes", @"playing", @"Song | Live", @"The Band", @"1,234 songs"]
+                                     componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *playing = ParseYouTubeStatus(playingLine, nil);
+            check([playing[@"tab"] boolValue] && [playing[@"playing"] isEqual:@YES] &&
+                  [playing[@"title"] isEqual:@"Song | Live"] && [playing[@"artist"] isEqual:@"The Band"] &&
+                  [playing[@"count"] integerValue] == 1234 && [playing[@"denied"] isEqual:@""],
+                  @"music: playing status keeps a title that contains a pipe");
+            NSString *pausedLine = [@[@"yes", @"paused", @"Title", @"Artist", @""]
+                                    componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *paused = ParseYouTubeStatus(pausedLine, @"");
+            check([paused[@"tab"] boolValue] && [paused[@"playing"] isEqual:@NO] &&
+                  [paused[@"title"] isEqual:@"Title"] && [paused[@"artist"] isEqual:@"Artist"] &&
+                  [paused[@"count"] integerValue] == 0 && [paused[@"denied"] isEqual:@""],
+                  @"music: paused status");
+            NSDictionary *none = ParseYouTubeStatus(@"\n", nil);
+            check(![none[@"tab"] boolValue] && none[@"playing"] == (id)NSNull.null &&
+                  [none[@"title"] isEqual:@""] && [none[@"artist"] isEqual:@""] &&
+                  [none[@"count"] integerValue] == 0 && [none[@"denied"] isEqual:@""],
+                  @"music: no tab");
+            NSDictionary *jsDenied = ParseYouTubeStatus(@"", @"Executing JavaScript through AppleScript is turned off. Allow JavaScript from Apple Events");
+            check([jsDenied[@"denied"] isEqual:@"javascript"] && [jsDenied[@"tab"] boolValue] &&
+                  jsDenied[@"playing"] == (id)NSNull.null,
+                  @"music: JavaScript-from-Apple-Events denial");
+            NSDictionary *autoDenied = ParseYouTubeStatus(@"", @"Not authorized to send Apple events to Google Chrome. (-1743)");
+            check([autoDenied[@"denied"] isEqual:@"automation"] && ![autoDenied[@"tab"] boolValue] &&
+                  ChromeAutomationDenied(autoDenied ? @"Not authorized to send Apple events to Google Chrome. (-1743)" : nil) &&
+                  !ChromeAutomationDenied(@"missing value"),
+                  @"music: Automation denial");
+            NSString *phraseTitle = [@[@"yes", @"playing", @"Not authorized to send Apple events", @"Artist", @"200"]
+                                     componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *phrase = ParseYouTubeStatus(phraseTitle, @"");
+            check([phrase[@"denied"] isEqual:@""] && [phrase[@"title"] isEqual:@"Not authorized to send Apple events"],
+                  @"music: a title that mentions Apple events is not an Automation error");
+            check(ParseYouTubeStatus(nil, nil) != nil, @"music: nil script output still returns a status");
+            check(YieldLocalMusic(YES, YES, NO) && !YieldLocalMusic(YES, YES, YES) &&
+                  !YieldLocalMusic(YES, NO, NO) && !YieldLocalMusic(NO, YES, NO),
+                  @"music: local mode yields only when online and idle");
+            check(YouTubeNewTabAllowed(1000, 0) && YouTubeNewTabAllowed(1000, 940) &&
+                  !YouTubeNewTabAllowed(1000, 950) && !YouTubeNewTabAllowed(1000, 1000),
+                  @"music: a new YouTube tab is allowed at most once a minute");
+            check(OfflineTrackListStale(NO, NO, 0) && OfflineTrackListStale(YES, YES, 1) &&
+                  OfflineTrackListStale(YES, NO, 60) && !OfflineTrackListStale(YES, NO, 59),
+                  @"music: the offline list refreshes on entry and after 60 seconds");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

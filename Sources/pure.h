@@ -429,6 +429,23 @@ NSString *YouTubeLikedMusicURL(uint32_t seed, NSInteger count);
 NSInteger ParsePlaylistCount(NSString *text);
 // Chrome's AppleScript error when View ▸ Developer ▸ Allow JavaScript from Apple Events is off.
 BOOL ChromeJavaScriptEventsDenied(NSString *errorText);
+// osascript's -1743: Glancebar is not allowed to send Apple events to Chrome.
+BOOL ChromeAutomationDenied(NSString *errorText);
+
+// ASCII unit separator (character 31). Status fields use it because song titles contain '|'.
+extern NSString *const YouTubeStatusSeparator;
+// One AppleScript round trip. Fields, in order: tab ("yes"/"no"), state ("playing"/"paused"/
+// other), title, artist, playlist-count text. Keys: tab (BOOL), playing (YES/NO or NSNull
+// when the page did not say), title, artist, count (0 when it is not a count), denied
+// (@"javascript", @"automation", or @""). Nil inputs are an empty result, not a crash.
+NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText);
+
+// The offline player is in the way: online, local mode, and not actually playing.
+BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing);
+// lastOpen <= 0 means Glancebar has not opened a tab. Otherwise at most one open per 60s.
+BOOL YouTubeNewTabAllowed(NSTimeInterval now, NSTimeInterval lastOpen);
+// Entering offline always rereads the folder; otherwise the list is good for 60 seconds.
+BOOL OfflineTrackListStale(BOOL haveCache, BOOL enteringOffline, NSTimeInterval ageSeconds);
 
 // Fisher–Yates order of the input paths/names. Stable for a given seed. Nil and empty in → empty.
 NSArray<NSString *> *ShuffledTrackOrder(NSArray<NSString *> *names, uint32_t seed);

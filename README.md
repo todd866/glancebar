@@ -43,12 +43,16 @@ opt-in) `/usr/bin/security`.
   unless they are already the default. Sound is not a menu bar segment.
 - **Play music** — the Sound section plays your YouTube Music Liked Music, shuffled, from
   a random song, in the signed-in Google Chrome profile and without bringing Chrome
-  forward. A later press pauses or resumes with the system media key when that tab is
-  already open; previous and next appear beside it. If Chrome is not set to allow
-  JavaScript from Apple Events, playback still starts at the random song and the popover
-  says so once. Offline, or if Chrome cannot open, the same buttons play the m4a files in
+  forward. Play, pause, previous, and next run in that music.youtube.com tab, and the
+  popover shows the artist and title. While the popover is open, Glancebar re-reads the
+  tab every few seconds. Shuffle is turned on when Glancebar starts playback, not on
+  every refresh. If Chrome is not set to allow JavaScript from Apple Events, the buttons
+  fall back to the system media key and the popover says how to turn that on. If
+  Glancebar is not allowed to control Chrome, it says so and will not keep opening tabs.
+  Offline, or if Chrome cannot open, the same buttons play the m4a files in
   `~/Music/YouTube Liked/` through Glancebar’s own player, shuffled, with the track’s
-  title and artist. An empty folder says “No offline music”. Glancebar does not fetch
+  title and artist; once the network is back and that player is paused, the next press
+  returns to YouTube. An empty folder says “No offline music”. Glancebar does not fetch
   YouTube itself.
 - **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
   swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
