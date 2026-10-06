@@ -216,6 +216,19 @@ NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows);
 // revoked it); drop it so the next attempt re-reads the Keychain.
 BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);
 
+// The `exp` claim of a JWT, in epoch seconds; 0 when the token is not a readable JWT.
+double JWTExpiryEpoch(NSString *jwt);
+
+// Cursor keeps one session per client: the desktop app in state.vscdb, the CLI in the
+// Keychain. Whichever client ran last holds the live one, so choose the unexpired token
+// that expires latest. A token whose expiry cannot be read is a last resort; nil when
+// every readable token has expired. `expired` (optional) reports that case.
+NSString *FreshestSessionToken(NSArray<NSString *> *tokens, double nowEpoch, BOOL *expired);
+
+// What an account row says after an HTTP failure: a 401/403 names the fix (sign in again
+// in `client`) instead of echoing the server's bare "Error".
+NSString *AccountFetchFailureStatus(NSInteger statusCode, NSString *message, NSString *client);
+
 // Classifies a Keychain credential read. Missing/denied/empty backs off an hour (each
 // retry may prompt the user); an expired token retries in 5 minutes (Claude Code
 // refreshes it quickly, and re-reading an item we already have ACL access to never

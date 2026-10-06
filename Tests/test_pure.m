@@ -752,6 +752,52 @@ int main(void) {
         check([mixedPick[@"window"] isEqual:@"billing period"],
               @"cursor planUsage overrides legacy auth buckets");
 
+        // Current GetCurrentPeriodUsage shape (captured 2026-10-06): no `remaining`, separate
+        // Auto and API pools, and a blended totalPercentUsed that hides the spent API pool.
+        NSDictionary *cursorPools = @{
+            @"billingCycleStart": @"1791030271000",
+            @"billingCycleEnd": @"1793708671000",
+            @"planUsage": @{@"totalSpend": @121695, @"includedSpend": @40000, @"bonusSpend": @81695,
+                            @"limit": @40000, @"remainingBonus": @NO,
+                            @"autoPercentUsed": @30.373666666666665, @"apiPercentUsed": @61.148,
+                            @"totalPercentUsed": @34.77},
+            @"spendLimitUsage": @{@"limitType": @"user"},
+            @"enabled": @YES,
+            @"displayMessage": @"You've hit your usage limit"
+        };
+        NSArray *poolWins = CursorLimitWindows(cursorPools, 1791246033.0);
+        check(poolWins.count == 2 && [poolWins[0][@"window"] isEqual:@"API models"]
+                  && [poolWins[1][@"window"] isEqual:@"Auto"], @"cursor pools surface API and Auto windows");
+        NSDictionary *poolPick = PickCursorLimitWindow(cursorPools, 1791246033.0);
+        check([poolPick[@"window"] isEqual:@"API models"]
+                  && fabs([poolPick[@"remainingFraction"] doubleValue] - (1 - 0.61148)) < 0.001,
+              @"cursor gauge follows the more-spent pool, not the blended total");
+        check(fabs([poolPick[@"resetsAt"] doubleValue] - 1793708671.0) < 0.001, @"cursor pool keeps cycle end");
+
+        // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
+        NSString *(^jwt)(double) = ^NSString *(double exp) {
+            NSData *claims = [NSJSONSerialization dataWithJSONObject:@{@"exp": @(exp), @"type": @"session"} options:0 error:nil];
+            NSString *b = [[[claims base64EncodedStringWithOptions:0]
+                stringByReplacingOccurrencesOfString:@"+" withString:@"-"]
+                stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+            b = [b stringByReplacingOccurrencesOfString:@"=" withString:@""];
+            return [NSString stringWithFormat:@"eyJhbGciOiJIUzI1NiJ9.%@.sig", b];
+        };
+        check(JWTExpiryEpoch(jwt(1791102072)) == 1791102072, @"jwt exp decoded from unpadded base64url");
+        check(JWTExpiryEpoch(@"not-a-jwt") == 0 && JWTExpiryEpoch(nil) == 0, @"non-jwt has no expiry");
+        NSString *dead = jwt(1000), *soon = jwt(3000), *later = jwt(5000);
+        BOOL expiredFlag = YES;
+        check([FreshestSessionToken(@[dead, soon, later], 2000, &expiredFlag) isEqual:later] && !expiredFlag,
+              @"freshest unexpired session wins");
+        check([FreshestSessionToken(@[dead, @"opaque"], 2000, NULL) isEqual:@"opaque"],
+              @"unreadable token is the fallback over an expired one");
+        check(FreshestSessionToken(@[dead], 2000, &expiredFlag) == nil && expiredFlag,
+              @"all-expired yields nil and says so");
+        check(FreshestSessionToken(@[], 2000, &expiredFlag) == nil && !expiredFlag, @"no tokens is not 'expired'");
+        check([AccountFetchFailureStatus(401, @"[unauthenticated] Error", @"Cursor") containsString:@"sign in to Cursor"],
+              @"401 names the sign-in fix");
+        check([AccountFetchFailureStatus(500, @"Boom", @"Cursor") isEqual:@"Usage API: Boom"], @"other errors keep the message");
+
         // --- CursorStaleLimitWindows / PickCursorStaleLimitWindow / CursorLimitStatusReason ---
         NSDictionary *cursorElapsed = @{
             @"billingCycleEnd": @1771077734000,

@@ -634,37 +634,47 @@ static double CursorEpochSeconds(id value) {
     return 0;
 }
 
-static NSDictionary *CursorPlanWindowFiltered(NSDictionary *usage, double nowEpoch, BOOL elapsedOnly) {
-    NSDictionary *plan = [usage[@"planUsage"] isKindOfClass:NSDictionary.class] ? usage[@"planUsage"] : nil;
-    if (!plan) return nil;
-    double resets = CursorEpochSeconds(usage[@"billingCycleEnd"]);
-    if (elapsedOnly) {
-        if (!(resets > 0 && resets <= nowEpoch)) return nil;
-    } else if (resets > 0 && resets <= nowEpoch) {
-        return nil;
-    }
-
-    double remainingFrac = -1;
-    NSNumber *remaining = [plan[@"remaining"] isKindOfClass:NSNumber.class] ? plan[@"remaining"] : nil;
-    NSNumber *limit = [plan[@"limit"] isKindOfClass:NSNumber.class] ? plan[@"limit"] : nil;
-    if (remaining && limit && limit.doubleValue > 0)
-        remainingFrac = remaining.doubleValue / limit.doubleValue;
-    else if ([plan[@"totalPercentUsed"] isKindOfClass:NSNumber.class])
-        remainingFrac = 1.0 - [plan[@"totalPercentUsed"] doubleValue] / 100.0;
-    else if ([plan[@"includedSpend"] isKindOfClass:NSNumber.class] && limit && limit.doubleValue > 0)
-        remainingFrac = 1.0 - [plan[@"includedSpend"] doubleValue] / limit.doubleValue;
-    if (remainingFrac < 0) return nil;
+static NSDictionary *CursorWindow(NSString *name, double remainingFrac, double resets) {
     remainingFrac = remainingFrac < 0 ? 0 : remainingFrac > 1 ? 1 : remainingFrac;
-
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    d[@"window"] = @"billing period";
+    d[@"window"] = name;
     d[@"remainingFraction"] = @(remainingFrac);
     if (resets > 0) d[@"resetsAt"] = @(resets);
     return d;
 }
 
-static NSDictionary *CursorPlanWindow(NSDictionary *usage, double nowEpoch) {
-    return CursorPlanWindowFiltered(usage, nowEpoch, NO);
+// GetCurrentPeriodUsage has changed shape before: early bodies carried remaining/limit;
+// current ones (seen 2026-10) drop `remaining` and split the allowance into an Auto pool
+// and an API pool for named models, each with its own percentage. totalPercentUsed blends
+// the two and hides a nearly spent API pool, so the pools win over it when present.
+static NSArray<NSDictionary *> *CursorPlanWindowsFiltered(NSDictionary *usage, double nowEpoch, BOOL elapsedOnly) {
+    NSDictionary *plan = [usage[@"planUsage"] isKindOfClass:NSDictionary.class] ? usage[@"planUsage"] : nil;
+    if (!plan) return @[];
+    double resets = CursorEpochSeconds(usage[@"billingCycleEnd"]);
+    if (elapsedOnly) {
+        if (!(resets > 0 && resets <= nowEpoch)) return @[];
+    } else if (resets > 0 && resets <= nowEpoch) {
+        return @[];
+    }
+
+    NSNumber *remaining = [plan[@"remaining"] isKindOfClass:NSNumber.class] ? plan[@"remaining"] : nil;
+    NSNumber *limit = [plan[@"limit"] isKindOfClass:NSNumber.class] ? plan[@"limit"] : nil;
+    if (remaining && limit && limit.doubleValue > 0)
+        return @[CursorWindow(@"billing period", remaining.doubleValue / limit.doubleValue, resets)];
+
+    NSNumber *api = [plan[@"apiPercentUsed"] isKindOfClass:NSNumber.class] ? plan[@"apiPercentUsed"] : nil;
+    NSNumber *autoPool = [plan[@"autoPercentUsed"] isKindOfClass:NSNumber.class] ? plan[@"autoPercentUsed"] : nil;
+    if (api || autoPool) {
+        NSMutableArray *pools = [NSMutableArray array];
+        if (api) [pools addObject:CursorWindow(@"API models", 1.0 - api.doubleValue / 100.0, resets)];
+        if (autoPool) [pools addObject:CursorWindow(@"Auto", 1.0 - autoPool.doubleValue / 100.0, resets)];
+        return pools;
+    }
+    if ([plan[@"totalPercentUsed"] isKindOfClass:NSNumber.class])
+        return @[CursorWindow(@"billing period", 1.0 - [plan[@"totalPercentUsed"] doubleValue] / 100.0, resets)];
+    if ([plan[@"includedSpend"] isKindOfClass:NSNumber.class] && limit && limit.doubleValue > 0)
+        return @[CursorWindow(@"billing period", 1.0 - [plan[@"includedSpend"] doubleValue] / limit.doubleValue, resets)];
+    return @[];
 }
 
 static NSArray<NSDictionary *> *CursorAuthWindows(NSDictionary *usage, double nowEpoch) {
@@ -705,8 +715,8 @@ static NSArray<NSDictionary *> *CursorAuthWindows(NSDictionary *usage, double no
 
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch) {
     if (![usage isKindOfClass:NSDictionary.class]) return @[];
-    NSDictionary *plan = CursorPlanWindow(usage, nowEpoch);
-    if (plan) return @[plan];
+    NSArray<NSDictionary *> *plan = CursorPlanWindowsFiltered(usage, nowEpoch, NO);
+    if (plan.count) return plan;
     return CursorAuthWindows(usage, nowEpoch);
 }
 
@@ -727,8 +737,7 @@ NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double now
     if (![usage isKindOfClass:NSDictionary.class]) return @[];
     // Plan billing cycles are the Cursor windows that actually expire. Auth buckets have
     // no reliable past reset marker, so they are not inventing a stale gauge here.
-    NSDictionary *plan = CursorPlanWindowFiltered(usage, nowEpoch, YES);
-    return plan ? @[plan] : @[];
+    return CursorPlanWindowsFiltered(usage, nowEpoch, YES);
 }
 
 NSDictionary *PickCursorStaleLimitWindow(NSDictionary *usage, double nowEpoch) {
@@ -893,6 +902,42 @@ NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows) {
 
 BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode) {
     return statusCode == 401 || statusCode == 403;
+}
+
+double JWTExpiryEpoch(NSString *jwt) {
+    NSArray<NSString *> *parts = [jwt componentsSeparatedByString:@"."];
+    if (parts.count != 3) return 0;
+    NSMutableString *b64 = [[[parts[1] stringByReplacingOccurrencesOfString:@"-" withString:@"+"]
+                             stringByReplacingOccurrencesOfString:@"_" withString:@"/"] mutableCopy];
+    while (b64.length % 4) [b64 appendString:@"="];
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    if (!data) return 0;
+    id claims = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![claims isKindOfClass:NSDictionary.class]) return 0;
+    id exp = claims[@"exp"];
+    return [exp isKindOfClass:NSNumber.class] ? [exp doubleValue] : 0;
+}
+
+NSString *FreshestSessionToken(NSArray<NSString *> *tokens, double nowEpoch, BOOL *expired) {
+    NSString *best = nil, *unknown = nil;
+    double bestExp = nowEpoch;
+    BOOL sawExpired = NO;
+    for (NSString *token in tokens) {
+        if (![token isKindOfClass:NSString.class] || !token.length) continue;
+        double exp = JWTExpiryEpoch(token);
+        if (exp <= 0) { if (!unknown) unknown = token; continue; }
+        if (exp <= nowEpoch) { sawExpired = YES; continue; }
+        if (exp > bestExp) { bestExp = exp; best = token; }
+    }
+    NSString *chosen = best ?: unknown;
+    if (expired) *expired = !chosen && sawExpired;
+    return chosen;
+}
+
+NSString *AccountFetchFailureStatus(NSInteger statusCode, NSString *message, NSString *client) {
+    if (statusCode == 401 || statusCode == 403)
+        return [NSString stringWithFormat:@"Signed out · sign in to %@ again", client.length ? client : @"the app"];
+    return message.length ? [@"Usage API: " stringByAppendingString:message] : @"Usage API unavailable";
 }
 
 NSDictionary *ClaudeKeychainOutcome(BOOL itemFound, NSString *token,

@@ -901,10 +901,10 @@ static NSString *RunSQLite(NSString *path, NSString *sql) {
 // deadline kills the child if `security` ever blocks (for example after an ACL change),
 // so we degrade quietly instead of hanging on a dialog. The returned blob is
 // a live OAuth token — callers must never log it.
-static NSString *KeychainBlobViaSecurity(NSString *service) {
+static NSString *KeychainBlobViaSecurity(NSString *service, NSString *account) {
     NSTask *t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
-    t.arguments = @[@"find-generic-password", @"-w", @"-s", service, @"-a", NSUserName()];
+    t.arguments = @[@"find-generic-password", @"-w", @"-s", service, @"-a", account.length ? account : NSUserName()];
     t.standardError = NSFileHandle.fileHandleWithNullDevice;
     NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
     if (![t launchAndReturnError:nil]) return nil;
@@ -938,7 +938,7 @@ static NSString *KeychainBlobViaSecurity(NSString *service) {
 // Expiry is judged by the caller via ClaudeKeychainOutcome (never refresh the token
 // ourselves — that could rotate the refresh token out from under Claude Code).
 static NSDictionary *ClaudeAccessTokenFromKeychain(void) {
-    NSString *blob = KeychainBlobViaSecurity(@"Claude Code-credentials");
+    NSString *blob = KeychainBlobViaSecurity(@"Claude Code-credentials", nil);
     if (!blob.length) return nil;
     NSData *data = [blob dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -999,6 +999,24 @@ static NSString *CursorAccessTokenFromStateDB(NSString *homeDirectory) {
     NSString *token = [[raw componentsSeparatedByString:@"\n"].firstObject
                        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     return token.length ? token : nil;
+}
+
+// The Cursor CLI (`agent`) keeps its own session in the Keychain, written through
+// /usr/bin/security, so the same Apple-tool read is silent. Someone who only uses the CLI
+// never refreshes the desktop app's state.vscdb token, which then expires and 401s
+// (2026-10-04); taking the freshest of the two keeps either kind of user signed in.
+// Only the real home has a Keychain session: a fixture home must never see it.
+static NSString *CursorSessionToken(NSString *homeDirectory) {
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    NSString *home = homeDirectory.length ? homeDirectory.stringByStandardizingPath : GBHomeDirectory();
+    if ([home isEqualToString:GBHomeDirectory().stringByStandardizingPath]) {
+        NSString *cli = KeychainBlobViaSecurity(@"cursor-access-token", @"cursor-user");
+        if (cli.length && cli.length < 8192) [tokens addObject:cli];
+    }
+    NSString *app = CursorAccessTokenFromStateDB(homeDirectory);
+    if (app.length) [tokens addObject:app];
+    // All expired: hand back one anyway so the caller can say "signed out" precisely.
+    return FreshestSessionToken(tokens, NSDate.date.timeIntervalSince1970, NULL) ?: tokens.firstObject;
 }
 
 static NSDictionary *FetchResult(NSData *data, NSHTTPURLResponse *http, NSError *err,
@@ -1240,7 +1258,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         _lastStatusReasons = [NSMutableDictionary dictionary];
         _claudeCredentialReader = ^NSDictionary *{ return ClaudeAccessTokenFromKeychain(); };
         _claudeUsageFetcher = ^NSDictionary *(NSString *token){ return FetchClaudeUsageJSON(token); };
-        _cursorTokenReader = ^NSString *(NSString *home){ return CursorAccessTokenFromStateDB(home); };
+        _cursorTokenReader = ^NSString *(NSString *home){ return CursorSessionToken(home); };
         _cursorUsageFetcher = ^NSDictionary *(NSString *token){ return FetchCursorUsageJSON(token); };
         [self loadPersistentState];
     }
@@ -2150,7 +2168,7 @@ static NSString *HashedMessageID(NSString *messageID) {
 - (void)rememberFetchError:(NSDictionary *)fetch now:(double)now
                      token:(NSString *__strong *)token expiresAt:(double *)expiresAt
                  nextFetch:(double *)nextFetch status:(NSString *__strong *)status
-           rateLimitStreak:(NSUInteger *)streak {
+           rateLimitStreak:(NSUInteger *)streak client:(NSString *)client {
     BOOL rateLimited = [fetch[@"rateLimited"] boolValue];
     double retry = [fetch[@"retryAfter"] doubleValue];
     NSString *message = [fetch[@"message"] isKindOfClass:NSString.class] ? fetch[@"message"] : nil;
@@ -2164,13 +2182,14 @@ static NSString *HashedMessageID(NSString *messageID) {
         *status = @"Usage API rate-limited; retrying shortly";
     } else {
         *streak = 0;
-        *status = message.length ? [@"Usage API: " stringByAppendingString:message] : @"Usage API unavailable";
+        *status = AccountFetchFailureStatus([fetch[@"statusCode"] integerValue], message, client);
     }
 }
 
 - (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
     [self rememberFetchError:fetch now:now token:&_claudeAccessToken expiresAt:&_claudeAccessTokenExpiresAt
-                   nextFetch:&_claudeNextFetch status:&_claudeAccountStatus rateLimitStreak:&_claudeRateLimitStreak];
+                   nextFetch:&_claudeNextFetch status:&_claudeAccountStatus rateLimitStreak:&_claudeRateLimitStreak
+                      client:@"Claude Code"];
 }
 
 static NSString *ISOStringFromEpoch(double epoch) {
@@ -2442,7 +2461,9 @@ typedef struct {
 }
 
 - (NSString *)cursorAccessTokenForNow:(double)now {
-    if (_cursorAccessToken.length) return _cursorAccessToken;
+    double cachedExp = JWTExpiryEpoch(_cursorAccessToken);
+    if (_cursorAccessToken.length && !(cachedExp > 0 && cachedExp <= now)) return _cursorAccessToken;
+    _cursorAccessToken = nil;
     if (now < _cursorStateNextTry) {
         if (!_cursorAccountStatus.length) _cursorAccountStatus = @"Cursor session unavailable; retrying later";
         return nil;
@@ -2457,6 +2478,15 @@ typedef struct {
         GBLog("cursor state read: missing (%.0f ms)", readMs);
         return nil;
     }
+    double exp = JWTExpiryEpoch(token);
+    if (exp > 0 && exp <= now) {
+        // Every session we can see has expired: no request would succeed, so say how to fix
+        // it and look again soon — signing in to either client takes effect within minutes.
+        _cursorStateNextTry = now + 300;
+        _cursorAccountStatus = AccountFetchFailureStatus(401, nil, @"Cursor");
+        GBLog("cursor state read: expired (%.0f ms)", readMs);
+        return nil;
+    }
     _cursorAccessToken = token;
     _cursorStateNextTry = 0;
     GBLog("cursor state read: ok (%.0f ms)", readMs);
@@ -2465,13 +2495,14 @@ typedef struct {
 
 - (void)rememberCursorFetchError:(NSDictionary *)fetch now:(double)now {
     [self rememberFetchError:fetch now:now token:&_cursorAccessToken expiresAt:NULL
-                   nextFetch:&_cursorNextFetch status:&_cursorAccountStatus rateLimitStreak:&_cursorRateLimitStreak];
+                   nextFetch:&_cursorNextFetch status:&_cursorAccountStatus rateLimitStreak:&_cursorRateLimitStreak
+                      client:@"Cursor"];
 }
 
 - (AIUsage *)cursorUsage {
     AIUsage *u = [AIUsage new];
     u.name = @"Cursor";
-    u.source = @"Cursor local session + api2.cursor.sh";
+    u.source = @"Cursor session (app or CLI) + api2.cursor.sh";
     u.remainingFraction = -1;
     u.resetText = @"Not exposed locally";
     u.statusReason = @"Cursor account access is off";
@@ -5519,7 +5550,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
         alert.messageText = @"Enable Cursor account status?";
-        alert.informativeText = @"Glancebar will read the signed-in Cursor session token from Cursor’s local state database (state.vscdb). It keeps the token only in memory and sends it only to api2.cursor.sh to request your included usage limits, at most every 15 minutes. This relies on Cursor’s private local layout and undocumented account endpoints, so it may stop working after an update.";
+        alert.informativeText = @"Glancebar will read the signed-in Cursor session token from Cursor’s local state database (state.vscdb) and, for the Cursor CLI, from your Keychain through Apple’s /usr/bin/security tool, using whichever is current. It keeps the token only in memory and sends it only to api2.cursor.sh to request your included usage limits, at most every 15 minutes. This relies on Cursor’s private local layout and undocumented account endpoints, so it may stop working after an update.";
         [alert addButtonWithTitle:@"Enable"];
         [alert addButtonWithTitle:@"Cancel"];
         if ([alert runModal] != NSAlertFirstButtonReturn) return;
