@@ -841,6 +841,27 @@ int main(void) {
                   @"power: on battery, 16.8 W drain");
             BatteryState none = {0};
             check(PowerFlowFor(none) == PowerFlowUnknown, @"power: no battery = unknown");
+            check([FormatSignedWatts(24.8) isEqual:@"+25 W"] && [FormatSignedWatts(-8.44) isEqual:@"\u22128.4 W"],
+                  @"power: whole watts from 10 W up, tenths below");
+        }
+
+        // --- ChargeMinutesToTarget ---
+        {
+            BatteryState b = {0};
+            b.valid = YES; b.acConnected = YES; b.isCharging = YES; b.percent = 61;
+            b.voltage_mV = 10000; b.amperage_mA = 2480; b.rawMax_mAh = 5200;
+            b.systemPowerIn_mW = 30000;
+            check(ChargeMinutesToTarget(b, 80) == 24,
+                  @"charge eta: 61%→80% at 24.8 W on a 52 Wh pack is 24 min");
+            b.percent = 80;
+            check(ChargeMinutesToTarget(b, 80) == -1, @"charge eta: already at the target");
+            b.percent = 95;
+            check(ChargeMinutesToTarget(b, 80) == -1, @"charge eta: above the target");
+            b.percent = 61; b.acConnected = NO; b.amperage_mA = -2480;
+            check(ChargeMinutesToTarget(b, 80) == -1, @"charge eta: discharging");
+            b.acConnected = YES; b.amperage_mA = 40;   // 0.4 W: flow is charging, estimate is not
+            check(PowerFlowFor(b) == PowerFlowCharging && ChargeMinutesToTarget(b, 80) == -1,
+                  @"charge eta: under 0.5 W");
         }
 
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---

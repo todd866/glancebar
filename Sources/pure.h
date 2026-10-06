@@ -42,6 +42,11 @@ double BatteryWatts(BatteryState b);
 NSString *FormatSignedWatts(double watts);
 // Energy in watt-hours from a charge in mAh at the pack's present voltage; NAN if unknown.
 double BatteryWattHours(long mAh, long voltage_mV);
+// Minutes to reach targetPercent while energy is going into the pack, or -1 when not
+// charging, already at or above the target, or the battery is accepting under 0.5 W.
+// Energy needed is (target − current) percent of full capacity (rawMax_mAh at the
+// present voltage), divided by battery watts.
+int ChargeMinutesToTarget(BatteryState b, int targetPercent);
 // "30.2 Wh" below 100 Wh, "112 Wh" above; nil for NAN.
 NSString *FormatWattHours(double wh);
 

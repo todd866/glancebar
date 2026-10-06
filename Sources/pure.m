@@ -1935,7 +1935,9 @@ double BatteryWatts(BatteryState b) {
 NSString *FormatSignedWatts(double watts) {
     if (isnan(watts)) return nil;
     if (fabs(watts) < 0.05) return @"0 W";
-    return [NSString stringWithFormat:@"%@%.1f W", watts > 0 ? @"+" : @"\u2212", fabs(watts)];
+    // Past 10 W the tenth is noise and costs the column room the charge time needs.
+    NSString *fmt = fabs(watts) >= 10 ? @"%@%.0f W" : @"%@%.1f W";
+    return [NSString stringWithFormat:fmt, watts > 0 ? @"+" : @"\u2212", fabs(watts)];
 }
 
 double BatteryWattHours(long mAh, long voltage_mV) {
@@ -1967,4 +1969,16 @@ double PowerFlowIntensity(BatteryState b) {
         case PowerFlowDischarging: return MIN(1.0, MAX(0.0, -w / 25.0));
         default:                   return 0;
     }
+}
+
+int ChargeMinutesToTarget(BatteryState b, int targetPercent) {
+    if (PowerFlowFor(b) != PowerFlowCharging) return -1;
+    if (targetPercent <= b.percent) return -1;
+    double watts = BatteryWatts(b);
+    if (isnan(watts) || watts < 0.5) return -1;
+    double fullWh = BatteryWattHours(b.rawMax_mAh, b.voltage_mV);
+    if (isnan(fullWh) || fullWh <= 0) return -1;
+    double needWh = ((double)(targetPercent - b.percent) / 100.0) * fullWh;
+    if (needWh <= 0) return -1;
+    return (int)lround(needWh / watts * 60.0);
 }

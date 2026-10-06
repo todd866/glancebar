@@ -2882,7 +2882,8 @@ static NSColor *PowerFlowColor(BatteryState b, NSColor *ink) {
     double k = PowerFlowIntensity(b);
     switch (PowerFlowFor(b)) {
         case PowerFlowCharging:
-            return [base blendedColorWithFraction:0.35 + 0.65 * k ofColor:NSColor.systemGreenColor] ?: NSColor.systemGreenColor;
+            // Even a trickle must read as green on a dark bar: start well into the green.
+            return [base blendedColorWithFraction:0.6 + 0.4 * k ofColor:NSColor.systemGreenColor] ?: NSColor.systemGreenColor;
         case PowerFlowPaused:
             return NSColor.systemYellowColor;
         case PowerFlowDischarging:
@@ -2894,9 +2895,9 @@ static NSColor *PowerFlowColor(BatteryState b, NSColor *ink) {
             return base;
     }
 }
-// SF Symbol battery.100 / .75 / .50 / .25 / .0. The bolt variant exists only for
-// battery.100 (battery.75.bolt and the rest are not in the system set); fall back
-// to the plain level rather than hand AppKit a nil image.
+// SF Symbol battery.100 / .75 / .50 / .25 / .0. The live glyph stays the plain level:
+// a bolt or pause badge is composited on top (BatteryGlyphWithBadge). The system bolt
+// variant exists only for battery.100 and has no pause counterpart.
 static NSString *BatterySymbolName(int percent, BOOL plugged) {
     int bucket = 0;
     if (percent >= 88) bucket = 100;
@@ -3371,6 +3372,58 @@ static NSImage *BarFittedSymbol(NSString *name, NSColor *color, CGFloat maxWidth
         if (!image || image.size.width <= maxWidth + 0.01) break;
     }
     return image;
+}
+
+// Largest point size whose symbol is no wider than maxWidth. The battery glyph is wider
+// than the other lead symbols; drawing it at 22pt and letting the button scale it down
+// smears the badge.
+static CGFloat FittedSymbolPointSize(NSString *name, CGFloat maxPoint, CGFloat maxWidth) {
+    CGFloat pt = maxPoint;
+    for (; pt >= 8; pt -= 0.5) {
+        NSImage *img = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:pt
+                                                                                          weight:NSFontWeightRegular]];
+        if (!img || img.size.width <= maxWidth + 0.01) break;
+    }
+    return pt;
+}
+
+// Bolt while energy is entering the pack, pause while a plugged-in charge is stalled.
+// Held and discharging keep the plain glyph. The badge is drawn in the glyph's own
+// colour inside a knocked-out halo, so it reads at menu-bar size without widening the image.
+static NSImage *BatteryGlyphWithBadge(NSImage *glyph, PowerFlow flow, NSColor *color) {
+    if (!glyph || glyph.size.width < 1 || glyph.size.height < 1) return glyph;
+    NSString *badgeName = nil;
+    if (flow == PowerFlowCharging) badgeName = @"bolt.fill";
+    else if (flow == PowerFlowPaused) badgeName = @"pause.fill";
+    if (!badgeName) return glyph;
+    NSImage *mark = [NSImage imageWithSystemSymbolName:badgeName accessibilityDescription:nil];
+    if (!mark) return glyph;
+    NSColor *ink = color ?: NSColor.labelColor;
+    NSImage *out = [NSImage imageWithSize:glyph.size flipped:NO drawingHandler:^BOOL(NSRect dst) {
+        [glyph drawInRect:dst fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
+        [ink set];
+        NSRectFillUsingOperation(dst, NSCompositingOperationSourceAtop);
+        CGFloat pt = MAX(4.0, dst.size.height * 0.36);
+        NSImage *badge = [mark imageWithSymbolConfiguration:
+            [NSImageSymbolConfiguration configurationWithPointSize:pt weight:NSFontWeightBold]];
+        if (!badge) return YES;
+        // The positive terminal is the nub on the right; sit the mark on the body.
+        CGFloat cx = dst.size.width * 0.43;
+        CGFloat cy = NSMidY(dst);
+        NSSize bs = badge.size;
+        CGFloat knock = 1.20;
+        NSRect hole = NSMakeRect(cx - bs.width * knock / 2.0, cy - bs.height * knock / 2.0,
+                                 bs.width * knock, bs.height * knock);
+        [badge drawInRect:hole fromRect:NSZeroRect operation:NSCompositingOperationDestinationOut fraction:1];
+        NSRect slot = NSMakeRect(cx - bs.width / 2.0, cy - bs.height / 2.0, bs.width, bs.height);
+        [badge drawInRect:slot fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
+        [ink set];
+        NSRectFillUsingOperation(slot, NSCompositingOperationSourceAtop);
+        return YES;
+    }];
+    out.template = NO;
+    return out;
 }
 
 // Builds the menu-bar image from selected metric segments.
@@ -4962,8 +5015,9 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                 seg[@"keepIcon"] = @YES;   // a reminder, not decoration: survives every tier
                 lidAwakeShown = YES;
             } else {
-                seg[@"image"] = BarFittedSymbol(BatterySymbolName(_bat.percent, _bat.acConnected),
-                                                PowerFlowColor(_bat, fg), 24);
+                NSColor *battColor = PowerFlowColor(_bat, fg);
+                NSImage *fitted = BarFittedSymbol(BatterySymbolName(_bat.percent, NO), battColor, 24);
+                seg[@"image"] = BatteryGlyphWithBadge(fitted, PowerFlowFor(_bat), battColor);
             }
         }
         [segments addObject:seg];
@@ -5488,7 +5542,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             datum.textColor = (flow == PowerFlowCharging || flow == PowerFlowPaused)
                 ? PowerFlowColor(_bat, NSColor.secondaryLabelColor) : NSColor.secondaryLabelColor;
             NSButton *glyph = (NSButton *)ViewWithAccessibilityIdentifier(root, @"popover.battery.symbol");
-            if ([glyph isKindOfClass:NSButton.class]) glyph.contentTintColor = PowerFlowColor(_bat, NSColor.secondaryLabelColor);
+            if ([glyph isKindOfClass:NSButton.class]) {
+                NSImage *batteryImage = [self liveBatteryGlyph];
+                if (batteryImage) glyph.image = batteryImage;
+                glyph.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
+            }
             NSString *tip = [self batteryPopoverTip];
             datum.toolTip = tip;
             NSView *row = ViewWithAccessibilityIdentifier(root, @"popover.row.battery");
@@ -5762,6 +5820,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery detected";
     NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:[self batteryStatusText]];
+    NSString *eta = [self chargeETAText];
+    if (eta.length) [parts addObject:eta];
     if (PowerFlowFor(_bat) == PowerFlowPaused)
         [parts addObject:(_bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000)
             ? @"Plugged in but no power is arriving — macOS (or a battery tool) has paused the charger, or the cable or charger isn't delivering"
@@ -5921,6 +5981,33 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         });
     });
 }
+- (int)chargeTargetPercent {
+    return [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 80 : 100;
+}
+// "0:24 to 80%" / "0:24 to full". Nil when the pack is not taking a charge we can time.
+- (NSString *)chargeETAText {
+    int target = [self chargeTargetPercent];
+    int minutes = ChargeMinutesToTarget(_bat, target);
+    if (minutes < 0) return nil;
+    return [NSString stringWithFormat:@"%@ to %@", FmtDuration(minutes), target == 80 ? @"80%" : @"full"];
+}
+- (NSImage *)liveBatteryGlyph {
+    NSString *name = BatterySymbolName(_bat.percent, NO);
+    CGFloat pt = FittedSymbolPointSize(name, kLeadSymbol, kLeadW);
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pt
+                                                                                      weight:NSFontWeightRegular];
+    NSImage *base = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:@"Charge limit"]
+                     imageWithSymbolConfiguration:cfg];
+    if (!base) return nil;
+    return BatteryGlyphWithBadge(base, PowerFlowFor(_bat), PowerFlowColor(_bat, NSColor.labelColor));
+}
+- (void)badgeBatterySymbolView:(NSImageView *)mark {
+    if (![mark isKindOfClass:NSImageView.class]) return;
+    NSImage *glyph = [self liveBatteryGlyph];
+    if (!glyph) return;
+    mark.image = glyph;
+    mark.contentTintColor = glyph.template ? mark.contentTintColor : nil;
+}
 - (NSString *)batteryDatumText {
     if (!_bat.valid) return @"";
     if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
@@ -5932,8 +6019,19 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         return nothingIn ? @"no power in" : (w ? [w stringByAppendingString:@" plugged"] : @"paused");
     }
     // Real units first: what the battery is doing, in signed watts. On battery the
-    // time to 20% rides along when it fits; the full power picture is in the tooltip.
+    // time to 20% rides along when it fits; while charging, the time to the limit does
+    // the same. The target ("to 80%" / "to full") stays on the tooltip.
     NSString *watts = _showWatts ? FormatSignedWatts(BatteryWatts(_bat)) : nil;
+    if (PowerFlowFor(_bat) == PowerFlowCharging) {
+        int minutes = ChargeMinutesToTarget(_bat, [self chargeTargetPercent]);
+        if (watts && minutes >= 0) {
+            NSString *both = [NSString stringWithFormat:@"%@ · %@", watts, FmtDuration(minutes)];
+            NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+            if ([both sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8)
+                return both;
+        }
+        return watts ?: @"AC";
+    }
     if (_bat.acConnected) return watts ?: @"AC";
     NSString *time = nil;
     if (_bat.percent > 20) {
@@ -6287,17 +6385,13 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         row.toolTip = tip;
         row.accessibilityLabel = tip;
         if (_bat.valid) {
-            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol
-                                                                                            weight:NSFontWeightRegular];
-            NSString *batterySymbol = BatterySymbolName(_bat.percent, _bat.acConnected);
-            NSImage *batteryImage = [[NSImage imageWithSystemSymbolName:batterySymbol accessibilityDescription:@"Charge limit"]
-                                     imageWithSymbolConfiguration:cfg];
+            NSImage *batteryImage = [self liveBatteryGlyph];
             NSButton *symbol = [NSButton buttonWithImage:batteryImage target:self action:@selector(toggleChargeLimit:)];
             symbol.title = @"";
             symbol.bordered = NO;
             symbol.imagePosition = NSImageOnly;
             symbol.imageScaling = NSImageScaleProportionallyDown;
-            symbol.contentTintColor = PowerFlowColor(_bat, NSColor.secondaryLabelColor);
+            symbol.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
             symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
             symbol.accessibilityIdentifier = @"popover.battery.symbol";
             symbol.toolTip = [self chargeLimitTooltip];
@@ -7578,9 +7672,10 @@ static NSColor *HealthColor(double fraction) {
         NSString *tip = [self batteryPopoverTip];
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.battery" tip:tip in:root];
         if (_bat.valid) {
-            NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
+            NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, NO) size:c.symbol
                                               tint:PowerFlowColor(_bat, NSColor.secondaryLabelColor) frame:DetailLeadRect(c)
                                         identifier:@"details.overview.battery.symbol" in:row];
+            [self badgeBatterySymbolView:mark];
             mark.toolTip = tip;
             NSTextField *batteryName = [self detailText:@"Battery"
                                                     font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
@@ -7789,9 +7884,10 @@ static NSColor *HealthColor(double fraction) {
 
         NSString *tip = [self batteryPopoverTip];
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.battery.row.charge" tip:tip in:root];
-        NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
+        NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, NO) size:c.symbol
                                           tint:PowerFlowColor(_bat, NSColor.secondaryLabelColor) frame:DetailLeadRect(c)
                                     identifier:@"details.battery.charge.symbol" in:row];
+        [self badgeBatterySymbolView:mark];
             [self detailRowName:@"Charge" cols:c identifier:@"details.battery.charge.name" in:row];
         mark.toolTip = tip;
         Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
@@ -7885,6 +7981,22 @@ static NSColor *HealthColor(double fraction) {
                 [self detailDatum:bw > 0.05 ? @"into battery" : bw < -0.05 ? @"from battery" : @"battery idle"
                             color:NSColor.secondaryLabelColor identifier:@"details.battery.power.datum" tip:flowTip in:battRow cols:c];
                 y += c.rowH;
+                int target = [self chargeTargetPercent];
+                int minutes = ChargeMinutesToTarget(_bat, target);
+                if (minutes >= 0) {
+                    NSString *etaName = target == 80 ? @"To 80%" : @"To full";
+                    NSString *etaTip = [self chargeETAText] ?: etaName;
+                    NSView *etaRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.eta" tip:etaTip in:root];
+                    [self detailSymbol:@"clock" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                            identifier:@"details.battery.eta.symbol" in:etaRow].toolTip = etaTip;
+                    [self detailRowName:etaName cols:c identifier:@"details.battery.eta.name" in:etaRow];
+                    [self detailValue:FmtDuration(minutes) color:NSColor.labelColor
+                           identifier:@"details.battery.eta.value" tip:etaTip in:etaRow cols:c];
+                    [self detailDatum:[NSString stringWithFormat:@"at %@", FormatSignedWatts(bw)]
+                                color:NSColor.secondaryLabelColor identifier:@"details.battery.eta.datum"
+                                  tip:etaTip in:etaRow cols:c];
+                    y += c.rowH;
+                }
             }
         }
     }

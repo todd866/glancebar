@@ -130,6 +130,30 @@ static NSColor *MeterPixel(ClaudeGauge *meter, CGFloat x, CGFloat y) {
 static BOOL Red(NSColor *c) { return c && c.redComponent > c.greenComponent + 0.2; }
 static BOOL Green(NSColor *c) { return c && c.greenComponent > c.redComponent + 0.2; }
 static int Fail(int line) { fprintf(stderr, "Popover check failed at line %d\n", line); return 1; }
+static BOOL RenderedImagesDiffer(NSImage *a, NSImage *b) {
+    if (!a || !b || a.size.width < 1 || b.size.width < 1) return NO;
+    NSInteger w = (NSInteger)llround(MAX(a.size.width, b.size.width) * 2.0);
+    NSInteger h = (NSInteger)llround(MAX(a.size.height, b.size.height) * 2.0);
+    if (w < 1 || h < 1) return NO;
+    if (fabs(a.size.width - b.size.width) > 0.5 || fabs(a.size.height - b.size.height) > 0.5) return YES;
+    NSBitmapImageRep *(^rep)(NSImage *) = ^NSBitmapImageRep *(NSImage *image) {
+        NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+            pixelsWide:w pixelsHigh:h bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+            colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:ctx];
+        [[NSColor blackColor] setFill];
+        NSRectFill(NSMakeRect(0, 0, w, h));
+        [image drawInRect:NSMakeRect(0, 0, w, h) fromRect:NSZeroRect
+                operation:NSCompositingOperationSourceOver fraction:1];
+        [NSGraphicsContext restoreGraphicsState];
+        return bitmap;
+    };
+    NSBitmapImageRep *ra = rep(a), *rb = rep(b);
+    if (!ra.bitmapData || !rb.bitmapData || ra.bytesPerRow != rb.bytesPerRow) return YES;
+    return memcmp(ra.bitmapData, rb.bitmapData, (size_t)ra.bytesPerRow * (size_t)h) != 0;
+}
 static NSView *FirstGauge(NSView *view) {
     if ([view isKindOfClass:Gauge.class] || [view isKindOfClass:ClaudeGauge.class]) return view;
     for (NSView *child in view.subviews) { NSView *g = FirstGauge(child); if (g) return g; }
@@ -162,6 +186,7 @@ static BOOL DetailColumnsMatch(NSArray<NSView *> *docs) {
         @"details.storage.row.0.value",
         @"details.battery.charge.value",
         @"details.battery.health.value",
+        @"details.battery.eta.value",
         @"details.system.cpu.value",
         @"details.system.memory.value",
         @"details.system.swap.value",
@@ -265,8 +290,8 @@ int main(int argc, const char **argv) {
         SystemState sys = {.cpuValid=YES, .memValid=YES, .swapValid=YES, .cpu=0.24,
             .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1};
         [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
-        BatteryState b = {.valid=YES, .percent=85, .acConnected=YES, .isCharging=YES,
-            .rawCurrent_mAh=3825, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
+        BatteryState b = {.valid=YES, .percent=61, .acConnected=YES, .isCharging=YES,
+            .rawCurrent_mAh=2745, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
             .cycleCount=120, .systemPowerIn_mW=18800, .systemLoad_mW=6800, .adapterWatts=20};
         [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
         [c setValue:@YES forKey:@"showWatts"]; [c setValue:@YES forKey:@"showHealth"];
@@ -344,6 +369,29 @@ int main(int argc, const char **argv) {
         }
         if (![storageSymbol isKindOfClass:NSImageView.class]) return Fail(__LINE__);
         if (![batterySymbol isKindOfClass:NSButton.class] || batterySymbol.action == NULL) return Fail(__LINE__);
+        NSTextField *batteryDatum = (NSTextField *)FindIdentifier(root, @"popover.battery.datum");
+        if (![batteryDatum isKindOfClass:NSTextField.class] || ![batteryDatum.stringValue containsString:@"W"] ||
+            [batteryDatum.stringValue containsString:@"…"]) return Fail(__LINE__);
+        NSString *levelName = BatterySymbolName(b.percent, NO);
+        CGFloat levelPt = FittedSymbolPointSize(levelName, kLeadSymbol, kLeadW);
+        NSImageSymbolConfiguration *plainCfg = [NSImageSymbolConfiguration configurationWithPointSize:levelPt
+                                                                                               weight:NSFontWeightRegular];
+        NSImage *plainGlyph = [[NSImage imageWithSystemSymbolName:levelName accessibilityDescription:nil]
+                               imageWithSymbolConfiguration:plainCfg];
+        NSColor *ink = PowerFlowColor(b, NSColor.secondaryLabelColor);
+        NSImage *plainTinted = [NSImage imageWithSize:plainGlyph.size flipped:NO drawingHandler:^BOOL(NSRect dst) {
+            [plainGlyph drawInRect:dst];
+            [ink set];
+            NSRectFillUsingOperation(dst, NSCompositingOperationSourceAtop);
+            return YES;
+        }];
+        // Charging bakes a non-template image. Same colour, no badge, must still differ.
+        if (batterySymbol.image.template || !RenderedImagesDiffer(batterySymbol.image, plainTinted))
+            return Fail(__LINE__);
+        int etaMin = ChargeMinutesToTarget(b, 80);
+        NSString *etaPhrase = [NSString stringWithFormat:@"%@ to 80%%", FmtDuration(etaMin)];
+        NSView *batteryRow = FindIdentifier(root, @"popover.row.battery");
+        if (etaMin < 0 || ![batteryRow.toolTip containsString:etaPhrase]) return Fail(__LINE__);
         NSPoint symbolMid = [batterySymbol convertPoint:NSMakePoint(NSMidX(batterySymbol.bounds),
                                                                      NSMidY(batterySymbol.bounds))
                                                   toView:batterySymbol.superview.superview];
@@ -481,6 +529,22 @@ int main(int argc, const char **argv) {
                 return Fail(__LINE__);
         }
         if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
+        NSTextField *etaName = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.name");
+        NSTextField *etaValue = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.value");
+        NSTextField *etaDatum = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.datum");
+        if (![etaName.stringValue isEqual:@"To 80%"] || ![etaValue.stringValue isEqual:FmtDuration(etaMin)] ||
+            ![etaDatum.stringValue hasPrefix:@"at +"] || ![etaDatum.stringValue containsString:@"W"])
+            return Fail(__LINE__);
+        NSArray *etaFields = @[etaName, etaValue, etaDatum];
+        for (NSTextField *field in etaFields) {
+            if (![field isKindOfClass:NSTextField.class]) return Fail(__LINE__);
+            CGFloat textW = [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
+            if (textW > field.bounds.size.width - 2) {
+                fprintf(stderr, "truncated %s (%.1f > %.1f)\n", field.accessibilityIdentifier.UTF8String,
+                        textW, field.bounds.size.width);
+                return Fail(__LINE__);
+            }
+        }
         NSTextField *volumeName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.storage.name");
         NSTextField *batteryName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.battery.name");
         NSTextField *systemName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.system.name");
