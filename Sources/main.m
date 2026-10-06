@@ -3770,7 +3770,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     AIReader *_aiReader;            // touched only on _aiQueue
     dispatch_queue_t _aiQueue;
     dispatch_queue_t _volumeQueue;
-    BOOL _aiLoading, _aiRefreshPending;
+    BOOL _aiLoading, _aiRefreshPending, _aiDraining;
     BOOL _volumesLoading, _volumesUnavailable;
     CFAbsoluteTime _volumeScanStarted;
     BOOL _powerRefreshPending;
@@ -4795,12 +4795,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // AI state lives in local files plus sqlite child processes — never read it on the
 // main thread (refresh fires every 15s and on IOPS bursts). Single-flight: a tick
 // that arrives mid-read is skipped; the next one catches up.
+// A catch-up continuation: skips the hidden-pass throttle, which exists to space out
+// fresh passes, not to strand one halfway through the backlog.
+- (void)refreshAIUsageAsyncDraining {
+    _aiDraining = YES;
+    [self refreshAIUsageAsync];
+    _aiDraining = NO;
+}
+
 - (void)refreshAIUsageAsync {
     BOOL showAI = _popover.isShown || _detailsWindow.isVisible;
     // While every AI surface is hidden, one bounded pass every few minutes keeps the figures
     // warm. Skipping hidden passes entirely meant every open began from whatever the last
     // open left behind, a "Cached limit" from hours ago that read as stuck (2026-10-06).
-    if (!showAI && _lastAIRefresh && -_lastAIRefresh.timeIntervalSinceNow < kHiddenAIRefreshInterval) return;
+    if (!showAI && !_aiDraining && _lastAIRefresh && -_lastAIRefresh.timeIntervalSinceNow < kHiddenAIRefreshInterval) return;
     if (_aiLoading) { _aiRefreshPending = YES; return; }
     _aiLoading = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
@@ -4852,12 +4860,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                 [self refreshVisibleSurfaces];
             }
             if (rerun) [self refreshAIUsageAsync];
-            else if (needsImmediateRescan && (self->_popover.isShown || self->_detailsWindow.isVisible)) {
-                // Drain the bounded reader promptly while an AI surface is visible instead
-                // of waiting 15 seconds per chunk. The visibility gate above stops this
-                // loop as soon as the user hides AI.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ [self refreshAIUsageAsync]; });
+            else if (needsImmediateRescan) {
+                // Drain the bounded reader to the end: promptly while an AI surface is
+                // visible, gently while hidden. A hidden pass that stopped after one chunk
+                // left hundreds of MB for every open to chew through (2026-10-06).
+                BOOL visible = self->_popover.isShown || self->_detailsWindow.isVisible;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((visible ? 0.15 : 1.0) * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [self refreshAIUsageAsyncDraining]; });
             }
         });
     });
@@ -5669,15 +5678,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if (!age.length || [age isEqualToString:@"pending"]) return @"stale";
         return [@"stale " stringByAppendingString:age];
     }
-    if (_aiTotalsIncomplete) {
-        NSString *status = _aiCatchUpStatus ?: @"";
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[Ii]ndexing\\s+([0-9]+)%"
-                                                                           options:0 error:nil];
-        NSTextCheckingResult *match = [re firstMatchInString:status options:0 range:NSMakeRange(0, status.length)];
-        if (match.numberOfRanges >= 2)
-            return [NSString stringWithFormat:@"indexing %@%%", [status substringWithRange:[match rangeAtIndex:1]]];
-        return @"incomplete";
-    }
+    // Token-total indexing never reaches the popover: it feeds Details' token counts,
+    // not the quota gauge, and "indexing 96%" in place of the reset read as a fault.
     if (!u.limitStatusAvailable || u.remainingFraction < 0) return @"unavailable";
     return nil;
 }
