@@ -3424,8 +3424,8 @@ static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW 
 static const CGFloat kGaugeX = 110, kGaugeW = 102, kGaugeH = 8; // kAINameX + kAINameW + 6
 static const CGFloat kValueX = 216, kValueW = 48;              // "100%" at 15pt
 static const CGFloat kDatumX = 272, kDatumW = 92;              // "resets 21:00"
-static const CGFloat kToggleH = 28, kToggleGap = 8;
-static const CGFloat kKeepW = 112, kLowW = 104;                // 16pt glyph + 12pt "Keep Awake" / "Low Power"
+static const CGFloat kToggleH = 28, kToggleGap = 6;
+static const CGFloat kKeepW = 106, kLowW = 98, kChargeW = 96;  // 16pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
 // The details document follows the resizable window. It is only touched on the
 // main thread; keeping the active width here avoids threading a layout argument
@@ -3743,7 +3743,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // Keep Awake IS the system SleepDisabled setting (no idle or lid-close sleep), read off-main.
     // One live state, so the bar's cup and the footer button can never disagree.
     BOOL _lidAwake, _lidAwakeReading;
-    NSButton *_keepAwakeButton, *_lowPowerButton;   // footer toggles; rebuilt with the popover
+    NSButton *_keepAwakeButton, *_lowPowerButton, *_chargeButton;   // footer toggles; rebuilt with the popover
     BOOL _aiGatesLogged, _lastShowAI, _lastUseAccount, _lastUseCursorAccount, _lastAllowTranscripts;
     BOOL _procStatsLoading, _procStatsUnavailable;
     CFAbsoluteTime _popoverClosedAt;   // guards the status-item click-to-dismiss race
@@ -5532,6 +5532,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                lowState, @"System Low Power Mode."];
     _keepAwakeButton.frame = NSMakeRect(kPad, 0, kKeepW, kToggleH);
     _lowPowerButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap, 0, kLowW, kToggleH);
+    if (_chargeButton) {
+        // A visible toggle, not a hidden click on the battery glyph: on = Apple's 80% limit,
+        // off = charging to full until tomorrow.
+        BOOL limited = ![[self effectiveChargeMode] isEqualToString:@"full"];
+        [self styleToggle:_chargeButton on:limited tint:NSColor.systemGreenColor ink:NSColor.whiteColor];
+        _chargeButton.accessibilityLabel = [NSString stringWithFormat:@"Limit charge to 80%% — %@", limited ? @"on" : @"off"];
+        _chargeButton.toolTip = [self chargeLimitTooltip];
+        _chargeButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap + kLowW + kToggleGap, 0, kChargeW, kToggleH);
+    }
 }
 - (NSBox *)dividerAt:(CGFloat)y {
     NSBox *b = [[NSBox alloc] initWithFrame:NSMakeRect(kPad, y, kW-2*kPad, 1)];
@@ -5761,6 +5770,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 }
 - (void)toggleChargeLimit:(id)sender {
     (void)sender;
+    [self syncPowerButtons];   // undo the click's own flip until the shortcut confirms
     if (!_musicProbesEnabled) return;
     BOOL fresh = _chargeShortcutsKnown && CFAbsoluteTimeGetCurrent() - _chargeShortcutsCheckedAt < 60;
     void (^act)(BOOL) = ^(BOOL present) {
@@ -6248,9 +6258,15 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
     _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"tortoise.fill" action:@selector(toggleLowPowerMode:)];
     _lowPowerButton.accessibilityIdentifier = @"popover.lowPower";
+    _chargeButton = nil;
+    if (_bat.valid) {   // desktop Macs have no charge limit to set
+        _chargeButton = [self powerToggle:@"Limit 80%" symbol:@"battery.75" action:@selector(toggleChargeLimit:)];
+        _chargeButton.accessibilityIdentifier = @"popover.chargeLimit";
+    }
     [self syncPowerButtons];
     [foot addSubview:_keepAwakeButton];
     [foot addSubview:_lowPowerButton];
+    if (_chargeButton) [foot addSubview:_chargeButton];
     NSImageSymbolConfiguration *moreCfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol
                                                                                          weight:NSFontWeightRegular];
     NSImage *moreImage = [[NSImage imageWithSystemSymbolName:@"ellipsis.circle" accessibilityDescription:@"More"]
@@ -6308,6 +6324,8 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         // that are actually on screen, or syncPowerButtons styles detached copies.
         NSButton *keepAwake = (NSButton *)ViewWithAccessibilityIdentifier(previousView, @"popover.keepAwake");
         NSButton *lowPower = (NSButton *)ViewWithAccessibilityIdentifier(previousView, @"popover.lowPower");
+        NSButton *charge = (NSButton *)ViewWithAccessibilityIdentifier(previousView, @"popover.chargeLimit");
+        if ([charge isKindOfClass:NSButton.class]) _chargeButton = charge;
         if ([keepAwake isKindOfClass:NSButton.class]) _keepAwakeButton = keepAwake;
         if ([lowPower isKindOfClass:NSButton.class]) _lowPowerButton = lowPower;
     } else {

@@ -383,6 +383,11 @@ int main(int argc, const char **argv) {
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
         NSView *more = FindIdentifier(p.contentViewController.view, @"popover.more");
+        // The charge limit is a visible footer toggle, not a hidden click on the battery glyph.
+        NSButton *chargeToggle = (NSButton *)FindIdentifier(p.contentViewController.view, @"popover.chargeLimit");
+        if (![chargeToggle isKindOfClass:NSButton.class] || !chargeToggle.image ||
+            ![chargeToggle.title isEqual:@"Limit 80%"] ||
+            NSMaxX(chargeToggle.frame) + 4 > more.frame.origin.x) return Fail(__LINE__);
         NSButton *keepButton = (NSButton *)keep, *lowButton = (NSButton *)low, *moreButton = (NSButton *)more;
         if (![keepButton isKindOfClass:NSButton.class] || ![lowButton isKindOfClass:NSButton.class] ||
             ![moreButton isKindOfClass:NSButton.class]) return Fail(__LINE__);
