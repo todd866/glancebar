@@ -1538,6 +1538,18 @@ static NSString *YouTubeStatusField(NSArray<NSString *> *fields, NSUInteger inde
     return [field stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
+// A finite number, or nil. Empty and non-numeric fields are absent, not zero:
+// the player bar has no clock until the video element reports one.
+static NSNumber *YouTubeStatusNumber(NSArray<NSString *> *fields, NSUInteger index) {
+    NSString *field = YouTubeStatusField(fields, index);
+    if (!field.length) return nil;
+    NSScanner *scanner = [NSScanner scannerWithString:field];
+    scanner.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];   // JavaScript writes "12.5" everywhere
+    double value = 0;
+    if (![scanner scanDouble:&value] || !scanner.isAtEnd || !isfinite(value)) return nil;
+    return @(value);
+}
+
 NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText) {
     NSString *out = [output isKindOfClass:NSString.class] ? output : @"";
     NSString *err = [errorText isKindOfClass:NSString.class] ? errorText : @"";
@@ -1559,15 +1571,40 @@ NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText) {
     NSString *title = YouTubeStatusField(fields, 2);
     NSString *artist = YouTubeStatusField(fields, 3);
     NSInteger count = ParsePlaylistCount(YouTubeStatusField(fields, 4));
+    NSNumber *elapsed = YouTubeStatusNumber(fields, 5);
+    NSNumber *duration = YouTubeStatusNumber(fields, 6);
     // JavaScript is refused only after a music tab was found and execute javascript ran.
-    // Automation is refused before any tab can be seen.
+    // Automation is refused before any tab can be seen. Either way the page told us nothing.
     if ([denied isEqual:@"automation"]) {
         tab = NO; playing = [NSNull null]; title = @""; artist = @""; count = 0;
+        elapsed = nil; duration = nil;
     } else if ([denied isEqual:@"javascript"]) {
         tab = YES; playing = [NSNull null]; title = @""; artist = @""; count = 0;
+        elapsed = nil; duration = nil;
     }
-    return @{@"tab": @(tab), @"playing": playing, @"title": title, @"artist": artist,
-             @"count": @(count), @"denied": denied};
+    NSMutableDictionary *status = [@{@"tab": @(tab), @"playing": playing, @"title": title,
+                                     @"artist": artist, @"count": @(count), @"denied": denied} mutableCopy];
+    if (elapsed) status[@"elapsed"] = elapsed;
+    if (duration) status[@"duration"] = duration;
+    return status;
+}
+
+static NSString *FormatClockPart(double seconds, BOOL withHours) {
+    int whole = (int)seconds;
+    int h = whole / 3600;
+    int m = (whole % 3600) / 60;
+    int s = whole % 60;
+    if (withHours) return [NSString stringWithFormat:@"%d:%02d:%02d", h, m, s];
+    return [NSString stringWithFormat:@"%d:%02d", m, s];
+}
+
+NSString *FormatTrackTime(double elapsed, double duration) {
+    if (!isfinite(duration) || duration <= 0 || !isfinite(elapsed)) return nil;
+    if (elapsed < 0) elapsed = 0;
+    if (elapsed > duration) elapsed = duration;
+    BOOL withHours = duration >= 3600.0;
+    return [NSString stringWithFormat:@"%@ / %@", FormatClockPart(elapsed, withHours),
+            FormatClockPart(duration, withHours)];
 }
 
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing) {
@@ -1793,4 +1830,86 @@ NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes) {
     if (![name isKindOfClass:NSString.class] || ![(NSString *)name length]) return nil;
     return @{@"text": [NSString stringWithFormat:@"%@ %d%% full", name, StorageUsedPercent(bestFrac)],
              @"fraction": @(bestFrac)};
+}
+
+NSString *NextOutputUID(NSArray<NSDictionary *> *menuDevices, NSString *currentUID) {
+    if (![menuDevices isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray<NSString *> *uids = [NSMutableArray array];
+    for (id row in menuDevices) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        id uid = ((NSDictionary *)row)[@"uid"];
+        if ([uid isKindOfClass:NSString.class] && [(NSString *)uid length]) [uids addObject:uid];
+    }
+    if (uids.count < 2) return nil;
+    NSUInteger index = [currentUID isKindOfClass:NSString.class] ? [uids indexOfObject:currentUID] : NSNotFound;
+    if (index == NSNotFound) return uids[0];
+    return uids[(index + 1) % uids.count];
+}
+
+NSString *CompactResetClock(NSDate *resetAt, NSDate *now) {
+    if (![resetAt isKindOfClass:NSDate.class]) return nil;
+    NSDate *reference = [now isKindOfClass:NSDate.class] ? now : NSDate.date;
+    NSCalendar *cal = NSCalendar.currentCalendar;
+    NSInteger days = [cal components:NSCalendarUnitDay
+                            fromDate:[cal startOfDayForDate:reference]
+                              toDate:[cal startOfDayForDate:resetAt]
+                             options:0].day;
+    // The column is a fixed instrument, so the words do not follow the locale:
+    // 24-hour digits, English weekday and month.
+    NSLocale *locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = locale;
+    fmt.timeZone = cal.timeZone;
+    fmt.calendar = cal;
+    if (days <= 0) {
+        fmt.dateFormat = @"HH:mm";
+        return [fmt stringFromDate:resetAt];
+    }
+    if (days <= 6) {
+        NSDateComponents *hm = [cal components:NSCalendarUnitHour | NSCalendarUnitMinute fromDate:resetAt];
+        fmt.dateFormat = (hm.hour == 0 && hm.minute == 0) ? @"EEE" : @"EEE HH:mm";
+        return [fmt stringFromDate:resetAt];
+    }
+    fmt.dateFormat = @"d MMM";
+    return [fmt stringFromDate:resetAt];
+}
+
+static NSString *ScaledByteCount(long long bytes, int decimals, BOOL trimZeros) {
+    if (bytes < 0) bytes = 0;
+    const double scale[] = {1e12, 1e9, 1e6, 1e3};
+    const char *unit[] = {"TB", "GB", "MB", "KB"};
+    for (int i = 0; i < 4; i++) {
+        if ((double)bytes < scale[i]) continue;
+        double value = (double)bytes / scale[i];
+        if (!trimZeros && value >= 100.0)
+            return [NSString stringWithFormat:@"%.0f %s", value, unit[i]];
+        if (!trimZeros) {
+            double tenths = round(value * 10.0) / 10.0;
+            if (tenths >= 100.0) return [NSString stringWithFormat:@"%.0f %s", tenths, unit[i]];
+            if (fabs(tenths - round(tenths)) < 0.05)
+                return [NSString stringWithFormat:@"%.0f %s", round(tenths), unit[i]];
+            return [NSString stringWithFormat:@"%.1f %s", tenths, unit[i]];
+        }
+        NSString *num = [NSString stringWithFormat:@"%.*f", decimals, value];
+        while ([num hasSuffix:@"0"]) num = [num substringToIndex:num.length - 1];
+        if ([num hasSuffix:@"."]) num = [num substringToIndex:num.length - 1];
+        return [NSString stringWithFormat:@"%@ %s", num, unit[i]];
+    }
+    return [NSString stringWithFormat:@"%lld B", bytes];
+}
+
+NSString *CompactByteCount(long long bytes) { return ScaledByteCount(bytes, 1, NO); }
+NSString *PreciseByteCount(long long bytes) { return ScaledByteCount(bytes, 2, YES); }
+
+NSString *StorageVolumeTooltip(NSString *name, long long total, long long available, long long purgeable) {
+    if (total < 0) total = 0;
+    if (available < 0) available = 0;
+    if (available > total) available = total;
+    long long used = total - available;
+    NSString *who = [name isKindOfClass:NSString.class] && name.length ? name : @"Volume";
+    NSString *line = [NSString stringWithFormat:@"%@ — %@ of %@ used · %@ free",
+                      who, PreciseByteCount(used), PreciseByteCount(total), PreciseByteCount(available)];
+    if (purgeable > 0)
+        line = [line stringByAppendingFormat:@" (%@ purgeable)", PreciseByteCount(purgeable)];
+    return line;
 }

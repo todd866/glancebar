@@ -435,10 +435,16 @@ BOOL ChromeAutomationDenied(NSString *errorText);
 // ASCII unit separator (character 31). Status fields use it because song titles contain '|'.
 extern NSString *const YouTubeStatusSeparator;
 // One AppleScript round trip. Fields, in order: tab ("yes"/"no"), state ("playing"/"paused"/
-// other), title, artist, playlist-count text. Keys: tab (BOOL), playing (YES/NO or NSNull
-// when the page did not say), title, artist, count (0 when it is not a count), denied
-// (@"javascript", @"automation", or @""). Nil inputs are an empty result, not a crash.
+// other), title, artist, playlist-count text, elapsed seconds, duration seconds.
+// Keys: tab (BOOL), playing (YES/NO or NSNull when the page did not say), title, artist,
+// count (0 when it is not a count), denied (@"javascript", @"automation", or @"").
+// elapsed and duration are NSNumbers when the script sent a finite number, and absent
+// otherwise (empty, missing, or not finite). Nil inputs are an empty result, not a crash.
 NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText);
+// "0:00 / 3:43", or "1:02:03 / 1:10:00" once the duration reaches an hour.
+// Nil when duration is <= 0 or not finite, or elapsed is not finite.
+// Elapsed is clamped into [0, duration].
+NSString *FormatTrackTime(double elapsed, double duration);
 
 // The offline player is in the way: online, local mode, and not actually playing.
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing);
@@ -504,3 +510,20 @@ extern const int kStorageFullSecondaryPercent;   // 85
 // Nil, or @{@"text": @"Backup 97% full", @"fraction": @(used 0..1)} for the fullest
 // such mount. The headline volume is never its own secondary line.
 NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes);
+
+// The device menu, in menu order. The uid after currentUID, wrapping to the first.
+// Current missing or empty → the first uid. One device, none, or nil → nil (a click
+// opens the menu instead of cycling).
+NSString *NextOutputUID(NSArray<NSDictionary *> *menuDevices, NSString *currentUID);
+
+// Fixed-width instrument copy. 24-hour, English abbreviations, so the column never
+// changes width with the locale: "21:00" today, "Sat" at midnight or "Sat 07:02"
+// within six days, "3 Nov" after that. Nil when resetAt is nil.
+NSString *CompactResetClock(NSDate *resetAt, NSDate *now);
+// "220 GB" at or above 100 of the unit, "89.4 GB" below. Decimal, like Finder.
+NSString *CompactByteCount(long long bytes);
+// "1.77 TB", "2 TB", "220.25 GB". Up to two decimals; trailing zeros dropped.
+NSString *PreciseByteCount(long long bytes);
+// "Macintosh HD — 1.77 TB of 2 TB used · 220.25 GB free (12 GB purgeable)".
+// The parenthetical is omitted when purgeable is <= 0. Nil name → "Volume".
+NSString *StorageVolumeTooltip(NSString *name, long long total, long long available, long long purgeable);

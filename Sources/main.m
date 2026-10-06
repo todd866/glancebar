@@ -2866,6 +2866,21 @@ static NSColor *DiskColor(double frac) {
 static NSColor *BattBarColor(int pct) {
     return pct <= 10 ? NSColor.systemRedColor : pct <= 20 ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
 }
+// SF Symbol battery.100 / .75 / .50 / .25 / .0. The bolt variant exists only for
+// battery.100 (battery.75.bolt and the rest are not in the system set); fall back
+// to the plain level rather than hand AppKit a nil image.
+static NSString *BatterySymbolName(int percent, BOOL plugged) {
+    int bucket = 0;
+    if (percent >= 88) bucket = 100;
+    else if (percent >= 63) bucket = 75;
+    else if (percent >= 38) bucket = 50;
+    else if (percent >= 13) bucket = 25;
+    if (plugged) {
+        NSString *bolt = [NSString stringWithFormat:@"battery.%d.bolt", bucket];
+        if ([NSImage imageWithSystemSymbolName:bolt accessibilityDescription:nil]) return bolt;
+    }
+    return [NSString stringWithFormat:@"battery.%d", bucket];
+}
 
 @interface Gauge : NSView
 @property (nonatomic) double fraction;
@@ -2972,11 +2987,13 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 }
 @end
 
-@interface SoundOutputRow : NSView
+// The whole instrument row is the control. hitTest returns self so the labels
+// do not eat the click that opens Details.
+@interface ClickRow : NSView
 @property (nonatomic, weak) id target;
 @property (nonatomic) SEL action;
 @end
-@implementation SoundOutputRow
+@implementation ClickRow
 - (NSView *)hitTest:(NSPoint)point {
     return NSPointInRect(point, self.bounds) ? self : nil;
 }
@@ -3035,6 +3052,17 @@ static NSColor *ClaudeQuotaColor(double fraction) {
         [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6] fill];
     }
     [super drawRect:dirtyRect];
+}
+@end
+
+// Left click cycles outputs. Right click (and Option-click, handled in the action)
+// opens the full device menu.
+@interface OutputCycleButton : NSButton
+@end
+@implementation OutputCycleButton
+- (void)rightMouseDown:(NSEvent *)event {
+    (void)event;
+    if (self.target && self.action) [self sendAction:self.action to:self.target];
 }
 @end
 
@@ -3178,9 +3206,13 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
 
     if ([existing isKindOfClass:NSTextField.class]) {
         NSTextField *old = (NSTextField *)existing, *new = (NSTextField *)fresh;
-        if (![old.stringValue isEqualToString:new.stringValue]) old.stringValue = new.stringValue;
         old.font = new.font;
         old.textColor = new.textColor;
+        // textColor paints the whole string. Put the attributed value back last so the
+        // system row keeps its per-word colours across an in-place refresh.
+        if (![old.attributedStringValue isEqualToAttributedString:new.attributedStringValue])
+            old.attributedStringValue = new.attributedStringValue;
+        else if (![old.stringValue isEqualToString:new.stringValue]) old.stringValue = new.stringValue;
         old.alignment = new.alignment;
         old.lineBreakMode = new.lineBreakMode;
         old.maximumNumberOfLines = new.maximumNumberOfLines;
@@ -3435,6 +3467,17 @@ static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width)
 #pragma mark - Controller
 
 static const CGFloat kW = 320, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
+// One instrument row. Lead, gauge, value and datum share these x positions so
+// storage, battery and every AI provider line up. kDatumX + kDatumW == kW - kPad.
+// Density is signal per area, not a small panel: space freed from words goes to
+// legible instruments (30pt rows, 8pt gauges, 15pt values), not to shrinking.
+static const CGFloat kRowH = 30, kSoundH = 40;
+static const CGFloat kLeadW = 52;                              // "Cursor" at 13pt, or a 22pt symbol
+static const CGFloat kLeadSymbol = 22;
+static const CGFloat kGaugeX = 74, kGaugeW = 78, kGaugeH = 8;  // kPad + kLeadW + 6
+static const CGFloat kValueX = 156, kValueW = 48;              // "100%" at 15pt
+static const CGFloat kDatumX = 212, kDatumW = 92;              // "220 GB free"
+static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
 // The details document follows the resizable window. It is only touched on the
 // main thread; keeping the active width here avoids threading a layout argument
 // through every detail-section builder.
@@ -3652,6 +3695,7 @@ static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSSt
 // Glancebar itself is starting playback. The JS stays inside one double-quoted
 // AppleScript string, so it cannot contain a double quote; fields come back
 // separated by ASCII 31 (YouTubeStatusSeparator) because titles contain '|'.
+// Fields: tab, state, title, artist, playlist count, elapsed seconds, duration seconds.
 static NSString *YouTubeControlScript(NSString *action) {
     if (![action isEqual:@"start"] && ![action isEqual:@"playpause"] &&
         ![action isEqual:@"next"] && ![action isEqual:@"previous"])
@@ -3691,7 +3735,10 @@ static NSString *YouTubeControlScript(NSString *action) {
         "var countText='';"
         "var nodes=action==='start'?document.querySelectorAll('yt-formatted-string, span'):[];"
         "for(var j=0;j<nodes.length&&j<5000;j++){var ct=trim(nodes[j].textContent||'');if(isCount(ct)){countText=ct;break;}}"
-        "return 'yes'+us+playing+us+title+us+artist+us+countText;})()",
+        "function num(v){return (typeof v==='number'&&isFinite(v))?(''+v):'';}"
+        "var elapsed=video?num(video.currentTime):'';"
+        "var duration=video?num(video.duration):'';"
+        "return 'yes'+us+playing+us+title+us+artist+us+countText+us+elapsed+us+duration;})()",
         action];
     return [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
@@ -3783,6 +3830,9 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSArray<NSString *> *_offlineTracks;
     CFAbsoluteTime _offlineTracksAt;
     BOOL _offlineTracksReady;
+    double _trackElapsed, _trackDuration;   // last probe; the tick interpolates from _trackSampledAt
+    CFAbsoluteTime _trackSampledAt;
+    NSTimer *_trackTick;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -4211,6 +4261,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                 _ytTitle = status[@"title"];
             if ([status[@"artist"] isKindOfClass:NSString.class] && (updateTransport || [status[@"artist"] length] || !_ytArtist.length))
                 _ytArtist = status[@"artist"];
+            NSNumber *elapsed = [status[@"elapsed"] isKindOfClass:NSNumber.class] ? status[@"elapsed"] : nil;
+            NSNumber *duration = [status[@"duration"] isKindOfClass:NSNumber.class] ? status[@"duration"] : nil;
+            if (elapsed || duration) {
+                double seconds = elapsed ? elapsed.doubleValue : 0;
+                double length = duration ? duration.doubleValue : 0;
+                if (!isfinite(seconds) || seconds < 0) seconds = 0;
+                _trackElapsed = seconds;
+                _trackSampledAt = CFAbsoluteTimeGetCurrent();
+                _trackDuration = (isfinite(length) && length > 0) ? length : 0;
+            } else {
+                _trackElapsed = 0;
+                _trackDuration = 0;
+                _trackSampledAt = 0;
+            }
             NSInteger count = [status[@"count"] integerValue];
             if (count > 0) [self rememberLikedCount:count];
         } else {
@@ -4399,7 +4463,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!_musicProbesEnabled) return;
     if (_localMode) {
         double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
-        if (seconds > 3) { [_localPlayer seekToTime:kCMTimeZero]; return; }
+        if (seconds > 3) {
+            // The clock ticks from its last sample; restart it with the seek, not 15s later.
+            [_localPlayer seekToTime:kCMTimeZero completionHandler:^(BOOL __unused finished) {
+                dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
+            }];
+            _trackElapsed = 0;
+            _trackSampledAt = CFAbsoluteTimeGetCurrent();
+            return;
+        }
         [self playLocalIndex:_localIndex - 1];
         return;
     }
@@ -4411,30 +4483,70 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
     if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
 }
-- (NSButton *)musicPill:(NSString *)title symbol:(NSString *)symbol action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
-    PillButton *button = [PillButton buttonWithTitle:title target:self action:action];
-    button.bordered = NO;
-    button.controlSize = NSControlSizeSmall;
-    button.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
-    NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+- (NSButton *)transportButton:(NSString *)symbol pointSize:(CGFloat)pointSize side:(CGFloat)side
+                         action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightSemibold];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
     if (!image) image = [NSImage imageWithSystemSymbolName:@"play.fill" accessibilityDescription:nil];
-    button.image = image;
-    button.imagePosition = title.length ? NSImageLeading : NSImageOnly;
-    button.imageHugsTitle = YES;
-    button.contentTintColor = NSColor.secondaryLabelColor;
+    NSButton *button = [NSButton buttonWithImage:image target:self action:action];
+    button.bordered = NO;
+    button.imagePosition = NSImageOnly;
+    button.imageScaling = NSImageScaleProportionallyDown;
+    button.contentTintColor = NSColor.labelColor;
     button.accessibilityIdentifier = identifier;
     button.accessibilityLabel = label;
-    [button sizeToFit];
-    CGFloat pad = title.length ? 16 : 10;
-    button.frame = NSMakeRect(0, 0, MAX(28, button.frame.size.width + pad), 22);
+    button.frame = NSMakeRect(0, (kSoundH - side) / 2.0, side, side);
     return button;
+}
+- (void)stopTrackTick {
+    [_trackTick invalidate];
+    _trackTick = nil;
+}
+- (void)syncTrackTick {
+    BOOL run = _popover.isShown && _playbackPlaying && isfinite(_trackDuration) && _trackDuration > 0;
+    if (!run) { [self stopTrackTick]; return; }
+    if (_trackTick) return;
+    _trackTick = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(trackTick:)
+                                                userInfo:nil repeats:YES];
+}
+// The popover reconciles its view tree in place, so a label captured at build time
+// would point at a view that is no longer on screen. Look the subtitle up each tick.
+- (void)trackTick:(NSTimer *)timer {
+    (void)timer;
+    if (!_popover.isShown || !_playbackPlaying) { [self stopTrackTick]; return; }
+    NSTextField *subtitle = (NSTextField *)ViewWithAccessibilityIdentifier(
+        _popover.contentViewController.view, @"popover.music.subtitle");
+    if (![subtitle isKindOfClass:NSTextField.class]) return;
+    double elapsed = _trackElapsed;
+    if (_trackSampledAt > 0) elapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
+    NSString *time = FormatTrackTime(elapsed, _trackDuration);
+    if (!time.length) return;
+    NSString *artist = _localMode ? _localArtist : _ytArtist;
+    subtitle.stringValue = artist.length ? [NSString stringWithFormat:@"%@ · %@", artist, time] : time;
+    subtitle.accessibilityLabel = subtitle.stringValue;   // VoiceOver reads the label, not the text
+}
+- (void)noteLocalPlaybackTime {
+    if (!_localPlayer) { _trackDuration = 0; _trackSampledAt = 0; return; }
+    CMTime now = _localPlayer.currentTime;
+    CMTime length = _localPlayer.currentItem ? _localPlayer.currentItem.duration : kCMTimeInvalid;
+    double elapsed = CMTIME_IS_NUMERIC(now) ? CMTimeGetSeconds(now) : 0;
+    double duration = CMTIME_IS_NUMERIC(length) ? CMTimeGetSeconds(length) : 0;
+    if (!isfinite(elapsed) || elapsed < 0) elapsed = 0;
+    _trackElapsed = elapsed;
+    _trackSampledAt = CFAbsoluteTimeGetCurrent();
+    _trackDuration = (isfinite(duration) && duration > 0) ? duration : 0;
 }
 - (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
     BOOL offline = [self musicOffline];
-    BOOL showTransport = _musicProbesEnabled && (_ytTabOpen || _localMode);
+    BOOL loaded = _ytTabOpen || _localMode;
     if (_musicProbesEnabled && offline && !_localMode) {
         NSArray *tracks = [self offlineTrackPaths];
         _localEmpty = tracks.count == 0;
+    }
+    if (_localMode && _localPlayer) {
+        [self noteLocalPlaybackTime];
+        _playbackKnown = YES;
+        _playbackPlaying = _localPlayer.rate > 0;
     }
     NSString *trackTitle = nil, *trackArtist = nil;
     if (_localMode && _localTitle.length) {
@@ -4444,123 +4556,142 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         trackTitle = _ytTitle;
         trackArtist = _ytArtist;
     }
-    if (trackTitle.length) {
-        NSString *line = trackArtist.length ? [NSString stringWithFormat:@"%@ — %@", trackArtist, trackTitle] : trackTitle;
-        NSTextField *track = [self text:line font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
-                                   color:nil at:NSMakeRect(kPad, y, kW - 2*kPad, 32) align:NSTextAlignmentLeft];
-        track.lineBreakMode = NSLineBreakByWordWrapping;
-        track.maximumNumberOfLines = 2;
-        track.accessibilityIdentifier = @"popover.music.track";
-        [root addSubview:track];
-        y += 34;
+    NSString *symbol = @"play.fill", *playLabel = @"Play";
+    if (loaded) {
+        if (!_playbackKnown) { symbol = @"playpause"; playLabel = @"Play or pause"; }
+        else if (_playbackPlaying) { symbol = @"pause.fill"; playLabel = @"Pause"; }
     }
-    if (_localEmpty && offline && !_localMode) {
-        NSTextField *empty = [self text:@"No offline music" font:[NSFont systemFontOfSize:12]
-                                   color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, kW - 2*kPad, 16)
-                                   align:NSTextAlignmentLeft];
-        empty.accessibilityIdentifier = @"popover.music.empty";
-        [root addSubview:empty];
-        return [self addMusicNoteTo:root at:y + 20];
-    }
-    NSString *symbol = @"play.fill", *title = @"Play music", *label = @"Play music";
-    if (showTransport) {
-        title = @"";
-        if (_localMode) { _playbackKnown = YES; _playbackPlaying = _localPlayer.rate > 0; }
-        if (_playbackKnown && _playbackPlaying) { symbol = @"pause.fill"; label = @"Pause"; }
-        else if (_playbackKnown) { symbol = @"play.fill"; label = @"Play"; }
-        else { symbol = @"playpause"; label = @"Play or pause"; }
-    }
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSoundH)];
+    row.accessibilityIdentifier = @"popover.sound.row";
     CGFloat x = kPad;
-    if (showTransport) {
-        NSButton *prev = [self musicPill:@"" symbol:@"backward.fill" action:@selector(musicPrevious:) identifier:@"popover.music.previous" label:@"Previous track"];
-        prev.frame = NSMakeRect(x, y, prev.frame.size.width, 22);
-        [root addSubview:prev];
-        x = NSMaxX(prev.frame) + 6;
+    NSButton *prev = [self transportButton:@"backward.end.fill" pointSize:13 side:20
+                                    action:@selector(musicPrevious:) identifier:@"popover.music.previous"
+                                     label:@"Previous track"];
+    prev.frame = NSOffsetRect(prev.frame, x, 0);
+    prev.enabled = loaded;
+    if (!loaded) prev.contentTintColor = NSColor.tertiaryLabelColor;
+    [row addSubview:prev];
+    x = NSMaxX(prev.frame) + 2;
+    NSButton *play = [self transportButton:symbol pointSize:20 side:28
+                                    action:@selector(musicPlay:) identifier:@"popover.music.play" label:playLabel];
+    play.frame = NSOffsetRect(play.frame, x, 0);
+    [row addSubview:play];
+    x = NSMaxX(play.frame) + 2;
+    NSButton *next = [self transportButton:@"forward.end.fill" pointSize:13 side:20
+                                    action:@selector(musicNext:) identifier:@"popover.music.next" label:@"Next track"];
+    next.frame = NSOffsetRect(next.frame, x, 0);
+    next.enabled = loaded;
+    if (!loaded) next.contentTintColor = NSColor.tertiaryLabelColor;
+    [row addSubview:next];
+    NSButton *output = [self outputButton];
+    output.frame = NSMakeRect(kW - kPad - 22, (kSoundH - 22) / 2.0, 22, 22);
+    [row addSubview:output];
+    CGFloat textX = NSMaxX(next.frame) + 8;
+    CGFloat textW = NSMinX(output.frame) - 8 - textX;
+    NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
+    // The row is a plain NSView, so y grows up; the flipped popover only applies to the root.
+    NSTextField *title = [self text:titleText font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+                              color:nil at:NSMakeRect(textX, 16, textW, 15) align:NSTextAlignmentLeft];
+    title.accessibilityIdentifier = @"popover.music.title";
+    title.accessibilityLabel = titleText;
+    [row addSubview:title];
+    double shownElapsed = _trackElapsed;
+    if (loaded && _playbackPlaying && _trackSampledAt > 0)
+        shownElapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
+    NSString *time = loaded ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
+    NSString *subtitleText;
+    if (!loaded) {
+        if (offline && _localEmpty) subtitleText = @"No offline music";
+        else if (offline) subtitleText = [NSString stringWithFormat:@"Shuffle · %lu offline",
+                                          (unsigned long)[self offlineTrackPaths].count];
+        else subtitleText = @"Shuffle · YouTube Music";
+    } else if (trackArtist.length && time.length) {
+        subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
+    } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
+    NSTextField *subtitle = [self text:subtitleText
+                                  font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
+                                 color:NSColor.secondaryLabelColor
+                                    at:NSMakeRect(textX, 2, textW, 14) align:NSTextAlignmentLeft];
+    subtitle.accessibilityIdentifier = @"popover.music.subtitle";
+    subtitle.accessibilityLabel = subtitleText;
+    [row addSubview:subtitle];
+    [root addSubview:row];
+    return [self addMusicNoteTo:root at:y + kSoundH + 2];
+}
+- (NSButton *)outputButton {
+    [self ensureAudioDisplay];
+    NSArray<NSDictionary *> *menu = AudioOutputMenuDevices(_audioDevices, _defaultOutputUID);
+    NSDictionary *current = nil;
+    for (NSDictionary *row in menu)
+        if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
+    if (!current)
+        for (NSDictionary *row in _audioDevices)
+            if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
+    NSString *name = current[@"name"] ?: @"No output device";
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:AudioSymbolName(current) accessibilityDescription:nil]
+                      imageWithSymbolConfiguration:cfg];
+    if (!image) image = [NSImage imageWithSystemSymbolName:@"speaker.wave.2" accessibilityDescription:nil];
+    OutputCycleButton *button = [OutputCycleButton buttonWithImage:image target:self action:@selector(cycleOutput:)];
+    button.bordered = NO;
+    button.imagePosition = NSImageOnly;
+    button.imageScaling = NSImageScaleProportionallyDown;
+    button.contentTintColor = NSColor.secondaryLabelColor;
+    button.accessibilityIdentifier = @"popover.sound";
+    button.accessibilityLabel = [NSString stringWithFormat:@"Sound output, %@", name];
+    NSString *nextUID = NextOutputUID(menu, _defaultOutputUID);
+    NSString *nextName = nil;
+    for (NSDictionary *row in menu)
+        if ([row[@"uid"] isEqual:nextUID]) { nextName = row[@"name"]; break; }
+    button.toolTip = nextName.length ? [NSString stringWithFormat:@"%@ — click for %@", name, nextName] : name;
+    return button;
+}
+- (IBAction)cycleOutput:(id)sender {
+    NSEvent *event = NSApp.currentEvent;
+    BOOL menuGesture = (event.modifierFlags & NSEventModifierFlagOption) ||
+        event.type == NSEventTypeRightMouseDown || event.type == NSEventTypeRightMouseUp;
+    NSView *anchor = [sender isKindOfClass:NSView.class] ? sender : nil;
+    if (menuGesture) { [self showOutputMenu:anchor]; return; }
+    NSArray<NSDictionary *> *devices = _audioDevices;
+    if (_musicProbesEnabled) {
+        devices = ReadAudioDevices();
+        _audioDevices = devices;
+        NSString *live = DefaultOutputUID(devices);
+        if (live.length) _defaultOutputUID = live;
     }
-    NSButton *play = [self musicPill:title symbol:symbol action:@selector(musicPlay:) identifier:@"popover.music.play" label:label];
-    play.frame = NSMakeRect(x, y, play.frame.size.width, 22);
-    [root addSubview:play];
-    x = NSMaxX(play.frame) + 6;
-    if (showTransport) {
-        NSButton *next = [self musicPill:@"" symbol:@"forward.fill" action:@selector(musicNext:) identifier:@"popover.music.next" label:@"Next track"];
-        next.frame = NSMakeRect(x, y, next.frame.size.width, 22);
-        [root addSubview:next];
+    NSArray<NSDictionary *> *menu = AudioOutputMenuDevices(devices, _defaultOutputUID);
+    NSString *next = NextOutputUID(menu, _defaultOutputUID);
+    if (!next.length) { [self showOutputMenu:anchor]; return; }
+    for (NSDictionary *row in menu) {
+        if (![row[@"uid"] isEqual:next]) continue;
+        if (_musicProbesEnabled)
+            SetOutputDevice((AudioObjectID)[row[@"deviceID"] unsignedIntValue]);
+        _defaultOutputUID = next;
+        break;
     }
-    return [self addMusicNoteTo:root at:y + 26];
+    if (_popover.isShown) [self rebuildContent];
 }
 - (CGFloat)addMusicNoteTo:(NSView *)root at:(CGFloat)y {
     if (!_musicNote.length) return y;
-    NSFont *font = [NSFont systemFontOfSize:10.5];
-    CGFloat width = kW - 2 * kPad;
-    CGFloat textH = MIN(42, MAX(14, [self soundNameHeight:_musicNote font:font width:width]));
-    NSTextField *hint = [self text:_musicNote font:font color:NSColor.secondaryLabelColor
-                                at:NSMakeRect(kPad, y, width, textH) align:NSTextAlignmentLeft];
-    hint.lineBreakMode = NSLineBreakByWordWrapping;
-    hint.maximumNumberOfLines = 3;
+    NSTextField *hint = [self text:_musicNote font:[NSFont systemFontOfSize:11]
+                             color:NSColor.secondaryLabelColor
+                                at:NSMakeRect(kPad, y, kW - 2 * kPad, 14) align:NSTextAlignmentLeft];
+    hint.maximumNumberOfLines = 1;
+    hint.toolTip = _musicNote;
     hint.accessibilityIdentifier = @"popover.music.hint";
     [root addSubview:hint];
-    return y + textH + 4;
-}
-- (CGFloat)soundNameHeight:(NSString *)name font:(NSFont *)font width:(CGFloat)width {
-    if (!name.length) return 16;
-    NSRect rect = [name boundingRectWithSize:NSMakeSize(width, 200) options:NSStringDrawingUsesLineFragmentOrigin
-                                  attributes:@{NSFontAttributeName: font}];
-    return ceil(NSHeight(rect));
-}
-- (NSView *)soundOutputRowAt:(CGFloat)y height:(CGFloat *)heightOut {
-    [self ensureAudioDisplay];
-    NSDictionary *current = nil;
-    for (NSDictionary *row in _audioDevices)
-        if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
-    NSString *name = current[@"name"] ?: @"No output device";
-    CGFloat iconW = 16, chevronW = 12, gap = 6;
-    CGFloat textX = kPad + iconW + gap;
-    CGFloat textW = kW - kPad - chevronW - gap - textX;
-    NSFont *font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-    CGFloat textH = [self soundNameHeight:name font:font width:textW];
-    if (textH > 34) {
-        font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
-        textH = [self soundNameHeight:name font:font width:textW];
-    }
-    BOOL shrinkMore = textH > 42;
-    if (shrinkMore) {
-        font = [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium];
-        textH = [self soundNameHeight:name font:font width:textW];
-    }
-    textH = MIN(MAX(16, textH), 48);
-    CGFloat rowH = MAX(22, textH + 4);
-    SoundOutputRow *row = [[SoundOutputRow alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
-    row.target = self;
-    row.action = @selector(showOutputMenu:);
-    row.accessibilityRole = NSAccessibilityButtonRole;
-    row.accessibilityIdentifier = @"popover.sound";
-    row.accessibilityLabel = [NSString stringWithFormat:@"Sound output, %@", name];
-    NSImage *icon = [NSImage imageWithSystemSymbolName:AudioSymbolName(current) accessibilityDescription:nil];
-    NSImageView *image = [NSImageView imageViewWithImage:icon];
-    image.contentTintColor = NSColor.secondaryLabelColor;
-    image.frame = NSMakeRect(kPad, (rowH - 16) / 2, iconW, 16);
-    [row addSubview:image];
-    NSTextField *label = [self text:name font:font color:nil at:NSMakeRect(textX, (rowH - textH) / 2, textW, textH) align:NSTextAlignmentLeft];
-    label.lineBreakMode = shrinkMore && textH >= 48 ? NSLineBreakByTruncatingTail : NSLineBreakByWordWrapping;
-    label.maximumNumberOfLines = 3;
-    label.cell.wraps = YES;
-    label.cell.truncatesLastVisibleLine = shrinkMore && textH >= 48;
-    label.accessibilityIdentifier = @"popover.sound.name";
-    [row addSubview:label];
-    NSImage *chevronImage = [NSImage imageWithSystemSymbolName:@"chevron.up.chevron.down" accessibilityDescription:nil];
-    NSImageView *chevron = [NSImageView imageViewWithImage:chevronImage];
-    chevron.contentTintColor = NSColor.tertiaryLabelColor;
-    chevron.frame = NSMakeRect(kW - kPad - chevronW, (rowH - 12) / 2, chevronW, 12);
-    chevron.accessibilityIdentifier = @"popover.sound.chevron";
-    [row addSubview:chevron];
-    if (heightOut) *heightOut = rowH;
-    return row;
+    return y + 16;
 }
 - (void)showOutputMenu:(NSView *)sender {
     [self ensureAudioDisplay];
-    NSArray<NSDictionary *> *devices = ReadAudioDevices();
-    _audioDevices = devices;
-    _defaultOutputUID = DefaultOutputUID(devices);
+    NSArray<NSDictionary *> *devices = _audioDevices;
+    // Layout tests preset the device list and must not touch CoreAudio.
+    if (_musicProbesEnabled) {
+        devices = ReadAudioDevices();
+        _audioDevices = devices;
+        NSString *live = DefaultOutputUID(devices);
+        if (live.length) _defaultOutputUID = live;
+    }
     NSMenu *menu = [NSMenu new];
     NSArray<NSDictionary *> *items = AudioOutputMenuDevices(devices, _defaultOutputUID);
     if (!items.count) {
@@ -5306,8 +5437,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // apart from the mouse-UP that trails a transient dismiss. Fires on every close path —
 // outside click, second icon click, or Escape — which is exactly the set we want to guard.
 - (void)popoverWillClose:(NSNotification *)note {
+    (void)note;
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
     [self stopYouTubeProbeTimer];
+    [self stopTrackTick];
 }
 
 // Starts both process samplers, invalidating any still-in-flight results: top takes
@@ -5521,111 +5654,204 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return reset;
 }
 
-- (NSView *)aiStatusRow:(AIUsage *)u width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
-    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
-    CGFloat inner = width - 2*pad;
-    CGFloat rightW = 70;
-    CGFloat titleW = 74;
-    CGFloat barX = pad + titleW + 8;
-    CGFloat barW = inner - titleW - rightW - 18;
-    BOOL hasGauge = u.limitStatusAvailable && u.remainingFraction >= 0;
-    NSString *title = u.name ?: @"AI";
-    [row addSubview:[self text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold] color:nil
-                          at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
-    // "left" makes the direction unambiguous — a bare "10%" reads as used just as
-    // easily as remaining.
-    NSString *rightText = hasGauge ? [[self aiPercentText:u] stringByAppendingString:@" left"] : @"—";
-    [row addSubview:[self text:rightText font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
-                         color:[self aiStatusColor:u] at:NSMakeRect(width-pad-rightW, 19, rightW, 17) align:NSTextAlignmentRight]];
-    if (hasGauge) {   // no gauge at all beats an empty gauge that implies "0% used"
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20, barW), 7)];
-        g.fraction = u.remainingFraction;
-        g.color = [self aiStatusColor:u];
-        g.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", title];
-        [row addSubview:g];
+// A problem replaces the reset clock in the datum column. The full sentence stays
+// on the tooltip (aiStatusSubtext / limitRefreshError). Nil means "show the reset".
+- (NSString *)aiProblemText:(AIUsage *)u {
+    NSString *err = u.limitRefreshError ?: @"";
+    if ([err hasPrefix:@"Signed out"]) return @"signed out";
+    NSString *blob = [[NSString stringWithFormat:@"%@ %@", err, u.statusReason ?: @""] lowercaseString];
+    if ([blob containsString:@"rate-limited"] || [blob containsString:@"rate limited"] ||
+        [blob containsString:@"429"])
+        return @"rate limited";
+    if ([self aiSnapshotStaleWarns:u]) {
+        NSString *age = u.limitUpdatedAt ? [self shortAgeForDate:u.limitUpdatedAt] : @"";
+        age = [age stringByReplacingOccurrencesOfString:@" ago" withString:@""];
+        if (!age.length || [age isEqualToString:@"pending"]) return @"stale";
+        return [@"stale " stringByAppendingString:age];
     }
-    [row addSubview:[self text:[self aiStatusSubtext:u] font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                          at:NSMakeRect(pad, 3, inner, 14) align:NSTextAlignmentLeft]];
-    return row;
+    if (_aiTotalsIncomplete) {
+        NSString *status = _aiCatchUpStatus ?: @"";
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[Ii]ndexing\\s+([0-9]+)%"
+                                                                           options:0 error:nil];
+        NSTextCheckingResult *match = [re firstMatchInString:status options:0 range:NSMakeRange(0, status.length)];
+        if (match.numberOfRanges >= 2)
+            return [NSString stringWithFormat:@"indexing %@%%", [status substringWithRange:[match rangeAtIndex:1]]];
+        return @"incomplete";
+    }
+    if (!u.limitStatusAvailable || u.remainingFraction < 0) return @"unavailable";
+    return nil;
 }
 
-// Claude's row: the gauge and the big number are the WEEKLY allowances — Fable from its
-// scoped window, Opus from the account-wide weekly that governs it (the Claude app's
-// "Current week (Fable)" and "Current week (all models)") — and the 5-hour session
-// window is named in the caption with its own reset. The two clocks are never mixed:
-// capping the weekly figure by the 5-hour one once rendered "57/57%" against a Claude
-// app that said the week had 65% left. Account-wide windows stay explicit in Details.
-- (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
-    NSDictionary *quotas = [u.name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable
-        ? ClaudeModelQuotas(u.limitWindows) : nil;
-    if (!quotas) {
-        [root addSubview:[self aiStatusRow:u width:width pad:pad at:y]];
-        return y + 40;
+- (NSString *)batteryPopoverTip {
+    if (!_bat.valid) return @"No battery detected";
+    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:[self batteryStatusText]];
+    if (_bat.voltage_mV > 0) [parts addObject:[self batteryPowerText]];
+    if (_bat.designCap_mAh > 0) {
+        int health = (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh);
+        [parts addObject:[NSString stringWithFormat:@"Health %d%% · %ld cycles", health, (long)_bat.cycleCount]];
     }
-    // One figure: the account's weekly allowance across all models (what Opus draws on).
-    // The per-model Fable window is left out at the user's call — it never binds in practice
-    // under Opus 5.5 — so the gauge gets no Fable value and draws a single full-height fill.
-    double week = [quotas[@"opus"] doubleValue];
-    // Staleness is said in the caption, in amber; the fill and the number keep their
-    // quota colours so a cached figure still reads as a figure.
-    BOOL staleWarns = [self aiSnapshotStaleWarns:u];
-    NSColor *dim = NSColor.secondaryLabelColor;
-    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, width, 40)];
-    CGFloat inner = width-2*pad, titleW = 74, rightW = 70;
-    CGFloat barX = pad+titleW+8, barW = inner-titleW-rightW-18;
-    [row addSubview:[self text:@"Claude" font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
-        color:nil at:NSMakeRect(pad, 21, titleW, 15) align:NSTextAlignmentLeft]];
-    ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(barX, 24, MAX(20,barW), 7)];
-    meter.opus = week;
-    NSString *pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week*100];
-    meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
-    NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
-        ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-    NSMutableArray *tip = [NSMutableArray arrayWithObject:
-        [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
-    if (weekClock.length) [tip addObject:[@"Week resets " stringByAppendingString:weekClock]];
-    for (NSDictionary *w in u.limitWindows)
-        if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
-            NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
-                ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-            [tip addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
-                [w[@"remainingFraction"] doubleValue] * 100, clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+    return [parts componentsJoinedByString:@" · "];
+}
+
+- (NSString *)batteryDatumText {
+    if (!_bat.valid) return @"";
+    NSString *datum = @"AC";
+    if (!_bat.acConnected) {
+        if (_bat.percent <= 20) datum = @"…";
+        else {
+            int minutes = MinutesTo20(_bat, [self avgAmp]);
+            datum = minutes >= 0 ? [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)] : @"…";
         }
-    meter.toolTip = [tip componentsJoinedByString:@"\n"];
-    [row addSubview:meter];
-    NSTextField *value = [self text:pct
-        font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightSemibold] color:dim
-        at:NSMakeRect(width-pad-rightW, 21, rightW, 15) align:NSTextAlignmentRight];
-    value.accessibilityIdentifier = @"popover.claude.value";
-    value.accessibilityLabel = @"Percent of the week remaining, all models";
-    value.toolTip = meter.toolTip; [row addSubview:value];
-    // Caption, one line, plain words: when the WEEK resets (the one clock the user plans
-    // around — the 5-hour session window stays in the tooltip and Details), then the cache
-    // age when it matters. Each fallback drops words, never facts.
-    NSString *middleLong, *middleShort;
-    if (weekClock.length) {
-        middleLong = [@"Week resets " stringByAppendingString:weekClock];
-        middleShort = [@"Resets " stringByAppendingString:weekClock];
-    } else {
-        middleLong = middleShort = [self compactResetText:u];
+    } else if (_showWatts && _bat.isCharging && _bat.voltage_mV > 0 && _bat.amperage_mA != 0) {
+        double watts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
+        datum = [NSString stringWithFormat:@"+%.1f W", watts];
     }
-    NSString *note = [self aiStalenessNote:u capitalized:NO];
-    NSString *noteShort = [note stringByReplacingOccurrencesOfString:@" ago" withString:@""];
-    NSFont *captionFont = [NSFont systemFontOfSize:10.5];
-    NSString *text = nil;
-    for (NSArray *variant in @[@[middleLong ?: @"", note ?: @""],
-                               @[middleShort ?: @"", note ?: @""],
-                               @[middleShort ?: @"", noteShort ?: @""]]) {
-        NSArray *parts = [variant filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
-        text = [parts componentsJoinedByString:@" · "];
-        if ([text sizeWithAttributes:@{NSFontAttributeName: captionFont}].width <= inner - 4) break;
+    if (_showHealth && _bat.designCap_mAh > 0 && datum.length) {
+        int health = (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh);
+        NSString *with = [NSString stringWithFormat:@"%@ · %d%%", datum, health];
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+        if ([with sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8) datum = with;   // a label pads its text
     }
-    NSTextField *caption = [self text:text font:captionFont
-        color:staleWarns ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor
-        at:NSMakeRect(pad,3,inner,14) align:NSTextAlignmentLeft];
-    caption.accessibilityIdentifier = @"popover.claude.caption";   // width-checked by tools/check-popover.m
-    caption.toolTip = meter.toolTip; [row addSubview:caption]; [root addSubview:row];
-    return y + 40;
+    return datum;
+}
+
+- (NSAttributedString *)systemReadout {
+    NSFont *label = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    NSFont *value = [NSFont monospacedDigitSystemFontOfSize:14 weight:NSFontWeightSemibold];
+    NSColor *tertiary = NSColor.tertiaryLabelColor;
+    NSColor *ink = NSColor.labelColor;
+    NSMutableAttributedString *line = [NSMutableAttributedString new];
+    void (^add)(NSString *, NSColor *, NSFont *) = ^(NSString *text, NSColor *color, NSFont *font) {
+        if (!text.length) return;
+        [line appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:@{
+            NSFontAttributeName: font, NSForegroundColorAttributeName: color ?: ink}]];
+    };
+    add(@"CPU ", tertiary, label);
+    add(_sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(_sys.cpu * 100)] : @"—", ink, value);
+    NSString *level = MemoryPressureLevel(_sys);
+    add(@"   MEM ", tertiary, label);
+    add(level.lowercaseString, SystemPressureColor(level), value);
+    add(@"   SWAP ", tertiary, label);
+    NSString *swap = @"—";
+    if (_sys.swapValid) swap = _sys.swapUsed == 0 ? @"0 GB" : FmtMemBytes((long long)_sys.swapUsed);
+    add(swap, ink, value);
+    return line;
+}
+
+- (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+    if (!image) image = [NSImage imageWithSystemSymbolName:@"questionmark.circle" accessibilityDescription:nil];
+    NSImageView *iv = [NSImageView imageViewWithImage:image];
+    iv.imageScaling = NSImageScaleProportionallyDown;
+    iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadSymbol + 4, kLeadSymbol);
+    iv.accessibilityIdentifier = identifier;
+    [row addSubview:iv];
+    return iv;
+}
+
+- (NSTextField *)instrumentValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
+    NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                              color:color at:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
+    field.accessibilityIdentifier = identifier;
+    [row addSubview:field];
+    return field;
+}
+
+- (NSTextField *)instrumentDatum:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
+    NSTextField *field = [self text:text ?: @"" font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                              color:color ?: NSColor.secondaryLabelColor
+                                 at:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH) align:NSTextAlignmentLeft];
+    field.accessibilityIdentifier = identifier;
+    [row addSubview:field];
+    return field;
+}
+
+// Claude's row: the gauge and the number are the WEEKLY allowance across all models.
+// The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
+// indexing) takes the datum column; the reset clock is the datum otherwise.
+- (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
+    (void)width; (void)pad;
+    NSString *name = u.name.length ? u.name : @"AI";
+    NSString *slug = name.lowercaseString;
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+    row.accessibilityIdentifier = [@"popover.row.ai." stringByAppendingString:slug];
+    NSDictionary *quotas = [name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable
+        ? ClaudeModelQuotas(u.limitWindows) : nil;
+    double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
+    BOOL claudeMeter = quotas != nil;
+    BOOL hasGauge = claudeMeter || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    NSTextField *title = [self text:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                              color:nil at:NSMakeRect(kPad, (kRowH - kValueH) / 2.0 - 1, kLeadW, kValueH) align:NSTextAlignmentLeft];
+    title.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.name", slug];
+    [row addSubview:title];
+
+    NSString *pct = @"—";
+    NSColor *valueColor = NSColor.tertiaryLabelColor;
+    NSString *tip = [self aiStatusSubtext:u] ?: @"";
+    if (claudeMeter) {
+        pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week * 100];
+        BOOL staleWarns = [self aiSnapshotStaleWarns:u];
+        valueColor = staleWarns ? NSColor.systemOrangeColor
+            : (week < 0 ? NSColor.tertiaryLabelColor : AIQuotaColor(week));
+        NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+        NSMutableArray *parts = [NSMutableArray arrayWithObject:
+            [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
+        if (weekClock.length) [parts addObject:[@"Week resets " stringByAppendingString:weekClock]];
+        for (NSDictionary *w in u.limitWindows)
+            if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
+                NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
+                    ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+                [parts addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
+                    [w[@"remainingFraction"] doubleValue] * 100,
+                    clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+            }
+        if (tip.length) [parts addObject:tip];
+        tip = [parts componentsJoinedByString:@"\n"];
+        ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        meter.opus = week;
+        meter.accessibilityIdentifier = @"popover.ai.claude.gauge";
+        meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
+        meter.toolTip = tip;
+        [row addSubview:meter];
+    } else if (hasGauge) {
+        pct = [self aiPercentText:u];
+        valueColor = [self aiStatusColor:u];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        g.fraction = u.remainingFraction;
+        g.color = valueColor;
+        g.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", name];
+        g.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
+        g.toolTip = tip;
+        [row addSubview:g];
+    }
+    NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
+        : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
+    NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
+    value.toolTip = tip;
+    if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
+    NSString *problem = [self aiProblemText:u];
+    NSColor *datumColor = NSColor.secondaryLabelColor;
+    NSString *datum = @"";
+    if (problem.length) {
+        datum = problem;
+        BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
+        datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (!u.overageActive) {
+        NSDate *reset = u.resetAt;
+        if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
+            reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+        datum = CompactResetClock(reset, NSDate.date) ?: @"";
+    }
+    NSTextField *datumField = [self instrumentDatum:datum color:datumColor
+                                        identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];
+    datumField.toolTip = tip;
+    datumField.accessibilityLabel = tip.length ? tip : datum;
+    row.toolTip = tip;
+    [root addSubview:row];
+    return y + kRowH;
 }
 
 - (NSString *)aiOverviewText {
@@ -5649,10 +5875,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSWindow *popoverWindow = previousView.window;
     NSDictionary *focusSnapshot = [self focusSnapshotForWindow:popoverWindow rootView:previousView];
     FlippedView *root = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
-    CGFloat y = kPad;
+    CGFloat y = 8;   // no header row any more; the first instrument starts at the top
 
-    // ---------- STORAGE ----------
-    [root addSubview:[self sectionHeader:@"Storage" at:y]]; y += 18;
+    // Machine group. No section labels: the symbol's colour is the state, and the
+    // name, the sentence and the breakdown live on the row's tooltip and in Details.
     if (!_vols.count) {
         NSString *status = VolumeScanStatus(_volumesLoading, _volumesUnavailable);
         NSTextField *statusField = [self text:status font:[NSFont systemFontOfSize:12]
@@ -5661,180 +5887,137 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                           align:NSTextAlignmentLeft];
         statusField.accessibilityIdentifier = @"popover.storage.status";
         [root addSubview:statusField];
-        y += 24;
+        y += kRowH;
     }
-    // Headline is the boot volume, same figure as the menu bar and Details Overview.
-    // Another mount that is fuller and over 85% is a second line, not the headline.
     Volume *leadVolume = [self primaryVolume];
     NSMutableArray *fillRows = [NSMutableArray arrayWithCapacity:_vols.count];
     for (Volume *vol in _vols)
         [fillRows addObject:@{@"name": vol.name ?: @"", @"fraction": @(vol.fraction),
                               @"boot": @([vol.path isEqualToString:@"/"])}];
     NSDictionary *secondaryNotice = StorageSecondaryNotice(fillRows);
-    for (Volume *v in leadVolume ? @[leadVolume] : @[]) {
-        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
-        CGFloat inner = kW - 2*kPad;
-        NSImage *ic = [NSImage imageWithSystemSymbolName:(v.isInternal ? @"internaldrive" : @"externaldrive")
-                                accessibilityDescription:nil];
-        NSImageView *iv = [NSImageView imageViewWithImage:ic];
-        iv.contentTintColor = NSColor.secondaryLabelColor; iv.frame = NSMakeRect(kPad, 31, 17, 15);
-        [row addSubview:iv];
-        NSString *volumeID = [@"popover.storage" stringByAppendingString:v.path ?: v.name];
-        NSTextField *nameField = [self text:v.name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
-                                          color:nil at:NSMakeRect(kPad+23, 31, inner-23-46, 16)
-                                          align:NSTextAlignmentLeft];
-        nameField.accessibilityIdentifier = [volumeID stringByAppendingString:@".name"];
-        [row addSubview:nameField];
-        NSTextField *percentField = [self text:[NSString stringWithFormat:@"%d%%", (int)lround(v.fraction*100)]
-                                             font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular]
-                                            color:NSColor.secondaryLabelColor
-                                               at:NSMakeRect(kW-kPad-46, 31, 46, 16)
-                                            align:NSTextAlignmentRight];
-        percentField.accessibilityIdentifier = [volumeID stringByAppendingString:@".percent"];
-        [row addSubview:percentField];
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 22, inner, 5)];
-        g.fraction = v.fraction; g.color = DiskColor(v.fraction);
-        g.metricLabel = [NSString stringWithFormat:@"%@ storage used", v.name];
-        g.accessibilityIdentifier = [volumeID stringByAppendingString:@".gauge"];
-        [row addSubview:g];
-        NSTextField *capacityField = [self text:[NSString stringWithFormat:@"%@ of %@ used · %@ free",
-                                                FmtBytes(v.used), FmtBytes(v.total), FmtBytes(v.available)]
-                                             font:[NSFont systemFontOfSize:11]
-                                            color:NSColor.secondaryLabelColor
-                                               at:NSMakeRect(kPad, 4, inner, 14)
-                                            align:NSTextAlignmentLeft];
-        if (_volumesUnavailable) {
-            capacityField.toolTip = capacityField.stringValue;
-            capacityField.stringValue = [NSString stringWithFormat:@"Cached %@ · scan unavailable",
+    if (leadVolume) {
+        Volume *v = leadVolume;
+        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        row.target = self;
+        row.action = @selector(showStorageDetails:);
+        row.accessibilityRole = NSAccessibilityButtonRole;
+        row.accessibilityIdentifier = @"popover.row.storage";
+        NSMutableString *tip = [StorageVolumeTooltip(v.name, v.total, v.available, v.purgeable) mutableCopy];
+        if ([secondaryNotice[@"text"] isKindOfClass:NSString.class])
+            [tip appendFormat:@" · %@", secondaryNotice[@"text"]];
+        if (_volumesUnavailable)
+            [tip appendFormat:@" · Cached %@ · scan unavailable",
                 _lastVolumeSuccess ? [self shortAgeForDate:_lastVolumeSuccess] : @"reading"];
-            capacityField.textColor = NSColor.systemOrangeColor;
-        }
-        capacityField.accessibilityIdentifier = [volumeID stringByAppendingString:@".capacity"];
-        [row addSubview:capacityField];
-        [root addSubview:row]; y += 54;
+        row.toolTip = tip;
+        row.accessibilityLabel = tip;
+        // A second mount over 85% full is the alarm: it tints the symbol and is named above.
+        NSColor *symbolTint = secondaryNotice ? DiskColor([secondaryNotice[@"fraction"] doubleValue])
+                                              : DiskColor(v.fraction);
+        [self instrumentSymbol:(v.isInternal ? @"internaldrive" : @"externaldrive")
+                         tint:symbolTint identifier:@"popover.storage.symbol" in:row];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        g.fraction = v.fraction;
+        g.color = DiskColor(v.fraction);
+        g.metricLabel = [NSString stringWithFormat:@"%@ storage used", v.name];
+        g.accessibilityIdentifier = @"popover.storage.gauge";
+        g.toolTip = tip;
+        [row addSubview:g];
+        NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(v.fraction * 100)];
+        NSTextField *value = [self instrumentValue:pct color:DiskColor(v.fraction)
+                                        identifier:@"popover.storage.value" in:row];
+        value.toolTip = tip;
+        value.accessibilityLabel = [NSString stringWithFormat:@"%@ percent used", pct];
+        NSTextField *datum = [self instrumentDatum:[NSString stringWithFormat:@"%@ free", CompactByteCount(v.available)]
+                                            color:NSColor.secondaryLabelColor
+                                       identifier:@"popover.storage.datum" in:row];
+        datum.toolTip = tip;
+        [root addSubview:row];
+        y += kRowH;
     }
-    if ([secondaryNotice[@"text"] isKindOfClass:NSString.class]) {
-        NSTextField *note = [self text:secondaryNotice[@"text"] font:[NSFont systemFontOfSize:11]
-                                  color:DiskColor([secondaryNotice[@"fraction"] doubleValue])
-                                     at:NSMakeRect(kPad, y, kW-2*kPad, 14)
-                                  align:NSTextAlignmentLeft];
-        note.accessibilityIdentifier = @"popover.storage.secondary";
-        [root addSubview:note];
-        y += 18;
-    }
-    if (_vols.count > 1) {
-        NSButton *drives = [NSButton buttonWithTitle:[NSString stringWithFormat:@"All %lu drives…", (unsigned long)_vols.count]
-                                              target:self action:@selector(showStorageDetails:)];
-        drives.alignment = NSTextAlignmentLeft;
-        drives.bordered = NO; drives.font = [NSFont systemFontOfSize:12];
-        drives.contentTintColor = NSColor.secondaryLabelColor;
-        drives.frame = NSMakeRect(kPad-4, y, 130, 22);
-        drives.accessibilityIdentifier = @"popover.storage.details";
-        [root addSubview:drives]; y += 22;
-    }
-    y += 2;
-    [root addSubview:[self dividerAt:y]]; y += 9;
 
-    // ---------- BATTERY ----------
-    [root addSubview:[self sectionHeader:@"Battery" at:y]]; y += 18;
-    if (_bat.valid) {
-        NSString *big, *sub;
-        if (_bat.acConnected) {
-            if (_bat.fullyCharged || _bat.percent >= 100) { big = @"Fully charged"; sub = @"On AC power"; }
-            else if (_bat.isCharging) { big = @"Charging"; sub = [NSString stringWithFormat:@"%d%% — plugged in", _bat.percent]; }
-            else { big = [NSString stringWithFormat:@"Held at %d%%", _bat.percent]; sub = @"On AC, not charging"; }
+    {
+        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        row.target = self;
+        row.action = @selector(showBatteryDetails:);
+        row.accessibilityRole = NSAccessibilityButtonRole;
+        row.accessibilityIdentifier = @"popover.row.battery";
+        NSString *tip = [self batteryPopoverTip];
+        row.toolTip = tip;
+        row.accessibilityLabel = tip;
+        if (_bat.valid) {
+            [self instrumentSymbol:BatterySymbolName(_bat.percent, _bat.acConnected)
+                             tint:BattBarColor(_bat.percent) identifier:@"popover.battery.symbol" in:row];
+            Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+            g.fraction = _bat.percent / 100.0;
+            g.color = BattBarColor(_bat.percent);
+            g.metricLabel = @"Battery charge";
+            g.accessibilityIdentifier = @"popover.battery.gauge";
+            g.toolTip = tip;
+            [row addSubview:g];
+            NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%d%%", _bat.percent]
+                                                color:BattBarColor(_bat.percent)
+                                           identifier:@"popover.battery.value" in:row];
+            value.toolTip = tip;
+            NSTextField *datum = [self instrumentDatum:[self batteryDatumText] color:NSColor.secondaryLabelColor
+                                           identifier:@"popover.battery.datum" in:row];
+            datum.toolTip = tip;
         } else {
-            if (_bat.percent <= 20) {
-                big = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
-                sub = @"At or below the 20% reserve";
-            } else {
-                int minutes = MinutesTo20(_bat, [self avgAmp]);
-                big = minutes >= 0 ? [NSString stringWithFormat:@"%@ until 20%%", FmtDuration(minutes)]
-                                   : @"Estimating time until 20%";
-                sub = [NSString stringWithFormat:@"%d%% remaining", _bat.percent];
-            }
+            [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
+                       identifier:@"popover.battery.symbol" in:row];
+            NSTextField *value = [self instrumentValue:@"—" color:NSColor.tertiaryLabelColor
+                                           identifier:@"popover.battery.value" in:row];
+            value.toolTip = tip;
+            [self instrumentDatum:@"" color:nil identifier:@"popover.battery.datum" in:row];
         }
-        NSView *hl = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
-        CGFloat inner = kW - 2*kPad;
-        [hl addSubview:[self text:big font:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold] color:nil
-                             at:NSMakeRect(kPad, 28, inner, 20) align:NSTextAlignmentLeft]];
-        [hl addSubview:[self text:sub font:[NSFont systemFontOfSize:11] color:NSColor.secondaryLabelColor
-                             at:NSMakeRect(kPad, 13, inner, 14) align:NSTextAlignmentLeft]];
-        Gauge *chargeGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kPad, 4, inner, 5)];
-        chargeGauge.fraction = _bat.percent / 100.0;
-        chargeGauge.color = BattBarColor(_bat.percent);
-        chargeGauge.metricLabel = @"Battery charge";
-        [hl addSubview:chargeGauge];
-        [root addSubview:hl]; y += 54;
-    } else {
-        [root addSubview:[self text:@"No battery detected" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
-                              color:nil at:NSMakeRect(kPad, y, kW-2*kPad, 17) align:NSTextAlignmentLeft]];
-        [root addSubview:[self text:@"Energy-impact sampling remains available on desktop Macs"
-                              font:[NSFont systemFontOfSize:10.5] color:NSColor.secondaryLabelColor
-                                at:NSMakeRect(kPad, y+18, kW-2*kPad, 14) align:NSTextAlignmentLeft]];
-        y += 38;
+        [root addSubview:row];
+        y += kRowH;
     }
 
-    if (_bat.valid && ((_showWatts && _bat.voltage_mV > 0) || (_showHealth && _bat.designCap_mAh > 0))) {
-        NSMutableArray<NSString *> *bits = [NSMutableArray array];
-        if (_showWatts && _bat.voltage_mV > 0) {
-            double watts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
-            NSString *s = _bat.amperage_mA == 0 ? (_bat.acConnected ? @"On AC" : @"Drawing —")
-                : [NSString stringWithFormat:@"%@ %.1f W", _bat.amperage_mA < 0 ? @"Drawing" : @"Charging", watts];
-            [bits addObject:s];
-        }
-        if (_showHealth && _bat.designCap_mAh > 0) {
-            [bits addObject:[NSString stringWithFormat:@"Health %d%%",
-                             (int)lround(100.0*_bat.rawMax_mAh/_bat.designCap_mAh)]];
-        }
-        if (bits.count) {
-            y += 2;
-            [root addSubview:[self text:[bits componentsJoinedByString:@" · "] font:[NSFont systemFontOfSize:11]
-                                  color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, kW-2*kPad, 14)
-                                  align:NSTextAlignmentLeft]];
-            y += 18;
-        }
+    {
+        NSString *sysLevel = SystemPressureLevel(_sys);
+        NSString *summary = SystemSummaryText(_sys);
+        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        row.target = self;
+        row.action = @selector(showSystemDetails:);
+        row.accessibilityRole = NSAccessibilityButtonRole;
+        row.accessibilityIdentifier = @"popover.row.system";
+        row.toolTip = summary;
+        row.accessibilityLabel = summary;
+        [self instrumentSymbol:@"cpu" tint:SystemPressureColor(sysLevel)
+                   identifier:@"popover.system.symbol" in:row];
+        NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
+        readout.frame = NSMakeRect(kGaugeX, (kRowH - kValueH) / 2.0, kW - kPad - kGaugeX, kValueH);
+        readout.lineBreakMode = NSLineBreakByTruncatingTail;
+        readout.accessibilityIdentifier = @"popover.system.readout";
+        readout.accessibilityLabel = summary;
+        readout.toolTip = summary;
+        [row addSubview:readout];
+        [root addSubview:row];
+        y += kRowH;
     }
 
-    // ---------- SYSTEM ----------
-    y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 9;
-    [root addSubview:[self sectionHeader:@"System" at:y]]; y += 18;
-    NSString *sysLevel = SystemPressureLevel(_sys);
-    NSView *sys = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 48)];
-    CGFloat inner = kW - 2*kPad;
-    [sys addSubview:[self text:[NSString stringWithFormat:@"%@ system pressure", sysLevel]
-                          font:[NSFont systemFontOfSize:15 weight:NSFontWeightSemibold]
-                         color:SystemPressureColor(sysLevel)
-                            at:NSMakeRect(kPad, 29, inner, 18) align:NSTextAlignmentLeft]];
-    NSTextField *systemSummary = [self text:SystemSummaryText(_sys) font:[NSFont systemFontOfSize:10.5]
-                                      color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 0, inner, 27)
-                                      align:NSTextAlignmentLeft];
-    systemSummary.lineBreakMode = NSLineBreakByWordWrapping;
-    systemSummary.maximumNumberOfLines = 2;
-    [sys addSubview:systemSummary];
-    [root addSubview:sys]; y += 50;
-
-    // ---------- SOUND ----------
-    y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 9;
-    [root addSubview:[self sectionHeader:@"Sound" at:y]]; y += 18;
-    CGFloat soundH = 0;
-    [root addSubview:[self soundOutputRowAt:y height:&soundH]]; y += soundH + 4;
+    y += 8;
+    NSBox *soundRule = [self dividerAt:y];
+    soundRule.accessibilityIdentifier = @"popover.divider.sound";
+    [root addSubview:soundRule];
+    y += 8;
     y = [self addMusicControlsTo:root at:y];
 
-    // ---------- AI STATUS ----------
-    y += 4;
-    [root addSubview:[self dividerAt:y]]; y += 9;
-    [root addSubview:[self sectionHeader:@"AI Status" at:y]]; y += 18;
+    y += 6;
+    NSBox *aiRule = [self dividerAt:y];
+    aiRule.accessibilityIdentifier = @"popover.divider.ai";
+    [root addSubview:aiRule];
+    y += 8;
     if (!_aiUsage.count) {
-        [root addSubview:[self text:@"Limit status unavailable" font:[NSFont systemFontOfSize:12]
-                              color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, y, inner, 16) align:NSTextAlignmentLeft]];
-        y += 22;
+        NSTextField *empty = [self text:@"Limit status unavailable" font:[NSFont systemFontOfSize:12]
+                                  color:NSColor.secondaryLabelColor
+                                     at:NSMakeRect(kPad, y, kW - 2 * kPad, 16) align:NSTextAlignmentLeft];
+        empty.accessibilityIdentifier = @"popover.ai.empty";
+        [root addSubview:empty];
+        y += kRowH;
     } else {
-        for (AIUsage *u in _aiUsage) {
+        for (AIUsage *u in _aiUsage)
             y = [self addAICard:u toView:root width:kW pad:kPad at:y];
-        }
     }
 
     // ---------- fixed footer ----------
@@ -5849,7 +6032,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // Fills windowBackgroundColor in drawRect: instead of freezing it into a CALayer CGColor,
     // so the footer follows a live Light/Dark switch like the panel above it.
     PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
-    [footer addSubview:[self dividerAt:0]];
+    NSBox *footerRule = [self dividerAt:0];
+    footerRule.accessibilityIdentifier = @"popover.divider.footer";
+    [footer addSubview:footerRule];
     NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
@@ -5905,6 +6090,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         freshView = root;
         _popover.contentSize = NSMakeSize(kW, y + footerH);
     }
+    [self syncTrackTick];
     if (ReconcileViewTree(previousView, freshView)) {
         _popoverScroll = FirstScrollView(previousView);
         // The outlets were assigned on the discarded fresh tree; point them at the buttons
@@ -6723,10 +6909,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self restoreFocus:focusSnapshot inView:_detailsWindow.contentView window:_detailsWindow];
 }
 
-- (void)showStorageDetails:(id)sender {
+- (void)showStorageDetails:(id)sender { [self showDetailsTab:@"storage" sender:sender]; }
+- (void)showBatteryDetails:(id)sender { [self showDetailsTab:@"battery" sender:sender]; }
+- (void)showSystemDetails:(id)sender { [self showDetailsTab:@"system" sender:sender]; }
+- (void)showDetailsTab:(NSString *)tab sender:(id)sender {
     [self showDetails:sender];
+    if (!tab.length) return;
     for (NSView *view in _detailsWindow.contentView.subviews)
-        if ([view isKindOfClass:NSTabView.class]) [(NSTabView *)view selectTabViewItemWithIdentifier:@"storage"];
+        if ([view isKindOfClass:NSTabView.class])
+            [(NSTabView *)view selectTabViewItemWithIdentifier:tab];
 }
 
 - (void)showDetails:(id)sender {

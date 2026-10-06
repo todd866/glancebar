@@ -7,15 +7,16 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 <p align="center">
-  <img src="docs/screenshot.png?v=4750bb62" alt="Glancebar menu bar item and its combined storage, battery, system, and AI status popover" width="380">
+  <img src="docs/screenshot.png?v=ac246d47" alt="Glancebar menu bar item and a compact instrument popover: one row each for storage, battery, and system, a mini player, and one AI quota row per provider" width="380">
 </p>
 
 ## Overview
 
 Glancebar puts the numbers that ruin your day in one compact menu bar item
-(`💾 61%  🔋 76%` by default). Click it for a single native popover with **Storage**,
-**Battery**, **System**, and **AI Status** summaries: volume gauges, time until 20%,
-battery and system summaries in plain English, and compact AI limit gauges.
+(`💾 61%  🔋 76%` by default). Click it for a single native popover laid out like
+an instrument panel: one row each for storage, battery, and system, a mini player,
+and one quota row per AI provider. Colour, the symbol, and the gauge carry the
+state; names, dates, and breakdowns sit on the row's tooltip.
 A **Details…** window keeps the fuller lists behind tabs without crowding the popover.
 
 One item, one slot, **no third-party dependencies, bundled daemons, or bundled helper
@@ -27,49 +28,12 @@ opt-in) `/usr/bin/security`.
 
 ## Features
 
-- **Storage** — every volume (internal + external/NTFS) with Finder-accurate free space
-  (purgeable counts as free, and Details says how much of the figure that is); gauges
-  turn orange past 85%, red past 95%.
-- **Battery** — "3:14 until 20%" (not a bare percentage), sampled energy impact grouped
-  by app/process with raw process names and plain-English context, live draw in watts,
-  and battery health / cycle count.
-- **Sound** — its own section, like Storage and Battery. The row shows the current output
-  (a speaker for a Bluetooth speaker such as a SoundLink, headphones only for headphones
-  or AirPods, a display for HDMI) and the full device name, and opens the device menu.
-  Choosing one sets the system output and the alert sound. **Switch to new outputs**
-  (on by default, under ⋯) makes a newly connected Bluetooth, USB, or HDMI/DisplayPort
-  device the default, including a Bluetooth speaker that appears as an input a moment
-  before its output. Virtual devices such as Microsoft Teams Audio stay off that list
-  unless they are already the default. Sound is not a menu bar segment.
-- **Play music** — the Sound section plays your YouTube Music Liked Music, shuffled, from
-  a random song, in the signed-in Google Chrome profile and without bringing Chrome
-  forward. Play, pause, previous, and next run in that music.youtube.com tab, and the
-  popover shows the artist and title. While the popover is open, Glancebar re-reads the
-  tab every few seconds. Shuffle is turned on when Glancebar starts playback, not on
-  every refresh. If Chrome is not set to allow JavaScript from Apple Events, the buttons
-  fall back to the system media key and the popover says how to turn that on. If
-  Glancebar is not allowed to control Chrome, it says so and will not keep opening tabs.
-  Offline, or if Chrome cannot open, the same buttons play the m4a files in
-  `~/Music/YouTube Liked/` through Glancebar’s own player, shuffled, with the track’s
-  title and artist; once the network is back and that player is paused, the next press
-  returns to YouTube. An empty folder says “No offline music”. Glancebar does not fetch
-  YouTube itself.
-- **System** — overall CPU, memory pressure (the kernel's own verdict, not a heuristic),
-  swap, and top CPU/memory apps with the same raw-process-plus-context treatment; the
-  popover shows overall pressure; Details keeps the process breakdowns. Memory and swap are
-  reported in binary units and by Activity Monitor's own "used" formula, so the figures
-  match the tool you would check them against.
-- **AI status** — Codex's official remaining-quota percentage and reset time from its
-  own session logs, kept apart per allowance bucket so a spent plan window is never
-  hidden behind an untouched side bucket, plus where requests bill once the plan is
-  spent ("Requests now bill to credits · none available"); an opt-in gauge for your
-  Claude account (5-hour, weekly, and the model-scoped weekly, e.g. "weekly Fable"); an
-  opt-in gauge for your Cursor account (included plan spend / request quota via Cursor's
-  local session); live per-day token totals, sessions, messages, tool calls and a
-  per-model split for Claude and Codex, counted the way a human would (cached context
-  re-reads shown separately). Each row's subtitle answers one question — when the quota
-  comes back ("Resets Thu 21:00 · in 4d") — and a figure that couldn't be refreshed says
-  how old it is ("· cached 3h ago"); why the refresh failed is in Details.
+- **Storage** — one row for the boot volume: percent used, a gauge (orange past 85%, red past 95%), and free space in short units. Finder-accurate free space counts purgeable data as free. Another mount over 85% full tints the symbol and is named on the tooltip, which also carries the volume name, capacity, and purgeable share. The row opens the Storage tab; every other volume stays in Details.
+- **Battery** — one row: charge percent, a gauge, and either time until 20% (`2:43 to 20%`, or `…` while estimating), charging watts (`+1.4 W`, hidden when Current draw is off), or `AC` when plugged in and not charging. The symbol is the charge level, with a bolt while plugged in. Health and cycle count are on the tooltip; with Health on, the datum also gains `· 93%` when the column fits. The row opens the Battery tab, where sampled energy impact still lives.
+- **Sound** — one control-bar row, not a device name. Previous, play, and next sit on the left; the track (or "Liked Music" before anything is loaded) and a subtitle sit in the middle; the current output's symbol sits on the right. A click cycles to the next output, in the same order as the device menu (virtual devices stay off the list unless they are already the default); a right-click or Option-click opens that menu, and so does a click when there is only one output. Choosing one sets the system output and the alert sound. **Switch to new outputs** (on by default, under ⋯) makes a newly connected Bluetooth, USB, or HDMI/DisplayPort device the default, including a Bluetooth speaker that appears as an input a moment before its output. Headphones are headphones or AirPods only; a Bluetooth speaker stays a speaker; HDMI is a display. Sound is not a menu bar segment.
+- **Play music** — play starts your YouTube Music Liked Music, shuffled, from a random song, in the signed-in Google Chrome profile and without bringing Chrome forward. Previous and next are always there, dimmed until a track is loaded. The subtitle is `Artist · 1:23 / 4:03` while something is playing (the clock advances once a second from the last reading) and, when nothing is loaded, `Shuffle · YouTube Music`, `Shuffle · N offline`, or `No offline music`. While the popover is open, Glancebar re-reads the tab every few seconds. Shuffle is turned on when Glancebar starts playback, not on every refresh. If Chrome is not set to allow JavaScript from Apple Events, the buttons fall back to the system media key and one line under the row says how to turn that on. If Glancebar is not allowed to control Chrome, it says so and will not keep opening tabs. Offline, or if Chrome cannot open, the same buttons play the m4a files in `~/Music/YouTube Liked/` through Glancebar’s own player, shuffled. Glancebar does not fetch YouTube itself.
+- **System** — one row: CPU percent, memory pressure (the kernel's own verdict, not a heuristic), and swap, with the symbol and the pressure word coloured by that verdict. The full sentence is the tooltip. The row opens the System tab, which keeps the process breakdowns. Memory and swap are reported in binary units and by Activity Monitor's own "used" formula, so the figures match the tool you would check them against.
+- **AI status** — one row per provider (Claude, Codex, Cursor): a fixed name, a gauge, percent left, and a compact reset (`21:00` today, `Sat` or `Sat 07:02` this week, `3 Nov` later). Codex's official remaining-quota percentage comes from its own session logs, kept apart per allowance bucket so a spent plan window is never hidden behind an untouched side bucket; where requests bill once the plan is spent stays on the tooltip ("Requests now bill to credits · none available"). Claude keeps its dual meter for the weekly allowance across all models (the 5-hour window is on the tooltip and in Details, never a second number). Cursor is the opt-in included-plan gauge. A problem takes the datum instead — `signed out`, `rate limited`, `stale 2h`, `indexing 95%` — in amber or red, with the full reason on the tooltip. Live per-day token totals, sessions, messages, tool calls and the per-model split stay in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   and/or system. AI status is deliberately not among them: a single percentage in the bar
   cannot say which pool it belongs to, and the pool with the least left is rarely the one
@@ -99,14 +63,7 @@ opt-in) `/usr/bin/security`.
   helper, and no network requests unless you opt in. The only `sudo`-level actions are the
   Keep Awake and Low Power switches, through the optional four-command rule or the standard admin prompt.
 
-The main popover shows the fullest drive, battery, overall system pressure, and one
-quota row per AI provider. Claude normally overlays two full-height fills on the
-same scale. Within three percentage points it uses thin lanes: Fable above, Opus
-below. Each changes colour independently; both are green after a full reset.
-A subtle boundary keeps different endpoints visible when both have the same colour. When no separate
-Opus quota is reported, its fill uses the shared allowance (identified on hover). **All drives…** opens the complete Storage tab; **Details…**
-keeps process breakdowns, every quota window, and diagnostics available on demand.
-The Details button's tooltip includes the last refresh times.
+The main popover is one row per instrument: boot-volume storage, battery, CPU / memory / swap, the mini player, and one quota row per AI provider. Claude's gauge is still the weekly allowance across all models, drawn as two full-height fills on the same scale. Within three percentage points it uses thin lanes: Fable above, Opus below. Each changes colour independently; both are green after a full reset. A subtle boundary keeps different endpoints visible when both have the same colour. When no separate Opus quota is reported, its fill uses the shared allowance (identified on hover). A storage, battery, or system row opens the matching Details tab. **Details…** keeps every volume, process breakdowns, every quota window, and diagnostics. The ⋯ button's tooltip includes the last refresh times.
 
 ## Build & Install
 

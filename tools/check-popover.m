@@ -23,6 +23,25 @@ static BOOL HasText(NSView *view, NSString *text) {
     for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
     return NO;
 }
+static BOOL HasTip(NSView *view, NSString *text) {
+    if ([view.toolTip containsString:text]) return YES;
+    if ([view.accessibilityLabel containsString:text]) return YES;
+    for (NSView *child in view.subviews) if (HasTip(child, text)) return YES;
+    return NO;
+}
+static NSUInteger CountIdentifier(NSView *view, NSString *identifier) {
+    NSUInteger count = [view.accessibilityIdentifier isEqual:identifier] ? 1 : 0;
+    for (NSView *child in view.subviews) count += CountIdentifier(child, identifier);
+    return count;
+}
+static BOOL InstrumentRowsFit(NSView *view) {
+    if ([view.accessibilityIdentifier hasPrefix:@"popover.row."] && view.frame.size.height > kRowH + 2) return NO;
+    for (NSView *child in view.subviews) if (!InstrumentRowsFit(child)) return NO;
+    return YES;
+}
+static BOOL SameColumn(NSView *a, NSView *b) {
+    return a && b && fabs(a.frame.origin.x - b.frame.origin.x) < 0.5;
+}
 static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
     if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
         NSTextField *f = (NSTextField *)view;
@@ -36,6 +55,25 @@ static NSView *FindIdentifier(NSView *view, NSString *identifier) {
     if ([view.accessibilityIdentifier isEqual:identifier]) return view;
     for (NSView *child in view.subviews) { NSView *hit = FindIdentifier(child, identifier); if (hit) return hit; }
     return nil;
+}
+static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL transportOn) {
+    NSTextField *titleField = (NSTextField *)FindIdentifier(root, @"popover.music.title");
+    NSTextField *subtitleField = (NSTextField *)FindIdentifier(root, @"popover.music.subtitle");
+    NSButton *prev = (NSButton *)FindIdentifier(root, @"popover.music.previous");
+    NSButton *play = (NSButton *)FindIdentifier(root, @"popover.music.play");
+    NSButton *next = (NSButton *)FindIdentifier(root, @"popover.music.next");
+    NSView *output = FindIdentifier(root, @"popover.sound");
+    NSView *row = FindIdentifier(root, @"popover.sound.row");
+    if (![titleField isKindOfClass:NSTextField.class] || ![titleField.stringValue isEqual:title]) return NO;
+    if (![subtitleField isKindOfClass:NSTextField.class] || ![subtitleField.stringValue isEqual:subtitle]) return NO;
+    if (![prev isKindOfClass:NSButton.class] || ![play isKindOfClass:NSButton.class] ||
+        ![next isKindOfClass:NSButton.class] || !output || !row) return NO;
+    if (row.frame.size.height > kSoundH + 2 || CountIdentifier(root, @"popover.sound.row") != 1) return NO;
+    if (prev.superview != row || play.superview != row || next.superview != row ||
+        output.superview != row || titleField.superview != row || subtitleField.superview != row) return NO;
+    if (prev.enabled != transportOn || next.enabled != transportOn) return NO;
+    return FindIdentifier(root, @"popover.sound.chevron") == nil &&
+           FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
     for (NSView *child in view.subviews) {
@@ -146,30 +184,39 @@ int main(int argc, const char **argv) {
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
-        if (FirstScrollView(root) || root.frame.size.height > 570 || CountGauges(root) != 5 ||
-            HasText(root,@"bengalfox") || !HasText(root,@"cached")) return Fail(__LINE__);
-        if (!HasText(root, @"SOUND") || !HasText(root, @"Bose Flex SoundLink") ||
-            !FindIdentifier(root, @"popover.music.play") || !FindIdentifier(root, @"popover.sound.chevron") ||
-            FindIdentifier(root, @"popover.sound.switch") ||
-            FindIdentifier(root, @"popover.music.previous")) return Fail(__LINE__);
-        NSTextField *soundName = (NSTextField *)FindIdentifier(root, @"popover.sound.name");
-        if (![soundName.stringValue isEqual:@"Bose Flex SoundLink"] ||
-            soundName.lineBreakMode == NSLineBreakByTruncatingTail) return Fail(__LINE__);
-        if (!FitsChildren(root)) return Fail(__LINE__);
+        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 5 ||
+            HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
+        if (HasText(root, @"STORAGE") || HasText(root, @"BATTERY") || HasText(root, @"SYSTEM") ||
+            HasText(root, @"SOUND") || HasText(root, @"AI STATUS") ||
+            FindIdentifier(root, @"popover.heading.storage") || FindIdentifier(root, @"popover.storage.details") ||
+            HasText(root, @"drives")) return Fail(__LINE__);
+        if (!InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+        NSView *storageGauge = FindIdentifier(root, @"popover.storage.gauge");
+        NSView *batteryGauge = FindIdentifier(root, @"popover.battery.gauge");
+        NSView *codexGauge = FindIdentifier(root, @"popover.ai.codex.gauge");
+        NSView *cursorGauge = FindIdentifier(root, @"popover.ai.cursor.gauge");
+        ClaudeGauge *meter = FindClaudeMeter(root);
+        if (!SameColumn(storageGauge, batteryGauge) || !SameColumn(storageGauge, meter) ||
+            !SameColumn(storageGauge, codexGauge) || !SameColumn(storageGauge, cursorGauge)) return Fail(__LINE__);
+        if (!SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.battery.value")) ||
+            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.claude.value")) ||
+            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.ai.codex.value")))
+            return Fail(__LINE__);
+        NSView *output = FindIdentifier(root, @"popover.sound");
+        if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) ||
+            ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
+            ![output.toolTip isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
         NSView *more = FindIdentifier(p.contentViewController.view, @"popover.more");
         if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
             !FitsChildren(keep.superview)) return Fail(__LINE__);
-        ClaudeGauge *meter = FindClaudeMeter(root);
-        // One figure: the account weekly across all models (33%), as the Claude app's
-        // "Current week (all models)". No Fable figure, and the 5-hour window never caps it.
-        if (!meter || meter.fable >= 0 || fabs(meter.opus-0.33)>0.001 ||
-            meter.frame.origin.x != 98 || meter.frame.size.width != 126 || !HasText(root,@"33%") ||
-            HasText(root,@"Fable")) return Fail(__LINE__);
-        // The caption carries the WEEKLY reset; the 5-hour window is never a cap and never the caption.
-        if (!HasText(root, @"Week resets tomorrow") || HasText(root, @"5-hour")) return Fail(__LINE__);
+        // One figure: the account weekly across all models (33%). No Fable figure, and the
+        // 5-hour window never caps it. The weekly reset is on the tooltip, not a caption.
+        if (!meter || meter.fable >= 0 || fabs(meter.opus-0.33)>0.001 || !HasText(root,@"33%") ||
+            HasText(root,@"Fable") || HasText(root, @"5-hour") || HasText(root, @" left")) return Fail(__LINE__);
+        if (!HasTip(root, @"Week resets tomorrow")) return Fail(__LINE__);
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
         // a weekly reset named by weekday and date, and a cache-age note.
         AIUsage *longest = usage[0];
@@ -179,7 +226,7 @@ int main(int argc, const char **argv) {
             @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 6.5*86400)},
             @{@"remainingFraction":@1, @"window":@"weekly Fable"}];
         [c rebuildContent];
-        if (!HasText(p.contentViewController.view, @"cached 10h") || !FitsChildren(p.contentViewController.view)) {
+        if (!HasText(p.contentViewController.view, @"stale 10h") || !FitsChildren(p.contentViewController.view)) {
             DumpClaudeCaption(p.contentViewController.view); return Fail(__LINE__);
         }
         longest.limitStale = NO; longest.limitUpdatedAt = nil;
@@ -188,11 +235,43 @@ int main(int argc, const char **argv) {
             @{@"remainingFraction":@0.33, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
             @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
         [c rebuildContent];
-        if (!HasText(root, @"Macintosh HD")) return Fail(__LINE__);
+        if (!HasTip(root, @"Macintosh HD")) return Fail(__LINE__);
         NSScrollView *storage = [c storageDetailsView];
         if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
         NSScrollView *ai = [c aiDetailsView];
         if (!HasText(ai.documentView, @"weekly")) return Fail(__LINE__);
+        const char *musicState = getenv("GLANCEBAR_MUSIC_STATE");
+        if (musicState && strcmp(musicState, "playing") == 0) {
+            [c setValue:@YES forKey:@"ytTabOpen"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Midnight City" forKey:@"ytTitle"];
+            [c setValue:@"M83" forKey:@"ytArtist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@243 forKey:@"trackDuration"];
+            [c setValue:@[
+                @{@"uid": @"speakers", @"name": @"MacBook Air Speakers",
+                  @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2, @"dataSource": @""},
+                @{@"uid": @"bose", @"name": @"Bose Flex SoundLink",
+                  @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""}
+            ] forKey:@"audioDevices"];
+            [c setValue:@"speakers" forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSView *playingOut = FindIdentifier(root, @"popover.sound");
+            if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+                ![playingOut.toolTip containsString:@"click for"] ||
+                ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"])
+                return Fail(__LINE__);
+        } else if (musicState && strcmp(musicState, "idle") == 0) {
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) || !FitsChildren(root))
+                return Fail(__LINE__);
+        }
         if (argc > 1) {
             root.appearance = [NSAppearance appearanceNamed:(argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)];
             NSBitmapImageRep *rep = [root bitmapImageRepForCachingDisplayInRect:root.bounds];
@@ -205,13 +284,14 @@ int main(int argc, const char **argv) {
         if (CountGauges(p.contentViewController.view) != 5) return Fail(__LINE__);
         AIUsage *codex = usage[1]; codex.billingNote = @"Requests now bill to credits · balance 20";
         [c rebuildContent];
-        if (!HasText(p.contentViewController.view, @"Using credits")) return Fail(__LINE__);
+        if (!HasTip(p.contentViewController.view, @"Using credits")) return Fail(__LINE__);
         // Missing and stale provider data must stay compact without faking a healthy bar.
         AIUsage *missing = usage.lastObject; missing.limitStatusAvailable = NO;
         missing.remainingFraction = -1; missing.resetAt = nil; missing.statusReason = @"Account unavailable";
         [c rebuildContent];
         if (CountGauges(p.contentViewController.view) != 4 ||
-            !HasText(p.contentViewController.view, @"Account unavailable")) return Fail(__LINE__);
+            !HasTip(p.contentViewController.view, @"Account unavailable") ||
+            !HasText(p.contentViewController.view, @"unavailable")) return Fail(__LINE__);
         meter = FindClaudeMeter(p.contentViewController.view);
         AIUsage *claude = usage[0];
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];

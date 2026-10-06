@@ -800,6 +800,13 @@ int main(void) {
               @"statusline overlay leaves a legacy body without limits[] so Opus stays readable");
         check(ClaudeUsageOverlayingStatusline(apiBody, @{@"fetchedAt": @1}) == nil, @"statusline without windows is ignored");
 
+        {
+            NSString *us = YouTubeStatusSeparator;
+            NSArray *f = @[@"yes", @"playing", @"T", @"A", @"", @"83.25", @"243.5"];
+            NSDictionary *st = ParseYouTubeStatus([f componentsJoinedByString:us], @"");
+            check(fabs([st[@"elapsed"] doubleValue] - 83.25) < 0.001 && fabs([st[@"duration"] doubleValue] - 243.5) < 0.001,
+                  @"music: JavaScript decimals parse with a dot whatever the locale");
+        }
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
         NSString *(^jwt)(double) = ^NSString *(double exp) {
             NSData *claims = [NSJSONSerialization dataWithJSONObject:@{@"exp": @(exp), @"type": @"session"} options:0 error:nil];
@@ -1508,6 +1515,38 @@ int main(void) {
             check([phrase[@"denied"] isEqual:@""] && [phrase[@"title"] isEqual:@"Not authorized to send Apple events"],
                   @"music: a title that mentions Apple events is not an Automation error");
             check(ParseYouTubeStatus(nil, nil) != nil, @"music: nil script output still returns a status");
+            check(playing[@"elapsed"] == nil && playing[@"duration"] == nil,
+                  @"music: elapsed and duration are absent until the script sends them");
+            NSString *timed = [@[@"yes", @"playing", @"Midnight City", @"M83", @"", @"83", @"243"]
+                               componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *withTime = ParseYouTubeStatus(timed, nil);
+            check([withTime[@"elapsed"] isEqual:@83] && [withTime[@"duration"] isEqual:@243] &&
+                  [withTime[@"title"] isEqual:@"Midnight City"],
+                  @"music: elapsed and duration come back as numbers");
+            NSString *fractional = [@[@"yes", @"paused", @"T", @"A", @"", @"83.9", @"243.2"]
+                                    componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *frac = ParseYouTubeStatus(fractional, @"");
+            check(fabs([frac[@"elapsed"] doubleValue] - 83.9) < 0.001 &&
+                  fabs([frac[@"duration"] doubleValue] - 243.2) < 0.001,
+                  @"music: fractional seconds are kept");
+            NSString *notFinite = [@[@"yes", @"playing", @"T", @"A", @"", @"", @"nan"]
+                                   componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *badTime = ParseYouTubeStatus(notFinite, @"");
+            check(badTime[@"elapsed"] == nil && badTime[@"duration"] == nil,
+                  @"music: an empty or non-finite time is absent");
+            NSString *infinite = [@[@"yes", @"playing", @"T", @"A", @"", @"inf", @"10"]
+                                  componentsJoinedByString:YouTubeStatusSeparator];
+            check(ParseYouTubeStatus(infinite, @"")[@"elapsed"] == nil,
+                  @"music: a non-finite elapsed is absent");
+            check([FormatTrackTime(0, 223) isEqual:@"0:00 / 3:43"], @"music: a short track is m:ss");
+            check([FormatTrackTime(83, 243) isEqual:@"1:23 / 4:03"], @"music: 83s of 243s is 1:23 / 4:03");
+            check([FormatTrackTime(3723, 4200) isEqual:@"1:02:03 / 1:10:00"],
+                  @"music: an hour or more is h:mm:ss on both sides");
+            check([FormatTrackTime(-5, 100) isEqual:@"0:00 / 1:40"], @"music: elapsed below zero clamps to 0");
+            check([FormatTrackTime(500, 100) isEqual:@"1:40 / 1:40"], @"music: elapsed past the end clamps to the duration");
+            check(FormatTrackTime(10, 0) == nil && FormatTrackTime(10, -1) == nil &&
+                  FormatTrackTime(10, NAN) == nil && FormatTrackTime(INFINITY, 100) == nil,
+                  @"music: no clock without a finite positive duration, or with a non-finite elapsed");
             check(YieldLocalMusic(YES, YES, NO) && !YieldLocalMusic(YES, YES, YES) &&
                   !YieldLocalMusic(YES, NO, NO) && !YieldLocalMusic(NO, YES, NO),
                   @"music: local mode yields only when online and idle");
@@ -1624,6 +1663,59 @@ int main(void) {
             @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
             @{@"name": @"Backup", @"fraction": @0.86, @"boot": @NO},
         ])[@"text"] isEqual:@"Backup 86% full"], @"86% full is over 85%");
+        check([NextOutputUID(@[
+            @{@"uid": @"a"}, @{@"uid": @"b"}, @{@"uid": @"c"}
+        ], @"b") isEqual:@"c"], @"output: the next device is the next menu row");
+        check([NextOutputUID(@[
+            @{@"uid": @"a"}, @{@"uid": @"b"}, @{@"uid": @"c"}
+        ], @"c") isEqual:@"a"], @"output: the last device wraps to the first");
+        check([NextOutputUID(@[
+            @{@"uid": @"a"}, @{@"uid": @"b"}
+        ], @"missing") isEqual:@"a"], @"output: an unknown current device cycles to the first");
+        check([NextOutputUID(@[@{@"uid": @"a"}, @{@"uid": @"b"}], nil) isEqual:@"a"],
+              @"output: no current device cycles to the first");
+        check(NextOutputUID(@[@{@"uid": @"only"}], @"only") == nil, @"output: a single device does not cycle");
+        check(NextOutputUID(@[], @"a") == nil && NextOutputUID(nil, @"a") == nil,
+              @"output: an empty menu does not cycle");
+
+        // --- Compact instrument copy ---
+        {
+            NSCalendar *cal = NSCalendar.currentCalendar;
+            NSDate *(^at)(NSInteger, NSInteger, NSInteger) = ^NSDate *(NSInteger day, NSInteger hour, NSInteger minute) {
+                NSDateComponents *c = [NSDateComponents new];
+                c.year = 2026; c.month = 6; c.day = day; c.hour = hour; c.minute = minute;
+                return [cal dateFromComponents:c];
+            };
+            NSDate *now = at(10, 10, 0);   // Wed 10 June 2026
+            check(CompactResetClock(nil, now) == nil, @"reset clock: no instant → nil");
+            check([CompactResetClock(at(10, 21, 0), now) isEqual:@"21:00"],
+                  @"reset clock: later today is 24-hour HH:mm");
+            check([CompactResetClock(at(13, 0, 0), now) isEqual:@"Sat"],
+                  @"reset clock: midnight this week is the weekday alone");
+            check([CompactResetClock(at(13, 7, 2), now) isEqual:@"Sat 07:02"],
+                  @"reset clock: a time this week keeps the weekday and 24-hour clock");
+            check([CompactResetClock(at(21, 9, 0), now) isEqual:@"21 Jun"],
+                  @"reset clock: past this week is the day and month, not a weekday");
+        }
+        check([CompactByteCount(220250000000LL) isEqual:@"220 GB"],
+              @"storage: free space at or above 100 GB has no decimal");
+        check([CompactByteCount(89400000000LL) isEqual:@"89.4 GB"],
+              @"storage: free space below 100 GB keeps one decimal");
+        check([CompactByteCount(1500000000000LL) isEqual:@"1.5 TB"],
+              @"storage: a terabyte below 100 keeps one decimal");
+        check([PreciseByteCount(1770000000000LL) isEqual:@"1.77 TB"] &&
+              [PreciseByteCount(2000000000000LL) isEqual:@"2 TB"] &&
+              [PreciseByteCount(220250000000LL) isEqual:@"220.25 GB"],
+              @"storage: the tooltip keeps two decimals and drops trailing zeros");
+        check([StorageVolumeTooltip(@"Macintosh HD", 2000000000000LL, 230000000000LL, 0)
+               isEqual:@"Macintosh HD — 1.77 TB of 2 TB used · 230 GB free"],
+              @"storage: the tooltip names the volume, used, capacity, and free");
+        check([StorageVolumeTooltip(@"Macintosh HD", 2000000000000LL, 220250000000LL, 12000000000LL)
+               isEqual:@"Macintosh HD — 1.78 TB of 2 TB used · 220.25 GB free (12 GB purgeable)"],
+              @"storage: purgeable space is a parenthetical on the tooltip");
+        check([StorageVolumeTooltip(nil, 1000, 1000, 0) isEqual:@"Volume — 0 B of 1 KB used · 1 KB free"],
+              @"storage: a missing name still produces a tooltip");
+
         check([StorageSecondaryNotice(@[
             @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
             @{@"name": @"Backup", @"fraction": @0.90, @"boot": @NO},
