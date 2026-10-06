@@ -157,6 +157,12 @@ static BatteryState ReadBattery(void) {
         b.amperage_mA = amp == LONG_MIN ? 0 : amp;
         b.voltage_mV = NumFor(d, @"Voltage");
         b.cycleCount = NumFor(d, @"CycleCount");
+        NSDictionary *telemetry = [d[@"PowerTelemetryData"] isKindOfClass:NSDictionary.class] ? d[@"PowerTelemetryData"] : nil;
+        b.systemPowerIn_mW = NumFor(telemetry, @"SystemPowerIn");
+        b.systemLoad_mW = NumFor(telemetry, @"SystemLoad");
+        NSDictionary *adapter = [d[@"AdapterDetails"] isKindOfClass:NSDictionary.class] ? d[@"AdapterDetails"] : nil;
+        long adapterWatts = NumFor(adapter, @"Watts");
+        b.adapterWatts = (b.acConnected && adapterWatts > 0 && adapterWatts < 1000) ? adapterWatts : 0;
         long tr = NumFor(d, @"TimeRemaining");
         b.minutesToEmpty = (tr == LONG_MIN || tr >= 65535) ? -1 : tr;
     }
@@ -5669,7 +5675,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery detected";
     NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:[self batteryStatusText]];
-    if (_bat.voltage_mV > 0) [parts addObject:[self batteryPowerText]];
+    NSString *flow = [self batteryPowerFlowText];
+    if (flow.length) [parts addObject:flow];
+    NSString *energy = [self batteryEnergyText];
+    if (energy.length) [parts addObject:energy];
     if (_bat.designCap_mAh > 0) {
         int health = (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh);
         [parts addObject:[NSString stringWithFormat:@"Health %d%% · %ld cycles", health, (long)_bat.cycleCount]];
@@ -5807,24 +5816,43 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (!_bat.valid) return @"";
     if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
         return @"held 80%";
-    NSString *datum = @"AC";
-    if (!_bat.acConnected) {
-        if (_bat.percent <= 20) datum = @"…";
-        else {
-            int minutes = MinutesTo20(_bat, [self avgAmp]);
-            datum = minutes >= 0 ? [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)] : @"…";
-        }
-    } else if (_showWatts && _bat.isCharging && _bat.voltage_mV > 0 && _bat.amperage_mA != 0) {
-        double watts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
-        datum = [NSString stringWithFormat:@"+%.1f W", watts];
+    // Real units first: what the battery is doing, in signed watts. On battery the
+    // time to 20% rides along when it fits; the full power picture is in the tooltip.
+    NSString *watts = _showWatts ? FormatSignedWatts(BatteryWatts(_bat)) : nil;
+    if (_bat.acConnected) return watts ?: @"AC";
+    NSString *time = nil;
+    if (_bat.percent > 20) {
+        int minutes = MinutesTo20(_bat, [self avgAmp]);
+        if (minutes >= 0) time = FmtDuration(minutes);
     }
-    if (_showHealth && _bat.designCap_mAh > 0 && datum.length) {
-        int health = (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh);
-        NSString *with = [NSString stringWithFormat:@"%@ · %d%%", datum, health];
-        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-        if ([with sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8) datum = with;   // a label pads its text
+    if (!watts) return time ? [time stringByAppendingString:@" to 20%"] : @"…";
+    if (!time) return watts;
+    NSString *both = [NSString stringWithFormat:@"%@ · %@", watts, time];
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    return [both sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8 ? both : watts;
+}
+// "Input 18.8 W (20 W charger) · system 14.9 W · battery +3.9 W", from Apple's telemetry.
+- (NSString *)batteryPowerFlowText {
+    NSMutableArray *parts = [NSMutableArray array];
+    if (_bat.acConnected && _bat.systemPowerIn_mW > 0 && _bat.systemPowerIn_mW != LONG_MIN) {
+        NSString *input = [NSString stringWithFormat:@"Input %.1f W", _bat.systemPowerIn_mW / 1000.0];
+        if (_bat.adapterWatts > 0) input = [input stringByAppendingFormat:@" (%ld W charger)", _bat.adapterWatts];
+        [parts addObject:input];
     }
-    return datum;
+    if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN)
+        [parts addObject:[NSString stringWithFormat:@"system %.1f W", _bat.systemLoad_mW / 1000.0]];
+    NSString *battery = FormatSignedWatts(BatteryWatts(_bat));
+    if (battery) [parts addObject:[@"battery " stringByAppendingString:battery]];
+    return [parts componentsJoinedByString:@" · "];
+}
+// "30.2 Wh of 52.0 Wh (design 55.3 Wh)".
+- (NSString *)batteryEnergyText {
+    NSString *now = FormatWattHours(BatteryWattHours(_bat.rawCurrent_mAh, _bat.voltage_mV));
+    NSString *full = FormatWattHours(BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV));
+    NSString *design = FormatWattHours(BatteryWattHours(_bat.designCap_mAh, _bat.voltage_mV));
+    if (!now) return nil;
+    NSString *text = full ? [NSString stringWithFormat:@"%@ of %@", now, full] : now;
+    return design ? [text stringByAppendingFormat:@" (design %@)", design] : text;
 }
 
 - (NSAttributedString *)systemReadout {
@@ -7618,6 +7646,12 @@ static NSColor *HealthColor(double fraction) {
     return [self detailScrollForRoot:root height:y];
 }
 
+- (NSTextField *)detailRowName:(NSString *)name cols:(DetailColumns)c identifier:(NSString *)identifier in:(NSView *)row {
+    return [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                      frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16) align:NSTextAlignmentLeft
+                 identifier:identifier in:row];
+}
+
 - (NSScrollView *)batteryDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 520)];
     root.accessibilityIdentifier = @"details.battery";
@@ -7640,6 +7674,7 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
                                           tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
                                     identifier:@"details.battery.charge.symbol" in:row];
+            [self detailRowName:@"Charge" cols:c identifier:@"details.battery.charge.name" in:row];
         mark.toolTip = tip;
         Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
                     label:@"Battery charge" identifier:@"details.battery.charge.gauge" tip:tip in:row];
@@ -7658,6 +7693,7 @@ static NSColor *HealthColor(double fraction) {
             NSView *healthRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.health" tip:healthTip in:root];
             NSImageView *heart = [self detailSymbol:@"heart" size:c.symbol tint:color frame:DetailLeadRect(c)
                                          identifier:@"details.battery.health.symbol" in:healthRow];
+            [self detailRowName:@"Health" cols:c identifier:@"details.battery.health.name" in:healthRow];
             heart.toolTip = healthTip;
             [self detailGauge:DetailGaugeRect(c) fraction:MIN(healthFrac, 1.0) color:color
                         label:@"Battery health" identifier:@"details.battery.health.gauge" tip:healthTip in:healthRow];
@@ -7668,17 +7704,70 @@ static NSColor *HealthColor(double fraction) {
                           tip:healthTip in:healthRow cols:c];
             y += c.rowH;
         }
-        if (power) {
-            BOOL charging = _bat.amperage_mA > 0;
-            NSColor *color = charging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
-            NSString *powerTip = [self batteryPowerText];
-            NSView *powerRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.power" tip:powerTip in:root];
-            NSImageView *bolt = [self detailSymbol:@"bolt" size:c.symbol tint:color frame:DetailLeadRect(c)
-                                        identifier:@"details.battery.power.symbol" in:powerRow];
-            bolt.toolTip = powerTip;
-            [self detailValue:[NSString stringWithFormat:@"%.1f W", watts] color:color
-                   identifier:@"details.battery.power.value" tip:powerTip in:powerRow cols:c];
+        // Real units: energy in watt-hours, and the power flow in watts.
+        double whNow = BatteryWattHours(_bat.rawCurrent_mAh, _bat.voltage_mV);
+        double whFull = BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV);
+        if (!isnan(whNow)) {
+            NSString *energyTip = [self batteryEnergyText] ?: @"";
+            NSView *energyRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.energy" tip:energyTip in:root];
+            [self detailSymbol:@"battery.100" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                    identifier:@"details.battery.energy.symbol" in:energyRow].toolTip = energyTip;
+            [self detailRowName:@"Energy" cols:c identifier:@"details.battery.energy.name" in:energyRow];
+            if (!isnan(whFull) && whFull > 0)
+                [self detailGauge:DetailGaugeRect(c) fraction:MIN(whNow / whFull, 1.0) color:BattBarColor(_bat.percent)
+                            label:@"Battery energy" identifier:@"details.battery.energy.gauge" tip:energyTip in:energyRow];
+            [self detailValue:FormatWattHours(whNow) color:NSColor.labelColor
+                   identifier:@"details.battery.energy.value" tip:energyTip in:energyRow cols:c];
+            if (!isnan(whFull))
+                [self detailDatum:[@"of " stringByAppendingString:FormatWattHours(whFull)] color:NSColor.secondaryLabelColor
+                       identifier:@"details.battery.energy.datum" tip:energyTip in:energyRow cols:c];
             y += c.rowH;
+        }
+        if (_showWatts) {
+            NSString *flowTip = [self batteryPowerFlowText];
+            if (_bat.acConnected && _bat.systemPowerIn_mW > 0 && _bat.systemPowerIn_mW != LONG_MIN) {
+                double inW = _bat.systemPowerIn_mW / 1000.0;
+                NSView *inRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.input" tip:flowTip in:root];
+                [self detailSymbol:@"powerplug" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                        identifier:@"details.battery.input.symbol" in:inRow].toolTip = flowTip;
+            [self detailRowName:@"Input" cols:c identifier:@"details.battery.input.name" in:inRow];
+                if (_bat.adapterWatts > 0) {
+                    // How hard the charger is working: a maxed-out charger is why charging is slow.
+                    double use = MIN(inW / (double)_bat.adapterWatts, 1.0);
+                    [self detailGauge:DetailGaugeRect(c) fraction:use
+                                color:use > 0.9 ? NSColor.systemOrangeColor : NSColor.systemGreenColor
+                                label:@"Charger load" identifier:@"details.battery.input.gauge" tip:flowTip in:inRow];
+                }
+                [self detailValue:[NSString stringWithFormat:@"%.1f W", inW] color:NSColor.labelColor
+                       identifier:@"details.battery.input.value" tip:flowTip in:inRow cols:c];
+                [self detailDatum:_bat.adapterWatts > 0 ? [NSString stringWithFormat:@"in · %ld W charger", _bat.adapterWatts] : @"in"
+                            color:NSColor.secondaryLabelColor identifier:@"details.battery.input.datum" tip:flowTip in:inRow cols:c];
+                y += c.rowH;
+            }
+            if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN) {
+                NSView *loadRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.load" tip:flowTip in:root];
+                [self detailSymbol:@"laptopcomputer" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                        identifier:@"details.battery.load.symbol" in:loadRow].toolTip = flowTip;
+            [self detailRowName:@"System" cols:c identifier:@"details.battery.load.name" in:loadRow];
+                [self detailValue:[NSString stringWithFormat:@"%.1f W", _bat.systemLoad_mW / 1000.0] color:NSColor.labelColor
+                       identifier:@"details.battery.load.value" tip:flowTip in:loadRow cols:c];
+                [self detailDatum:@"system draw" color:NSColor.secondaryLabelColor
+                       identifier:@"details.battery.load.datum" tip:flowTip in:loadRow cols:c];
+                y += c.rowH;
+            }
+            double bw = BatteryWatts(_bat);
+            if (!isnan(bw)) {
+                NSColor *color = bw > 0.05 ? NSColor.systemGreenColor : bw < -0.05 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+                NSView *battRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.power" tip:flowTip in:root];
+                [self detailSymbol:@"bolt" size:c.symbol tint:color frame:DetailLeadRect(c)
+                        identifier:@"details.battery.power.symbol" in:battRow].toolTip = flowTip;
+            [self detailRowName:@"Battery" cols:c identifier:@"details.battery.power.name" in:battRow];
+                [self detailValue:FormatSignedWatts(bw) color:color
+                       identifier:@"details.battery.power.value" tip:flowTip in:battRow cols:c];
+                [self detailDatum:bw > 0.05 ? @"into battery" : bw < -0.05 ? @"from battery" : @"battery idle"
+                            color:NSColor.secondaryLabelColor identifier:@"details.battery.power.datum" tip:flowTip in:battRow cols:c];
+                y += c.rowH;
+            }
         }
     }
 

@@ -16,7 +16,21 @@ typedef struct {
     long voltage_mV;
     long cycleCount;
     long minutesToEmpty;   // macOS-smoothed; <=0 = invalid
+    // Apple's PowerTelemetryData, in milliwatts (LONG_MIN when absent): what the adapter
+    // delivers, what the machine consumes, and what goes into (+) or out of (−) the battery.
+    long systemPowerIn_mW;
+    long systemLoad_mW;
+    long adapterWatts;     // the charger's rating, 0 when unplugged/unknown
 } BatteryState;
+
+// Battery power in watts, signed: + charging, − discharging. NAN when not measurable.
+double BatteryWatts(BatteryState b);
+// "+3.9 W", "−8.4 W" (true minus sign), "0 W" for |w| < 0.05; nil for NAN.
+NSString *FormatSignedWatts(double watts);
+// Energy in watt-hours from a charge in mAh at the pack's present voltage; NAN if unknown.
+double BatteryWattHours(long mAh, long voltage_mV);
+// "30.2 Wh" below 100 Wh, "112 Wh" above; nil for NAN.
+NSString *FormatWattHours(double wh);
 
 // Minutes until 20%, or -1 if not estimable (charging / settling / already ≤20%).
 int MinutesTo20(BatteryState b, double avgAmp_mA);

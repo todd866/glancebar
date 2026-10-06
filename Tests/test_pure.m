@@ -807,6 +807,22 @@ int main(void) {
             check(fabs([st[@"elapsed"] doubleValue] - 83.25) < 0.001 && fabs([st[@"duration"] doubleValue] - 243.5) < 0.001,
                   @"music: JavaScript decimals parse with a dot whatever the locale");
         }
+        // --- BatteryWatts / FormatSignedWatts / BatteryWattHours / FormatWattHours ---
+        {
+            BatteryState charging = {0};
+            charging.valid = YES; charging.amperage_mA = 285; charging.voltage_mV = 11941;
+            check([FormatSignedWatts(BatteryWatts(charging)) isEqual:@"+3.4 W"], @"battery: charging reads +W");
+            BatteryState draining = charging; draining.amperage_mA = -700;
+            check([FormatSignedWatts(BatteryWatts(draining)) isEqual:@"\u22128.4 W"], @"battery: draining reads a true minus");
+            BatteryState idle = charging; idle.amperage_mA = 0;
+            check([FormatSignedWatts(BatteryWatts(idle)) isEqual:@"0 W"], @"battery: idle reads 0 W");
+            BatteryState unknown = {0};
+            check(FormatSignedWatts(BatteryWatts(unknown)) == nil, @"battery: no voltage, no watts");
+            check([FormatWattHours(BatteryWattHours(4348, 11941)) isEqual:@"51.9 Wh"], @"battery: mAh x V = Wh");
+            check([FormatWattHours(112.4) isEqual:@"112 Wh"], @"battery: big packs drop the decimal");
+            check(FormatWattHours(BatteryWattHours(0, 11941)) == nil, @"battery: no charge, no Wh");
+        }
+
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
         NSString *(^jwt)(double) = ^NSString *(double exp) {
             NSData *claims = [NSJSONSerialization dataWithJSONObject:@{@"exp": @(exp), @"type": @"session"} options:0 error:nil];

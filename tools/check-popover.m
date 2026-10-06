@@ -266,8 +266,8 @@ int main(int argc, const char **argv) {
             .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1};
         [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
         BatteryState b = {.valid=YES, .percent=85, .acConnected=YES, .isCharging=YES,
-            .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
-            .cycleCount=120};
+            .rawCurrent_mAh=3825, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
+            .cycleCount=120, .systemPowerIn_mW=18800, .systemLoad_mW=6800, .adapterWatts=20};
         [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
         [c setValue:@YES forKey:@"showWatts"]; [c setValue:@YES forKey:@"showHealth"];
         NSMutableArray *usage = [NSMutableArray array];

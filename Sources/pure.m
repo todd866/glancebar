@@ -1926,3 +1926,24 @@ NSString *StorageVolumeTooltip(NSString *name, long long total, long long availa
         line = [line stringByAppendingFormat:@" (%@ purgeable)", PreciseByteCount(purgeable)];
     return line;
 }
+
+double BatteryWatts(BatteryState b) {
+    if (!b.valid || b.voltage_mV <= 0) return NAN;
+    return (double)b.amperage_mA * (double)b.voltage_mV / 1e6;
+}
+
+NSString *FormatSignedWatts(double watts) {
+    if (isnan(watts)) return nil;
+    if (fabs(watts) < 0.05) return @"0 W";
+    return [NSString stringWithFormat:@"%@%.1f W", watts > 0 ? @"+" : @"\u2212", fabs(watts)];
+}
+
+double BatteryWattHours(long mAh, long voltage_mV) {
+    if (mAh <= 0 || voltage_mV <= 0 || mAh == LONG_MIN || voltage_mV == LONG_MIN) return NAN;
+    return (double)mAh * (double)voltage_mV / 1e6;
+}
+
+NSString *FormatWattHours(double wh) {
+    if (isnan(wh)) return nil;
+    return wh < 100 ? [NSString stringWithFormat:@"%.1f Wh", wh] : [NSString stringWithFormat:@"%.0f Wh", wh];
+}
