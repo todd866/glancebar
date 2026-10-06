@@ -930,19 +930,11 @@ static NSString *KeychainBlobViaSecurity(NSString *service, NSString *account) {
     // `security` normally returns instantly; if it ever wedges, terminate at 5s and
     // force-kill at 6s. Without the kill, a child that ignores SIGTERM leaves the read
     // below blocked forever and wedges the serial AI queue with it.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (!t.isRunning) return;
-        [t terminate];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            if (t.isRunning) kill(t.processIdentifier, SIGKILL);
-        });
-    });
-
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:t.processIdentifier seconds:5];
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];   // unblocks on exit/terminate
     [t waitUntilExit];
-    if (t.terminationStatus != 0 || data.length == 0 || data.length > 64 * 1024) return nil;
+    [watchdog disarm];
+    if (t.terminationReason != NSTaskTerminationReasonExit || t.terminationStatus != 0 || data.length == 0 || data.length > 64 * 1024) return nil;
 
     NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -1024,7 +1016,7 @@ static NSString *CursorAccessTokenFromStateDB(NSString *homeDirectory) {
 // never refreshes the desktop app's state.vscdb token, which then expires and 401s
 // (2026-10-04); taking the freshest of the two keeps either kind of user signed in.
 // Only the real home has a Keychain session: a fixture home must never see it.
-static NSString *CursorSessionToken(NSString *homeDirectory) {
+static NSString *CursorSessionToken(NSString *homeDirectory, NSString *rejected) {
     NSMutableArray<NSString *> *tokens = [NSMutableArray array];
     NSString *home = homeDirectory.length ? homeDirectory.stringByStandardizingPath : GBHomeDirectory();
     if ([home isEqualToString:GBHomeDirectory().stringByStandardizingPath]) {
@@ -1033,6 +1025,9 @@ static NSString *CursorSessionToken(NSString *homeDirectory) {
     }
     NSString *app = CursorAccessTokenFromStateDB(homeDirectory);
     if (app.length) [tokens addObject:app];
+    // A token the server just refused is passed over, so a shorter-lived live session in
+    // the other client still gets its turn.
+    if (rejected.length && tokens.count > 1) [tokens removeObject:rejected];
     // All expired: hand back one anyway so the caller can say "signed out" precisely.
     return FreshestSessionToken(tokens, NSDate.date.timeIntervalSince1970, NULL) ?: tokens.firstObject;
 }
@@ -1126,11 +1121,16 @@ static NSDictionary *FetchCursorUsageJSON(NSString *token) {
         return period;
     // A rejected token is rejected everywhere; a second request only doubles the noise.
     if (ShouldDropCachedTokenForStatus([period[@"statusCode"] integerValue])) return period;
+    // An ended billing cycle is still the plan's answer; legacy request buckets would
+    // pass it off as leftover quota.
+    if (![period[@"_glancebarFetchError"] boolValue] && CursorStaleLimitWindows(period, now).count) return period;
 
     NSDictionary *auth = HTTPJSON(token, @"GET", @"https://api2.cursor.sh/auth/usage", @"api2.cursor.sh",
                                   nil, nil, @"Cursor usage API request timed out");
     if (![auth[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(auth, now))
         return auth;
+    // A 401 from either call means sign in again, whatever the other one said.
+    if (ShouldDropCachedTokenForStatus([auth[@"statusCode"] integerValue])) return auth;
     // Keep a successful-but-empty period body over a transport error so diagnostics stay useful.
     if (![period[@"_glancebarFetchError"] boolValue]) return period;
     if (![auth[@"_glancebarFetchError"] boolValue]) return auth;
@@ -1170,6 +1170,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 @property (copy) NSDictionary *(^claudeCredentialReader)(void);          // @{token, expiresAt} or nil
 @property (copy) NSDictionary *(^claudeUsageFetcher)(NSString *token);
 @property (copy) NSString *(^cursorTokenReader)(NSString *homeDirectory);
+@property (copy) NSString *cursorRejectedToken;   // last token a Cursor endpoint refused
 @property (copy) NSDictionary *(^cursorUsageFetcher)(NSString *token);
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory;
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory
@@ -1279,7 +1280,8 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         _lastStatusReasons = [NSMutableDictionary dictionary];
         _claudeCredentialReader = ^NSDictionary *{ return ClaudeAccessTokenFromKeychain(); };
         _claudeUsageFetcher = ^NSDictionary *(NSString *token){ return FetchClaudeUsageJSON(token); };
-        _cursorTokenReader = ^NSString *(NSString *home){ return CursorSessionToken(home); };
+        __weak AIReader *weakSelf = self;
+        _cursorTokenReader = ^NSString *(NSString *home){ return CursorSessionToken(home, weakSelf.cursorRejectedToken); };
         _cursorUsageFetcher = ^NSDictionary *(NSString *token){ return FetchCursorUsageJSON(token); };
         [self loadPersistentState];
     }
@@ -2544,6 +2546,8 @@ typedef struct {
 }
 
 - (void)rememberCursorFetchError:(NSDictionary *)fetch now:(double)now {
+    if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue]))
+        self.cursorRejectedToken = _cursorAccessToken;
     [self rememberFetchError:fetch now:now token:&_cursorAccessToken expiresAt:NULL
                    nextFetch:&_cursorNextFetch status:&_cursorAccountStatus rateLimitStreak:&_cursorRateLimitStreak
                       client:@"Cursor"];
@@ -3727,6 +3731,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     BOOL _powerRefreshPending;
     dispatch_queue_t _pmsetQueue;
     BOOL _pmsetInFlight;
+    volatile BOOL _terminating;
+    LAContext *_pmsetContext;
+    NSUInteger _volumeScanGen;
+    CFAbsoluteTime _volumeAbandonedAt;
     NSString *_barCapacityKey;
     double _barCapacityCached, _barCapacityMeasuredAt;
     NSString *_aiSignature;
@@ -3793,8 +3801,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // prompt. The plist read is cheap; its pmset fallback and the sudo each sit under the
     // 8s task watchdog. Stay synchronous — the process is quitting — but don't give them
     // the main thread for longer than the shared budget.
+    _terminating = YES;
     dispatch_semaphore_t pmsetDone = dispatch_semaphore_create(0);
-    dispatch_async([self pmsetWorkQueue], ^{
+    // Not behind the pmset queue: an apply waiting on a password dialog would eat the budget.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSNumber *awake = SleepDisabledState();
         if (awake.boolValue && PmsetTouchIDInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
         dispatch_semaphore_signal(pmsetDone);
@@ -4292,7 +4302,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         (void)app;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self->_musicGen) return;
-            if (error) { [self beginChromeFallback]; return; }
+            // A failed open must not hold the next Play press off for a minute.
+            if (error) { self->_ytTabOpenedAt = 0; [self beginChromeFallback]; return; }
             if ([self->_musicNote isEqualToString:kYouTubeChromeNote]) self->_musicNote = nil;
             [self stopLocalForYouTube];
             self->_ytTabOpen = YES;
@@ -4585,12 +4596,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 
 - (void)refreshVolumesAsync {
+    // Each abandoned scan leaves a thread blocked in the kernel; retry a mount that keeps
+    // hanging every few minutes, not every tick.
+    if (_volumeAbandonedAt > 0 && CFAbsoluteTimeGetCurrent() - _volumeAbandonedAt < 300) return;
     if (_volumesLoading) {
         // The in-flight scan owns the serial queue. Another tick must not enqueue a
         // second one behind it; past the budget the UI says the reading is unavailable.
         if (!_volumesUnavailable &&
             VolumeScanUnavailable(YES, CFAbsoluteTimeGetCurrent() - _volumeScanStarted)) {
             _volumesUnavailable = YES;
+            // The stuck call cannot be cancelled. Abandon its queue to it and let the next
+            // tick scan on a fresh one, so a mount that recovers is read again.
+            _volumeQueue = dispatch_queue_create("com.iantodd.glancebar.volumes", DISPATCH_QUEUE_SERIAL);
+            _volumesLoading = NO;
+            _volumeAbandonedAt = CFAbsoluteTimeGetCurrent();
             [self updateBar];
             [self refreshVisibleSurfaces];
         }
@@ -4598,9 +4617,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     }
     _volumesLoading = YES;
     _volumeScanStarted = CFAbsoluteTimeGetCurrent();
+    NSUInteger generation = ++_volumeScanGen;
     dispatch_async(_volumeQueue, ^{
         NSArray<Volume *> *volumes = ScanVolumes();
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self->_volumeScanGen) return;   // an abandoned scan finishing late
             self->_volumesLoading = NO;
             // Keep last-good data if an offline mount makes a scan fail wholesale.
             if (volumes.count) {
@@ -6088,9 +6109,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *adminPrompt = [NSString stringWithFormat:@"Glancebar needs administrator access to %@.", reason];
     NSString *command = [NSString stringWithFormat:@"/usr/bin/pmset -a %@ %d", setting, on ? 1 : 0];
     if (PmsetTouchIDInstalled()) {
-        [[LAContext new] evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:reason
+        // Held until the reply: a context released mid-prompt cancels it, and with the
+        // in-flight guard a reply that never comes would lock both toggles.
+        LAContext *context = [LAContext new];
+        _pmsetContext = context;
+        [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:reason
                                   reply:^(BOOL ok, __unused NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ self->_pmsetContext = nil; });
             dispatch_async(work, ^{
+                if (self->_terminating) { finish(); return; }   // never enable as the app quits
                 // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
                 if (ok && !RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
                 finish();

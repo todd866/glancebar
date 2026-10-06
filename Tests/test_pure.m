@@ -793,6 +793,11 @@ int main(void) {
         check([overlaid[@"seven_day"][@"utilization"] isEqual:@95], @"statusline updates the legacy seven_day body");
         NSDictionary *fromNothing = ClaudeUsageOverlayingStatusline(nil, statusline);
         check([fromNothing[@"limits"] count] == 2, @"statusline alone yields session and weekly windows");
+        NSDictionary *legacyOnly = ClaudeUsageOverlayingStatusline(
+            @{@"seven_day": @{@"utilization": @50}, @"seven_day_opus": @{@"utilization": @20}}, statusline);
+        check(legacyOnly[@"limits"] == nil && [legacyOnly[@"seven_day"][@"utilization"] isEqual:@95]
+                  && legacyOnly[@"seven_day_opus"] != nil,
+              @"statusline overlay leaves a legacy body without limits[] so Opus stays readable");
         check(ClaudeUsageOverlayingStatusline(apiBody, @{@"fetchedAt": @1}) == nil, @"statusline without windows is ignored");
 
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
@@ -1572,11 +1577,11 @@ int main(void) {
               @"an unavailable volume scan does not keep reading as scanning");
 
         // --- Quit-time Keep Awake budget and tooltip ---
-        check(kQuitPmsetBudgetSec == 3, @"quit waits at most 3s to clear Keep Awake");
-        check(fabs(QuitPmsetBudgetRemaining(0) - 3) < 0.001 &&
-              fabs(QuitPmsetBudgetRemaining(2) - 1) < 0.001 &&
-              QuitPmsetBudgetRemaining(3) == 0 && QuitPmsetBudgetRemaining(10) == 0 &&
-              fabs(QuitPmsetBudgetRemaining(-5) - 3) < 0.001,
+        check(kQuitPmsetBudgetSec == 10, @"quit waits long enough for a watchdogged pmset to clear Keep Awake");
+        check(fabs(QuitPmsetBudgetRemaining(0) - 10) < 0.001 &&
+              fabs(QuitPmsetBudgetRemaining(2) - 8) < 0.001 &&
+              QuitPmsetBudgetRemaining(10) == 0 && QuitPmsetBudgetRemaining(30) == 0 &&
+              fabs(QuitPmsetBudgetRemaining(-5) - 10) < 0.001,
               @"the quit pmset budget is 3s total and never negative");
         NSString *tooltipOn = KeepAwakeTooltip(YES);
         NSString *tooltipOff = KeepAwakeTooltip(NO);

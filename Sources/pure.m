@@ -1659,6 +1659,10 @@ NSDictionary *ClaudeUsageOverlayingStatusline(NSDictionary *usage, NSDictionary 
     setLegacy(@"five_hour", session);
     setLegacy(@"seven_day", weekly);
 
+    // A body without limits[] is read through its legacy keys, seven_day_opus among them;
+    // adding a limits[] would make it authoritative and hide those. Only a body we
+    // invent from nothing gets one.
+    if ([usage isKindOfClass:NSDictionary.class] && ![usage[@"limits"] isKindOfClass:NSArray.class]) return out;
     NSMutableArray *limits = [NSMutableArray array];
     BOOL sawSession = NO, sawWeekly = NO;
     NSArray *existing = [out[@"limits"] isKindOfClass:NSArray.class] ? out[@"limits"] : @[];
@@ -1686,7 +1690,7 @@ NSDictionary *ClaudeUsageOverlayingStatusline(NSDictionary *usage, NSDictionary 
 const double kPowerRefreshCoalesceSec = 1;
 const double kBarCapacityMaxAgeSec = 60;
 const double kVolumeScanUnavailableSec = 20;
-const double kQuitPmsetBudgetSec = 3;
+const double kQuitPmsetBudgetSec = 10;   // covers the 8s task watchdog plus the sudo itself
 const int kStorageFullSecondaryPercent = 85;
 
 BOOL ShouldArmPowerRefresh(BOOL pending) { return !pending; }

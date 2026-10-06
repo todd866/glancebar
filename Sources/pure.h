@@ -484,7 +484,7 @@ NSString *VolumeScanStatus(BOOL loading, BOOL unavailable);
 
 // SleepDisabledState and the sudo that clears it stay synchronous on quit — the process
 // is going away — but the main thread waits at most this long for both together.
-extern const double kQuitPmsetBudgetSec;   // 3
+extern const double kQuitPmsetBudgetSec;   // 10
 // Seconds still inside the budget. 0 once elapsed has used it up; never negative.
 double QuitPmsetBudgetRemaining(double elapsedSec);
 
