@@ -42,6 +42,41 @@ static BOOL InstrumentRowsFit(NSView *view) {
 static BOOL SameColumn(NSView *a, NSView *b) {
     return a && b && fabs(a.frame.origin.x - b.frame.origin.x) < 0.5;
 }
+static BOOL SameSize(NSView *a, NSView *b) {
+    return a && b && fabs(a.frame.size.width - b.frame.size.width) < 0.5 &&
+        fabs(a.frame.size.height - b.frame.size.height) < 0.5;
+}
+// Separators and section headers are not actionable. A submenu item (Settings) is.
+static BOOL ActionableMenuImages(NSMenu *menu) {
+    if (!menu) return NO;
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.isSeparatorItem) continue;
+        BOOL actionable = item.action != NULL || item.submenu != nil;
+        if (actionable && !item.image) {
+            fprintf(stderr, "menu item missing image: %s\n", item.title.UTF8String ?: "");
+            return NO;
+        }
+        if (item.submenu && !ActionableMenuImages(item.submenu)) return NO;
+    }
+    return YES;
+}
+static BOOL RenderOffscreen(NSView *view, NSString *path, NSAppearanceName appearance) {
+    if (!view || view.bounds.size.width < 1 || view.bounds.size.height < 1 || !path.length) return NO;
+    // A detail document does not paint its own window background. On a clear bitmap that
+    // leaves light-mode text black-on-black, so composite onto the same fill the window uses.
+    NSAppearance *chrome = [NSAppearance appearanceNamed:appearance];
+    PopoverRootView *host = [[PopoverRootView alloc] initWithFrame:
+        NSMakeRect(0, 0, view.bounds.size.width, view.bounds.size.height)];
+    host.appearance = chrome;
+    view.appearance = chrome;
+    view.frame = host.bounds;
+    [host addSubview:view];
+    NSBitmapImageRep *rep = [host bitmapImageRepForCachingDisplayInRect:host.bounds];
+    if (!rep) return NO;
+    [host cacheDisplayInRect:host.bounds toBitmapImageRep:rep];
+    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    return [png writeToFile:path atomically:YES];
+}
 static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
     if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
         NSTextField *f = (NSTextField *)view;
@@ -186,6 +221,13 @@ int main(int argc, const char **argv) {
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
         if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 5 ||
             HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
+        // Token indexing is internal machinery: it never reaches an instrument (2026-10-06).
+        [c setValue:@YES forKey:@"_aiTotalsIncomplete"];
+        [c setValue:@"Indexing 96% · totals incomplete" forKey:@"_aiCatchUpStatus"];
+        [c rebuildContent];
+        if (HasText(root, @"ndexing")) return Fail(__LINE__);
+        [c setValue:@NO forKey:@"_aiTotalsIncomplete"];
+        [c rebuildContent];
         if (HasText(root, @"STORAGE") || HasText(root, @"BATTERY") || HasText(root, @"SYSTEM") ||
             HasText(root, @"SOUND") || HasText(root, @"AI STATUS") ||
             FindIdentifier(root, @"popover.heading.storage") || FindIdentifier(root, @"popover.storage.details") ||
@@ -198,9 +240,35 @@ int main(int argc, const char **argv) {
         ClaudeGauge *meter = FindClaudeMeter(root);
         if (!SameColumn(storageGauge, batteryGauge) || !SameColumn(storageGauge, meter) ||
             !SameColumn(storageGauge, codexGauge) || !SameColumn(storageGauge, cursorGauge)) return Fail(__LINE__);
+        if (fabs(storageGauge.frame.size.width - batteryGauge.frame.size.width) > 0.5 ||
+            fabs(storageGauge.frame.size.width - meter.frame.size.width) > 0.5 ||
+            fabs(storageGauge.frame.origin.x - kGaugeX) > 0.5 ||
+            fabs(storageGauge.frame.size.width - kGaugeW) > 0.5) return Fail(__LINE__);
         if (!SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.battery.value")) ||
             !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.claude.value")) ||
-            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.ai.codex.value")))
+            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.ai.codex.value")) ||
+            fabs(FindIdentifier(root, @"popover.storage.value").frame.origin.x - kValueX) > 0.5 ||
+            fabs(FindIdentifier(root, @"popover.storage.datum").frame.origin.x - kDatumX) > 0.5)
+            return Fail(__LINE__);
+        // Provider names are the lead symbol, not a text field. The name leads the tooltip.
+        NSView *storageSymbol = FindIdentifier(root, @"popover.storage.symbol");
+        NSArray *leads = @[
+            storageSymbol,
+            FindIdentifier(root, @"popover.battery.symbol"),
+            FindIdentifier(root, @"popover.system.symbol"),
+            FindIdentifier(root, @"popover.ai.claude.name"),
+            FindIdentifier(root, @"popover.ai.codex.name"),
+            FindIdentifier(root, @"popover.ai.cursor.name"),
+        ];
+        for (NSView *lead in leads) {
+            if (![lead isKindOfClass:NSImageView.class] || !SameColumn(storageSymbol, lead) ||
+                !SameSize(storageSymbol, lead)) return Fail(__LINE__);
+        }
+        if (fabs(storageSymbol.frame.origin.x - kPad) > 0.5 ||
+            fabs(storageSymbol.frame.size.width - kLeadW) > 0.5 ||
+            fabs(storageSymbol.frame.size.height - kLeadSymbol) > 0.5) return Fail(__LINE__);
+        if (HasText(root, @"Claude") || HasText(root, @"Codex") || HasText(root, @"Cursor") ||
+            !HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
             return Fail(__LINE__);
         NSView *output = FindIdentifier(root, @"popover.sound");
         if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) ||
@@ -210,6 +278,16 @@ int main(int argc, const char **argv) {
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
         NSView *more = FindIdentifier(p.contentViewController.view, @"popover.more");
+        NSButton *keepButton = (NSButton *)keep, *lowButton = (NSButton *)low, *moreButton = (NSButton *)more;
+        if (![keepButton isKindOfClass:NSButton.class] || ![lowButton isKindOfClass:NSButton.class] ||
+            ![moreButton isKindOfClass:NSButton.class]) return Fail(__LINE__);
+        if (keepButton.title.length || lowButton.title.length || moreButton.title.length ||
+            !keepButton.image || !lowButton.image || !moreButton.image) return Fail(__LINE__);
+        if (fabs(keepButton.frame.origin.x - kPad) > 0.5 ||
+            fabs(NSMinX(lowButton.frame) - NSMaxX(keepButton.frame) - kToggleGap) > 0.5 ||
+            fabs(NSMaxX(moreButton.frame) - (kW - kPad)) > 0.5 ||
+            fabs(keepButton.frame.size.width - kToggleW) > 0.5 ||
+            fabs(keepButton.frame.size.height - kToggleH) > 0.5) return Fail(__LINE__);
         if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
             !FitsChildren(keep.superview)) return Fail(__LINE__);
         // One figure: the account weekly across all models (33%). No Fable figure, and the
@@ -272,6 +350,50 @@ int main(int argc, const char **argv) {
             if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) || !FitsChildren(root))
                 return Fail(__LINE__);
         }
+        if (!ActionableMenuImages([c moreMenu])) return Fail(__LINE__);
+        // Toolbar tabs, built but not ordered front. Every tab keeps its identifier and a symbol.
+        NSWindow *details = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 520)
+                                                        styleMask:(NSWindowStyleMaskTitled |
+                                                                   NSWindowStyleMaskClosable |
+                                                                   NSWindowStyleMaskResizable)
+                                                          backing:NSBackingStoreBuffered defer:YES];
+        details.releasedWhenClosed = NO;
+        [c setValue:details forKey:@"detailsWindow"];
+        [c rebuildDetails];
+        NSTabViewController *tabs = (NSTabViewController *)details.contentViewController;
+        if (![tabs isKindOfClass:NSTabViewController.class] ||
+            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 5)
+            return Fail(__LINE__);
+        [c rebuildDetails];   // in-place refresh must keep the symbols and the documents
+        if (tabs.tabViewItems.count != 5) return Fail(__LINE__);
+        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"ai"]];
+        for (NSTabViewItem *item in tabs.tabViewItems) {
+            if (!item.image || ![item.identifier isKindOfClass:NSString.class] ||
+                ![idents containsObject:item.identifier]) return Fail(__LINE__);
+            if ([item.identifier isEqual:@"overview"]) {
+                NSView *doc = [item.view isKindOfClass:NSScrollView.class]
+                    ? ((NSScrollView *)item.view).documentView : item.view;
+                if (!HasText(doc, @"OVERVIEW") || !HasText(doc, @"Macintosh HD")) return Fail(__LINE__);
+                // viewController forwards -view. A structural refresh assigns item.view and
+                // must actually replace the document the tab shows.
+                NSView *marker = [[NSView alloc] initWithFrame:item.view.frame];
+                marker.accessibilityIdentifier = @"details.replace-probe";
+                item.view = marker;
+                if (item.view != marker && item.viewController.view != marker) return Fail(__LINE__);
+                item.view = [c detailViewForIdentifier:@"overview"];
+            }
+        }
+        const char *detailsPrefix = getenv("GLANCEBAR_RENDER_DETAILS");
+        if (detailsPrefix && detailsPrefix[0]) {
+            NSAppearanceName appearance = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"ai"]) {
+                NSScrollView *scroll = [c detailViewForIdentifier:tab];
+                NSView *doc = [scroll isKindOfClass:NSScrollView.class] ? scroll.documentView : scroll;
+                NSString *path = [NSString stringWithFormat:@"%s-%@.png", detailsPrefix, tab];
+                if (!RenderOffscreen(doc, path, appearance)) return Fail(__LINE__);
+            }
+        }
+        [c setValue:nil forKey:@"detailsWindow"];
         if (argc > 1) {
             root.appearance = [NSAppearance appearanceNamed:(argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)];
             NSBitmapImageRep *rep = [root bitmapImageRepForCachingDisplayInRect:root.bounds];

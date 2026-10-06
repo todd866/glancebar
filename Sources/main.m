@@ -3472,11 +3472,13 @@ static const CGFloat kW = 320, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
 // Density is signal per area, not a small panel: space freed from words goes to
 // legible instruments (30pt rows, 8pt gauges, 15pt values), not to shrinking.
 static const CGFloat kRowH = 30, kSoundH = 40;
-static const CGFloat kLeadW = 52;                              // "Cursor" at 13pt, or a 22pt symbol
 static const CGFloat kLeadSymbol = 22;
-static const CGFloat kGaugeX = 74, kGaugeW = 78, kGaugeH = 8;  // kPad + kLeadW + 6
-static const CGFloat kValueX = 156, kValueW = 48;              // "100%" at 15pt
+static const CGFloat kFooterSymbol = 16;   // inside a 36×28 toggle: the glyph needs margin, not 22pt
+static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6: the symbol, not the word "Cursor"
+static const CGFloat kGaugeX = 50, kGaugeW = 102, kGaugeH = 8; // kPad + kLeadW + 6; the reclaimed name width
+static const CGFloat kValueX = 156, kValueW = 48;              // "100%" at 15pt, same x as before
 static const CGFloat kDatumX = 212, kDatumW = 92;              // "220 GB free"
+static const CGFloat kToggleW = 36, kToggleH = 28, kToggleGap = 8;
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
 // The details document follows the resizable window. It is only touched on the
 // main thread; keeping the active width here avoids threading a layout argument
@@ -4485,10 +4487,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (NSButton *)transportButton:(NSString *)symbol pointSize:(CGFloat)pointSize side:(CGFloat)side
                          action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightSemibold];
+    // Same configuration family as the output mark and the lead symbols: regular weight, point size only.
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightRegular];
     NSImage *image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
     if (!image) image = [NSImage imageWithSystemSymbolName:@"play.fill" accessibilityDescription:nil];
     NSButton *button = [NSButton buttonWithImage:image target:self action:action];
+    button.title = @"";   // buttonWithImage: leaves the stock "Button" title
     button.bordered = NO;
     button.imagePosition = NSImageOnly;
     button.imageScaling = NSImageScaleProportionallyDown;
@@ -4564,7 +4568,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSoundH)];
     row.accessibilityIdentifier = @"popover.sound.row";
     CGFloat x = kPad;
-    NSButton *prev = [self transportButton:@"backward.end.fill" pointSize:13 side:20
+    NSButton *prev = [self transportButton:@"backward.end.fill" pointSize:18 side:22
                                     action:@selector(musicPrevious:) identifier:@"popover.music.previous"
                                      label:@"Previous track"];
     prev.frame = NSOffsetRect(prev.frame, x, 0);
@@ -4572,26 +4576,31 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!loaded) prev.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:prev];
     x = NSMaxX(prev.frame) + 2;
-    NSButton *play = [self transportButton:symbol pointSize:20 side:28
+    NSButton *play = [self transportButton:symbol pointSize:24 side:28
                                     action:@selector(musicPlay:) identifier:@"popover.music.play" label:playLabel];
     play.frame = NSOffsetRect(play.frame, x, 0);
     [row addSubview:play];
     x = NSMaxX(play.frame) + 2;
-    NSButton *next = [self transportButton:@"forward.end.fill" pointSize:13 side:20
+    NSButton *next = [self transportButton:@"forward.end.fill" pointSize:18 side:22
                                     action:@selector(musicNext:) identifier:@"popover.music.next" label:@"Next track"];
     next.frame = NSOffsetRect(next.frame, x, 0);
     next.enabled = loaded;
     if (!loaded) next.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:next];
     NSButton *output = [self outputButton];
-    output.frame = NSMakeRect(kW - kPad - 22, (kSoundH - 22) / 2.0, 22, 22);
+    // 22pt, right edge on the same inset as every other row. The box matches the lead column.
+    output.frame = NSMakeRect(kW - kPad - kLeadW, (kSoundH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
     [row addSubview:output];
     CGFloat textX = NSMaxX(next.frame) + 8;
     CGFloat textW = NSMinX(output.frame) - 8 - textX;
     NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
     // The row is a plain NSView, so y grows up; the flipped popover only applies to the root.
+    // Title and subtitle are one block, centred in the row with the symbols.
+    const CGFloat titleH = 15, subtitleH = 14, textGap = 1;
+    CGFloat textBottom = (kSoundH - (titleH + textGap + subtitleH)) / 2.0;
     NSTextField *title = [self text:titleText font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
-                              color:nil at:NSMakeRect(textX, 16, textW, 15) align:NSTextAlignmentLeft];
+                              color:nil at:NSMakeRect(textX, textBottom + subtitleH + textGap, textW, titleH)
+                             align:NSTextAlignmentLeft];
     title.accessibilityIdentifier = @"popover.music.title";
     title.accessibilityLabel = titleText;
     [row addSubview:title];
@@ -4611,7 +4620,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSTextField *subtitle = [self text:subtitleText
                                   font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
                                  color:NSColor.secondaryLabelColor
-                                    at:NSMakeRect(textX, 2, textW, 14) align:NSTextAlignmentLeft];
+                                    at:NSMakeRect(textX, textBottom, textW, subtitleH) align:NSTextAlignmentLeft];
     subtitle.accessibilityIdentifier = @"popover.music.subtitle";
     subtitle.accessibilityLabel = subtitleText;
     [row addSubview:subtitle];
@@ -4628,11 +4637,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         for (NSDictionary *row in _audioDevices)
             if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
     NSString *name = current[@"name"] ?: @"No output device";
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
     NSImage *image = [[NSImage imageWithSystemSymbolName:AudioSymbolName(current) accessibilityDescription:nil]
                       imageWithSymbolConfiguration:cfg];
     if (!image) image = [NSImage imageWithSystemSymbolName:@"speaker.wave.2" accessibilityDescription:nil];
     OutputCycleButton *button = [OutputCycleButton buttonWithImage:image target:self action:@selector(cycleOutput:)];
+    button.title = @"";   // buttonWithImage: leaves the stock "Button" title
     button.bordered = NO;
     button.imagePosition = NSImageOnly;
     button.imageScaling = NSImageScaleProportionallyDown;
@@ -5520,29 +5530,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [v addSubview:heading];
     return v;
 }
-// The panel's two controls: a pill that is tinted while its setting is on. Push-on/push-off
-// so VoiceOver reports a toggle; the tint is set explicitly because a rounded bezel shows
-// no "on" state of its own.
+// Icon-only pill. The words live on the tooltip and accessibility label; the glyph is the
+// same one the menu bar uses for that mode. Push-on/push-off so VoiceOver reports a toggle.
 - (NSButton *)powerToggle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
-    PillButton *b = [PillButton buttonWithTitle:title target:self action:action];
+    PillButton *b = [PillButton buttonWithTitle:@"" target:self action:action];
     [b setButtonType:NSButtonTypePushOnPushOff];
     b.bordered = NO;   // PillButton draws the background itself
-    b.controlSize = NSControlSizeSmall;
-    b.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
-    b.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
-    b.imagePosition = NSImageLeading;
-    b.imageHugsTitle = YES;
+    b.imagePosition = NSImageOnly;
+    b.imageScaling = NSImageScaleProportionallyDown;
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kFooterSymbol
+                                                                                     weight:NSFontWeightRegular];
+    b.image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:title]
+               imageWithSymbolConfiguration:cfg];
+    b.accessibilityLabel = title;
     return b;
 }
-// `ink` is the title/icon colour on the tint: dark on yellow, white on brown.
+// `ink` is the icon colour on the tint: dark on yellow, white on brown.
 - (void)styleToggle:(NSButton *)b on:(BOOL)on tint:(NSColor *)tint ink:(NSColor *)ink {
     if (!b) return;   // popover not built yet (a Low Power change can arrive before first open)
     b.state = on ? NSControlStateValueOn : NSControlStateValueOff;
     if ([b isKindOfClass:PillButton.class]) ((PillButton *)b).onColor = tint;
-    NSColor *color = on ? ink : NSColor.secondaryLabelColor;
-    b.contentTintColor = color;
-    b.attributedTitle = [[NSAttributedString alloc] initWithString:b.title attributes:@{
-        NSFontAttributeName: b.font, NSForegroundColorAttributeName: color}];
+    b.contentTintColor = on ? ink : NSColor.secondaryLabelColor;
     b.needsDisplay = YES;
 }
 // The footer shows exactly what the menu bar shows, from the same live state: the cup
@@ -5550,15 +5558,20 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (void)syncPowerButtons {
     if (!_keepAwakeButton || !_lowPowerButton) return;   // popover not built yet
     [self styleToggle:_keepAwakeButton on:_lidAwake tint:NSColor.systemBrownColor ink:NSColor.whiteColor];
-    [self styleToggle:_lowPowerButton on:LowPowerModeEnabled() tint:NSColor.systemYellowColor
+    BOOL lowPower = LowPowerModeEnabled();
+    [self styleToggle:_lowPowerButton on:lowPower tint:NSColor.systemYellowColor
                   ink:[NSColor colorWithWhite:0.1 alpha:1]];
-    // Titles change width with state, so lay the pair out again.
-    CGFloat x = kPad - 2;
-    for (NSButton *b in @[_keepAwakeButton, _lowPowerButton]) {
-        [b sizeToFit];
-        b.frame = NSMakeRect(x, 1, b.frame.size.width + 16, 22);   // borderless: add the pill's padding
-        x = NSMaxX(b.frame) + 6;
-    }
+    NSString *awakeState = _lidAwake ? @"on" : @"off";
+    NSString *lowState = lowPower ? @"on" : @"off";
+    _keepAwakeButton.accessibilityLabel = [NSString stringWithFormat:@"Keep Awake — %@", awakeState];
+    _lowPowerButton.accessibilityLabel = [NSString stringWithFormat:@"Low Power — %@", lowState];
+    _keepAwakeButton.toolTip = [NSString stringWithFormat:@"Keep Awake — %@\n%@",
+                                awakeState, KeepAwakeTooltip(PmsetRuleInstalled())];
+    _lowPowerButton.toolTip = [NSString stringWithFormat:@"Low Power — %@\n%@",
+                               lowState, @"System Low Power Mode."];
+    // Fixed icon buttons: the title no longer changes the width.
+    _keepAwakeButton.frame = NSMakeRect(kPad, 0, kToggleW, kToggleH);
+    _lowPowerButton.frame = NSMakeRect(kPad + kToggleW + kToggleGap, 0, kToggleW, kToggleH);
 }
 - (NSBox *)dividerAt:(CGFloat)y {
     NSBox *b = [[NSBox alloc] initWithFrame:NSMakeRect(kPad, y, kW-2*kPad, 1)];
@@ -5747,7 +5760,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSImageView *iv = [NSImageView imageViewWithImage:image];
     iv.imageScaling = NSImageScaleProportionallyDown;
     iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
-    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadSymbol + 4, kLeadSymbol);
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
     iv.accessibilityIdentifier = identifier;
     [row addSubview:iv];
     return iv;
@@ -5770,9 +5783,21 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return field;
 }
 
+// The lead glyph for a provider. Missing symbols (older than the OS that shipped them)
+// fall back to a dashed circle so the column still lines up.
+- (NSString *)aiSymbolName:(NSString *)provider {
+    NSString *symbol = @"circle.dashed";
+    if ([provider isEqualToString:@"Claude"]) symbol = @"sparkle";
+    else if ([provider isEqualToString:@"Codex"]) symbol = @"chevron.left.forwardslash.chevron.right";
+    else if ([provider isEqualToString:@"Cursor"]) symbol = @"cursorarrow.rays";
+    if (![NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil]) symbol = @"circle.dashed";
+    return symbol;
+}
+
 // Claude's row: the gauge and the number are the WEEKLY allowance across all models.
 // The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
 // indexing) takes the datum column; the reset clock is the datum otherwise.
+// The provider's name is not drawn: it leads the tooltip, same as storage and battery.
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
     (void)width; (void)pad;
     NSString *name = u.name.length ? u.name : @"AI";
@@ -5784,14 +5809,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
     BOOL claudeMeter = quotas != nil;
     BOOL hasGauge = claudeMeter || (u.limitStatusAvailable && u.remainingFraction >= 0);
-    NSTextField *title = [self text:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
-                              color:nil at:NSMakeRect(kPad, (kRowH - kValueH) / 2.0 - 1, kLeadW, kValueH) align:NSTextAlignmentLeft];
-    title.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.name", slug];
-    [row addSubview:title];
-
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
+    // Lead is the symbol, tinted with the value once that colour is known. The name stays
+    // on popover.ai.<slug>.name so focus restoration still finds this column.
+    NSImageView *mark = [self instrumentSymbol:[self aiSymbolName:name] tint:valueColor
+                                   identifier:[NSString stringWithFormat:@"popover.ai.%@.name", slug] in:row];
+    ClaudeGauge *meter = nil;
+    Gauge *plainGauge = nil;
     if (claudeMeter) {
         pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week * 100];
         BOOL staleWarns = [self aiSnapshotStaleWarns:u];
@@ -5812,27 +5838,31 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             }
         if (tip.length) [parts addObject:tip];
         tip = [parts componentsJoinedByString:@"\n"];
-        ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
         meter.opus = week;
         meter.accessibilityIdentifier = @"popover.ai.claude.gauge";
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
-        meter.toolTip = tip;
         [row addSubview:meter];
     } else if (hasGauge) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
-        g.fraction = u.remainingFraction;
-        g.color = valueColor;
-        g.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", name];
-        g.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
-        g.toolTip = tip;
-        [row addSubview:g];
+        plainGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        plainGauge.fraction = u.remainingFraction;
+        plainGauge.color = valueColor;
+        plainGauge.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", name];
+        plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
+        [row addSubview:plainGauge];
     }
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
+    mark.contentTintColor = valueColor;
+    mark.toolTip = named;
+    mark.accessibilityLabel = named;
+    if (meter) meter.toolTip = named;
+    if (plainGauge) plainGauge.toolTip = named;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
         : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
     NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
-    value.toolTip = tip;
+    value.toolTip = named;
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
     NSColor *datumColor = NSColor.secondaryLabelColor;
@@ -5849,9 +5879,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     }
     NSTextField *datumField = [self instrumentDatum:datum color:datumColor
                                         identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];
-    datumField.toolTip = tip;
-    datumField.accessibilityLabel = tip.length ? tip : datum;
-    row.toolTip = tip;
+    datumField.toolTip = named;
+    datumField.accessibilityLabel = named.length ? named : datum;
+    row.toolTip = named;
+    row.accessibilityLabel = named;
     [root addSubview:row];
     return y + kRowH;
 }
@@ -6030,29 +6061,33 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         ? _aiCatchUpStatus
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
-    const CGFloat footerH = 34;
+    const CGFloat footerH = kToggleH + 12;   // 6pt above and below the icon toggles
     // Fills windowBackgroundColor in drawRect: instead of freezing it into a CALayer CGColor,
     // so the footer follows a live Light/Dark switch like the panel above it.
     PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
     NSBox *footerRule = [self dividerAt:0];
     footerRule.accessibilityIdentifier = @"popover.divider.footer";
     [footer addSubview:footerRule];
-    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
+    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 6, kW, kToggleH)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
-    _keepAwakeButton.toolTip = KeepAwakeTooltip(PmsetRuleInstalled());
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
     _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"tortoise.fill" action:@selector(toggleLowPowerMode:)];
-    _lowPowerButton.toolTip = @"System Low Power Mode.";
     _lowPowerButton.accessibilityIdentifier = @"popover.lowPower";
     [self syncPowerButtons];
     [foot addSubview:_keepAwakeButton];
     [foot addSubview:_lowPowerButton];
-    NSButton *more = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"ellipsis.circle"
-                                                           accessibilityDescription:@"More"]
-                                        target:self action:@selector(showMenu:)];
-    more.bordered = NO; more.contentTintColor = NSColor.secondaryLabelColor;
-    more.frame = NSMakeRect(kW - kPad - 24, 0, 24, 24);
+    NSImageSymbolConfiguration *moreCfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol
+                                                                                         weight:NSFontWeightRegular];
+    NSImage *moreImage = [[NSImage imageWithSystemSymbolName:@"ellipsis.circle" accessibilityDescription:@"More"]
+                          imageWithSymbolConfiguration:moreCfg];
+    NSButton *more = [NSButton buttonWithImage:moreImage target:self action:@selector(showMenu:)];
+    more.title = @"";   // buttonWithImage: leaves the stock "Button" title
+    more.bordered = NO;
+    more.imagePosition = NSImageOnly;
+    more.imageScaling = NSImageScaleProportionallyDown;
+    more.contentTintColor = NSColor.secondaryLabelColor;
+    more.frame = NSMakeRect(kW - kPad - kToggleH, 0, kToggleH, kToggleH);
     more.toolTip = [@"Details, settings and Quit. " stringByAppendingString:freshness];
     more.accessibilityIdentifier = @"popover.more";
     [foot addSubview:more];
@@ -6108,31 +6143,57 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     }
 }
 
+// 16pt template glyph. Every actionable menu item, Details tab, and instrument heading
+// goes through here so the small-symbol size cannot drift.
+- (NSImage *)menuSymbol:(NSString *)name {
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:16
+                                                                                     weight:NSFontWeightRegular];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil]
+                      imageWithSymbolConfiguration:cfg];
+    if (!image)
+        image = [[NSImage imageWithSystemSymbolName:@"circle.dashed" accessibilityDescription:nil]
+                 imageWithSymbolConfiguration:cfg];
+    image.template = YES;
+    return image;
+}
+
 // One short menu off the footer's ⋯: the things you reach for, then everything that is
 // set once and left alone tucked into Settings.
-- (void)showMenu:(NSButton *)sender {
+- (NSMenu *)moreMenu {
     NSMenu *m = [NSMenu new];
     NSMenuItem *details = [m addItemWithTitle:@"Details…" action:@selector(showDetails:) keyEquivalent:@""];
     details.target = self;
+    details.image = [self menuSymbol:@"rectangle.grid.1x2"];
     NSMenuItem *settings = [m addItemWithTitle:@"Settings" action:nil keyEquivalent:@""];
+    settings.image = [self menuSymbol:@"gearshape"];
     settings.submenu = [self settingsMenu];
+    NSString *switchSymbol = [NSImage imageWithSystemSymbolName:@"hifispeaker.and.appletv" accessibilityDescription:nil]
+        ? @"hifispeaker.and.appletv" : @"speaker.badge.plus";
     NSMenuItem *switchOutputs = [m addItemWithTitle:@"Switch to new outputs" action:@selector(toggleSwitchToNewOutputs:) keyEquivalent:@""];
     switchOutputs.target = self;
+    switchOutputs.image = [self menuSymbol:switchSymbol];
     switchOutputs.state = SwitchToNewOutputs() ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:NSMenuItem.separatorItem];
     NSMenuItem *about = [m addItemWithTitle:@"About Glancebar" action:@selector(showAbout:) keyEquivalent:@""];
     about.target = self;
-    [m addItemWithTitle:@"Quit Glancebar" action:@selector(terminate:) keyEquivalent:@"q"].target = NSApp;
-    [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
+    about.image = [self menuSymbol:@"info.circle"];
+    NSMenuItem *quit = [m addItemWithTitle:@"Quit Glancebar" action:@selector(terminate:) keyEquivalent:@"q"];
+    quit.target = NSApp;
+    quit.image = [self menuSymbol:@"power"];
+    return m;
+}
+- (void)showMenu:(NSButton *)sender {
+    [[self moreMenu] popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, sender.bounds.size.height) inView:sender];
 }
 - (void)addSection:(NSMenu *)m title:(NSString *)title {
     if (m.numberOfItems) [m addItem:NSMenuItem.separatorItem];
     if (@available(macOS 14.0, *)) { [m addItem:[NSMenuItem sectionHeaderWithTitle:title]]; return; }
     [m addItemWithTitle:title action:nil keyEquivalent:@""].enabled = NO;
 }
-- (NSMenuItem *)settingsItem:(NSMenu *)m title:(NSString *)title action:(SEL)action on:(BOOL)on {
+- (NSMenuItem *)settingsItem:(NSMenu *)m title:(NSString *)title symbol:(NSString *)symbol action:(SEL)action on:(BOOL)on {
     NSMenuItem *item = [m addItemWithTitle:title action:action keyEquivalent:@""];
     item.target = self;
+    item.image = [self menuSymbol:symbol];
     item.state = on ? NSControlStateValueOn : NSControlStateValueOff;
     return item;
 }
@@ -6140,29 +6201,34 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSMenu *m = [NSMenu new];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [self addSection:m title:@"Menu bar"];
-    [self settingsItem:m title:@"Storage" action:@selector(toggleBarDisk:) on:_barShowDisk];
-    [self settingsItem:m title:@"Battery" action:@selector(toggleBarBattery:) on:_barShowBattery];
-    [self settingsItem:m title:@"System" action:@selector(toggleBarSystem:) on:_barShowSystem];
+    [self settingsItem:m title:@"Storage" symbol:@"internaldrive" action:@selector(toggleBarDisk:) on:_barShowDisk];
+    [self settingsItem:m title:@"Battery" symbol:@"battery.100" action:@selector(toggleBarBattery:) on:_barShowBattery];
+    [self settingsItem:m title:@"System" symbol:@"cpu" action:@selector(toggleBarSystem:) on:_barShowSystem];
 
     [self addSection:m title:@"Battery"];
-    [self settingsItem:m title:@"Current draw" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
-    [self settingsItem:m title:@"Health" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
-    [self settingsItem:m title:@"Keep Awake & Low Power without a password" action:@selector(togglePmsetRule:)
+    [self settingsItem:m title:@"Current draw" symbol:@"bolt" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
+    [self settingsItem:m title:@"Health" symbol:@"heart" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
+    [self settingsItem:m title:@"Keep Awake & Low Power without a password" symbol:@"lock.open"
+                    action:@selector(togglePmsetRule:)
                     on:PmsetRuleInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
 
     [self addSection:m title:@"AI status"];
-    [self settingsItem:m title:@"Claude transcript token totals" action:@selector(toggleClaudeTranscripts:)
+    [self settingsItem:m title:@"Claude transcript token totals" symbol:@"doc.text"
+                    action:@selector(toggleClaudeTranscripts:)
                     on:[ud boolForKey:@"useClaudeTranscripts"]];
-    [self settingsItem:m title:@"Claude account via Keychain/API…" action:@selector(toggleClaudeAccount:)
+    [self settingsItem:m title:@"Claude account via Keychain/API…" symbol:@"sparkle"
+                    action:@selector(toggleClaudeAccount:)
                     on:[ud boolForKey:@"useClaudeAccount"]];
     if (CursorServicePresent(GBHomeDirectory()))
-        [self settingsItem:m title:@"Cursor account via local session/API…" action:@selector(toggleCursorAccount:)
+        [self settingsItem:m title:@"Cursor account via local session/API…" symbol:@"cursorarrow.rays"
+                        action:@selector(toggleCursorAccount:)
                         on:[ud boolForKey:@"useCursorAccount"]];
 
     [m addItem:NSMenuItem.separatorItem];
     SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
     NSMenuItem *login = [self settingsItem:m title:loginStatus == SMAppServiceStatusRequiresApproval
                                                     ? @"Launch at Login (approve in System Settings)" : @"Launch at Login"
+                                    symbol:@"power.circle"
                                     action:@selector(toggleLaunchAtLogin:) on:loginStatus == SMAppServiceStatusEnabled];
     if (loginStatus == SMAppServiceStatusRequiresApproval) login.state = NSControlStateValueMixed;
     return m;
@@ -6439,16 +6505,53 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
             _bat.amperage_mA < 0 ? @"Drawing" : @"Charging at", watts];
 }
 
+// The glyph that already means this instrument in the popover, or nil for a heading that
+// is not one of those instruments (a breakdown, a privacy note, a model list).
+- (NSString *)detailHeadingSymbolForTitle:(NSString *)title key:(NSString *)sectionKey {
+    NSString *key = sectionKey.lowercaseString ?: @"";
+    if ([key isEqualToString:@"overview"]) return @"square.grid.2x2";
+    if ([key isEqualToString:@"storage"]) return @"internaldrive";
+    if ([key hasPrefix:@"volume."]) {
+        for (Volume *volume in _vols) {
+            NSString *volumeKey = [@"volume." stringByAppendingString:volume.path ?: volume.name ?: @""].lowercaseString;
+            if ([volumeKey isEqualToString:key])
+                return volume.isInternal ? @"internaldrive" : @"externaldrive";
+        }
+        return @"externaldrive";
+    }
+    if ([key isEqualToString:@"battery"]) return @"battery.100";
+    if ([key isEqualToString:@"system"]) return @"cpu";
+    if ([key isEqualToString:@"ai-status"]) return @"sparkle";
+    if ([key hasSuffix:@".claude"] || [title isEqualToString:@"Claude"]) return [self aiSymbolName:@"Claude"];
+    if ([key hasSuffix:@".codex"] || [title isEqualToString:@"Codex"]) return [self aiSymbolName:@"Codex"];
+    if ([key hasSuffix:@".cursor"] || [title isEqualToString:@"Cursor"]) return [self aiSymbolName:@"Cursor"];
+    if ([title isEqualToString:@"AI"]) return [self aiSymbolName:@"AI"];
+    return nil;
+}
+
 // `sectionKey` is a stable semantic path for the section this heading OPENS — never the
 // section it follows, and never a build-order index. Rows added after it inherit it.
 - (void)addDetailHeading:(NSString *)title key:(NSString *)sectionKey
                       to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
     if (*y > kDetailPad) *y += 8;
     FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
+    CGFloat textX = kDetailPad;
+    CGFloat textY = *y;
+    NSString *symbol = [self detailHeadingSymbolForTitle:title key:sectionKey];
+    if (symbol.length) {
+        NSImageView *mark = [NSImageView imageViewWithImage:[self menuSymbol:symbol]];
+        mark.imageScaling = NSImageScaleProportionallyDown;
+        mark.contentTintColor = NSColor.secondaryLabelColor;
+        mark.frame = NSMakeRect(kDetailPad, *y, 16, 16);
+        mark.accessibilityElement = NO;   // the heading text is the accessible name
+        [root addSubview:mark];
+        textX = kDetailPad + 20;
+        textY = *y + 1;
+    }
     NSTextField *heading = [self text:title.uppercaseString
                                   font:[NSFont systemFontOfSize:10 weight:NSFontWeightSemibold]
                                  color:NSColor.tertiaryLabelColor
-                                    at:NSMakeRect(kDetailPad, *y, width-2*kDetailPad, 14)
+                                    at:NSMakeRect(textX, textY, width - kDetailPad - textX, 14)
                                  align:NSTextAlignmentLeft];
     ApplyHeadingAccessibility(heading, title);
     NSString *key = sectionKey.length ? sectionKey.lowercaseString : title.lowercaseString;
@@ -6521,11 +6624,44 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return scroll;
 }
 
+- (NSString *)detailTabSymbol:(NSString *)identifier {
+    if ([identifier isEqualToString:@"overview"]) return @"square.grid.2x2";
+    if ([identifier isEqualToString:@"storage"]) return @"internaldrive";
+    if ([identifier isEqualToString:@"battery"]) return @"battery.100";
+    if ([identifier isEqualToString:@"system"]) return @"cpu";
+    if ([identifier isEqualToString:@"ai"]) return @"sparkle";
+    return @"circle.dashed";
+}
+
+// Toolbar-tab items. Assigning viewController overwrites identifier, label, and image
+// from the controller, so the stable tab id and the symbol go on after that.
 - (NSTabViewItem *)detailTabWithIdentifier:(NSString *)identifier title:(NSString *)title view:(NSView *)view {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:identifier];
+    NSViewController *child = [[NSViewController alloc] init];
+    child.title = title;
+    child.view = view;
+    NSTabViewItem *item = [NSTabViewItem tabViewItemWithViewController:child];
+    item.identifier = identifier;
     item.label = title;
-    item.view = view;
+    item.image = [self menuSymbol:[self detailTabSymbol:identifier]];
     return item;
+}
+
+- (NSTabViewController *)newDetailsTabController {
+    NSTabViewController *controller = [[NSTabViewController alloc] init];
+    controller.tabStyle = NSTabViewControllerTabStyleToolbar;
+    controller.transitionOptions = NSViewControllerTransitionNone;
+    controller.tabView.accessibilityIdentifier = @"details.tabs";
+    NSArray<NSArray<NSString *> *> *specs = @[
+        @[@"overview", @"Overview"],
+        @[@"storage", @"Storage"],
+        @[@"battery", @"Battery"],
+        @[@"system", @"System"],
+        @[@"ai", @"AI"],
+    ];
+    for (NSArray<NSString *> *spec in specs)
+        [controller addTabViewItem:[self detailTabWithIdentifier:spec[0] title:spec[1]
+                                                            view:[self detailViewForIdentifier:spec[0]]]];
+    return controller;
 }
 
 - (NSScrollView *)overviewDetailsView {
@@ -6867,26 +7003,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // minimum, then rebuild rows so wrapping and right-aligned gauges stay exact.
     kDetailW = MAX(kDetailMinW, _detailsWindow.contentView.bounds.size.width - 60.0);
 
-    NSTabView *tabs = nil;
-    for (NSView *subview in _detailsWindow.contentView.subviews) {
-        if ([subview isKindOfClass:NSTabView.class]) { tabs = (NSTabView *)subview; break; }
-    }
+    NSTabViewController *controller = [_detailsWindow.contentViewController isKindOfClass:NSTabViewController.class]
+        ? (NSTabViewController *)_detailsWindow.contentViewController : nil;
+    NSTabView *tabs = controller.tabView;
 
-    if (!tabs) {   // first build: create the shell once
-        NSRect bounds = _detailsWindow.contentView ? _detailsWindow.contentView.bounds : NSMakeRect(0, 0, 660, 520);
-        if (bounds.size.width < 100 || bounds.size.height < 100) bounds = NSMakeRect(0, 0, 660, 520);
-        NSView *content = [[NSView alloc] initWithFrame:bounds];
-        tabs = [[NSTabView alloc] initWithFrame:NSInsetRect(content.bounds, 12, 12)];
-        tabs.accessibilityIdentifier = @"details.tabs";
-        tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        [tabs addTabViewItem:[self detailTabWithIdentifier:@"overview" title:@"Overview" view:[self detailViewForIdentifier:@"overview"]]];
-        [tabs addTabViewItem:[self detailTabWithIdentifier:@"storage" title:@"Storage" view:[self detailViewForIdentifier:@"storage"]]];
-        [tabs addTabViewItem:[self detailTabWithIdentifier:@"battery" title:@"Battery" view:[self detailViewForIdentifier:@"battery"]]];
-        [tabs addTabViewItem:[self detailTabWithIdentifier:@"system" title:@"System" view:[self detailViewForIdentifier:@"system"]]];
-        [tabs addTabViewItem:[self detailTabWithIdentifier:@"ai" title:@"AI" view:[self detailViewForIdentifier:@"ai"]]];
-        [content addSubview:tabs];
-        _detailsWindow.contentView = content;
-        [self restoreFocus:focusSnapshot inView:content window:_detailsWindow];
+    if (!controller) {   // first build: toolbar tabs, same identifiers and documents as before
+        controller = [self newDetailsTabController];
+        _detailsWindow.contentViewController = controller;
+        [self restoreFocus:focusSnapshot inView:_detailsWindow.contentView window:_detailsWindow];
         return;
     }
 
@@ -6916,10 +7040,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (void)showSystemDetails:(id)sender { [self showDetailsTab:@"system" sender:sender]; }
 - (void)showDetailsTab:(NSString *)tab sender:(id)sender {
     [self showDetails:sender];
-    if (!tab.length) return;
-    for (NSView *view in _detailsWindow.contentView.subviews)
-        if ([view isKindOfClass:NSTabView.class])
-            [(NSTabView *)view selectTabViewItemWithIdentifier:tab];
+    if (!tab.length || ![_detailsWindow.contentViewController isKindOfClass:NSTabViewController.class]) return;
+    [((NSTabViewController *)_detailsWindow.contentViewController).tabView selectTabViewItemWithIdentifier:tab];
 }
 
 - (void)showDetails:(id)sender {
