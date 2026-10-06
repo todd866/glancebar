@@ -1947,3 +1947,24 @@ NSString *FormatWattHours(double wh) {
     if (isnan(wh)) return nil;
     return wh < 100 ? [NSString stringWithFormat:@"%.1f Wh", wh] : [NSString stringWithFormat:@"%.0f Wh", wh];
 }
+
+PowerFlow PowerFlowFor(BatteryState b) {
+    if (!b.valid) return PowerFlowUnknown;
+    double w = BatteryWatts(b);
+    if (!b.acConnected) return PowerFlowDischarging;
+    if (!isnan(w) && w > 0.3) return PowerFlowCharging;
+    BOOL inputKnown = b.systemPowerIn_mW != LONG_MIN && b.systemPowerIn_mW >= 0;
+    if (inputKnown && b.systemPowerIn_mW < 1000) return PowerFlowPaused;   // charger recognised, nothing arriving
+    if (!isnan(w) && w < -0.5) return PowerFlowPaused;                     // plugged in, battery still carrying load
+    return PowerFlowHeld;
+}
+
+double PowerFlowIntensity(BatteryState b) {
+    double w = BatteryWatts(b);
+    if (isnan(w)) return 0;
+    switch (PowerFlowFor(b)) {
+        case PowerFlowCharging:    return MIN(1.0, MAX(0.0, w / 30.0));
+        case PowerFlowDischarging: return MIN(1.0, MAX(0.0, -w / 25.0));
+        default:                   return 0;
+    }
+}

@@ -7,6 +7,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
+#import <notify.h>
 #import <Network/Network.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
@@ -2872,6 +2873,27 @@ static NSColor *DiskColor(double frac) {
 static NSColor *BattBarColor(int pct) {
     return pct <= 10 ? NSColor.systemRedColor : pct <= 20 ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
 }
+
+// The battery glyph's colour says what the power is doing: green while charging (pale for a
+// trickle, vivid when fast), amber when plugged in but nothing is arriving, orange to red as
+// the drain gets heavy, and the ordinary ink otherwise. `ink` is the surface's normal colour.
+static NSColor *PowerFlowColor(BatteryState b, NSColor *ink) {
+    NSColor *base = ink ?: NSColor.labelColor;
+    double k = PowerFlowIntensity(b);
+    switch (PowerFlowFor(b)) {
+        case PowerFlowCharging:
+            return [base blendedColorWithFraction:0.35 + 0.65 * k ofColor:NSColor.systemGreenColor] ?: NSColor.systemGreenColor;
+        case PowerFlowPaused:
+            return NSColor.systemYellowColor;
+        case PowerFlowDischarging:
+            if (b.percent <= 20) return BattBarColor(b.percent);
+            if (k < 0.35) return base;
+            return [NSColor.systemOrangeColor blendedColorWithFraction:(k - 0.35) / 0.65 ofColor:NSColor.systemRedColor]
+                ?: NSColor.systemOrangeColor;
+        default:
+            return base;
+    }
+}
 // SF Symbol battery.100 / .75 / .50 / .25 / .0. The bolt variant exists only for
 // battery.100 (battery.75.bolt and the rest are not in the system set); fall back
 // to the plain level rather than hand AppKit a nil image.
@@ -3913,6 +3935,12 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
         CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
         CFRelease(src);
     }
+    // powerd posts this whenever the adapter or its charging policy changes (PowerUIAgent
+    // pausing or resuming at a limit, a charger renegotiating). The IOPS source above misses
+    // some of those, so the bar sat on a stale state until the next 15s tick.
+    int token = 0;
+    notify_register_dispatch("com.apple.system.powermanagement.poweradapter", &token,
+                             dispatch_get_main_queue(), ^(int __unused t) { [self schedulePowerRefresh]; });
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefresh]; }
@@ -4933,8 +4961,8 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                 seg[@"keepIcon"] = @YES;   // a reminder, not decoration: survives every tier
                 lidAwakeShown = YES;
             } else {
-                NSColor *fill = lowBattery ? BattBarColor(_bat.percent) : fg;
-                seg[@"image"] = BarFittedSymbol(BatterySymbolName(_bat.percent, _bat.acConnected), fill, 24);
+                seg[@"image"] = BarFittedSymbol(BatterySymbolName(_bat.percent, _bat.acConnected),
+                                                PowerFlowColor(_bat, fg), 24);
             }
         }
         [segments addObject:seg];
@@ -5449,11 +5477,17 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         return;
     }
     if (!powerChanged) return;
+    [self updateBar];   // the bar glyph's shade follows the watts
     if (popover) {
         NSView *root = _popover.contentViewController.view;
         NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(root, @"popover.battery.datum");
         if ([datum isKindOfClass:NSTextField.class]) {
             datum.stringValue = [self batteryDatumText];
+            PowerFlow flow = PowerFlowFor(_bat);
+            datum.textColor = (flow == PowerFlowCharging || flow == PowerFlowPaused)
+                ? PowerFlowColor(_bat, NSColor.secondaryLabelColor) : NSColor.secondaryLabelColor;
+            NSButton *glyph = (NSButton *)ViewWithAccessibilityIdentifier(root, @"popover.battery.symbol");
+            if ([glyph isKindOfClass:NSButton.class]) glyph.contentTintColor = PowerFlowColor(_bat, NSColor.secondaryLabelColor);
             NSString *tip = [self batteryPopoverTip];
             datum.toolTip = tip;
             NSView *row = ViewWithAccessibilityIdentifier(root, @"popover.row.battery");
@@ -5727,6 +5761,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery detected";
     NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:[self batteryStatusText]];
+    if (PowerFlowFor(_bat) == PowerFlowPaused)
+        [parts addObject:(_bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000)
+            ? @"Plugged in but no power is arriving — macOS (or a battery tool) has paused the charger, or the cable or charger isn't delivering"
+            : @"Plugged in but the charger can't cover the load — the battery is still draining"];
     NSString *flow = [self batteryPowerFlowText];
     if (flow.length) [parts addObject:flow];
     NSString *energy = [self batteryEnergyText];
@@ -5868,6 +5906,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (!_bat.valid) return @"";
     if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
         return @"held 80%";
+    if (PowerFlowFor(_bat) == PowerFlowPaused) {
+        // Plugged in but not charging: say so plainly — the reason is in the tooltip.
+        BOOL nothingIn = _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000;
+        NSString *w = FormatSignedWatts(BatteryWatts(_bat));
+        return nothingIn ? @"no power in" : (w ? [w stringByAppendingString:@" plugged"] : @"paused");
+    }
     // Real units first: what the battery is doing, in signed watts. On battery the
     // time to 20% rides along when it fits; the full power picture is in the tooltip.
     NSString *watts = _showWatts ? FormatSignedWatts(BatteryWatts(_bat)) : nil;
@@ -6234,7 +6278,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
             symbol.bordered = NO;
             symbol.imagePosition = NSImageOnly;
             symbol.imageScaling = NSImageScaleProportionallyDown;
-            symbol.contentTintColor = BattBarColor(_bat.percent);
+            symbol.contentTintColor = PowerFlowColor(_bat, NSColor.secondaryLabelColor);
             symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
             symbol.accessibilityIdentifier = @"popover.battery.symbol";
             symbol.toolTip = [self chargeLimitTooltip];
@@ -6253,7 +6297,10 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
                                                 color:BattBarColor(_bat.percent)
                                            identifier:@"popover.battery.value" in:row];
             value.toolTip = tip;
-            NSTextField *datum = [self instrumentDatum:[self batteryDatumText] color:NSColor.secondaryLabelColor
+            PowerFlow flow = PowerFlowFor(_bat);
+            NSColor *datumColor = (flow == PowerFlowCharging || flow == PowerFlowPaused)
+                ? PowerFlowColor(_bat, NSColor.secondaryLabelColor) : NSColor.secondaryLabelColor;
+            NSTextField *datum = [self instrumentDatum:[self batteryDatumText] color:datumColor
                                            identifier:@"popover.battery.datum" in:row];
             datum.toolTip = tip;
         } else {
@@ -7513,7 +7560,7 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.battery" tip:tip in:root];
         if (_bat.valid) {
             NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
-                                              tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
+                                              tint:PowerFlowColor(_bat, NSColor.secondaryLabelColor) frame:DetailLeadRect(c)
                                         identifier:@"details.overview.battery.symbol" in:row];
             mark.toolTip = tip;
             NSTextField *batteryName = [self detailText:@"Battery"
@@ -7724,7 +7771,7 @@ static NSColor *HealthColor(double fraction) {
         NSString *tip = [self batteryPopoverTip];
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.battery.row.charge" tip:tip in:root];
         NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
-                                          tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
+                                          tint:PowerFlowColor(_bat, NSColor.secondaryLabelColor) frame:DetailLeadRect(c)
                                     identifier:@"details.battery.charge.symbol" in:row];
             [self detailRowName:@"Charge" cols:c identifier:@"details.battery.charge.name" in:row];
         mark.toolTip = tip;

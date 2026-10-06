@@ -23,6 +23,19 @@ typedef struct {
     long adapterWatts;     // the charger's rating, 0 when unplugged/unknown
 } BatteryState;
 
+// What the power is actually doing, from the telemetry rather than the IsCharging flag,
+// which lags and says nothing about a charger that is plugged in but delivering nothing.
+typedef NS_ENUM(NSInteger, PowerFlow) {
+    PowerFlowUnknown = 0,
+    PowerFlowCharging,      // energy going into the battery
+    PowerFlowHeld,          // plugged in, the charger covers the load, the battery rests (e.g. at its limit)
+    PowerFlowPaused,        // plugged in, but no power comes in or the battery still drains
+    PowerFlowDischarging,   // on battery
+};
+PowerFlow PowerFlowFor(BatteryState b);
+// 0..1: how hard it is charging (30 W = 1) or draining (25 W = 1). 0 for held/paused/unknown.
+double PowerFlowIntensity(BatteryState b);
+
 // Battery power in watts, signed: + charging, − discharging. NAN when not measurable.
 double BatteryWatts(BatteryState b);
 // "+3.9 W", "−8.4 W" (true minus sign), "0 W" for |w| < 0.05; nil for NAN.

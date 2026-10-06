@@ -823,6 +823,26 @@ int main(void) {
             check(FormatWattHours(BatteryWattHours(0, 11941)) == nil, @"battery: no charge, no Wh");
         }
 
+        // --- PowerFlowFor / PowerFlowIntensity ---
+        {
+            BatteryState b = {0};
+            b.valid = YES; b.voltage_mV = 12000; b.acConnected = YES;
+            b.amperage_mA = 2069; b.systemPowerIn_mW = 42897;
+            check(PowerFlowFor(b) == PowerFlowCharging && fabs(PowerFlowIntensity(b) - 24.8 / 30.0) < 0.01,
+                  @"power: +24.8 W is charging at ~83% intensity");
+            b.amperage_mA = -1197; b.systemPowerIn_mW = 0;
+            check(PowerFlowFor(b) == PowerFlowPaused, @"power: plugged, 0 W in, battery draining = paused");
+            b.amperage_mA = 0; b.systemPowerIn_mW = 18000;
+            check(PowerFlowFor(b) == PowerFlowHeld && PowerFlowIntensity(b) == 0, @"power: plugged, battery resting = held");
+            b.amperage_mA = -300; b.systemPowerIn_mW = 18700;
+            check(PowerFlowFor(b) == PowerFlowPaused, @"power: a charger too weak for the load still drains = paused");
+            b.acConnected = NO; b.amperage_mA = -1400; b.systemPowerIn_mW = 0;
+            check(PowerFlowFor(b) == PowerFlowDischarging && fabs(PowerFlowIntensity(b) - 16.8 / 25.0) < 0.01,
+                  @"power: on battery, 16.8 W drain");
+            BatteryState none = {0};
+            check(PowerFlowFor(none) == PowerFlowUnknown, @"power: no battery = unknown");
+        }
+
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
         NSString *(^jwt)(double) = ^NSString *(double exp) {
             NSData *claims = [NSJSONSerialization dataWithJSONObject:@{@"exp": @(exp), @"type": @"session"} options:0 error:nil];
