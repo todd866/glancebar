@@ -1867,7 +1867,8 @@ NSString *CompactResetClock(NSDate *resetAt, NSDate *now) {
     }
     if (days <= 6) {
         NSDateComponents *hm = [cal components:NSCalendarUnitHour | NSCalendarUnitMinute fromDate:resetAt];
-        fmt.dateFormat = (hm.hour == 0 && hm.minute == 0) ? @"EEE" : @"EEE HH:mm";
+        (void)hm;   // the day is the glance; the exact time is in the tooltip
+        fmt.dateFormat = @"EEE";
         return [fmt stringFromDate:resetAt];
     }
     fmt.dateFormat = @"d MMM";

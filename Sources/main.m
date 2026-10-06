@@ -5875,7 +5875,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSDate *reset = u.resetAt;
         if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
             reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
-        datum = CompactResetClock(reset, NSDate.date) ?: @"";
+        // A bare "21:00" beside a bar could mean anything; one word says what it is.
+        NSString *clock = CompactResetClock(reset, NSDate.date);
+        datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
     }
     NSTextField *datumField = [self instrumentDatum:datum color:datumColor
                                         identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];

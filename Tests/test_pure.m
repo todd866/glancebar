@@ -1692,8 +1692,8 @@ int main(void) {
                   @"reset clock: later today is 24-hour HH:mm");
             check([CompactResetClock(at(13, 0, 0), now) isEqual:@"Sat"],
                   @"reset clock: midnight this week is the weekday alone");
-            check([CompactResetClock(at(13, 7, 2), now) isEqual:@"Sat 07:02"],
-                  @"reset clock: a time this week keeps the weekday and 24-hour clock");
+            check([CompactResetClock(at(13, 7, 2), now) isEqual:@"Sat"],
+                  @"reset clock: a time this week is the weekday; the exact time lives in the tooltip");
             check([CompactResetClock(at(21, 9, 0), now) isEqual:@"21 Jun"],
                   @"reset clock: past this week is the day and month, not a weekday");
         }
