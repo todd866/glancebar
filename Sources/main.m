@@ -6522,7 +6522,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         return @"externaldrive";
     }
     if ([key isEqualToString:@"battery"]) return @"battery.100";
-    if ([key isEqualToString:@"system"]) return @"cpu";
+    if ([key isEqualToString:@"system"] || [key isEqualToString:@"top-cpu"]) return @"cpu";
+    if ([key isEqualToString:@"top-memory"]) return @"memorychip";
+    if ([key isEqualToString:@"energy"]) return @"bolt";
+    if ([key isEqualToString:@"top-signals"]) return @"chart.bar";
+    if ([key isEqualToString:@"sources"] || [key isEqualToString:@"privacy"]) return @"checkmark.circle";
     if ([key isEqualToString:@"ai-status"]) return @"sparkle";
     if ([key hasSuffix:@".claude"] || [title isEqualToString:@"Claude"]) return [self aiSymbolName:@"Claude"];
     if ([key hasSuffix:@".codex"] || [title isEqualToString:@"Codex"]) return [self aiSymbolName:@"Codex"];
@@ -6533,8 +6537,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 // `sectionKey` is a stable semantic path for the section this heading OPENS — never the
 // section it follows, and never a build-order index. Rows added after it inherit it.
+// `tint` and `tip` carry a problem on the heading (an amber symbol, the sentence in the
+// tooltip) so the document does not grow a status line under it.
 - (void)addDetailHeading:(NSString *)title key:(NSString *)sectionKey
-                      to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
+                      to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width
+                    tint:(NSColor *)tint tip:(NSString *)tip {
     if (*y > kDetailPad) *y += 8;
     FlippedView *detailRoot = [root isKindOfClass:FlippedView.class] ? (FlippedView *)root : nil;
     CGFloat textX = kDetailPad;
@@ -6543,9 +6550,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (symbol.length) {
         NSImageView *mark = [NSImageView imageViewWithImage:[self menuSymbol:symbol]];
         mark.imageScaling = NSImageScaleProportionallyDown;
-        mark.contentTintColor = NSColor.secondaryLabelColor;
+        mark.contentTintColor = tint ?: NSColor.secondaryLabelColor;
         mark.frame = NSMakeRect(kDetailPad, *y, 16, 16);
         mark.accessibilityElement = NO;   // the heading text is the accessible name
+        if (tip.length) mark.toolTip = tip;
         [root addSubview:mark];
         textX = kDetailPad + 20;
         textY = *y + 1;
@@ -6556,6 +6564,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                     at:NSMakeRect(textX, textY, width - kDetailPad - textX, 14)
                                  align:NSTextAlignmentLeft];
     ApplyHeadingAccessibility(heading, title);
+    if (tip.length) heading.toolTip = tip;
     NSString *key = sectionKey.length ? sectionKey.lowercaseString : title.lowercaseString;
     NSString *scope = root.accessibilityIdentifier ?: @"details";
     heading.accessibilityIdentifier = DisambiguatedDetailKey(detailRoot, @"id",
@@ -6563,6 +6572,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (detailRoot) detailRoot.accessibilitySection = key;
     [root addSubview:heading];
     *y += 24;
+}
+
+- (void)addDetailHeading:(NSString *)title key:(NSString *)sectionKey
+                      to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
+    [self addDetailHeading:title key:sectionKey to:root y:y width:width tint:nil tip:nil];
 }
 
 - (void)addDetailKey:(NSString *)key value:(NSString *)value to:(NSView *)root y:(CGFloat *)y width:(CGFloat)width {
@@ -6666,59 +6680,611 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return controller;
 }
 
+// Details columns, shared by every tab. The gauge takes the width left between the
+// lead (symbol, or an indented window label) and the fixed value and datum columns.
+// Storage spends some of that gauge on a volume name; capacity and the reveal button
+// sit in the trailing part of the datum column, so values still share an x.
+static const CGFloat kDetailRowH = 32;
+static const CGFloat kDetailGaugeH = 10;
+static const CGFloat kDetailBarH = 4;
+
+typedef struct {
+    CGFloat width, rowH, symbol, gaugeH, barH, gap;
+    CGFloat gaugeX, gaugeW, gaugeRight;
+    CGFloat valueX, valueW, valueH, datumX, datumW, datumH;
+    CGFloat labelX, labelW, nameX, nameW, storageGaugeX, storageGaugeW;
+    CGFloat freeW, trailW, capX, capW, revealX, revealW;
+    CGFloat barNameX, barNameW, barX, barW;
+} DetailColumns;
+
+static DetailColumns DetailLayout(CGFloat width) {
+    DetailColumns c;
+    c.width = width;
+    c.rowH = kDetailRowH;
+    c.symbol = kLeadSymbol;
+    c.gaugeH = kDetailGaugeH;
+    c.barH = kDetailBarH;
+    c.gap = 8;
+    c.valueW = 72;
+    c.valueH = kValueH;
+    c.datumH = kDatumH;
+    c.freeW = 116;
+    c.capW = 56;
+    c.revealW = 24;
+    c.labelX = kDetailPad + 14;
+    c.labelW = 78;   // "Fable", "bengalfox": the window label has to fit on one line
+    c.gaugeX = c.labelX + c.labelW + c.gap;
+    CGFloat right = width - kDetailPad;
+    c.revealX = right - c.revealW;
+    c.capX = c.revealX - 6 - c.capW;
+    c.datumX = c.capX - 6 - c.freeW;
+    c.datumW = c.freeW;
+    c.trailW = right - c.datumX;   // storage keeps freeW; every other datum runs to the margin
+    c.valueX = c.datumX - c.gap - c.valueW;
+    c.gaugeRight = c.valueX - c.gap;
+    c.gaugeW = MAX(32.0, c.gaugeRight - c.gaugeX);
+    c.nameX = kDetailPad + kLeadW + 6;
+    c.nameW = 120;
+    c.storageGaugeX = c.nameX + c.nameW + c.gap;
+    c.storageGaugeW = MAX(32.0, c.gaugeRight - c.storageGaugeX);
+    c.barNameX = kDetailPad;
+    c.barNameW = 172;
+    c.barX = c.barNameX + c.barNameW + c.gap;
+    c.barW = MAX(24.0, c.gaugeRight - c.barX);
+    return c;
+}
+
+static NSRect DetailLeadRect(DetailColumns c) {
+    return NSMakeRect(kDetailPad, (c.rowH - c.symbol) / 2.0, kLeadW, c.symbol);
+}
+static NSRect DetailValueRect(DetailColumns c) {
+    return NSMakeRect(c.valueX, (c.rowH - c.valueH) / 2.0, c.valueW, c.valueH);
+}
+static NSRect DetailDatumRect(DetailColumns c) {
+    return NSMakeRect(c.datumX, (c.rowH - c.datumH) / 2.0, c.trailW, c.datumH);
+}
+
+static NSString *DetailBucketLabel(NSDictionary *w) {
+    if ([w[@"bucketLabel"] isKindOfClass:NSString.class] && [w[@"bucketLabel"] length]) return w[@"bucketLabel"];
+    if ([w[@"bucket"] isKindOfClass:NSString.class]) return CodexBucketLabel(w[@"bucket"]);
+    return nil;
+}
+static NSRect DetailGaugeRect(DetailColumns c) {
+    return NSMakeRect(c.gaugeX, (c.rowH - c.gaugeH) / 2.0, c.gaugeW, c.gaugeH);
+}
+
+static NSString *DetailWindowBaseLabel(NSString *window) {
+    if (![window isKindOfClass:NSString.class] || !window.length) return @"—";
+    if ([window isEqualToString:@"5-hour"]) return @"5h";
+    if ([window isEqualToString:@"weekly"]) return @"week";
+    if ([window hasPrefix:@"weekly "]) {
+        NSString *rest = [window substringFromIndex:7];
+        return rest.length ? rest : @"week";
+    }
+    return window.length > 8 ? [window substringToIndex:8] : window;
+}
+
+static NSArray<NSString *> *DetailWindowLabels(NSArray *windows) {
+    if (![windows isKindOfClass:NSArray.class] || !windows.count) return @[];
+    NSMutableArray<NSString *> *bases = [NSMutableArray arrayWithCapacity:windows.count];
+    NSCountedSet *counts = [NSCountedSet set];
+    NSMutableSet *buckets = [NSMutableSet set];
+    for (id item in windows) {
+        NSDictionary *w = [item isKindOfClass:NSDictionary.class] ? item : @{};
+        NSString *base = DetailWindowBaseLabel(w[@"window"]);
+        [bases addObject:base];
+        [counts addObject:base];
+        if (w[@"bucket"]) [buckets addObject:w[@"bucket"]];
+    }
+    BOOL multi = buckets.count > 1;
+    NSMutableArray<NSString *> *labels = [NSMutableArray arrayWithCapacity:windows.count];
+    [windows enumerateObjectsUsingBlock:^(id item, NSUInteger i, BOOL *stop) {
+        (void)stop;
+        NSDictionary *w = [item isKindOfClass:NSDictionary.class] ? item : @{};
+        NSString *bucket = DetailBucketLabel(w);
+        if (multi && [counts countForObject:bases[i]] > 1 && bucket.length) [labels addObject:bucket];
+        else [labels addObject:bases[i]];
+    }];
+    return labels;
+}
+
+static double HogShare(NSDictionary *h, NSArray *hogs) {
+    double total = [hogs.firstObject[@"totalImpact"] doubleValue];
+    if (total <= 0) for (NSDictionary *row in hogs) total += [row[@"impact"] doubleValue];
+    return total > 0 ? [h[@"impact"] doubleValue] / total : 0;
+}
+
+static NSColor *HealthColor(double fraction) {
+    if (fraction < 0.60) return NSColor.systemRedColor;
+    if (fraction < 0.80) return NSColor.systemOrangeColor;
+    return NSColor.systemGreenColor;
+}
+
+- (NSTextField *)detailText:(NSString *)text font:(NSFont *)font color:(NSColor *)color
+                       frame:(NSRect)frame align:(NSTextAlignment)align
+                  identifier:(NSString *)identifier in:(NSView *)row {
+    NSTextField *field = [self text:text ?: @"" font:font color:color at:frame align:align];
+    field.maximumNumberOfLines = 1;
+    field.lineBreakMode = NSLineBreakByTruncatingTail;
+    field.cell.wraps = NO;
+    if (identifier.length) field.accessibilityIdentifier = identifier;
+    [row addSubview:field];
+    return field;
+}
+
+- (NSImageView *)detailSymbol:(NSString *)name size:(CGFloat)size tint:(NSColor *)tint
+                         frame:(NSRect)frame identifier:(NSString *)identifier in:(NSView *)row {
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:size weight:NSFontWeightRegular];
+    NSImage *base = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    if (!base) base = [NSImage imageWithSystemSymbolName:@"questionmark.circle" accessibilityDescription:nil];
+    NSImageView *iv = [NSImageView imageViewWithImage:[base imageWithSymbolConfiguration:cfg]];
+    iv.imageScaling = NSImageScaleProportionallyDown;
+    iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
+    iv.frame = frame;
+    iv.accessibilityIdentifier = identifier;
+    [row addSubview:iv];
+    return iv;
+}
+
+- (Gauge *)detailGauge:(NSRect)frame fraction:(double)fraction color:(NSColor *)color
+                  label:(NSString *)label identifier:(NSString *)identifier tip:(NSString *)tip in:(NSView *)row {
+    Gauge *gauge = [[Gauge alloc] initWithFrame:frame];
+    gauge.fraction = MIN(1.0, MAX(0.0, fraction));
+    gauge.color = color ?: NSColor.controlAccentColor;
+    gauge.metricLabel = label.length ? label : @"Progress";
+    gauge.accessibilityIdentifier = identifier;   // metricLabel overwrites this; set it after
+    gauge.toolTip = tip;
+    [row addSubview:gauge];
+    return gauge;
+}
+
+- (NSView *)detailRowAt:(CGFloat)y cols:(DetailColumns)c identifier:(NSString *)identifier
+                    tip:(NSString *)tip in:(NSView *)root {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, c.width, c.rowH)];
+    row.accessibilityIdentifier = identifier;
+    if (tip.length) {
+        row.toolTip = tip;
+        row.accessibilityLabel = tip;
+    }
+    [root addSubview:row];
+    return row;
+}
+
+- (NSTextField *)detailValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier
+                          tip:(NSString *)tip in:(NSView *)row cols:(DetailColumns)c {
+    NSTextField *field = [self detailText:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                                     color:color frame:DetailValueRect(c) align:NSTextAlignmentRight
+                                identifier:identifier in:row];
+    if (tip.length) field.toolTip = tip;
+    return field;
+}
+
+- (NSTextField *)detailDatum:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier
+                          tip:(NSString *)tip in:(NSView *)row cols:(DetailColumns)c {
+    NSTextField *field = [self detailText:text ?: @"" font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                     color:color ?: NSColor.secondaryLabelColor
+                                     frame:DetailDatumRect(c) align:NSTextAlignmentLeft
+                                identifier:identifier in:row];
+    if (tip.length) field.toolTip = tip;
+    return field;
+}
+
+// A list that is empty carries nothing, so the caller skips it. Loading is a dim dash;
+// a failed sampler is an amber mark plus the word, with the sentence in the tooltip.
+- (CGFloat)addDetailNoticeTo:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c
+                   identifier:(NSString *)identifier tip:(NSString *)tip problem:(BOOL)problem {
+    NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
+    if (problem) {
+        NSImageView *mark = [self detailSymbol:@"exclamationmark.triangle" size:c.symbol
+                                          tint:NSColor.systemOrangeColor frame:DetailLeadRect(c)
+                                    identifier:[identifier stringByAppendingString:@".symbol"] in:row];
+        mark.toolTip = tip;
+        mark.accessibilityLabel = tip;
+        [self detailDatum:@"unavailable" color:NSColor.systemOrangeColor
+               identifier:[identifier stringByAppendingString:@".datum"] tip:tip in:row cols:c];
+    } else {
+        [self detailValue:@"—" color:NSColor.tertiaryLabelColor
+               identifier:[identifier stringByAppendingString:@".value"] tip:tip in:row cols:c];
+    }
+    return y + c.rowH;
+}
+
+- (CGFloat)addDetailBar:(NSDictionary *)h value:(NSString *)value context:(NSString *)context
+               fraction:(double)fraction color:(NSColor *)color identifier:(NSString *)identifier
+                     to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSDictionary *info = ProcessDisplayInfo(h);
+    NSString *title = info[@"title"] ?: @"Process";
+    NSString *detail = info[@"detail"] ?: @"";
+    NSString *shown = context.length ? context : detail;
+    NSString *tip = detail.length && ![detail isEqualToString:shown]
+        ? [NSString stringWithFormat:@"%@ · %@\n%@", title, value ?: @"", detail]
+        : [NSString stringWithFormat:@"%@ · %@", title, value ?: @""];
+    NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
+    NSTextField *name = [self detailText:title font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
+                                    color:NSColor.labelColor
+                                    frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16)
+                                    align:NSTextAlignmentLeft
+                               identifier:[identifier stringByAppendingString:@".name"] in:row];
+    name.toolTip = tip;
+    NSRect bar = NSMakeRect(c.barX, (c.rowH - c.barH) / 2.0, c.barW, c.barH);
+    [self detailGauge:bar fraction:fraction color:color label:tip
+           identifier:[identifier stringByAppendingString:@".bar"] tip:tip in:row];
+    [self detailValue:value color:color identifier:[identifier stringByAppendingString:@".value"] tip:tip in:row cols:c];
+    NSTextField *note = [self detailText:shown font:[NSFont systemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                    color:NSColor.tertiaryLabelColor
+                                    frame:DetailDatumRect(c) align:NSTextAlignmentLeft
+                               identifier:[identifier stringByAppendingString:@".context"] in:row];
+    note.toolTip = tip;
+    return y + c.rowH;
+}
+
+- (BOOL)batteryWattsKnown:(double *)outWatts {
+    if (!_bat.valid || _bat.voltage_mV <= 0 || _bat.amperage_mA == 0) return NO;
+    if (outWatts) *outWatts = fabs((double)_bat.amperage_mA) * _bat.voltage_mV / 1e6;
+    return YES;
+}
+
+// Charge-row datum only. Health is its own instrument on the Battery tab, so it is not
+// appended here the way the narrow popover datum sometimes does.
+- (NSString *)batteryDetailDatum {
+    if (!_bat.valid) return @"";
+    if (!_bat.acConnected) {
+        if (_bat.percent <= 20) return @"reserve";
+        int minutes = MinutesTo20(_bat, [self avgAmp]);
+        return minutes >= 0 ? [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)] : @"…";
+    }
+    double watts = 0;
+    if (_showWatts && _bat.isCharging && [self batteryWattsKnown:&watts])
+        return [NSString stringWithFormat:@"+%.1f W", watts];
+    return @"AC";
+}
+
+// The provider row the popover draws, at the Details column positions. Window rows and
+// token history are added by the AI tab; Overview stops at this one line per provider.
+- (CGFloat)addDetailProviderRow:(AIUsage *)u scope:(NSString *)scope
+                             to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSString *name = u.name.length ? u.name : @"AI";
+    NSString *slug = name.lowercaseString;
+    BOOL overview = [scope isEqualToString:@"details.overview"];
+    NSString *rowID = overview ? [NSString stringWithFormat:@"details.overview.row.ai.%@", slug]
+                               : [NSString stringWithFormat:@"details.ai.row.%@", slug];
+    NSString *stem = overview ? [NSString stringWithFormat:@"details.overview.ai.%@", slug]
+                              : [NSString stringWithFormat:@"details.ai.%@", slug];
+    NSDictionary *quotas = [name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable
+        ? ClaudeModelQuotas(u.limitWindows) : nil;
+    double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
+    BOOL claudeMeter = quotas != nil;
+    BOOL hasGauge = claudeMeter || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    NSString *pct = @"—";
+    NSColor *valueColor = NSColor.tertiaryLabelColor;
+    NSString *tip = [self aiStatusSubtext:u] ?: @"";
+    if (claudeMeter) {
+        pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week * 100];
+        BOOL staleWarns = [self aiSnapshotStaleWarns:u];
+        valueColor = staleWarns ? NSColor.systemOrangeColor
+            : (week < 0 ? NSColor.tertiaryLabelColor : AIQuotaColor(week));
+        NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+        NSMutableArray *parts = [NSMutableArray arrayWithObject:
+            [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
+        if (weekClock.length) [parts addObject:[@"Week resets " stringByAppendingString:weekClock]];
+        for (NSDictionary *w in u.limitWindows)
+            if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
+                NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
+                    ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+                [parts addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
+                    [w[@"remainingFraction"] doubleValue] * 100,
+                    clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+            }
+        if (tip.length) [parts addObject:tip];
+        tip = [parts componentsJoinedByString:@"\n"];
+    } else if (hasGauge) {
+        pct = [self aiPercentText:u];
+        valueColor = [self aiStatusColor:u];
+    }
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
+    if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
+        named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
+    if (u.billingNote.length && ![named containsString:u.billingNote])
+        named = [named stringByAppendingFormat:@"\n%@", u.billingNote];
+    if (u.extraUsage.length) named = [named stringByAppendingFormat:@"\n%@", u.extraUsage];
+    if (u.limitUpdatedAt) named = [named stringByAppendingFormat:@"\nChecked %@", ClockText(u.limitUpdatedAt)];
+    if (u.statusSource.length && ![[u.statusSource lowercaseString] isEqualToString:@"unknown"])
+        named = [named stringByAppendingFormat:@"\n%@", u.statusSource];
+
+    NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:named in:root];
+    NSImageView *mark = [self detailSymbol:[self aiSymbolName:name] size:c.symbol tint:valueColor
+                                     frame:DetailLeadRect(c)
+                                identifier:[stem stringByAppendingString:@".symbol"] in:row];
+    mark.toolTip = named;
+    mark.accessibilityLabel = named;
+    if (claudeMeter) {
+        ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:DetailGaugeRect(c)];
+        meter.opus = week;   // weekly all-models figure; Fable stays off this gauge
+        meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+        meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
+        meter.toolTip = named;
+        [row addSubview:meter];
+    } else if (hasGauge) {
+        [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
+                    label:[NSString stringWithFormat:@"%@ quota remaining", name]
+               identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+    }
+    NSTextField *value = [self detailValue:pct color:valueColor
+                                 identifier:[stem stringByAppendingString:@".value"] tip:named in:row cols:c];
+    if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
+    NSString *problem = [self aiProblemText:u];
+    NSColor *datumColor = NSColor.secondaryLabelColor;
+    NSString *datum = @"";
+    if (problem.length) {
+        datum = problem;
+        BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
+        datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (!u.overageActive) {
+        NSDate *reset = u.resetAt;
+        if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
+            reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+        datum = CompactResetClock(reset, NSDate.date) ?: @"";
+    }
+    [self detailDatum:datum color:datumColor identifier:[stem stringByAppendingString:@".datum"] tip:named in:row cols:c];
+    return y + c.rowH;
+}
+
+- (CGFloat)addDetailWindows:(AIUsage *)u to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSString *slug = (u.name.length ? u.name : @"AI").lowercaseString;
+    NSArray *windows = u.limitWindows ?: @[];
+    NSArray<NSString *> *labels = DetailWindowLabels(windows);
+    NSString *problem = [self aiProblemText:u];
+    NSColor *problemColor = nil;
+    if (problem.length) {
+        BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
+        problemColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    }
+    for (NSUInteger i = 0; i < windows.count; i++) {
+        NSDictionary *w = [windows[i] isKindOfClass:NSDictionary.class] ? windows[i] : @{};
+        NSString *label = i < labels.count ? labels[i] : @"—";
+        NSString *windowName = [w[@"window"] isKindOfClass:NSString.class] ? w[@"window"] : label;
+        NSString *bucket = DetailBucketLabel(w);
+        NSString *full = bucket.length ? [NSString stringWithFormat:@"%@ · %@", windowName, bucket] : windowName;
+        BOOL hasFrac = [w[@"remainingFraction"] isKindOfClass:NSNumber.class];
+        double frac = hasFrac ? [w[@"remainingFraction"] doubleValue] : -1;
+        NSString *pct = hasFrac ? [NSString stringWithFormat:@"%d%%", (int)lround(frac * 100.0)] : @"—";
+        NSDate *resetDate = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? [NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]] : nil;
+        NSString *reset = CompactResetClock(resetDate, NSDate.date) ?: @"";
+        NSColor *color = problemColor ?: (hasFrac ? [self windowColor:frac] : NSColor.tertiaryLabelColor);
+        NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@ left", full, pct];
+        if (reset.length) [tip appendFormat:@" · resets %@", reset];
+        else if ([w[@"fresh"] boolValue]) [tip appendString:@" · not started"];
+        NSString *rowID = [NSString stringWithFormat:@"details.ai.window.%@.%lu", slug, (unsigned long)i];
+        NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
+        NSTextField *lab = [self detailText:label font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+                                       color:NSColor.secondaryLabelColor
+                                       frame:NSMakeRect(c.labelX, (c.rowH - 16) / 2.0, c.labelW, 16)
+                                       align:NSTextAlignmentLeft
+                                  identifier:[rowID stringByAppendingString:@".label"] in:row];
+        lab.toolTip = tip;
+        if (hasFrac && frac >= 0)
+            [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
+                   identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
+        [self detailValue:pct color:color identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
+        [self detailDatum:reset color:(problemColor ?: NSColor.secondaryLabelColor)
+               identifier:[rowID stringByAppendingString:@".datum"] tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    return y;
+}
+
+- (NSString *)detailHistoryTip:(AIUsage *)u {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (u.todayTokens > 0)
+        [parts addObject:[NSString stringWithFormat:@"Today %@", FmtTokenCount(u.todayTokens)]];
+    if (u.todayTokensAll > u.todayTokens && u.todayTokensAll > 0)
+        [parts addObject:[NSString stringWithFormat:@"%@ today including cached context", FmtCompact(u.todayTokensAll)]];
+    if (u.weekTokens > 0)
+        [parts addObject:[NSString stringWithFormat:@"7 days %@", FmtTokenCount(u.weekTokens)]];
+    if (u.weekTokensAll > u.weekTokens && u.weekTokensAll > 0)
+        [parts addObject:[NSString stringWithFormat:@"%@ in 7 days including cached context", FmtCompact(u.weekTokensAll)]];
+    if (u.todaySessions > 0 || u.weekSessions > 0)
+        [parts addObject:[NSString stringWithFormat:@"%lld sessions today · %lld in 7 days",
+                          u.todaySessions, u.weekSessions]];
+    if (u.todayMessages > 0)
+        [parts addObject:[NSString stringWithFormat:@"%lld messages · %lld tool calls",
+                          u.todayMessages, u.todayToolCalls]];
+    for (NSDictionary *model in u.models) {
+        NSString *raw = [model[@"name"] isKindOfClass:NSString.class] ? model[@"name"] : nil;
+        long long tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? [model[@"tokens"] longLongValue] : 0;
+        if (!raw.length) continue;
+        [parts addObject:[NSString stringWithFormat:@"%@ · %@", ShortModelName(raw), FmtTokenCount(tokens)]];
+    }
+    if (u.lastActivity) [parts addObject:[NSString stringWithFormat:@"Updated %@", ClockText(u.lastActivity)]];
+    NSString *source = u.source ?: @"";
+    if (source.length && ![[source lowercaseString] isEqualToString:@"unknown"]) [parts addObject:source];
+    return parts.count ? [parts componentsJoinedByString:@"\n"] : (u.name ?: @"Usage");
+}
+
+- (CGFloat)addDetailHistory:(AIUsage *)u to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    BOOL hasData = u.todayTokens > 0 || u.weekTokens > 0 || u.todayTokensAll > 0 || u.weekTokensAll > 0;
+    if (!hasData) return y;
+    NSString *slug = (u.name.length ? u.name : @"AI").lowercaseString;
+    NSString *tip = [self detailHistoryTip:u];
+    NSString *rowID = [@"details.ai.history." stringByAppendingString:slug];
+    NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
+    CGFloat mark = 16;
+    NSRect symbol = NSMakeRect(kDetailPad + (kLeadW - mark) / 2.0, (c.rowH - mark) / 2.0, mark, mark);
+    NSImageView *glyph = [self detailSymbol:[self aiSymbolName:u.name] size:mark tint:NSColor.tertiaryLabelColor
+                                      frame:symbol identifier:[rowID stringByAppendingString:@".symbol"] in:row];
+    glyph.toolTip = tip;
+    glyph.accessibilityLabel = tip;
+    NSString *todayText = u.todayTokens > 0 ? FmtCompact(u.todayTokens) : @"—";
+    NSString *weekText = u.weekTokens > 0 ? FmtCompact(u.weekTokens) : @"—";
+    CGFloat tagW = 46;
+    CGFloat todayTagX = c.valueX - c.gap - tagW;
+    CGFloat todayValueW = MAX(36.0, todayTagX - 4 - c.gaugeX);
+    NSFont *figure = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold];
+    NSFont *tag = [NSFont systemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    NSTextField *today = [self detailText:todayText font:figure
+                                     color:(u.todayTokens > 0 ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+                                     frame:NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, todayValueW, c.valueH)
+                                     align:NSTextAlignmentRight
+                                identifier:[rowID stringByAppendingString:@".today"] in:row];
+    today.toolTip = tip;
+    NSTextField *todayTag = [self detailText:@"today" font:tag color:NSColor.tertiaryLabelColor
+                                        frame:NSMakeRect(todayTagX, (c.rowH - c.datumH) / 2.0, tagW, c.datumH)
+                                        align:NSTextAlignmentLeft
+                                   identifier:[rowID stringByAppendingString:@".todayLabel"] in:row];
+    todayTag.toolTip = tip;
+    [self detailValue:weekText color:(u.weekTokens > 0 ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+           identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
+    NSTextField *weekTag = [self detailText:@"7d" font:tag color:NSColor.tertiaryLabelColor
+                                       frame:DetailDatumRect(c) align:NSTextAlignmentLeft
+                                  identifier:[rowID stringByAppendingString:@".weekLabel"] in:row];
+    weekTag.toolTip = tip;
+    return y + c.rowH;
+}
+
+- (CGFloat)addDetailSource:(NSString *)name on:(BOOL)on datum:(NSString *)datum tip:(NSString *)tip
+                 identifier:(NSString *)identifier to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
+    NSImageView *mark = [self detailSymbol:(on ? @"checkmark.circle.fill" : @"circle") size:c.symbol
+                                      tint:(on ? NSColor.systemGreenColor : NSColor.tertiaryLabelColor)
+                                     frame:DetailLeadRect(c)
+                                identifier:[identifier stringByAppendingString:@".symbol"] in:row];
+    mark.toolTip = tip;
+    mark.accessibilityLabel = tip;
+    CGFloat nameW = c.valueX + c.valueW - c.gaugeX - c.gap;
+    NSTextField *title = [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
+                                     color:NSColor.labelColor
+                                     frame:NSMakeRect(c.gaugeX, (c.rowH - 16) / 2.0, nameW, 16)
+                                     align:NSTextAlignmentLeft
+                                identifier:[identifier stringByAppendingString:@".name"] in:row];
+    title.toolTip = tip;
+    [self detailDatum:datum color:(on ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor)
+           identifier:[identifier stringByAppendingString:@".datum"] tip:tip in:row cols:c];
+    return y + c.rowH;
+}
+
 - (NSScrollView *)overviewDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 360)];
     root.accessibilityIdentifier = @"details.overview";
+    DetailColumns c = DetailLayout(kDetailW);
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"Overview" key:@"overview" to:root y:&y width:kDetailW];
 
-    Volume *primary = [self primaryVolume];
-    NSString *storage = primary
-        ? [NSString stringWithFormat:@"%d%% used · %@ free on %@",
-           (int)lround(primary.fraction * 100), FmtBytes(primary.available), primary.name]
-        : @"Unavailable";
-    [self addDetailKey:@"Storage" value:storage to:root y:&y width:kDetailW];
-    [self addDetailKey:@"Battery" value:[self batteryStatusText] to:root y:&y width:kDetailW];
-    [self addDetailKey:@"System" value:[NSString stringWithFormat:@"%@ · %@",
-                                        SystemPressureLevel(_sys), SystemSummaryText(_sys)]
-                    to:root y:&y width:kDetailW];
-    [self addDetailKey:@"AI status" value:[self aiOverviewText] to:root y:&y width:kDetailW];
-
-    [self addDetailHeading:@"Top Signals" key:@"top-signals" to:root y:&y width:kDetailW];
-    if (_hogsLoading || _procStatsLoading) {
-        [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
-    } else if (_hogsUnavailable || _procStatsUnavailable) {
-        [self addDetailStatus:@"One or more app samplers are unavailable" to:root y:&y width:kDetailW];
-    } else if (!_hogs.count && !_topCPU.count && !_topMem.count) {
-        [self addDetailStatus:@"No sampled app activity" to:root y:&y width:kDetailW];
+    Volume *v = [self primaryVolume];
+    if (!v) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.overview.storage.empty"
+                                tip:VolumeScanStatus(_volumesLoading, _volumesUnavailable)
+                            problem:(_volumesUnavailable || !_volumesLoading)];
     } else {
+        NSMutableArray *fillRows = [NSMutableArray arrayWithCapacity:_vols.count];
+        for (Volume *vol in _vols)
+            [fillRows addObject:@{@"name": vol.name ?: @"", @"fraction": @(vol.fraction),
+                                  @"boot": @([vol.path isEqualToString:@"/"])}];
+        NSDictionary *secondary = StorageSecondaryNotice(fillRows);
+        NSMutableString *tip = [StorageVolumeTooltip(v.name, v.total, v.available, v.purgeable) mutableCopy];
+        if ([secondary[@"text"] isKindOfClass:NSString.class])
+            [tip appendFormat:@" · %@", secondary[@"text"]];
+        if (_volumesUnavailable)
+            [tip appendFormat:@" · Cached %@ · scan unavailable",
+                _lastVolumeSuccess ? [self shortAgeForDate:_lastVolumeSuccess] : @"reading"];
+        NSColor *tint = secondary ? DiskColor([secondary[@"fraction"] doubleValue]) : DiskColor(v.fraction);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.storage" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:(v.isInternal ? @"internaldrive" : @"externaldrive")
+                                          size:c.symbol tint:tint frame:DetailLeadRect(c)
+                                    identifier:@"details.overview.storage.symbol" in:row];
+        mark.toolTip = tip;
+        [self detailGauge:DetailGaugeRect(c) fraction:v.fraction color:DiskColor(v.fraction)
+                    label:[NSString stringWithFormat:@"%@ storage used", v.name]
+               identifier:@"details.overview.storage.gauge" tip:tip in:row];
+        NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(v.fraction * 100)];
+        [self detailValue:pct color:DiskColor(v.fraction) identifier:@"details.overview.storage.value" tip:tip in:row cols:c];
+        [self detailDatum:[NSString stringWithFormat:@"%@ free", CompactByteCount(v.available)]
+                    color:NSColor.secondaryLabelColor identifier:@"details.overview.storage.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+
+    {
+        NSString *tip = [self batteryPopoverTip];
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.battery" tip:tip in:root];
+        if (_bat.valid) {
+            NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
+                                              tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
+                                        identifier:@"details.overview.battery.symbol" in:row];
+            mark.toolTip = tip;
+            [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
+                        label:@"Battery charge" identifier:@"details.overview.battery.gauge" tip:tip in:row];
+            [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
+                   identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
+            [self detailDatum:[self batteryDatumText] color:NSColor.secondaryLabelColor
+                   identifier:@"details.overview.battery.datum" tip:tip in:row cols:c];
+        } else {
+            [self detailSymbol:@"battery.0" size:c.symbol tint:NSColor.tertiaryLabelColor frame:DetailLeadRect(c)
+                    identifier:@"details.overview.battery.symbol" in:row];
+            [self detailValue:@"—" color:NSColor.tertiaryLabelColor
+                   identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
+        }
+        y += c.rowH;
+    }
+
+    {
+        NSString *level = SystemPressureLevel(_sys);
+        NSString *tip = SystemSummaryText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.system" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:@"cpu" size:c.symbol tint:SystemPressureColor(level)
+                                         frame:DetailLeadRect(c) identifier:@"details.overview.system.symbol" in:row];
+        mark.toolTip = tip;
+        NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
+        readout.frame = NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, c.width - kDetailPad - c.gaugeX, c.valueH);
+        readout.lineBreakMode = NSLineBreakByTruncatingTail;
+        readout.maximumNumberOfLines = 1;
+        readout.accessibilityIdentifier = @"details.overview.system.readout";
+        readout.toolTip = tip;
+        readout.accessibilityLabel = tip;
+        [row addSubview:readout];
+        y += c.rowH;
+    }
+
+    for (AIUsage *u in _aiUsage)
+        y = [self addDetailProviderRow:u scope:@"details.overview" to:root y:y cols:c];
+
+    if (_hogsLoading || _procStatsLoading) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.overview.signals.empty"
+                                tip:@"Measuring top apps…" problem:NO];
+    } else if ((_hogsUnavailable || _procStatsUnavailable) && !_hogs.count && !_topCPU.count && !_topMem.count) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.overview.signals.empty"
+                                tip:@"One or more app samplers are unavailable" problem:YES];
+    } else {
+        NSUInteger n = (_hogs.count ? 1 : 0) + (_topCPU.count ? 1 : 0) + (_topMem.count ? 1 : 0);
+        if (n >= 2) [self addDetailHeading:@"Top Signals" key:@"top-signals" to:root y:&y width:kDetailW];
+        NSUInteger index = 0;
         if (_hogs.count) {
             NSDictionary *h = _hogs.firstObject;
-            double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
-            if (total <= 0) for (NSDictionary *row in _hogs) total += [row[@"impact"] doubleValue];
-            double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Sample %d%%", (int)lround(share * 100)]
-                                           fraction:share color:PressureColor(share) width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+            double share = HogShare(h, _hogs);
+            y = [self addDetailBar:h value:[NSString stringWithFormat:@"%d%%", (int)lround(share * 100)]
+                           context:@"energy" fraction:MIN(share, 1.0) color:PressureColor(share)
+                        identifier:[NSString stringWithFormat:@"details.overview.signal.%lu", (unsigned long)index]
+                                to:root y:y cols:c];
+            index++;
         }
         if (_topCPU.count) {
             NSDictionary *h = _topCPU.firstObject;
             double share = GroupCPUShare(h);
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"CPU %d%%", (int)lround(share * 100)]
-                                           fraction:MIN(share, 1.0) color:CPUColor(share)
-                                              width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+            y = [self addDetailBar:h value:[NSString stringWithFormat:@"%d%%", (int)lround(share * 100)]
+                           context:@"CPU" fraction:MIN(share, 1.0) color:CPUColor(share)
+                        identifier:[NSString stringWithFormat:@"details.overview.signal.%lu", (unsigned long)index]
+                                to:root y:y cols:c];
+            index++;
         }
         if (_topMem.count) {
             NSDictionary *h = _topMem.firstObject;
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             uint64_t total = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : bytes;
             double frac = total > 0 ? (double)bytes / (double)total : 0;
-            [root addSubview:[self processMetricRow:h right:[NSString stringWithFormat:@"Mem %@", FmtMemBytes(bytes)]
-                                           fraction:(frac < 1.0 ? frac : 1.0)
-                                              color:SystemPressureColor(MemoryPressureLevel(_sys))
-                                              width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+            y = [self addDetailBar:h value:FmtMemBytes(bytes) context:@"memory" fraction:MIN(frac, 1.0)
+                             color:SystemPressureColor(MemoryPressureLevel(_sys))
+                        identifier:[NSString stringWithFormat:@"details.overview.signal.%lu", (unsigned long)index]
+                                to:root y:y cols:c];
         }
     }
     return [self detailScrollForRoot:root height:y];
@@ -6733,39 +7299,78 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSScrollView *)storageDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 420)];
     root.accessibilityIdentifier = @"details.storage";
+    DetailColumns c = DetailLayout(kDetailW);
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"Storage" key:@"storage" to:root y:&y width:kDetailW];
-    if (_volumesUnavailable && _vols.count)
-        [self addDetailStatus:@"Volume scan unavailable; showing the last successful reading"
-                           to:root y:&y width:kDetailW];
-    if (!_vols.count) {
-        [self addDetailStatus:VolumeScanStatus(_volumesLoading, _volumesUnavailable)
-                           to:root y:&y width:kDetailW];
+    BOOL staleScan = _volumesUnavailable && _vols.count > 0;
+    if (_vols.count > 1 || staleScan) {
+        NSString *tip = staleScan ? @"Volume scan unavailable; showing the last successful reading" : nil;
+        if (staleScan && _lastVolumeSuccess)
+            tip = [tip stringByAppendingFormat:@" · cached %@", [self shortAgeForDate:_lastVolumeSuccess]];
+        [self addDetailHeading:@"Storage" key:@"storage" to:root y:&y width:kDetailW
+                          tint:(staleScan ? NSColor.systemOrangeColor : nil) tip:tip];
     }
+    if (!_vols.count) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.storage.empty"
+                                tip:VolumeScanStatus(_volumesLoading, _volumesUnavailable)
+                            problem:(_volumesUnavailable || !_volumesLoading)];
+    }
+    NSUInteger index = 0;
     for (Volume *volume in _vols) {
-        [self addDetailHeading:volume.name key:[@"volume." stringByAppendingString:volume.path ?: volume.name] to:root y:&y width:kDetailW];
-        [root addSubview:[self compactSignalRow:@"Used"
-                                          right:[NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)]
-                                       fraction:volume.fraction color:DiskColor(volume.fraction)
-                                          width:kDetailW pad:kDetailPad at:y]];
-        y += 34;
-        [self addDetailKey:@"Used" value:FmtBytes(volume.used) to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Available" value:FmtBytes(volume.available) to:root y:&y width:kDetailW];
-        if (volume.purgeable > volume.total / 100)   // worth a line only when it moves the number
-            [self addDetailKey:@"Purgeable"
-                         value:[NSString stringWithFormat:@"%@ of that · macOS thins it on demand, so Finder counts it as free",
-                                FmtBytes(volume.purgeable)]
-                            to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Capacity" value:FmtBytes(volume.total) to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Mount point" value:volume.path to:root y:&y width:kDetailW];
-        NSButton *reveal = [NSButton buttonWithTitle:@"Reveal in Finder" target:self action:@selector(revealVolume:)];
+        NSMutableString *tip = [StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable) mutableCopy];
+        if (volume.path.length) [tip appendFormat:@"\n%@", volume.path];
+        if (volume.purgeable > volume.total / 100)
+            [tip appendString:@"\nPurgeable space is thinned on demand, so Finder counts it as free"];
+        NSString *rowID = [NSString stringWithFormat:@"details.storage.row.%lu", (unsigned long)index];
+        NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
+        NSColor *fill = DiskColor(volume.fraction);
+        NSImageView *mark = [self detailSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
+                                          size:c.symbol tint:fill frame:DetailLeadRect(c)
+                                    identifier:[rowID stringByAppendingString:@".symbol"] in:row];
+        mark.toolTip = tip;
+        NSTextField *name = [self detailText:volume.name ?: @"Volume"
+                                         font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
+                                        color:NSColor.labelColor
+                                        frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                        align:NSTextAlignmentLeft
+                                   identifier:[rowID stringByAppendingString:@".name"] in:row];
+        name.toolTip = tip;
+        NSRect gauge = NSMakeRect(c.storageGaugeX, (c.rowH - c.gaugeH) / 2.0, c.storageGaugeW, c.gaugeH);
+        [self detailGauge:gauge fraction:volume.fraction color:fill
+                    label:[NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"]
+               identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
+        NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)];
+        [self detailValue:pct color:fill identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
+        NSTextField *free = [self detailText:[NSString stringWithFormat:@"%@ free", CompactByteCount(volume.available)]
+                                         font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                        color:NSColor.secondaryLabelColor
+                                        frame:NSMakeRect(c.datumX, (c.rowH - c.datumH) / 2.0, c.freeW, c.datumH)
+                                        align:NSTextAlignmentLeft
+                                   identifier:[rowID stringByAppendingString:@".free"] in:row];
+        free.toolTip = tip;
+        NSTextField *cap = [self detailText:CompactByteCount(volume.total)
+                                        font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                       color:NSColor.tertiaryLabelColor
+                                       frame:NSMakeRect(c.capX, (c.rowH - c.datumH) / 2.0, c.capW, c.datumH)
+                                       align:NSTextAlignmentRight
+                                  identifier:[rowID stringByAppendingString:@".capacity"] in:row];
+        cap.toolTip = tip;
+        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
+        NSImage *image = [[NSImage imageWithSystemSymbolName:@"arrow.up.forward.square" accessibilityDescription:@"Reveal in Finder"]
+                          imageWithSymbolConfiguration:cfg];
+        NSButton *reveal = [NSButton buttonWithImage:image target:self action:@selector(revealVolume:)];
+        reveal.title = @"";
+        reveal.bordered = NO;
+        reveal.imagePosition = NSImageOnly;
+        reveal.imageScaling = NSImageScaleProportionallyDown;
+        reveal.contentTintColor = NSColor.secondaryLabelColor;
         reveal.identifier = volume.path;
-        reveal.bezelStyle = NSBezelStyleRounded;
-        reveal.frame = NSMakeRect(kDetailPad, y, 126, 28);
-        reveal.accessibilityIdentifier = [@"details.reveal." stringByAppendingString:volume.path];
-        reveal.toolTip = [NSString stringWithFormat:@"Reveal %@ in Finder", volume.name];
-        [root addSubview:reveal];
-        y += 36;
+        reveal.toolTip = @"Reveal in Finder";
+        reveal.accessibilityLabel = [NSString stringWithFormat:@"Reveal %@ in Finder", volume.name ?: @"volume"];
+        reveal.accessibilityIdentifier = [@"details.reveal." stringByAppendingString:volume.path ?: @""];
+        reveal.frame = NSMakeRect(c.revealX, (c.rowH - c.revealW) / 2.0, c.revealW, c.revealW);
+        [row addSubview:reveal];
+        y += c.rowH;
+        index++;
     }
     return [self detailScrollForRoot:root height:y];
 }
@@ -6773,46 +7378,83 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSScrollView *)batteryDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 520)];
     root.accessibilityIdentifier = @"details.battery";
+    DetailColumns c = DetailLayout(kDetailW);
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"Battery" key:@"battery" to:root y:&y width:kDetailW];
     if (!_bat.valid) {
-        [self addDetailStatus:@"Battery unavailable" to:root y:&y width:kDetailW];
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.battery.empty"
+                                tip:@"No battery detected" problem:YES];
     } else {
-        [root addSubview:[self compactSignalRow:@"Charge level"
-                                          right:[NSString stringWithFormat:@"%d%%", _bat.percent]
-                                       fraction:_bat.percent / 100.0
-                                          color:BattBarColor(_bat.percent)
-                                          width:kDetailW pad:kDetailPad at:y]];
-        y += 34;
-        [self addDetailKey:@"Charge" value:[self batteryStatusText] to:root y:&y width:kDetailW];
-        if (_showWatts)
-            [self addDetailKey:@"Power" value:[self batteryPowerText] to:root y:&y width:kDetailW];
-        if (!_bat.acConnected && _bat.percent > 20)
-            [self addDetailKey:@"Until 20%" value:FmtDuration(MinutesTo20(_bat, [self avgAmp])) to:root y:&y width:kDetailW];
-        if (_showHealth && _bat.designCap_mAh > 0) {
-            NSString *health = [NSString stringWithFormat:@"%d%% · %ld/%ld mAh · %ld cycles",
-                                (int)lround(100.0*_bat.rawMax_mAh/_bat.designCap_mAh),
-                                _bat.rawMax_mAh, _bat.designCap_mAh, _bat.cycleCount];
-            [self addDetailKey:@"Health" value:health to:root y:&y width:kDetailW];
+        double healthFrac = 0;
+        BOOL health = _showHealth && _bat.designCap_mAh > 0;
+        if (health) healthFrac = (double)_bat.rawMax_mAh / (double)_bat.designCap_mAh;
+        double watts = 0;
+        BOOL power = _showWatts && [self batteryWattsKnown:&watts];
+        if (health || power)
+            [self addDetailHeading:@"Battery" key:@"battery" to:root y:&y width:kDetailW];
+
+        NSString *tip = [self batteryPopoverTip];
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.battery.row.charge" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:BatterySymbolName(_bat.percent, _bat.acConnected) size:c.symbol
+                                          tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
+                                    identifier:@"details.battery.charge.symbol" in:row];
+        mark.toolTip = tip;
+        [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
+                    label:@"Battery charge" identifier:@"details.battery.charge.gauge" tip:tip in:row];
+        [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
+               identifier:@"details.battery.charge.value" tip:tip in:row cols:c];
+        [self detailDatum:[self batteryDetailDatum] color:NSColor.secondaryLabelColor
+               identifier:@"details.battery.charge.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+
+        if (health) {
+            int pct = (int)lround(healthFrac * 100.0);
+            NSString *healthTip = [NSString stringWithFormat:@"Health %d%% · %ld of %ld mAh · %ld cycles",
+                                   pct, _bat.rawMax_mAh, _bat.designCap_mAh, (long)_bat.cycleCount];
+            NSColor *color = HealthColor(healthFrac);
+            NSView *healthRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.health" tip:healthTip in:root];
+            NSImageView *heart = [self detailSymbol:@"heart" size:c.symbol tint:color frame:DetailLeadRect(c)
+                                         identifier:@"details.battery.health.symbol" in:healthRow];
+            heart.toolTip = healthTip;
+            [self detailGauge:DetailGaugeRect(c) fraction:MIN(healthFrac, 1.0) color:color
+                        label:@"Battery health" identifier:@"details.battery.health.gauge" tip:healthTip in:healthRow];
+            [self detailValue:[NSString stringWithFormat:@"%d%%", pct] color:color
+                   identifier:@"details.battery.health.value" tip:healthTip in:healthRow cols:c];
+            [self detailDatum:[NSString stringWithFormat:@"%ld cycles", (long)_bat.cycleCount]
+                        color:NSColor.secondaryLabelColor identifier:@"details.battery.health.datum"
+                          tip:healthTip in:healthRow cols:c];
+            y += c.rowH;
+        }
+        if (power) {
+            BOOL charging = _bat.amperage_mA > 0;
+            NSColor *color = charging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+            NSString *powerTip = [self batteryPowerText];
+            NSView *powerRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.power" tip:powerTip in:root];
+            NSImageView *bolt = [self detailSymbol:@"bolt" size:c.symbol tint:color frame:DetailLeadRect(c)
+                                        identifier:@"details.battery.power.symbol" in:powerRow];
+            bolt.toolTip = powerTip;
+            [self detailValue:[NSString stringWithFormat:@"%.1f W", watts] color:color
+                   identifier:@"details.battery.power.value" tip:powerTip in:powerRow cols:c];
+            y += c.rowH;
         }
     }
 
-    [self addDetailHeading:@"Sampled Energy Impact" key:@"energy" to:root y:&y width:kDetailW];
     if (_hogsLoading) {
-        [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
-    } else if (_hogsUnavailable) {
-        [self addDetailStatus:@"Energy-impact sampler unavailable" to:root y:&y width:kDetailW];
-    } else if (!_hogs.count) {
-        [self addDetailStatus:@"No active sampled apps" to:root y:&y width:kDetailW];
-    } else {
-        double total = [_hogs.firstObject[@"totalImpact"] doubleValue];
-        if (total <= 0) for (NSDictionary *h in _hogs) total += [h[@"impact"] doubleValue];
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.battery.energy.empty"
+                                tip:@"Measuring top apps…" problem:NO];
+    } else if (_hogsUnavailable && !_hogs.count) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.battery.energy.empty"
+                                tip:@"Energy-impact sampler unavailable" problem:YES];
+    } else if (_hogs.count) {
+        if (_hogs.count >= 2)
+            [self addDetailHeading:@"Energy" key:@"energy" to:root y:&y width:kDetailW];
+        NSUInteger index = 0;
         for (NSDictionary *h in _hogs) {
-            double share = total > 0 ? [h[@"impact"] doubleValue] / total : 0;
-            NSString *right = [NSString stringWithFormat:@"Sample %d%%", (int)lround(share * 100)];
-            [root addSubview:[self processMetricRow:h right:right fraction:share color:PressureColor(share)
-                                              width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+            double share = HogShare(h, _hogs);
+            y = [self addDetailBar:h value:[NSString stringWithFormat:@"%d%%", (int)lround(share * 100)]
+                           context:nil fraction:MIN(share, 1.0) color:PressureColor(share)
+                        identifier:[NSString stringWithFormat:@"details.battery.bar.energy.%lu", (unsigned long)index]
+                                to:root y:y cols:c];
+            index++;
         }
     }
     return [self detailScrollForRoot:root height:y];
@@ -6821,114 +7463,46 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSScrollView *)aiDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
     root.accessibilityIdentifier = @"details.ai";
+    DetailColumns c = DetailLayout(kDetailW);
     CGFloat y = kDetailPad;
-    [self addDetailHeading:@"AI Status" key:@"ai-status" to:root y:&y width:kDetailW];
-
+    NSUInteger providerIndex = 0;
     for (AIUsage *u in _aiUsage) {
-        NSString *providerKey = (u.name ?: @"ai").lowercaseString;
-        [self addDetailHeading:u.name ?: @"AI" key:[@"ai-status." stringByAppendingString:providerKey]
-                            to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Remaining" value:[self aiPercentText:u] to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Reset" value:[self aiResetDetailText:u] to:root y:&y width:kDetailW];
-        NSMutableSet *bucketsListed = [NSMutableSet set];
-        for (NSDictionary *w in u.limitWindows) if (w[@"bucket"]) [bucketsListed addObject:w[@"bucket"]];
-        for (NSDictionary *w in u.limitWindows) {
-            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
-            NSString *reset = resets ? ResetTextFromDate([NSDate dateWithTimeIntervalSince1970:resets.doubleValue]) : nil;
-            int pct = (int)lround([w[@"remainingFraction"] doubleValue] * 100);
-            NSString *val = reset.length ? [NSString stringWithFormat:@"%d%% left · resets %@", pct, reset]
-                          : [w[@"fresh"] boolValue] ? [NSString stringWithFormat:@"%d%% left · not started", pct]
-                          : [NSString stringWithFormat:@"%d%% left", pct];
-            NSString *key = bucketsListed.count > 1 && [w[@"bucketLabel"] isKindOfClass:NSString.class]
-                ? [NSString stringWithFormat:@"%@ (%@)", w[@"window"], w[@"bucketLabel"]] : w[@"window"];
-            [self addDetailKey:key value:val to:root y:&y width:kDetailW];
-        }
-        if (u.billingNote.length)
-            [self addDetailKey:@"Billing" value:u.billingNote to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Status" value:u.limitStatusAvailable ? (u.statusReason ?: @"Limit status available")
-                                                                   : (u.statusReason ?: @"No limit status source")
-                        to:root y:&y width:kDetailW];
-        if (u.limitUpdatedAt)
-            [self addDetailKey:@"Limit checked" value:ClockText(u.limitUpdatedAt) to:root y:&y width:kDetailW];
-        if (u.limitRefreshError.length)   // why the figure above is the last-known one
-            [self addDetailKey:@"Refresh" value:u.limitRefreshError to:root y:&y width:kDetailW];
-        if (u.extraUsage)
-            [self addDetailKey:@"Extra usage" value:u.extraUsage to:root y:&y width:kDetailW];
-        if (u.statusSource)
-            [self addDetailKey:@"Status source" value:u.statusSource to:root y:&y width:kDetailW];
+        if (providerIndex++) y += 6;
+        y = [self addDetailProviderRow:u scope:@"details.ai" to:root y:y cols:c];
+        y = [self addDetailWindows:u to:root y:y cols:c];
+        y = [self addDetailHistory:u to:root y:y cols:c];
     }
 
-    [self addDetailHeading:@"Privacy & Sources" key:@"privacy" to:root y:&y width:kDetailW];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [self addDetailKey:@"Claude account"
-                 value:[ud boolForKey:@"useClaudeAccount"] ? @"On · Keychain token + api.anthropic.com" : @"Off · no Keychain/API access"
-                    to:root y:&y width:kDetailW];
-    [self addDetailKey:@"Claude transcripts"
-                 value:[ud boolForKey:@"useClaudeTranscripts"] ? @"On · local ~/.claude/projects JSONL" : @"Off · transcripts not read"
-                    to:root y:&y width:kDetailW];
-    if (CursorServicePresent(GBHomeDirectory())) {
-        [self addDetailKey:@"Cursor account"
-                     value:[ud boolForKey:@"useCursorAccount"]
-                        ? @"On · local Cursor session + api2.cursor.sh" : @"Off · no Cursor session/API access"
-                        to:root y:&y width:kDetailW];
-    }
-    [self addDetailKey:@"Codex logs" value:@"On · local ~/.codex session JSONL"
-                    to:root y:&y width:kDetailW];
     NSString *statusPath = [GBHomeDirectory() stringByAppendingPathComponent:@".glancebar/ai-status.json"];
-    NSString *statusState = [NSFileManager.defaultManager fileExistsAtPath:statusPath]
-        ? @"Present · overrides provider gauges" : @"Not found";
-    [self addDetailKey:@"Status file" value:statusState to:root y:&y width:kDetailW];
-
-    [self addDetailHeading:@"Local History" key:@"local-history" to:root y:&y width:kDetailW];
-    for (AIUsage *u in _aiUsage) {
-        NSString *providerKey = (u.name ?: @"ai").lowercaseString;
-        [self addDetailHeading:u.name ?: @"AI" key:[@"local-history." stringByAppendingString:providerKey]
-                            to:root y:&y width:kDetailW];
-        if (!u.available) {
-            [self addDetailStatus:u.statusText ?: @"Local state not found" to:root y:&y width:kDetailW];
-            [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
-            continue;
-        }
-        NSString *todayVal = u.todayTokens > 0 ? FmtTokenCount(u.todayTokens) : @"No local usage today";
-        if (u.todayTokensAll > u.todayTokens)
-            todayVal = [todayVal stringByAppendingFormat:@" · %@ incl. cached context", FmtCompact(u.todayTokensAll)];
-        [self addDetailKey:@"Today" value:todayVal to:root y:&y width:kDetailW];
-        NSString *weekVal = u.weekTokens > 0 ? FmtTokenCount(u.weekTokens) : @"No local usage";
-        if (u.weekTokensAll > u.weekTokens)
-            weekVal = [weekVal stringByAppendingFormat:@" · %@ incl. cached context", FmtCompact(u.weekTokensAll)];
-        [self addDetailKey:@"7 days" value:weekVal to:root y:&y width:kDetailW];
-        if (u.todaySessions > 0 || u.weekSessions > 0) {
-            NSString *sessions = [NSString stringWithFormat:@"%lld today · %lld in 7d", u.todaySessions, u.weekSessions];
-            [self addDetailKey:@"Sessions" value:sessions to:root y:&y width:kDetailW];
-        }
-        if (u.todayMessages > 0) {
-            NSString *activity = [NSString stringWithFormat:@"%lld messages · %lld tool calls",
-                                  u.todayMessages, u.todayToolCalls];
-            [self addDetailKey:@"Activity" value:activity to:root y:&y width:kDetailW];
-        }
-        [self addDetailKey:@"Status" value:u.statusText ?: @"Local stats" to:root y:&y width:kDetailW];
-        if (u.lastActivity)   // file/db activity time — distinct from "stats computed through"
-            [self addDetailKey:@"State updated" value:ClockText(u.lastActivity) to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Source" value:u.source ?: @"unknown" to:root y:&y width:kDetailW];
-
-        if (u.models.count) {
-            // Keyed by provider: Claude gaining a Models section must not rename Codex's rows.
-            [self addDetailHeading:@"Models · 7 days"
-                               key:[NSString stringWithFormat:@"local-history.%@.models", providerKey]
-                                to:root y:&y width:kDetailW];
-            for (NSDictionary *model in u.models) {
-                NSString *rawName = [model[@"name"] isKindOfClass:NSString.class] ? model[@"name"] : nil;
-                NSString *name = ShortModelName(rawName);
-                long long tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? [model[@"tokens"] longLongValue] : 0;
-                NSNumber *sessions = [model[@"sessions"] isKindOfClass:NSNumber.class] ? model[@"sessions"] : nil;
-                NSString *right = tokens > 0 && sessions ? [NSString stringWithFormat:@"%@ · %@ sessions", FmtTokenCount(tokens), sessions]
-                                : sessions ? [NSString stringWithFormat:@"%@ sessions", sessions]
-                                : FmtTokenCount(tokens);
-                // The raw model id, not the shortened display name: rows are ordered by usage.
-                [self addDetailKey:name value:right identifierKey:rawName ?: name
-                                to:root y:&y width:kDetailW];
-            }
-        }
+    BOOL statusFile = [NSFileManager.defaultManager fileExistsAtPath:statusPath];
+    BOOL cursor = CursorServicePresent(GBHomeDirectory());
+    [self addDetailHeading:@"Sources" key:@"sources" to:root y:&y width:kDetailW];
+    BOOL claudeAccount = [ud boolForKey:@"useClaudeAccount"];
+    y = [self addDetailSource:@"Claude account" on:claudeAccount
+                        datum:(claudeAccount ? @"keychain" : @"off")
+                          tip:(claudeAccount ? @"On · Keychain token + api.anthropic.com" : @"Off · no Keychain/API access")
+                   identifier:@"details.ai.source.claude-account" to:root y:y cols:c];
+    BOOL transcripts = [ud boolForKey:@"useClaudeTranscripts"];
+    y = [self addDetailSource:@"Claude transcripts" on:transcripts
+                        datum:(transcripts ? @"local" : @"off")
+                          tip:(transcripts ? @"On · local ~/.claude/projects JSONL" : @"Off · transcripts not read")
+                   identifier:@"details.ai.source.claude-transcripts" to:root y:y cols:c];
+    if (cursor) {
+        BOOL cursorAccount = [ud boolForKey:@"useCursorAccount"];
+        y = [self addDetailSource:@"Cursor account" on:cursorAccount
+                            datum:(cursorAccount ? @"session" : @"off")
+                              tip:(cursorAccount ? @"On · local Cursor session + api2.cursor.sh"
+                                                 : @"Off · no Cursor session/API access")
+                       identifier:@"details.ai.source.cursor-account" to:root y:y cols:c];
+    }
+    y = [self addDetailSource:@"Codex logs" on:YES datum:@"local"
+                          tip:@"On · local ~/.codex session JSONL"
+                   identifier:@"details.ai.source.codex-logs" to:root y:y cols:c];
+    if (statusFile) {
+        y = [self addDetailSource:@"Status file" on:YES datum:@"override"
+                              tip:@"Present · overrides provider gauges"
+                       identifier:@"details.ai.source.status-file" to:root y:y cols:c];
     }
     return [self detailScrollForRoot:root height:y];
 }
@@ -6936,51 +7510,108 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSScrollView *)systemDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 620)];
     root.accessibilityIdentifier = @"details.system";
+    DetailColumns c = DetailLayout(kDetailW);
     CGFloat y = kDetailPad;
     [self addDetailHeading:@"System" key:@"system" to:root y:&y width:kDetailW];
-    [self addDetailKey:@"Pressure" value:SystemPressureLevel(_sys) to:root y:&y width:kDetailW];
-    [self addDetailKey:@"CPU" value:CPUStatusText(_sys) to:root y:&y width:kDetailW];
-    [self addDetailKey:@"Memory" value:MemoryStatusText(_sys) to:root y:&y width:kDetailW];
-    [self addDetailKey:@"Swap" value:SwapStatusText(_sys) to:root y:&y width:kDetailW];
 
-    [self addDetailHeading:@"Top CPU" key:@"top-cpu" to:root y:&y width:kDetailW];
-    if (_procStatsLoading) {
-        [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
-    } else if (_procStatsUnavailable) {
-        [self addDetailStatus:@"Process sampler unavailable" to:root y:&y width:kDetailW];
-    } else if (!_topCPU.count) {
-        [self addDetailStatus:@"No sampled CPU activity" to:root y:&y width:kDetailW];
-    } else {
-        for (NSDictionary *h in _topCPU) {
-            double share = GroupCPUShare(h);
-            NSString *right = [NSString stringWithFormat:@"%d%%", (int)lround(share * 100)];
-            [root addSubview:[self processMetricRow:h right:right fraction:MIN(share, 1.0)
-                                              color:CPUColor(share) width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+    {
+        BOOL known = _sys.cpuValid;
+        double cpu = known ? _sys.cpu : 0;
+        NSColor *color = known ? CPUColor(cpu) : NSColor.tertiaryLabelColor;
+        NSString *tip = CPUStatusText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.cpu" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:@"cpu" size:c.symbol tint:color frame:DetailLeadRect(c)
+                                    identifier:@"details.system.cpu.symbol" in:row];
+        mark.toolTip = tip;
+        if (known)
+            [self detailGauge:DetailGaugeRect(c) fraction:MIN(cpu, 1.0) color:color label:tip
+                   identifier:@"details.system.cpu.gauge" tip:tip in:row];
+        [self detailValue:(known ? [NSString stringWithFormat:@"%d%%", (int)lround(cpu * 100)] : @"—")
+                    color:color identifier:@"details.system.cpu.value" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    {
+        NSString *level = MemoryPressureLevel(_sys);
+        NSColor *color = SystemPressureColor(level);
+        BOOL known = _sys.memValid && _sys.memTotal > 0;
+        NSString *tip = MemoryStatusText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.memory" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:@"memorychip" size:c.symbol tint:color frame:DetailLeadRect(c)
+                                    identifier:@"details.system.memory.symbol" in:row];
+        mark.toolTip = tip;
+        if (known) {
+            double frac = (double)_sys.memUsed / (double)_sys.memTotal;
+            [self detailGauge:DetailGaugeRect(c) fraction:MIN(frac, 1.0) color:color label:tip
+                   identifier:@"details.system.memory.gauge" tip:tip in:row];
         }
-        double rowShare = 0;
-        for (NSDictionary *row in _topCPU) rowShare += GroupCPUShare(row);
-        if (_sys.cpuValid && _sys.cpu >= 0.5 && _sys.cpu > 2.0 * rowShare)
-            [self addDetailStatus:@"Headline CPU is mostly system-level work (kernel), which per-app sampling can't see"
-                               to:root y:&y width:kDetailW];
+        [self detailValue:level color:color identifier:@"details.system.memory.value" tip:tip in:row cols:c];
+        if (known)
+            [self detailDatum:[NSString stringWithFormat:@"%@ free", FmtMemBytes((long long)_sys.memAvailable)]
+                        color:NSColor.secondaryLabelColor identifier:@"details.system.memory.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    {
+        NSString *value = @"—";
+        if (_sys.swapValid) value = _sys.swapUsed == 0 ? @"0 GB" : FmtMemBytes((long long)_sys.swapUsed);
+        NSString *tip = SwapStatusText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.swap" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:@"arrow.left.arrow.right" size:c.symbol
+                                          tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                                    identifier:@"details.system.swap.symbol" in:row];
+        mark.toolTip = tip;
+        [self detailValue:value color:(_sys.swapValid ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+               identifier:@"details.system.swap.value" tip:tip in:row cols:c];
+        y += c.rowH;
     }
 
-    [self addDetailHeading:@"Top Memory" key:@"top-memory" to:root y:&y width:kDetailW];
     if (_procStatsLoading) {
-        [self addDetailStatus:@"Measuring top apps…" to:root y:&y width:kDetailW];
-    } else if (_procStatsUnavailable) {
-        [self addDetailStatus:@"Process sampler unavailable" to:root y:&y width:kDetailW];
-    } else if (!_topMem.count) {
-        [self addDetailStatus:@"No sampled memory activity" to:root y:&y width:kDetailW];
-    } else {
-        uint64_t memTotal = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal : [_topMem.firstObject[@"bytes"] unsignedLongLongValue];
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.system.cpu.empty"
+                                tip:@"Measuring top apps…" problem:NO];
+    } else if (_procStatsUnavailable && !_topCPU.count) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.system.cpu.empty"
+                                tip:@"Process sampler unavailable" problem:YES];
+    } else if (_topCPU.count) {
+        double rowShare = 0;
+        for (NSDictionary *row in _topCPU) rowShare += GroupCPUShare(row);
+        NSString *kernelTip = (_sys.cpuValid && _sys.cpu >= 0.5 && _sys.cpu > 2.0 * rowShare)
+            ? @"Headline CPU is mostly system-level work (kernel), which per-app sampling can't see" : nil;
+        if (_topCPU.count >= 2)
+            [self addDetailHeading:@"Top CPU" key:@"top-cpu" to:root y:&y width:kDetailW tint:nil tip:kernelTip];
+        NSUInteger index = 0;
+        for (NSDictionary *h in _topCPU) {
+            double share = GroupCPUShare(h);
+            NSString *ident = [NSString stringWithFormat:@"details.system.bar.cpu.%lu", (unsigned long)index];
+            y = [self addDetailBar:h value:[NSString stringWithFormat:@"%d%%", (int)lround(share * 100)]
+                           context:nil fraction:MIN(share, 1.0) color:CPUColor(share)
+                        identifier:ident to:root y:y cols:c];
+            if (index == 0 && kernelTip.length && _topCPU.count < 2) {
+                NSView *bar = root.subviews.lastObject;
+                bar.toolTip = [NSString stringWithFormat:@"%@\n%@", bar.toolTip ?: @"", kernelTip];
+            }
+            index++;
+        }
+    }
+
+    if (_procStatsLoading) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.system.memory.empty"
+                                tip:@"Measuring top apps…" problem:NO];
+    } else if (_procStatsUnavailable && !_topMem.count) {
+        y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.system.memory.empty"
+                                tip:@"Process sampler unavailable" problem:YES];
+    } else if (_topMem.count) {
+        if (_topMem.count >= 2)
+            [self addDetailHeading:@"Top Memory" key:@"top-memory" to:root y:&y width:kDetailW];
+        uint64_t memTotal = _sys.memValid && _sys.memTotal > 0 ? _sys.memTotal
+            : [_topMem.firstObject[@"bytes"] unsignedLongLongValue];
+        NSColor *color = SystemPressureColor(MemoryPressureLevel(_sys));
+        NSUInteger index = 0;
         for (NSDictionary *h in _topMem) {
             uint64_t bytes = [h[@"bytes"] unsignedLongLongValue];
             double frac = memTotal > 0 ? (double)bytes / (double)memTotal : 0;
-            [root addSubview:[self processMetricRow:h right:FmtMemBytes(bytes) fraction:(frac < 1.0 ? frac : 1.0)
-                                              color:SystemPressureColor(MemoryPressureLevel(_sys))
-                                              width:kDetailW pad:kDetailPad at:y]];
-            y += 42;
+            y = [self addDetailBar:h value:FmtMemBytes(bytes) context:nil fraction:MIN(frac, 1.0) color:color
+                        identifier:[NSString stringWithFormat:@"details.system.bar.memory.%lu", (unsigned long)index]
+                                to:root y:y cols:c];
+            index++;
         }
     }
     return [self detailScrollForRoot:root height:y];

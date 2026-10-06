@@ -130,6 +130,80 @@ static NSColor *MeterPixel(ClaudeGauge *meter, CGFloat x, CGFloat y) {
 static BOOL Red(NSColor *c) { return c && c.redComponent > c.greenComponent + 0.2; }
 static BOOL Green(NSColor *c) { return c && c.greenComponent > c.redComponent + 0.2; }
 static int Fail(int line) { fprintf(stderr, "Popover check failed at line %d\n", line); return 1; }
+static NSView *FirstGauge(NSView *view) {
+    if ([view isKindOfClass:Gauge.class] || [view isKindOfClass:ClaudeGauge.class]) return view;
+    for (NSView *child in view.subviews) { NSView *g = FirstGauge(child); if (g) return g; }
+    return nil;
+}
+static BOOL DetailFiller(NSView *view) {
+    NSArray *bad = @[@"Not provided", @"Limit status available", @"unknown", @"No local usage"];
+    if ([view isKindOfClass:NSTextField.class]) {
+        NSString *s = ((NSTextField *)view).stringValue ?: @"";
+        for (NSString *phrase in bad) if ([s containsString:phrase]) {
+            fprintf(stderr, "detail filler \"%s\" in \"%s\"\n", phrase.UTF8String, s.UTF8String);
+            return YES;
+        }
+    }
+    for (NSView *child in view.subviews) if (DetailFiller(child)) return YES;
+    return NO;
+}
+static NSView *FindInDocs(NSArray<NSView *> *docs, NSString *identifier) {
+    for (NSView *doc in docs) {
+        NSView *hit = FindIdentifier(doc, identifier);
+        if (hit) return hit;
+    }
+    return nil;
+}
+static BOOL DetailColumnsMatch(NSArray<NSView *> *docs) {
+    NSArray *values = @[
+        @"details.overview.storage.value",
+        @"details.overview.battery.value",
+        @"details.overview.ai.claude.value",
+        @"details.storage.row.0.value",
+        @"details.battery.charge.value",
+        @"details.battery.health.value",
+        @"details.system.cpu.value",
+        @"details.system.memory.value",
+        @"details.system.swap.value",
+        @"details.ai.claude.value",
+        @"details.ai.codex.value",
+        @"details.ai.history.claude.value",
+    ];
+        NSView *anchor = nil;
+        for (NSString *ident in values) {
+            NSView *field = FindInDocs(docs, ident);
+            if (!field) { fprintf(stderr, "missing value column %s\n", ident.UTF8String); return NO; }
+        if (!anchor) anchor = field;
+        else if (!SameColumn(anchor, field)) {
+            fprintf(stderr, "value x %.1f vs %.1f (%s)\n", anchor.frame.origin.x, field.frame.origin.x, ident.UTF8String);
+            return NO;
+        }
+    }
+    NSArray *gauges = @[
+        @"details.overview.storage.gauge",
+        @"details.overview.battery.gauge",
+        @"details.overview.ai.claude.gauge",
+        @"details.battery.charge.gauge",
+        @"details.battery.health.gauge",
+        @"details.system.cpu.gauge",
+        @"details.system.memory.gauge",
+        @"details.ai.claude.gauge",
+        @"details.ai.codex.gauge",
+    ];
+        NSView *gaugeAnchor = nil;
+        for (NSString *ident in gauges) {
+            NSView *gauge = FindInDocs(docs, ident);
+            if (!gauge) { fprintf(stderr, "missing gauge %s\n", ident.UTF8String); return NO; }
+        if (!gaugeAnchor) gaugeAnchor = gauge;
+        else if (!SameColumn(gaugeAnchor, gauge) || !SameSize(gaugeAnchor, gauge)) {
+            fprintf(stderr, "gauge %.1f,%.1f vs %.1f,%.1f (%s)\n",
+                    gaugeAnchor.frame.origin.x, gaugeAnchor.frame.size.width,
+                    gauge.frame.origin.x, gauge.frame.size.width, ident.UTF8String);
+            return NO;
+        }
+    }
+    return YES;
+}
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -190,7 +264,8 @@ int main(int argc, const char **argv) {
             .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1};
         [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
         BatteryState b = {.valid=YES, .percent=85, .acConnected=YES, .isCharging=YES,
-            .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000};
+            .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
+            .cycleCount=120};
         [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
         [c setValue:@YES forKey:@"showWatts"]; [c setValue:@YES forKey:@"showHealth"];
         NSMutableArray *usage = [NSMutableArray array];
@@ -314,10 +389,69 @@ int main(int argc, const char **argv) {
             @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
         [c rebuildContent];
         if (!HasTip(root, @"Macintosh HD")) return Fail(__LINE__);
+        AIUsage *history = usage[0];
+        history.todayTokens = 12500;
+        history.weekTokens = 84000;
+        history.todaySessions = 2;
+        history.weekSessions = 9;
+        NSArray *sampleApps = @[
+            @{@"name": @"WindowServer", @"impact": @50, @"cpu": @120, @"bytes": @(6ULL << 30)},
+            @{@"name": @"kernel_task", @"impact": @30, @"cpu": @80, @"bytes": @(4ULL << 30)},
+            @{@"name": @"nsurlsessiond", @"impact": @20, @"cpu": @40, @"bytes": @(2ULL << 30)},
+        ];
+        [c setValue:sampleApps forKey:@"hogs"];
+        [c setValue:sampleApps forKey:@"topCPU"];
+        [c setValue:sampleApps forKey:@"topMem"];
+        NSScrollView *overview = [c overviewDetailsView];
         NSScrollView *storage = [c storageDetailsView];
-        if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
+        NSScrollView *battery = [c batteryDetailsView];
+        NSScrollView *system = [c systemDetailsView];
         NSScrollView *ai = [c aiDetailsView];
-        if (!HasText(ai.documentView, @"weekly")) return Fail(__LINE__);
+        if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
+        if (!HasText(ai.documentView, @"week") || !HasText(ai.documentView, @"5h") ||
+            !HasText(ai.documentView, @"Fable") || !HasTip(ai.documentView, @"weekly")) return Fail(__LINE__);
+        if (HasText(ai.documentView, @"weekly")) return Fail(__LINE__);
+        NSArray *docs = @[overview.documentView, storage.documentView, battery.documentView,
+                          system.documentView, ai.documentView];
+        for (NSView *doc in docs) if (DetailFiller(doc)) return Fail(__LINE__);
+        if (HasText(storage.documentView, @"Volume scan unavailable")) return Fail(__LINE__);
+        if (!HasTip(storage.documentView, @"Volume scan unavailable")) return Fail(__LINE__);
+        NSUInteger volumeCount = [[c valueForKey:@"vols"] count];
+        NSUInteger storageRows = 0;
+        for (NSUInteger i = 0; i < volumeCount; i++) {
+            NSString *ident = [NSString stringWithFormat:@"details.storage.row.%lu", (unsigned long)i];
+            NSView *row = FindIdentifier(storage.documentView, ident);
+            if (CountIdentifier(storage.documentView, ident) != 1 || !row || row.frame.size.height > 36)
+                return Fail(__LINE__);
+            storageRows++;
+        }
+        if (storageRows != volumeCount) return Fail(__LINE__);
+        NSView *stored = FindIdentifier(storage.documentView, @"details.storage.row.0");
+        NSButton *reveal = nil;
+        for (NSView *sub in stored.subviews) if ([sub isKindOfClass:NSButton.class]) reveal = (NSButton *)sub;
+        if (!reveal || reveal.title.length || !reveal.image || ![reveal.toolTip isEqualToString:@"Reveal in Finder"])
+            return Fail(__LINE__);
+        NSView *provider = FindIdentifier(ai.documentView, @"details.ai.row.claude");
+        NSView *windowRow = FindIdentifier(ai.documentView, @"details.ai.window.claude.0");
+        NSView *providerGauge = FirstGauge(provider);
+        NSView *windowGauge = FirstGauge(windowRow);
+        if (!providerGauge || !windowGauge ||
+            fabs(providerGauge.frame.origin.x - windowGauge.frame.origin.x) > 0.5) return Fail(__LINE__);
+        for (NSString *slug in @[@"codex", @"cursor"]) {
+            NSView *prow = FindIdentifier(ai.documentView, [@"details.ai.row." stringByAppendingString:slug]);
+            NSView *wrow = FindIdentifier(ai.documentView, [NSString stringWithFormat:@"details.ai.window.%@.0", slug]);
+            if (!prow || !wrow || fabs(FirstGauge(prow).frame.origin.x - FirstGauge(wrow).frame.origin.x) > 0.5)
+                return Fail(__LINE__);
+        }
+        if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
+        for (NSString *ident in @[@"details.overview.row.storage", @"details.overview.row.battery",
+                                  @"details.overview.row.system", @"details.overview.row.ai.claude",
+                                  @"details.overview.row.ai.codex", @"details.overview.row.ai.cursor"])
+            if (!FindIdentifier(overview.documentView, ident)) return Fail(__LINE__);
+        NSView *cpuGauge = FindIdentifier(system.documentView, @"details.system.cpu.gauge");
+        NSView *cpuBar = FindIdentifier(system.documentView, @"details.system.bar.cpu.0.bar");
+        if (!cpuBar || cpuBar.frame.size.height > 6 ||
+            fabs(NSMaxX(cpuBar.frame) - NSMaxX(cpuGauge.frame)) > 0.5) return Fail(__LINE__);
         const char *musicState = getenv("GLANCEBAR_MUSIC_STATE");
         if (musicState && strcmp(musicState, "playing") == 0) {
             [c setValue:@YES forKey:@"ytTabOpen"];
@@ -373,7 +507,10 @@ int main(int argc, const char **argv) {
             if ([item.identifier isEqual:@"overview"]) {
                 NSView *doc = [item.view isKindOfClass:NSScrollView.class]
                     ? ((NSScrollView *)item.view).documentView : item.view;
-                if (!HasText(doc, @"OVERVIEW") || !HasText(doc, @"Macintosh HD")) return Fail(__LINE__);
+                if (!HasText(doc, @"OVERVIEW") || !HasTip(doc, @"Macintosh HD") ||
+                    !FindIdentifier(doc, @"details.overview.row.storage") ||
+                    !FindIdentifier(doc, @"details.overview.row.battery") ||
+                    !FindIdentifier(doc, @"details.overview.row.system")) return Fail(__LINE__);
                 // viewController forwards -view. A structural refresh assigns item.view and
                 // must actually replace the document the tab shows.
                 NSView *marker = [[NSView alloc] initWithFrame:item.view.frame];
