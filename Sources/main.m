@@ -3808,6 +3808,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSUInteger _musicGen;
     BOOL _remoteCommandsOn;
     NSTimer *_ytProbeTimer;
+    NSString *_chargePendingName, *_chargePendingMode;
     NSTimer *_powerTickTimer;   // 1s battery/power refresh while a surface is visible
     NSUInteger _powerTicks;
     CFAbsoluteTime _ytTabOpenedAt;
@@ -5835,8 +5836,13 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         });
     });
 }
-- (void)runChargeShortcut:(NSString *)name mode:(NSString *)mode {
-    if (_chargeShortcutInFlight || !name.length || !mode.length) return;
+- (void)runChargeShortcut:(NSString *)name mode:(NSString *)mode previous:(NSString *)previous previousAt:(NSDate *)previousAt {
+    if (!name.length || !mode.length) return;
+    if (_chargeShortcutInFlight) {
+        // Clicked again mid-run: the last click wins once the running shortcut returns.
+        _chargePendingName = name; _chargePendingMode = mode;
+        return;
+    }
     _chargeShortcutInFlight = YES;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [NSTask new];
@@ -5855,33 +5861,46 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         BOOL ok = task.terminationReason == NSTaskTerminationReasonExit && task.terminationStatus == 0;
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_chargeShortcutInFlight = NO;
-            if (!ok) return;
-            self->_chargeMode = mode;
-            self->_chargeModeAt = NSDate.date;
-            self->_chargeModeLoaded = YES;
-            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-            [ud setObject:mode forKey:@"glancebarChargeMode"];
-            [ud setObject:self->_chargeModeAt forKey:@"glancebarChargeModeAt"];
-            if (self->_popover.isShown) [self rebuildContent];
-            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+            // Already shown as set; only a failed shortcut walks the toggle back.
+            if (!ok) [self applyChargeModeLocally:previous at:previousAt];
+            NSString *nextName = self->_chargePendingName, *nextMode = self->_chargePendingMode;
+            self->_chargePendingName = nil; self->_chargePendingMode = nil;
+            if (nextName && ![nextMode isEqualToString:(ok ? mode : previous)])
+                [self runChargeShortcut:nextName mode:nextMode previous:(ok ? mode : previous) previousAt:NSDate.date];
         });
     });
 }
+- (void)applyChargeModeLocally:(NSString *)mode at:(NSDate *)at {
+    _chargeMode = mode;
+    _chargeModeAt = at;
+    _chargeModeLoaded = YES;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setObject:mode forKey:@"glancebarChargeMode"];
+    [ud setObject:at forKey:@"glancebarChargeModeAt"];
+    [self syncPowerButtons];
+    if (_popover.isShown) [self rebuildContent];
+    if (_detailsWindow.isVisible) [self rebuildDetails];
+}
 - (void)toggleChargeLimit:(id)sender {
     (void)sender;
-    [self syncPowerButtons];   // undo the click's own flip until the shortcut confirms
-    if (!_musicProbesEnabled) return;
+    if (!_musicProbesEnabled) { [self syncPowerButtons]; return; }
+    // The toggle answers the click at once; the shortcut sets the limit in the background
+    // and only a failure puts the toggle back (Ian: the second it takes needn't show).
+    NSString *previous = [self effectiveChargeMode];
+    NSDate *previousAt = _chargeModeAt;
+    BOOL toFull = ![previous isEqualToString:@"full"];
+    NSString *target = toFull ? @"full" : @"limit80";
+    [self applyChargeModeLocally:target at:NSDate.date];
     BOOL fresh = _chargeShortcutsKnown && CFAbsoluteTimeGetCurrent() - _chargeShortcutsCheckedAt < 60;
     void (^act)(BOOL) = ^(BOOL present) {
         if (!present) {
+            [self applyChargeModeLocally:previous at:previousAt];
             NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Battery-Settings.extension"];
             if (url) [NSWorkspace.sharedWorkspace openURL:url];
-            if (self->_popover.isShown) [self rebuildContent];
             return;
         }
-        BOOL toFull = ![[self effectiveChargeMode] isEqualToString:@"full"];
         [self runChargeShortcut:(toFull ? @"Glancebar Charge Full" : @"Glancebar Charge 80")
-                           mode:(toFull ? @"full" : @"limit80")];
+                           mode:target previous:previous previousAt:previousAt];
     };
     if (fresh) { act(_chargeShortcutsPresent); return; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
