@@ -454,3 +454,54 @@ NSArray<NSString *> *LikedMusicAudioFiles(NSArray<NSString *> *names);
 // "Artist - Title [id].m4a" → artist, title, trackID. Otherwise title is the basename
 // without an extension and artist/trackID are empty. Nil for a nil or empty name.
 NSDictionary *ParseLikedTrackFilename(NSString *filename);
+
+// --- Refresh coalescing, volume scans, quit-time pmset, storage headline ---
+// IOPS power-source callbacks arrive in bursts. Arm at most one delayed refresh;
+// a pending arm already covers this burst. The caller waits kPowerRefreshCoalesceSec
+// and clears the flag when that refresh runs.
+extern const double kPowerRefreshCoalesceSec;   // 1
+BOOL ShouldArmPowerRefresh(BOOL pending);
+
+// CGWindowListCopyWindowInfo is the expensive part of laying out the menu bar item.
+// Reuse the last measurement while the rendered segment strings and the screen
+// configuration are unchanged, but never past kBarCapacityMaxAgeSec.
+extern const double kBarCapacityMaxAgeSec;   // 60
+// Nil when screenKey is missing: an unknown screen must not match a cached one.
+NSString *BarCapacityCacheKey(NSArray<NSString *> *segmentTexts, NSString *screenKey);
+// ageSec is seconds since the cached measurement. ageSec >= maxAgeSec is stale.
+BOOL BarCapacityMeasurementFresh(NSString *cachedKey, NSString *currentKey,
+                                 double ageSec, double maxAgeSec);
+
+// One resource-values query. Important-usage capacity hangs on some network mounts,
+// so it is included only when the volume is local (NSURLVolumeIsLocalKey == YES).
+NSArray<NSString *> *VolumeResourceKeys(BOOL isLocal);
+// A scan still in flight past this long is shown as unavailable. The caller does not
+// enqueue another while one is running.
+extern const double kVolumeScanUnavailableSec;   // 20
+BOOL VolumeScanUnavailable(BOOL scanning, double elapsedSec);
+// Empty-state copy. Unavailable wins over "scanning" so a hung scan does not look healthy.
+NSString *VolumeScanStatus(BOOL loading, BOOL unavailable);
+
+// SleepDisabledState and the sudo that clears it stay synchronous on quit — the process
+// is going away — but the main thread waits at most this long for both together.
+extern const double kQuitPmsetBudgetSec;   // 3
+// Seconds still inside the budget. 0 once elapsed has used it up; never negative.
+double QuitPmsetBudgetRemaining(double elapsedSec);
+
+// Footer tooltip. "Switches it off when it quits" is true only with the passwordless
+// sudoers rule; without the rule, quit leaves Keep Awake on.
+NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled);
+
+// A second click must not overlap an in-flight pmset (the LocalAuthentication reply
+// runs sudo/osascript off the main thread).
+BOOL ShouldStartPmset(BOOL inFlight);
+
+// Index of the boot volume (@YES), else 0 when the list is non-empty, else NSNotFound.
+// The menu bar, the popover headline, and Details Overview all use this.
+NSInteger StorageHeadlineIndex(NSArray<NSNumber *> *bootFlags);
+// Another mount that is both fuller than the headline and over this percent used
+// gets a secondary popover line. 85 itself does not qualify.
+extern const int kStorageFullSecondaryPercent;   // 85
+// Nil, or @{@"text": @"Backup 97% full", @"fraction": @(used 0..1)} for the fullest
+// such mount. The headline volume is never its own secondary line.
+NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes);

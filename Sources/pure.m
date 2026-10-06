@@ -1680,3 +1680,113 @@ NSDictionary *ClaudeUsageOverlayingStatusline(NSDictionary *usage, NSDictionary 
     out[@"limits"] = limits;
     return out;
 }
+
+#pragma mark - Refresh coalescing, volumes, quit, storage headline
+
+const double kPowerRefreshCoalesceSec = 1;
+const double kBarCapacityMaxAgeSec = 60;
+const double kVolumeScanUnavailableSec = 20;
+const double kQuitPmsetBudgetSec = 3;
+const int kStorageFullSecondaryPercent = 85;
+
+BOOL ShouldArmPowerRefresh(BOOL pending) { return !pending; }
+
+NSString *BarCapacityCacheKey(NSArray<NSString *> *segmentTexts, NSString *screenKey) {
+    if (![screenKey isKindOfClass:NSString.class] || !screenKey.length) return nil;
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if ([segmentTexts isKindOfClass:NSArray.class]) {
+        for (id text in segmentTexts)
+            [parts addObject:[text isKindOfClass:NSString.class] ? text : @""];
+    }
+    return [NSString stringWithFormat:@"%@\n%@", [parts componentsJoinedByString:@"\t"], screenKey];
+}
+
+BOOL BarCapacityMeasurementFresh(NSString *cachedKey, NSString *currentKey,
+                                 double ageSec, double maxAgeSec) {
+    if (![cachedKey isKindOfClass:NSString.class] || !cachedKey.length) return NO;
+    if (![currentKey isKindOfClass:NSString.class] || !currentKey.length) return NO;
+    if (!isfinite(ageSec) || !isfinite(maxAgeSec) || maxAgeSec < 0) return NO;
+    if (ageSec < 0 || ageSec >= maxAgeSec) return NO;
+    return [cachedKey isEqualToString:currentKey];
+}
+
+static NSArray<NSString *> *VolumeBaseResourceKeys(void) {
+    return @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
+             NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey,
+             NSURLVolumeIsLocalKey];
+}
+
+NSArray<NSString *> *VolumeResourceKeys(BOOL isLocal) {
+    NSArray<NSString *> *base = VolumeBaseResourceKeys();
+    if (!isLocal) return base;
+    return [base arrayByAddingObject:NSURLVolumeAvailableCapacityForImportantUsageKey];
+}
+
+BOOL VolumeScanUnavailable(BOOL scanning, double elapsedSec) {
+    return scanning && isfinite(elapsedSec) && elapsedSec >= kVolumeScanUnavailableSec;
+}
+
+NSString *VolumeScanStatus(BOOL loading, BOOL unavailable) {
+    return (!unavailable && loading) ? @"Scanning mounted volumes…" : @"Storage information unavailable";
+}
+
+double QuitPmsetBudgetRemaining(double elapsedSec) {
+    if (!(elapsedSec > 0)) return kQuitPmsetBudgetSec;
+    double left = kQuitPmsetBudgetSec - elapsedSec;
+    return left > 0 ? left : 0;
+}
+
+NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled) {
+    NSString *base = @"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. ";
+    return [base stringByAppendingString:sudoersRuleInstalled
+            ? @"Glancebar switches it off when it quits."
+            : @"Glancebar leaves it on when it quits."];
+}
+
+BOOL ShouldStartPmset(BOOL inFlight) { return !inFlight; }
+
+NSInteger StorageHeadlineIndex(NSArray<NSNumber *> *bootFlags) {
+    if (![bootFlags isKindOfClass:NSArray.class] || bootFlags.count == 0) return NSNotFound;
+    NSInteger first = NSNotFound;
+    for (NSUInteger i = 0; i < bootFlags.count; i++) {
+        if (first == NSNotFound) first = (NSInteger)i;
+        id flag = bootFlags[i];
+        if ([flag isKindOfClass:NSNumber.class] && [flag boolValue]) return (NSInteger)i;
+    }
+    return first;
+}
+
+static int StorageUsedPercent(double fraction) {
+    if (!isfinite(fraction) || fraction < 0) return 0;
+    return (int)lround(fraction * 100.0);
+}
+
+NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes) {
+    if (![volumes isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *boots = [NSMutableArray array];
+    for (id row in volumes) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        [rows addObject:row];
+        id boot = row[@"boot"];
+        [boots addObject:[boot isKindOfClass:NSNumber.class] ? boot : @NO];
+    }
+    NSInteger headline = StorageHeadlineIndex(boots);
+    if (headline == NSNotFound) return nil;
+    double headlineFrac = [rows[(NSUInteger)headline][@"fraction"] doubleValue];
+    if (!isfinite(headlineFrac)) headlineFrac = 0;
+    NSInteger best = NSNotFound;
+    double bestFrac = 0;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        if ((NSInteger)i == headline) continue;
+        double frac = [rows[i][@"fraction"] doubleValue];
+        if (!isfinite(frac) || !(frac > headlineFrac)) continue;
+        if (StorageUsedPercent(frac) <= kStorageFullSecondaryPercent) continue;
+        if (best == NSNotFound || frac > bestFrac) { best = (NSInteger)i; bestFrac = frac; }
+    }
+    if (best == NSNotFound) return nil;
+    id name = rows[(NSUInteger)best][@"name"];
+    if (![name isKindOfClass:NSString.class] || ![(NSString *)name length]) return nil;
+    return @{@"text": [NSString stringWithFormat:@"%@ %d%% full", name, StorageUsedPercent(bestFrac)],
+             @"fraction": @(bestFrac)};
+}

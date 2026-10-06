@@ -61,8 +61,9 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
     if (total.longLongValue <= 0) return nil;
 
     long long avail = [v[NSURLVolumeAvailableCapacityKey] longLongValue];
-    NSNumber *important = [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
-                                               error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
+    // Important-usage rides in `keys` only for a local volume. A second query for it
+    // stalls this serial queue when the mount is a hung network volume.
+    NSNumber *important = v[NSURLVolumeAvailableCapacityForImportantUsageKey];
     // APFS reports purgeable space in the "important usage" figure, which can exceed
     // total capacity; clamp so used/free/fraction stay self-consistent.
     long long physical = MAX(0LL, MIN(avail, total.longLongValue));
@@ -83,9 +84,7 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
 
 static Volume *RootVolumeFallback(void) {
     NSURL *root = [NSURL fileURLWithPath:@"/" isDirectory:YES];
-    NSArray *keys = @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
-                      NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey];
-    Volume *fromURL = VolumeFromURL(root, keys);
+    Volume *fromURL = VolumeFromURL(root, VolumeResourceKeys(YES));
     if (fromURL) return fromURL;
 
     struct statfs s;
@@ -102,15 +101,19 @@ static Volume *RootVolumeFallback(void) {
 }
 
 static NSArray<Volume *> *ScanVolumes(void) {
-    NSArray *keys = @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
-                      NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey];
+    // Prefetch every key except important-usage. That one is added only after the
+    // cached local flag says the mount is local — asking a network volume for it hangs.
+    NSArray *enumKeys = VolumeResourceKeys(NO);
     NSArray<NSURL *> *urls = [NSFileManager.defaultManager
-        mountedVolumeURLsIncludingResourceValuesForKeys:keys
+        mountedVolumeURLsIncludingResourceValuesForKeys:enumKeys
                                                 options:NSVolumeEnumerationSkipHiddenVolumes];
     NSMutableArray<Volume *> *found = [NSMutableArray array];
     BOOL hasRoot = NO;
     for (NSURL *url in urls) {
-        Volume *vol = VolumeFromURL(url, keys);
+        id localValue = nil;
+        BOOL haveLocal = [url getResourceValue:&localValue forKey:NSURLVolumeIsLocalKey error:nil];
+        BOOL isLocal = haveLocal && [localValue isKindOfClass:NSNumber.class] && [localValue boolValue];
+        Volume *vol = VolumeFromURL(url, VolumeResourceKeys(isLocal));
         if (!vol) continue;
         if ([vol.path isEqualToString:@"/"]) hasRoot = YES;
         [found addObject:vol];
@@ -3446,6 +3449,8 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 - (void)rebuildDetails;
 - (void)showWelcomeIfNeeded;
 - (void)refreshVolumesAsync;
+- (void)schedulePowerRefresh;
+- (dispatch_queue_t)pmsetWorkQueue;
 - (void)refreshAIUsageAsync;
 - (void)refreshLidAwakeAsync;
 - (void)refreshLidAwakeForced:(BOOL)force;
@@ -3718,6 +3723,12 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     dispatch_queue_t _volumeQueue;
     BOOL _aiLoading, _aiRefreshPending;
     BOOL _volumesLoading, _volumesUnavailable;
+    CFAbsoluteTime _volumeScanStarted;
+    BOOL _powerRefreshPending;
+    dispatch_queue_t _pmsetQueue;
+    BOOL _pmsetInFlight;
+    NSString *_barCapacityKey;
+    double _barCapacityCached, _barCapacityMeasuredAt;
     NSString *_aiSignature;
     NSString *_aiCatchUpStatus;
     BOOL _aiTotalsIncomplete;
@@ -3778,10 +3789,19 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
 // briefly and abandon it.
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;
-    // Keep Awake must not outlive the app that shows it. Only the Touch ID rule makes this
-    // possible without a prompt at quit; without it the setting persists (and says so).
-    NSNumber *awake = SleepDisabledState();
-    if (awake.boolValue && PmsetTouchIDInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
+    // Keep Awake must not outlive the app when the Touch ID rule can clear it without a
+    // prompt. The plist read is cheap; its pmset fallback and the sudo each sit under the
+    // 8s task watchdog. Stay synchronous — the process is quitting — but don't give them
+    // the main thread for longer than the shared budget.
+    dispatch_semaphore_t pmsetDone = dispatch_semaphore_create(0);
+    dispatch_async([self pmsetWorkQueue], ^{
+        NSNumber *awake = SleepDisabledState();
+        if (awake.boolValue && PmsetTouchIDInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
+        dispatch_semaphore_signal(pmsetDone);
+    });
+    if (dispatch_semaphore_wait(pmsetDone, dispatch_time(DISPATCH_TIME_NOW,
+            (int64_t)(kQuitPmsetBudgetSec * NSEC_PER_SEC))))
+        GBLog("terminate: Keep Awake cleanup timed out");
     if (!_aiQueue || !_aiReader) return;
     dispatch_semaphore_t flushed = dispatch_semaphore_create(0);
     dispatch_async(_aiQueue, ^{
@@ -3876,7 +3896,25 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     }
 }
 
-static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
+static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefresh]; }
+
+- (void)schedulePowerRefresh {
+    // IOPS fires on every power-source twitch. One refresh a second covers the burst;
+    // the 15s timer still samples on its own cadence.
+    if (!ShouldArmPowerRefresh(_powerRefreshPending)) return;
+    _powerRefreshPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPowerRefreshCoalesceSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self->_powerRefreshPending = NO;
+        [self refresh];
+    });
+}
+
+- (dispatch_queue_t)pmsetWorkQueue {
+    if (!_pmsetQueue)
+        _pmsetQueue = dispatch_queue_create("com.iantodd.glancebar.pmset", DISPATCH_QUEUE_SERIAL);
+    return _pmsetQueue;
+}
 
 - (void)startAudioOutputWatch {
     _audioDevices = ReadAudioDevices();
@@ -4547,8 +4585,19 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (void)refreshVolumesAsync {
-    if (_volumesLoading) return;
+    if (_volumesLoading) {
+        // The in-flight scan owns the serial queue. Another tick must not enqueue a
+        // second one behind it; past the budget the UI says the reading is unavailable.
+        if (!_volumesUnavailable &&
+            VolumeScanUnavailable(YES, CFAbsoluteTimeGetCurrent() - _volumeScanStarted)) {
+            _volumesUnavailable = YES;
+            [self updateBar];
+            [self refreshVisibleSurfaces];
+        }
+        return;
+    }
     _volumesLoading = YES;
+    _volumeScanStarted = CFAbsoluteTimeGetCurrent();
     dispatch_async(_volumeQueue, ^{
         NSArray<Volume *> *volumes = ScanVolumes();
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -4672,8 +4721,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 }
 
 - (int)rootDiskPct {
-    for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return (int)lround(v.fraction*100);
-    return _vols.count ? (int)lround(_vols.firstObject.fraction*100) : -1;
+    Volume *boot = [self primaryVolume];
+    return boot ? (int)lround(boot.fraction * 100) : -1;
 }
 
 // A cached figure whose window has since reset says nothing about now.
@@ -4847,6 +4896,37 @@ static double BarCapacityForWindows(NSArray *list, CGRect displayBounds, double 
     return capacity < 0 ? capacity : MIN(capacity, MAX(0.0, own.x + own.width - fixedBoundary));
 }
 
+static NSArray<NSString *> *BarRenderedSegmentStrings(NSArray<NSDictionary *> *segments) {
+    NSMutableArray<NSString *> *texts = [NSMutableArray array];
+    for (NSDictionary *seg in segments) {
+        id text = seg[@"text"];
+        [texts addObject:[text isKindOfClass:NSString.class] ? text : @""];
+    }
+    return texts;
+}
+
+// Displays, the notch, and our own frame — the geometry MeasuredBarCapacity reads
+// besides the window list. The list itself is what the 60s bound rechecks.
+static NSString *BarScreenConfigurationKey(NSStatusItem *item) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSScreen *screen in NSScreen.screens) {
+        NSRect frame = screen.frame;
+        NSRect aux = screen.auxiliaryTopRightArea;
+        id number = screen.deviceDescription[@"NSScreenNumber"] ?: @"?";
+        [parts addObject:[NSString stringWithFormat:@"%@ %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+                          number,
+                          frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+                          aux.origin.x, aux.origin.y, aux.size.width, aux.size.height]];
+    }
+    NSWindow *win = item.button.window;
+    NSRect itemFrame = win.frame;
+    id own = win.screen.deviceDescription[@"NSScreenNumber"] ?: @"-";
+    [parts addObject:[NSString stringWithFormat:@"own %@ item %.1f %.1f %.1f %.1f",
+                      own, itemFrame.origin.x, itemFrame.origin.y,
+                      itemFrame.size.width, itemFrame.size.height]];
+    return parts.count ? [parts componentsJoinedByString:@"|"] : nil;
+}
+
 static double MeasuredBarCapacity(NSStatusItem *item) {
     NSWindow *win = item.button.window;
     NSScreen *screen = win.screen ?: NSScreen.screens.firstObject;
@@ -4998,7 +5078,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         BOOL onBar = observable && BarItemOnBar(self->_item);
         // Before the hosted item is actually on-bar, its app-side frame is not a valid
         // self-exclusion key. Hold the current tier until Control Centre places it.
-        double capacity = onBar ? MeasuredBarCapacity(self->_item) : -1;
+        // The window list is the expensive read. Skip it while the strings we draw and
+        // the screen geometry are the ones we last measured, and never for longer than
+        // a minute — neighbours move without changing either.
+        double capacity = -1;
+        if (onBar) {
+            NSString *key = BarCapacityCacheKey(BarRenderedSegmentStrings(full),
+                                                BarScreenConfigurationKey(self->_item));
+            double now = CFAbsoluteTimeGetCurrent();
+            double age = self->_barCapacityMeasuredAt > 0 ? now - self->_barCapacityMeasuredAt
+                                                          : kBarCapacityMaxAgeSec;
+            if (BarCapacityMeasurementFresh(self->_barCapacityKey, key, age, kBarCapacityMaxAgeSec)) {
+                capacity = self->_barCapacityCached;
+            } else {
+                capacity = MeasuredBarCapacity(self->_item);
+                if (key && capacity >= 0) {
+                    self->_barCapacityKey = key;
+                    self->_barCapacityCached = capacity;
+                    self->_barCapacityMeasuredAt = now;
+                }
+            }
+        }
         // The status-item host is wider than its image (16pt on the live Tahoe shell).
         // Price that chrome into every candidate tier or a 115pt image can be judged to
         // fit in 130pt even though its real 131pt host will be evicted. Derive it from
@@ -5536,7 +5636,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // ---------- STORAGE ----------
     [root addSubview:[self sectionHeader:@"Storage" at:y]]; y += 18;
     if (!_vols.count) {
-        NSString *status = _volumesLoading ? @"Scanning mounted volumes…" : @"Storage information unavailable";
+        NSString *status = VolumeScanStatus(_volumesLoading, _volumesUnavailable);
         NSTextField *statusField = [self text:status font:[NSFont systemFontOfSize:12]
                                           color:NSColor.secondaryLabelColor
                                              at:NSMakeRect(kPad, y, kW-2*kPad, 16)
@@ -5545,9 +5645,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [root addSubview:statusField];
         y += 24;
     }
-    // Lead with the fullest drive; the complete mounted-volume list lives in Details.
-    Volume *leadVolume = nil;
-    for (Volume *v in _vols) if (!leadVolume || v.fraction > leadVolume.fraction) leadVolume = v;
+    // Headline is the boot volume, same figure as the menu bar and Details Overview.
+    // Another mount that is fuller and over 85% is a second line, not the headline.
+    Volume *leadVolume = [self primaryVolume];
+    NSMutableArray *fillRows = [NSMutableArray arrayWithCapacity:_vols.count];
+    for (Volume *vol in _vols)
+        [fillRows addObject:@{@"name": vol.name ?: @"", @"fraction": @(vol.fraction),
+                              @"boot": @([vol.path isEqualToString:@"/"])}];
+    NSDictionary *secondaryNotice = StorageSecondaryNotice(fillRows);
     for (Volume *v in leadVolume ? @[leadVolume] : @[]) {
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, 50)];
         CGFloat inner = kW - 2*kPad;
@@ -5589,6 +5694,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         capacityField.accessibilityIdentifier = [volumeID stringByAppendingString:@".capacity"];
         [row addSubview:capacityField];
         [root addSubview:row]; y += 54;
+    }
+    if ([secondaryNotice[@"text"] isKindOfClass:NSString.class]) {
+        NSTextField *note = [self text:secondaryNotice[@"text"] font:[NSFont systemFontOfSize:11]
+                                  color:DiskColor([secondaryNotice[@"fraction"] doubleValue])
+                                     at:NSMakeRect(kPad, y, kW-2*kPad, 14)
+                                  align:NSTextAlignmentLeft];
+        note.accessibilityIdentifier = @"popover.storage.secondary";
+        [root addSubview:note];
+        y += 18;
     }
     if (_vols.count > 1) {
         NSButton *drives = [NSButton buttonWithTitle:[NSString stringWithFormat:@"All %lu drives…", (unsigned long)_vols.count]
@@ -5721,7 +5835,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 7, kW, 24)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
-    _keepAwakeButton.toolTip = @"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar switches it off when it quits.";
+    _keepAwakeButton.toolTip = KeepAwakeTooltip(PmsetTouchIDInstalled());
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
     _lowPowerButton = [self powerToggle:@"Low Power" symbol:@"tortoise.fill" action:@selector(toggleLowPowerMode:)];
     _lowPowerButton.toolTip = @"System Low Power Mode. Changing it needs Touch ID or your administrator password.";
@@ -5905,8 +6019,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // Keep Awake flips the SleepDisabled system power setting: the only switch that also holds
 // a closed lid (a caffeinate-style IOPMAssertion defeats idle sleep only). Nothing is
 // stored — the live setting is the single source of truth, so the bar and the button
-// always agree however it was last changed. It survives a reboot on its own, which is why
-// Glancebar switches it off when it quits (applicationWillTerminate:).
+// always agree however it was last changed. It survives a reboot on its own. Quit clears
+// it only when the passwordless sudoers rule is installed (applicationWillTerminate:).
 - (void)toggleKeepAwake:(id)s {
     [self syncPowerButtons];   // undo the click's own flip until the system confirms
     NSNumber *current = SleepDisabledState();
@@ -5924,7 +6038,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSAlert *alert = [NSAlert new];
         alert.alertStyle = NSAlertStyleInformational;
         alert.messageText = @"Keep this Mac awake?";
-        alert.informativeText = @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Glancebar switches it off when it quits; if it’s left on some other way, a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder.";
+        alert.informativeText = PmsetTouchIDInstalled()
+            ? @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Glancebar switches it off when it quits; if it’s left on some other way, a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder."
+            : @"Keep Awake stops the Mac sleeping at all—when idle, and with the lid closed (the display still sleeps). macOS needs Touch ID or your password to change it. Without the Touch ID rule, Glancebar leaves it on when it quits; a closed Mac can keep running and overheat in a bag, so the cup in the menu bar stays as a reminder.";
         [alert addButtonWithTitle:@"Keep Awake"];
         [alert addButtonWithTitle:@"Cancel"];
         [NSApp activateIgnoringOtherApps:YES];
@@ -5958,15 +6074,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // re-read live state, so a cancel needs no rollback). With the Touch ID rule installed:
 // Touch ID, then `sudo -n`. Without it: offer the one-time setup once, else the password prompt.
 - (void)applyPmset:(NSString *)setting on:(BOOL)on reason:(NSString *)reason then:(dispatch_block_t)then {
-    dispatch_block_t finish = ^{ dispatch_async(dispatch_get_main_queue(), then); };
+    // The LocalAuthentication reply runs sudo/osascript off the main thread. A second
+    // click, or quit, must not start another one until this attempt finishes.
+    if (!ShouldStartPmset(_pmsetInFlight)) return;
+    _pmsetInFlight = YES;
+    dispatch_queue_t work = [self pmsetWorkQueue];
+    dispatch_block_t finish = ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_pmsetInFlight = NO;
+            if (then) then();
+        });
+    };
     NSString *adminPrompt = [NSString stringWithFormat:@"Glancebar needs administrator access to %@.", reason];
     NSString *command = [NSString stringWithFormat:@"/usr/bin/pmset -a %@ %d", setting, on ? 1 : 0];
     if (PmsetTouchIDInstalled()) {
         [[LAContext new] evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:reason
                                   reply:^(BOOL ok, __unused NSError *error) {
-            // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
-            if (ok && !RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
-            finish();
+            dispatch_async(work, ^{
+                // A rule that no longer matches (edited, or sudo changed) falls back to the prompt.
+                if (ok && !RunPmsetViaSudo(setting, on)) SetPmsetShellViaAdmin(command, adminPrompt);
+                finish();
+            });
         }];
         return;
     }
@@ -5980,7 +6108,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [alert addButtonWithTitle:@"Use Password"];
         [NSApp activateIgnoringOtherApps:YES];
         BOOL setUp = [alert runModal] == NSAlertFirstButtonReturn;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        dispatch_async(work, ^{
             // Just authenticated to install, so apply this first change without asking again.
             if (!(setUp && InstallPmsetTouchID() && RunPmsetViaSudo(setting, on)))
                 SetPmsetShellViaAdmin(command, adminPrompt);
@@ -5988,7 +6116,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         });
         return;
     }
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(work, ^{
         SetPmsetShellViaAdmin(command, adminPrompt);
         finish();
     });
@@ -5999,8 +6127,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if (installed) RemovePmsetTouchID(); else InstallPmsetTouchID();
     });
 }
-- (void)toggleWatts:(id)s { _showWatts = !_showWatts; [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"]; [self rebuildContent]; }
-- (void)toggleHealth:(id)s { _showHealth = !_showHealth; [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"]; [self rebuildContent]; }
+- (void)toggleWatts:(id)s {
+    _showWatts = !_showWatts;
+    [NSUserDefaults.standardUserDefaults setBool:_showWatts forKey:@"showWatts"];
+    [self rebuildContent];
+    if (_detailsWindow.isVisible) [self rebuildDetails];
+}
+- (void)toggleHealth:(id)s {
+    _showHealth = !_showHealth;
+    [NSUserDefaults.standardUserDefaults setBool:_showHealth forKey:@"showHealth"];
+    [self rebuildContent];
+    if (_detailsWindow.isVisible) [self rebuildDetails];
+}
 
 - (void)showError:(NSError *)error title:(NSString *)title {
     NSAlert *alert = error ? [NSAlert alertWithError:error] : [NSAlert new];
@@ -6067,8 +6205,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     _barShowSystem = !_barShowSystem; [self saveBarOption:@"barShowSystem" value:_barShowSystem];
 }
 - (Volume *)primaryVolume {
-    for (Volume *v in _vols) if ([v.path isEqualToString:@"/"]) return v;
-    return _vols.firstObject;
+    NSMutableArray<NSNumber *> *boots = [NSMutableArray arrayWithCapacity:_vols.count];
+    for (Volume *v in _vols) [boots addObject:@([v.path isEqualToString:@"/"])];
+    NSInteger index = StorageHeadlineIndex(boots);
+    if (index < 0 || (NSUInteger)index >= _vols.count) return nil;
+    return _vols[(NSUInteger)index];
 }
 
 - (NSString *)batteryStatusText {
@@ -6256,7 +6397,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [self addDetailStatus:@"Volume scan unavailable; showing the last successful reading"
                            to:root y:&y width:kDetailW];
     if (!_vols.count) {
-        [self addDetailStatus:_volumesLoading ? @"Scanning mounted volumes…" : @"Storage information unavailable"
+        [self addDetailStatus:VolumeScanStatus(_volumesLoading, _volumesUnavailable)
                            to:root y:&y width:kDetailW];
     }
     for (Volume *volume in _vols) {
@@ -6302,10 +6443,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                           width:kDetailW pad:kDetailPad at:y]];
         y += 34;
         [self addDetailKey:@"Charge" value:[self batteryStatusText] to:root y:&y width:kDetailW];
-        [self addDetailKey:@"Power" value:[self batteryPowerText] to:root y:&y width:kDetailW];
+        if (_showWatts)
+            [self addDetailKey:@"Power" value:[self batteryPowerText] to:root y:&y width:kDetailW];
         if (!_bat.acConnected && _bat.percent > 20)
             [self addDetailKey:@"Until 20%" value:FmtDuration(MinutesTo20(_bat, [self avgAmp])) to:root y:&y width:kDetailW];
-        if (_bat.designCap_mAh > 0) {
+        if (_showHealth && _bat.designCap_mAh > 0) {
             NSString *health = [NSString stringWithFormat:@"%d%% · %ld/%ld mAh · %ld cycles",
                                 (int)lround(100.0*_bat.rawMax_mAh/_bat.designCap_mAh),
                                 _bat.rawMax_mAh, _bat.designCap_mAh, _bat.cycleCount];

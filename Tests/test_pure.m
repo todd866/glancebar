@@ -1514,6 +1514,134 @@ int main(void) {
                   @"music: the offline list refreshes on entry and after 60 seconds");
         }
 
+        // --- Power-source refresh coalescing ---
+        check(kPowerRefreshCoalesceSec == 1, @"power refresh coalesces to one per second");
+        check(ShouldArmPowerRefresh(NO), @"the first power-source callback arms a refresh");
+        check(!ShouldArmPowerRefresh(YES), @"a pending arm absorbs later power-source callbacks");
+
+        // --- Menu-bar capacity measurement cache ---
+        check(kBarCapacityMaxAgeSec == 60, @"bar capacity is remeasured at least every 60s");
+        NSString *capKey = BarCapacityCacheKey(@[@"61%", @"76%"], @"screen-a");
+        check([capKey isEqual:BarCapacityCacheKey(@[@"61%", @"76%"], @"screen-a")],
+              @"capacity cache key is stable for the same strings and screen");
+        check(![capKey isEqual:BarCapacityCacheKey(@[@"62%", @"76%"], @"screen-a")],
+              @"a changed segment string misses the capacity cache");
+        check(![capKey isEqual:BarCapacityCacheKey(@[@"76%", @"61%"], @"screen-a")],
+              @"segment order is part of the capacity cache key");
+        check(![capKey isEqual:BarCapacityCacheKey(@[@"61%", @"76%"], @"screen-b")],
+              @"a changed screen misses the capacity cache");
+        check(BarCapacityCacheKey(@[@"61%"], nil) == nil && BarCapacityCacheKey(@[@"61%"], @"") == nil,
+              @"an unknown screen is not a capacity cache hit");
+        check(BarCapacityCacheKey(nil, @"screen-a") != nil, @"a screen with no segment strings is still a key");
+        check(BarCapacityMeasurementFresh(capKey, capKey, 0, kBarCapacityMaxAgeSec),
+              @"a just-taken capacity measurement is reused");
+        check(BarCapacityMeasurementFresh(capKey, capKey, 59.9, kBarCapacityMaxAgeSec),
+              @"a capacity measurement just under 60s is still fresh");
+        check(!BarCapacityMeasurementFresh(capKey, capKey, 60, kBarCapacityMaxAgeSec),
+              @"a capacity measurement at 60s is stale");
+        check(!BarCapacityMeasurementFresh(capKey, BarCapacityCacheKey(@[@"62%", @"76%"], @"screen-a"), 1, 60),
+              @"a new capacity key is not fresh");
+        check(!BarCapacityMeasurementFresh(nil, capKey, 1, 60) &&
+              !BarCapacityMeasurementFresh(capKey, nil, 1, 60),
+              @"a missing capacity key is not fresh");
+        check(!BarCapacityMeasurementFresh(capKey, capKey, -1, 60),
+              @"a negative capacity age is not fresh");
+
+        // --- Volume resource keys and a hung scan ---
+        NSArray *remoteKeys = VolumeResourceKeys(NO);
+        NSArray *localKeys = VolumeResourceKeys(YES);
+        BOOL remoteHasBase = YES;
+        for (NSString *key in @[NSURLVolumeNameKey, NSURLVolumeTotalCapacityKey,
+                                NSURLVolumeAvailableCapacityKey, NSURLVolumeIsInternalKey,
+                                NSURLVolumeIsLocalKey])
+            if (![remoteKeys containsObject:key]) remoteHasBase = NO;
+        check(remoteHasBase && ![remoteKeys containsObject:NSURLVolumeAvailableCapacityForImportantUsageKey],
+              @"a non-local volume skips the important-usage key");
+        check([localKeys isEqual:[remoteKeys arrayByAddingObject:NSURLVolumeAvailableCapacityForImportantUsageKey]],
+              @"a local volume fetches important-usage in the same key list");
+        check(kVolumeScanUnavailableSec == 20, @"a volume scan is unavailable after 20s");
+        check(!VolumeScanUnavailable(NO, 1000), @"a finished volume scan is not marked unavailable");
+        check(!VolumeScanUnavailable(YES, 0) && !VolumeScanUnavailable(YES, 19.9),
+              @"a volume scan under 20s stays in progress");
+        check(VolumeScanUnavailable(YES, 20) && VolumeScanUnavailable(YES, 21),
+              @"a volume scan of 20s or more is unavailable");
+        check([VolumeScanStatus(YES, NO) isEqual:@"Scanning mounted volumes…"] &&
+              [VolumeScanStatus(YES, YES) isEqual:@"Storage information unavailable"] &&
+              [VolumeScanStatus(NO, NO) isEqual:@"Storage information unavailable"] &&
+              [VolumeScanStatus(NO, YES) isEqual:@"Storage information unavailable"],
+              @"an unavailable volume scan does not keep reading as scanning");
+
+        // --- Quit-time Keep Awake budget and tooltip ---
+        check(kQuitPmsetBudgetSec == 3, @"quit waits at most 3s to clear Keep Awake");
+        check(fabs(QuitPmsetBudgetRemaining(0) - 3) < 0.001 &&
+              fabs(QuitPmsetBudgetRemaining(2) - 1) < 0.001 &&
+              QuitPmsetBudgetRemaining(3) == 0 && QuitPmsetBudgetRemaining(10) == 0 &&
+              fabs(QuitPmsetBudgetRemaining(-5) - 3) < 0.001,
+              @"the quit pmset budget is 3s total and never negative");
+        NSString *tooltipOn = KeepAwakeTooltip(YES);
+        NSString *tooltipOff = KeepAwakeTooltip(NO);
+        check([tooltipOn isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar switches it off when it quits."],
+              @"with the sudoers rule, the Keep Awake tooltip says quit switches it off");
+        check([tooltipOff isEqual:@"Stops this Mac sleeping — when idle or with the lid closed; the display can still sleep. Needs Touch ID or your password. Glancebar leaves it on when it quits."],
+              @"without the sudoers rule, the Keep Awake tooltip says quit leaves it on");
+        check(![tooltipOff containsString:@"switches it off"],
+              @"without the rule the tooltip does not promise to switch Keep Awake off");
+        check(ShouldStartPmset(NO) && !ShouldStartPmset(YES),
+              @"a pmset click is ignored while one is in flight");
+
+        // --- Storage headline is the boot volume ---
+        check(kStorageFullSecondaryPercent == 85, @"a secondary storage line starts over 85%");
+        check(StorageHeadlineIndex(nil) == NSNotFound && StorageHeadlineIndex(@[]) == NSNotFound,
+              @"no volumes → no storage headline");
+        check(StorageHeadlineIndex(@[@NO, @YES, @NO]) == 1, @"the storage headline is the boot volume");
+        check(StorageHeadlineIndex(@[@NO, @NO]) == 0, @"without a boot volume the first mount is the headline");
+        check(StorageHeadlineIndex(@[@YES, @YES]) == 0, @"the first boot volume is the headline");
+        NSDictionary *secondary = StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.61, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.97, @"boot": @NO},
+        ]);
+        check([secondary[@"text"] isEqual:@"Backup 97% full"] &&
+              fabs([secondary[@"fraction"] doubleValue] - 0.97) < 0.001,
+              @"a fuller mount over 85% is named under the boot headline");
+        check(StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.99, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.97, @"boot": @NO},
+        ]) == nil, @"a mount that is not fuller than the boot volume is not a secondary line");
+        check(StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.90, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.90, @"boot": @NO},
+        ]) == nil, @"an equally full mount is not fuller");
+        check(StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.85, @"boot": @NO},
+        ]) == nil, @"85% full is not over 85%");
+        check([StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.86, @"boot": @NO},
+        ])[@"text"] isEqual:@"Backup 86% full"], @"86% full is over 85%");
+        check([StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.90, @"boot": @NO},
+            @{@"name": @"Archive", @"fraction": @0.96, @"boot": @NO},
+        ])[@"text"] isEqual:@"Archive 96% full"], @"the fullest qualifying mount is the secondary line");
+        check([StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
+            @{@"name": @"Backup", @"fraction": @0.96, @"boot": @NO},
+            @{@"name": @"Archive", @"fraction": @0.96, @"boot": @NO},
+        ])[@"text"] isEqual:@"Backup 96% full"], @"a tie names the earlier mount");
+        check(StorageSecondaryNotice(@[
+            @{@"name": @"Macintosh HD", @"fraction": @0.97, @"boot": @YES},
+        ]) == nil, @"the boot volume is not its own secondary line");
+        check(StorageSecondaryNotice(@[
+            @{@"name": @"", @"fraction": @0.99, @"boot": @NO},
+            @{@"name": @"Macintosh HD", @"fraction": @0.10, @"boot": @YES},
+        ]) == nil, @"a fuller mount with no name is not a secondary line");
+        check([StorageSecondaryNotice(@[
+            @{@"name": @"First", @"fraction": @0.10, @"boot": @NO},
+            @{@"name": @"Second", @"fraction": @0.90, @"boot": @NO},
+        ])[@"text"] isEqual:@"Second 90% full"],
+              @"without a boot volume the secondary line is judged against the first mount");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;
