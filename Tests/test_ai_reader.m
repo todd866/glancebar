@@ -1081,6 +1081,31 @@ int main(void) {
                   @"account: Cursor fetches through its own seam and gets a gauge");
             check(fabs(cursorUsage.remainingFraction - 0.75) < 0.001, @"account: Cursor plan spend drives the gauge");
             check([cursorUsage.statusSource isEqual:@"Cursor usage API (opt-in)"], @"account: Cursor names its own source");
+
+            // 7. A signed-out session (2026-10-04): the row says so, the cached figure stays
+            // marked stale, and the retry comes in minutes rather than a full poll interval.
+            cursor.cursorUsageFetcher = ^NSDictionary *(NSString *__unused token) {
+                cursorFetches++;
+                return @{@"_glancebarFetchError": @YES, @"statusCode": @401, @"rateLimited": @NO,
+                         @"retryAfter": @0, @"message": @"[unauthenticated] Error"};
+            };
+            [cursor setValue:@0 forKey:@"cursorNextFetch"];
+            double before401 = NSDate.date.timeIntervalSince1970;
+            AIUsage *signedOut = UsageNamed([cursor read], @"Cursor");
+            check([signedOut.limitRefreshError hasPrefix:@"Signed out"],
+                  @"account: a Cursor 401 says signed out, not 'Usage API: Error'");
+            check([[cursor valueForKey:@"cursorNextFetch"] doubleValue] <= before401 + 301,
+                  @"account: a 401 retries within five minutes");
+
+            // 8. No token, no request: the poll slot is not spent.
+            cursor.cursorTokenReader = ^NSString *(NSString *__unused home) { return nil; };
+            [cursor setValue:nil forKey:@"cursorAccessToken"];
+            [cursor setValue:@0 forKey:@"cursorStateNextTry"];
+            [cursor setValue:@0 forKey:@"cursorNextFetch"];
+            NSUInteger fetchesBefore = cursorFetches;
+            [cursor read];
+            check(cursorFetches == fetchesBefore && [[cursor valueForKey:@"cursorNextFetch"] doubleValue] == 0,
+                  @"account: a missing token leaves the fetch schedule alone");
         }
 
         // Two processes share the state file: a fresher account response written by one

@@ -180,6 +180,27 @@ static NSString *AppGroupForPid(pid_t pid) {
     return name.length ? name : nil;
 }
 
+// SIGTERM a child after `seconds`, SIGKILL a second later, unless disarmed first. Callers
+// disarm right after waitUntilExit, so a reaped child's recycled pid is never signalled.
+@interface GBWatchdog : NSObject
+- (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds;
+- (void)disarm;
+@end
+@implementation GBWatchdog { pid_t _pid; BOOL _disarmed; }
+- (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds {
+    if (!(self = [super init])) return nil;
+    _pid = pid;
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC), q, ^{
+        [self signal:SIGTERM];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), q, ^{ [self signal:SIGKILL]; });
+    });
+    return self;
+}
+- (void)signal:(int)sig { @synchronized (self) { if (!_disarmed) kill(_pid, sig); } }
+- (void)disarm { @synchronized (self) { _disarmed = YES; } }
+@end
+
 static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
     NSTask *t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:path];
@@ -192,20 +213,13 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
 
     // `top`, `ps`, and sqlite normally complete quickly. Never let a wedged child pin the
     // sampling queue or the serial AI reader forever; terminate at 8s and force-kill at 9s.
-    __block BOOL timedOut = NO;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (!t.isRunning) return;
-        timedOut = YES;
-        [t terminate];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            if (t.isRunning) kill(t.processIdentifier, SIGKILL);
-        });
-    });
+    // Signal by pid (NSTask is not thread-safe), and judge the outcome by how the child
+    // ended rather than by a flag shared across queues: a killed child is never a success.
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:t.processIdentifier seconds:8];
     NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
     [t waitUntilExit];
-    if (timedOut || t.terminationStatus != 0) return nil;
+    [watchdog disarm];
+    if (t.terminationReason != NSTaskTerminationReasonExit || t.terminationStatus != 0) return nil;
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
@@ -573,6 +587,8 @@ static NSColor *CPUColor(double cpu) {
 // How often an account limit may be re-fetched. Both endpoints rate-limit readily, so a
 // cached figure younger than this is as current as a fresh fetch would have made it.
 static const double kAccountPollInterval = 900;   // 15 minutes
+static const double kHiddenAIRefreshInterval = 300;   // background pass while no AI surface shows
+static const double kAuthFailureRetryInterval = 300;  // after a 401/403: a re-login is quick
 
 // Unified logging for the AI pipeline: transitions only, metadata only (booleans,
 // HTTP codes, our own status strings — never tokens, counts, or credentials).
@@ -1106,6 +1122,8 @@ static NSDictionary *FetchCursorUsageJSON(NSString *token) {
         emptyBody, @"Cursor usage API request timed out");
     if (![period[@"_glancebarFetchError"] boolValue] && PickCursorLimitWindow(period, now))
         return period;
+    // A rejected token is rejected everywhere; a second request only doubles the noise.
+    if (ShouldDropCachedTokenForStatus([period[@"statusCode"] integerValue])) return period;
 
     NSDictionary *auth = HTTPJSON(token, @"GET", @"https://api2.cursor.sh/auth/usage", @"api2.cursor.sh",
                                   nil, nil, @"Cursor usage API request timed out");
@@ -2175,6 +2193,7 @@ static NSString *HashedMessageID(NSString *messageID) {
     if (ShouldDropCachedTokenForStatus([fetch[@"statusCode"] integerValue])) {
         *token = nil;   // revoked; re-read the credential next attempt
         if (expiresAt) *expiresAt = 0;
+        *nextFetch = MIN(*nextFetch, now + kAuthFailureRetryInterval);
     }
     if (rateLimited) {
         *streak += 1;
@@ -2212,9 +2231,11 @@ static NSString *ISOStringFromEpoch(double epoch) {
                     fetcher:(NSDictionary *(^)(NSString *))fetcher
                     onError:(void (^)(NSDictionary *))onError {
     if (ShouldFetchClaudeAccount(use, allow, *usageJSON != nil, (*accountStatus).length > 0, now, *nextFetch)) {
-        *nextFetch = now + kAccountPollInterval;   // the endpoints rate-limit readily
         *skipReason = nil;
         NSString *token = tokenForNow();
+        // No token, no request: leave the schedule to the credential reader's own backoff
+        // instead of spending the 15-minute slot on nothing.
+        if (token) *nextFetch = now + kAccountPollInterval;   // the endpoints rate-limit readily
         NSDictionary *fetch = token ? fetcher(token) : nil;
         if ([fetch[@"_glancebarFetchError"] boolValue]) {
             onError(fetch);
@@ -3136,9 +3157,20 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     } else if ([existing isKindOfClass:NSButton.class]) {
         NSButton *old = (NSButton *)existing, *new = (NSButton *)fresh;
         old.title = new.title;
+        // A pill's icon carries its state (play ↔ pause, cup vs tortoise); without these
+        // an in-place refresh kept the old glyph and colour behind a new label.
+        if (new.attributedTitle.length && ![old.attributedTitle isEqual:new.attributedTitle])
+            old.attributedTitle = new.attributedTitle;
+        old.image = new.image;
+        old.imagePosition = new.imagePosition;
+        old.target = new.target;
+        old.action = new.action;
         old.enabled = new.enabled;
         old.state = new.state;
         old.contentTintColor = new.contentTintColor;
+        if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
+            ((PillButton *)old).onColor = ((PillButton *)new).onColor;
+        old.needsDisplay = YES;
     } else if ([existing isKindOfClass:NSImageView.class]) {
         NSImageView *old = (NSImageView *)existing, *new = (NSImageView *)fresh;
         old.image = new.image;
@@ -4290,16 +4322,17 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
 // that arrives mid-read is skipped; the next one catches up.
 - (void)refreshAIUsageAsync {
     BOOL showAI = _popover.isShown || _detailsWindow.isVisible;
-    // Codex histories can be large. Do no transcript/database work while every AI surface
-    // is hidden; opening the popover or the Details window starts/resumes indexing.
-    if (!showAI) return;
+    // While every AI surface is hidden, one bounded pass every few minutes keeps the figures
+    // warm. Skipping hidden passes entirely meant every open began from whatever the last
+    // open left behind, a "Cached limit" from hours ago that read as stuck (2026-10-06).
+    if (!showAI && _lastAIRefresh && -_lastAIRefresh.timeIntervalSinceNow < kHiddenAIRefreshInterval) return;
     if (_aiLoading) { _aiRefreshPending = YES; return; }
     _aiLoading = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
     BOOL useCursorAccount = [ud boolForKey:@"useCursorAccount"];
-    BOOL allowAccountFetch = showAI && useAccount;
-    BOOL allowCursorAccountFetch = showAI && useCursorAccount;
+    BOOL allowAccountFetch = useAccount;          // still at most every 15 minutes
+    BOOL allowCursorAccountFetch = useCursorAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
         useCursorAccount != _lastUseCursorAccount || allowTranscripts != _lastAllowTranscripts) {
@@ -4342,7 +4375,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
                 [self refreshVisibleSurfaces];
             }
             if (rerun) [self refreshAIUsageAsync];
-            else if (needsImmediateRescan) {
+            else if (needsImmediateRescan && (self->_popover.isShown || self->_detailsWindow.isVisible)) {
                 // Drain the bounded reader promptly while an AI surface is visible instead
                 // of waiting 15 seconds per chunk. The visibility gate above stops this
                 // loop as soon as the user hides AI.
@@ -5064,6 +5097,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *note = [self aiStalenessNote:u capitalized:NO];
     // Overage has no reset to report — the paid budget is not a window that rolls over.
     NSString *lead = u.overageActive ? nil : [self compactResetText:u];
+    // A signed-out account will not refresh on its own; the fix outranks the reset clock,
+    // which would otherwise sit beside a figure frozen at the last good fetch.
+    if ([u.limitRefreshError hasPrefix:@"Signed out"]) lead = u.limitRefreshError;
     if (!lead.length) lead = u.statusReason;
     // Keep billing visible even when a carried-forward plan window has a reset.
     if ([u.billingNote containsString:@"credits"]) {
@@ -5457,6 +5493,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     }
     if (ReconcileViewTree(previousView, freshView)) {
         _popoverScroll = FirstScrollView(previousView);
+        // The outlets were assigned on the discarded fresh tree; point them at the buttons
+        // that are actually on screen, or syncPowerButtons styles detached copies.
+        NSButton *keepAwake = (NSButton *)ViewWithAccessibilityIdentifier(previousView, @"popover.keepAwake");
+        NSButton *lowPower = (NSButton *)ViewWithAccessibilityIdentifier(previousView, @"popover.lowPower");
+        if ([keepAwake isKindOfClass:NSButton.class]) _keepAwakeButton = keepAwake;
+        if ([lowPower isKindOfClass:NSButton.class]) _lowPowerButton = lowPower;
     } else {
         _popover.contentViewController.view = freshView;
         _popoverScroll = freshScroll;
