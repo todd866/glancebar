@@ -774,6 +774,27 @@ int main(void) {
               @"cursor gauge follows the more-spent pool, not the blended total");
         check(fabs([poolPick[@"resetsAt"] doubleValue] - 1793708671.0) < 0.001, @"cursor pool keeps cycle end");
 
+        // --- ClaudeUsageOverlayingStatusline ---
+        NSDictionary *apiBody = @{@"limits": @[
+            @{@"kind": @"session", @"percent": @4, @"resets_at": @"2026-10-06T03:40:00Z"},
+            @{@"kind": @"weekly_all", @"percent": @90, @"resets_at": @"2026-10-06T13:00:00Z"},
+            @{@"kind": @"weekly_scoped", @"percent": @0, @"resets_at": @"2026-10-06T13:00:00Z",
+              @"scope": @{@"model": @{@"display_name": @"Fable"}}}],
+            @"seven_day": @{@"utilization": @90, @"resets_at": @"2026-10-06T13:00:00Z"}};
+        NSDictionary *statusline = @{@"fetchedAt": @1791247048955,
+                                     @"fiveHour": @{@"usedPct": @3, @"resetsAt": @1791258000},
+                                     @"sevenDay": @{@"usedPct": @95, @"resetsAt": @1791291600}};
+        NSDictionary *overlaid = ClaudeUsageOverlayingStatusline(apiBody, statusline);
+        NSArray *ol = overlaid[@"limits"];
+        check(ol.count == 3 && [ol[1][@"percent"] isEqual:@95] && [ol[0][@"percent"] isEqual:@3],
+              @"statusline replaces session and weekly_all figures");
+        check([ol[2][@"kind"] isEqual:@"weekly_scoped"] && [ol[2][@"percent"] isEqual:@0],
+              @"statusline overlay keeps the scoped Fable window");
+        check([overlaid[@"seven_day"][@"utilization"] isEqual:@95], @"statusline updates the legacy seven_day body");
+        NSDictionary *fromNothing = ClaudeUsageOverlayingStatusline(nil, statusline);
+        check([fromNothing[@"limits"] count] == 2, @"statusline alone yields session and weekly windows");
+        check(ClaudeUsageOverlayingStatusline(apiBody, @{@"fetchedAt": @1}) == nil, @"statusline without windows is ignored");
+
         // --- JWTExpiryEpoch / FreshestSessionToken / AccountFetchFailureStatus ---
         NSString *(^jwt)(double) = ^NSString *(double exp) {
             NSData *claims = [NSJSONSerialization dataWithJSONObject:@{@"exp": @(exp), @"type": @"session"} options:0 error:nil];

@@ -1236,6 +1236,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     BOOL _cursorFetchedThisRun;
     BOOL _cursorUsageCacheAbandoned;
     NSString *_claudeFetchSkipReason, *_cursorFetchSkipReason;
+    BOOL _claudeStatuslineLogged;
     NSMutableDictionary<NSString *, NSString *> *_lastStatusReasons;
     NSUInteger _scanBytesRemaining;
     double _scanDeadline;
@@ -2205,6 +2206,31 @@ static NSString *HashedMessageID(NSString *messageID) {
     }
 }
 
+// The usage endpoint 429s readily and every other poller of it (a statusline, a budget
+// script) shares the account's allowance. When Claude Code has written its own figures in
+// the last few minutes, use them and push our next request back: fresher, and no request.
+- (void)adoptClaudeStatuslineCacheAt:(double)now {
+    NSString *path = [_homeDirectory stringByAppendingPathComponent:@".claude/.cache/rate-limits.json"];
+    NSDate *mtime = FileMTime(path);
+    if (!mtime || now - mtime.timeIntervalSince1970 > kAccountPollInterval) return;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    NSDictionary *cache = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![cache isKindOfClass:NSDictionary.class]) return;
+    double fetchedAt = [cache[@"fetchedAt"] doubleValue] / 1000.0;   // ms epoch
+    if (fetchedAt <= _claudeLastSuccessAt + 1 || fetchedAt > now + 60 || now - fetchedAt > kAccountPollInterval) return;
+    NSDictionary *merged = ClaudeUsageOverlayingStatusline(_claudeUsageJSON, cache);
+    if (!merged) return;
+    _claudeUsageJSON = merged;
+    _claudeLastSuccessAt = fetchedAt;
+    _claudeNextFetch = MAX(_claudeNextFetch, fetchedAt + kAccountPollInterval);
+    _claudeAccountStatus = nil;
+    _claudeRateLimitStreak = 0;
+    _claudeFetchedThisRun = YES;
+    _claudeUsageCacheAbandoned = NO;
+    _stateDirty = YES;
+    if (!_claudeStatuslineLogged) { GBLog("claude: using statusline cache"); _claudeStatuslineLogged = YES; }
+}
+
 - (void)rememberClaudeFetchError:(NSDictionary *)fetch now:(double)now {
     [self rememberFetchError:fetch now:now token:&_claudeAccessToken expiresAt:&_claudeAccessTokenExpiresAt
                    nextFetch:&_claudeNextFetch status:&_claudeAccountStatus rateLimitStreak:&_claudeRateLimitStreak
@@ -2389,6 +2415,7 @@ typedef struct {
 
     if (self.useClaudeAccount) {
         double now = NSDate.date.timeIntervalSince1970;
+        [self adoptClaudeStatuslineCacheAt:now];
         [self refreshAccountNamed:"claude" use:self.useClaudeAccount allow:self.allowClaudeAccountFetch now:now
                         usageJSON:&_claudeUsageJSON lastSuccessAt:&_claudeLastSuccessAt nextFetch:&_claudeNextFetch
                     accountStatus:&_claudeAccountStatus fetchedThisRun:&_claudeFetchedThisRun
@@ -4331,8 +4358,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx refresh]; }
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
     BOOL useCursorAccount = [ud boolForKey:@"useCursorAccount"];
-    BOOL allowAccountFetch = useAccount;          // still at most every 15 minutes
-    BOOL allowCursorAccountFetch = useCursorAccount;
+    // Hidden passes are local-only: the account endpoints rate-limit readily, and an open
+    // fetches at once when the cache is past its 15 minutes, so a hidden request buys little.
+    BOOL allowAccountFetch = showAI && useAccount;
+    BOOL allowCursorAccountFetch = showAI && useCursorAccount;
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
         useCursorAccount != _lastUseCursorAccount || allowTranscripts != _lastAllowTranscripts) {

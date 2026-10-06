@@ -212,6 +212,12 @@ BOOL StaleSnapshotWarns(double ageSeconds, double pollIntervalSeconds);
 // it is a different clock and lives in the caption.
 NSDictionary *ClaudeModelQuotas(NSArray<NSDictionary *> *windows);
 
+// A Claude Code statusline cache ({fetchedAt: ms, fiveHour/sevenDay: {usedPct, resetsAt: s}})
+// is written from Claude Code's own responses, so it is fresher than our poll and costs no
+// request. Lays its session and all-models weekly figures over `usage` (an OAuth usage body,
+// or nil), keeping every other window, e.g. the scoped Fable weekly. nil when unusable.
+NSDictionary *ClaudeUsageOverlayingStatusline(NSDictionary *usage, NSDictionary *statusline);
+
 // An auth failure means the cached access token is dead (e.g. Claude Code re-login
 // revoked it); drop it so the next attempt re-reads the Keychain.
 BOOL ShouldDropCachedTokenForStatus(NSInteger statusCode);

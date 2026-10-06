@@ -1568,3 +1568,51 @@ NSDictionary *ParseLikedTrackFilename(NSString *filename) {
     if ([title.lowercaseString hasSuffix:@".m4a"]) title = [title substringToIndex:title.length - 4];
     return @{@"artist": @"", @"title": title, @"trackID": @""};
 }
+
+static NSDictionary *StatuslineWindow(NSDictionary *statusline, NSString *key) {
+    NSDictionary *w = [statusline[key] isKindOfClass:NSDictionary.class] ? statusline[key] : nil;
+    if (![w[@"usedPct"] isKindOfClass:NSNumber.class] || ![w[@"resetsAt"] isKindOfClass:NSNumber.class]) return nil;
+    return w;
+}
+
+NSDictionary *ClaudeUsageOverlayingStatusline(NSDictionary *usage, NSDictionary *statusline) {
+    if (![statusline isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *session = StatuslineWindow(statusline, @"fiveHour");
+    NSDictionary *weekly = StatuslineWindow(statusline, @"sevenDay");
+    if (!session && !weekly) return nil;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    NSString *(^isoFor)(NSDictionary *) = ^NSString *(NSDictionary *w) {
+        return [iso stringFromDate:[NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]]];
+    };
+    NSMutableDictionary *out = [usage isKindOfClass:NSDictionary.class] ? [usage mutableCopy] : [NSMutableDictionary dictionary];
+    void (^setLegacy)(NSString *, NSDictionary *) = ^(NSString *key, NSDictionary *w) {
+        if (!w) return;
+        NSMutableDictionary *legacy = [out[key] isKindOfClass:NSDictionary.class] ? [out[key] mutableCopy] : [NSMutableDictionary dictionary];
+        legacy[@"utilization"] = w[@"usedPct"];
+        legacy[@"resets_at"] = isoFor(w);
+        out[key] = legacy;
+    };
+    setLegacy(@"five_hour", session);
+    setLegacy(@"seven_day", weekly);
+
+    NSMutableArray *limits = [NSMutableArray array];
+    BOOL sawSession = NO, sawWeekly = NO;
+    NSArray *existing = [out[@"limits"] isKindOfClass:NSArray.class] ? out[@"limits"] : @[];
+    for (id entry in existing) {
+        if (![entry isKindOfClass:NSDictionary.class]) continue;
+        NSString *kind = [entry[@"kind"] isKindOfClass:NSString.class] ? entry[@"kind"] : @"";
+        NSDictionary *w = [kind isEqualToString:@"session"] ? session : [kind isEqualToString:@"weekly_all"] ? weekly : nil;
+        if (!w) { [limits addObject:entry]; continue; }
+        NSMutableDictionary *m = [entry mutableCopy];
+        m[@"percent"] = w[@"usedPct"];
+        m[@"resets_at"] = isoFor(w);
+        [limits addObject:m];
+        if (w == session) sawSession = YES; else sawWeekly = YES;
+    }
+    if (session && !sawSession)
+        [limits addObject:@{@"kind": @"session", @"group": @"session", @"percent": session[@"usedPct"], @"resets_at": isoFor(session)}];
+    if (weekly && !sawWeekly)
+        [limits addObject:@{@"kind": @"weekly_all", @"group": @"weekly", @"percent": weekly[@"usedPct"], @"resets_at": isoFor(weekly)}];
+    out[@"limits"] = limits;
+    return out;
+}

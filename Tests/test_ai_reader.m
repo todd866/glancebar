@@ -1059,6 +1059,30 @@ int main(void) {
             check(reReads == 1 && [revoked valueForKey:@"claudeAccessToken"] == nil,
                   @"account: a 401 drops the cached token");
 
+            // 5b. A fresh Claude Code statusline cache stands in for the request.
+            {
+                NSString *cacheDir = [aHome stringByAppendingPathComponent:@".claude/.cache"];
+                [fm createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
+                double nowMs = NSDate.date.timeIntervalSince1970 * 1000.0;
+                NSDictionary *line = @{@"fetchedAt": @(nowMs - 30000),
+                                       @"fiveHour": @{@"usedPct": @10, @"resetsAt": @(base + 3600)},
+                                       @"sevenDay": @{@"usedPct": @60, @"resetsAt": @(base + 86400)}};
+                NSString *linePath = [cacheDir stringByAppendingPathComponent:@"rate-limits.json"];
+                [[NSJSONSerialization dataWithJSONObject:line options:0 error:nil] writeToFile:linePath atomically:YES];
+                AIReader *viaLine = [[AIReader alloc] initWithHomeDirectory:aHome applicationSupportDirectory:
+                                     [root stringByAppendingPathComponent:@"support-statusline"]];
+                __block NSUInteger lineFetches = 0;
+                viaLine.claudeCredentialReader = ^NSDictionary *{ return @{@"token": @"t", @"expiresAt": @(base + 3600)}; };
+                viaLine.claudeUsageFetcher = ^NSDictionary *(NSString *__unused token) { lineFetches++; return @{}; };
+                viaLine.useClaudeAccount = YES;
+                viaLine.allowClaudeAccountFetch = YES;
+                AIUsage *lineUsage = UsageNamed([viaLine read], @"Claude");
+                check(lineFetches == 0, @"account: a fresh statusline cache means no usage request");
+                check(lineUsage.limitStatusAvailable && fabs(lineUsage.remainingFraction - 0.40) < 0.001,
+                      @"account: the statusline weekly figure drives the gauge");
+                [fm removeItemAtPath:linePath error:nil];
+            }
+
             // 6. Cursor runs the same path through its own seams.
             NSString *cursorDir = [aHome stringByAppendingPathComponent:@"Library/Application Support/Cursor/User/globalStorage"];
             [fm createDirectoryAtPath:cursorDir withIntermediateDirectories:YES attributes:nil error:nil];
