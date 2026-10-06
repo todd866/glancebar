@@ -1875,6 +1875,18 @@ NSString *CompactResetClock(NSDate *resetAt, NSDate *now) {
     return [fmt stringFromDate:resetAt];
 }
 
+NSString *ChargeModeEffective(NSString *storedMode, NSDate *storedAt, NSDate *now) {
+    if ([storedMode isEqualToString:@"full"] && [storedAt isKindOfClass:NSDate.class]) {
+        NSDate *reference = [now isKindOfClass:NSDate.class] ? now : NSDate.date;
+        if ([reference timeIntervalSinceDate:storedAt] < 24 * 60 * 60) return @"full";
+    }
+    return @"limit80";
+}
+
+BOOL ChargeHeld(BOOL plugged, BOOL charging, int percent, NSString *mode) {
+    return plugged && !charging && percent >= 79 && [mode isEqualToString:@"limit80"];
+}
+
 static NSString *ScaledByteCount(long long bytes, int decimals, BOOL trimZeros) {
     if (bytes < 0) bytes = 0;
     const double scale[] = {1e12, 1e9, 1e6, 1e3};

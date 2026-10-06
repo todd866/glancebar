@@ -2884,12 +2884,14 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 
 @interface Gauge : NSView
 @property (nonatomic) double fraction;
+@property (nonatomic) double markerFraction; // negative: no tick. 0.8 draws the 80% charge-limit mark
 @property (nonatomic, strong) NSColor *color;
 @property (nonatomic, copy) NSString *metricLabel;
 @end
 @implementation Gauge
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
+        _markerFraction = -1;
         [self setAccessibilityElement:YES];
         [self setAccessibilityRole:NSAccessibilityProgressIndicatorRole];
         [self setAccessibilityMinValue:@0.0];
@@ -2904,6 +2906,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
     self.needsDisplay = YES;
 }
 - (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
+- (void)setMarkerFraction:(double)markerFraction { _markerFraction = markerFraction; self.needsDisplay = YES; }
 - (void)setMetricLabel:(NSString *)metricLabel {
     _metricLabel = [metricLabel copy];
     [self setAccessibilityLabel:_metricLabel.length ? _metricLabel : @"Progress"];
@@ -2917,6 +2920,12 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
     NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*self.fraction);
     [(self.color ?: NSColor.controlAccentColor) setFill];
     [[NSBezierPath bezierPathWithRoundedRect:f xRadius:rad yRadius:rad] fill];
+    if (self.markerFraction >= 0 && self.markerFraction <= 1) {
+        CGFloat tickW = 1.5;
+        CGFloat x = NSMinX(r) + NSWidth(r) * self.markerFraction - tickW / 2.0;
+        [NSColor.labelColor setFill];
+        NSRectFill(NSMakeRect(x, NSMinY(r), tickW, NSHeight(r)));
+    }
 }
 @end
 
@@ -2995,7 +3004,17 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @end
 @implementation ClickRow
 - (NSView *)hitTest:(NSPoint)point {
-    return NSPointInRect(point, self.bounds) ? self : nil;
+    // `point` is in the superview's coordinates. The battery symbol is its own control
+    // (charge limit). Everything else in the row, including the labels, still opens Details.
+    NSPoint inRow = [self convertPoint:point fromView:self.superview];
+    if (!NSPointInRect(inRow, self.bounds)) return nil;
+    for (NSView *sub in self.subviews) {
+        if (![sub.accessibilityIdentifier isEqualToString:@"popover.battery.symbol"]) continue;
+        NSPoint inSub = [sub convertPoint:inRow fromView:self];
+        if (!NSPointInRect(inSub, sub.bounds)) break;
+        return [sub hitTest:inRow] ?: sub;
+    }
+    return self;
 }
 - (void)mouseDown:(NSEvent *)event { (void)event; }
 - (void)sendAction {
@@ -3244,6 +3263,7 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     } else if ([existing isKindOfClass:Gauge.class]) {
         Gauge *old = (Gauge *)existing, *new = (Gauge *)fresh;
         old.fraction = new.fraction;
+        old.markerFraction = new.markerFraction;
         old.color = new.color;
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
@@ -3314,90 +3334,15 @@ static NSImage *TintedSymbol(NSString *name, double varValue, CGFloat pt, NSColo
     return out;
 }
 
-static NSColor *BarIconTrackColor(NSColor *fg) {
-    return [fg colorWithAlphaComponent:0.25];
-}
-
-static NSImage *DriveMeterIcon(double fraction, NSColor *fg, NSColor *fill) {
-    CGFloat w = 17, h = 14;
-    fraction = MIN(1.0, MAX(0.0, fraction));
-    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
-    [img lockFocus];
-
-    // Keep the hard-drive silhouette, but put usage on a rectangular front face:
-    // equal changes in capacity now move a straight edge by equal distances.
-    NSBezierPath *top = [NSBezierPath bezierPath];
-    [top moveToPoint:NSMakePoint(1, 7.5)];
-    [top lineToPoint:NSMakePoint(3, 11.8)];
-    [top curveToPoint:NSMakePoint(4.2, 12.8) controlPoint1:NSMakePoint(3.2, 12.5) controlPoint2:NSMakePoint(3.5, 12.8)];
-    [top lineToPoint:NSMakePoint(12.8, 12.8)];
-    [top curveToPoint:NSMakePoint(14, 11.8) controlPoint1:NSMakePoint(13.5, 12.8) controlPoint2:NSMakePoint(13.8, 12.5)];
-    [top lineToPoint:NSMakePoint(16, 7.5)];
-    [top closePath];
-    [[fg colorWithAlphaComponent:0.12] setFill]; [top fill];
-    [fg setStroke]; top.lineWidth = 1.1; [top stroke];
-
-    NSBezierPath *front = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 1.5, 15, 6.3)
-                                                                  xRadius:1.1 yRadius:1.1];
-    [fg setStroke]; front.lineWidth = 1.1; [front stroke];
-    NSRect meter = NSMakeRect(2.6, 3.1, 11.8, 3.1);
-    [[fg colorWithAlphaComponent:0.12] setFill]; NSRectFill(meter);
-    [(fill ?: fg) setFill];
-    meter.size.width *= fraction;
-    if (fraction > 0) NSRectFill(meter);
-    // The indicator belongs on the lid so it cannot obscure the usage meter.
-    [fg setFill];
-    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(11.4, 9.4, 1.2, 1.2)] fill];
-
-    [img unlockFocus];
-    img.template = NO;
-    return img;
-}
-
-static NSImage *BatteryMeterIcon(BatteryState b, NSColor *fg, NSColor *fill) {
-    CGFloat w = 24, h = 14;
-    double fraction = b.valid ? MIN(1.0, MAX(0.0, b.percent / 100.0)) : 0.0;
-    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
-    [img lockFocus];
-
-    NSRect body = NSMakeRect(1.5, 3.0, 18.0, 8.0);
-    NSBezierPath *outer = [NSBezierPath bezierPathWithRoundedRect:body xRadius:2.0 yRadius:2.0];
-    [BarIconTrackColor(fg) setFill];
-    [outer fill];
-
-    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(body, 1.4, 1.4) xRadius:1.0 yRadius:1.0];
-    [NSGraphicsContext saveGraphicsState];
-    [clip addClip];
-    [(fill ?: fg) setFill];
-    NSRect fillRect = NSInsetRect(body, 1.4, 1.4);
-    fillRect.size.width *= fraction;
-    NSRectFill(fillRect);
-    [NSGraphicsContext restoreGraphicsState];
-
-    [fg setStroke];
-    outer.lineWidth = 1.2;
-    [outer stroke];
-    NSBezierPath *cap = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(20.2, 5.0, 2.3, 4.0)
-                                                        xRadius:0.8 yRadius:0.8];
-    [fg setFill];
-    [cap fill];
-
-    if (b.valid && b.acConnected) {
-        NSBezierPath *bolt = [NSBezierPath bezierPath];
-        [bolt moveToPoint:NSMakePoint(11.6, 10.2)];
-        [bolt lineToPoint:NSMakePoint(8.8, 6.5)];
-        [bolt lineToPoint:NSMakePoint(11.0, 6.5)];
-        [bolt lineToPoint:NSMakePoint(9.7, 3.8)];
-        [bolt lineToPoint:NSMakePoint(14.1, 8.0)];
-        [bolt lineToPoint:NSMakePoint(11.8, 8.0)];
-        [bolt closePath];
-        [[NSColor colorWithWhite:0 alpha:0.38] setFill];
-        [bolt fill];
+// Menu-bar SF Symbol at ~13pt, shrunk until it is no wider than the glyph it replaces
+// (the old drive silhouette was 17pt, the old battery 24pt). The bar must not grow.
+static NSImage *BarFittedSymbol(NSString *name, NSColor *color, CGFloat maxWidth) {
+    NSImage *image = nil;
+    for (CGFloat pt = 13; pt >= 8; pt -= 0.5) {
+        image = TintedSymbol(name, -1, pt, color);
+        if (!image || image.size.width <= maxWidth + 0.01) break;
     }
-
-    [img unlockFocus];
-    img.template = NO;
-    return img;
+    return image;
 }
 
 // Builds the menu-bar image from selected metric segments.
@@ -3466,19 +3411,21 @@ static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width)
 
 #pragma mark - Controller
 
-static const CGFloat kW = 320, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
-// One instrument row. Lead, gauge, value and datum share these x positions so
-// storage, battery and every AI provider line up. kDatumX + kDatumW == kW - kPad.
-// Density is signal per area, not a small panel: space freed from words goes to
-// legible instruments (30pt rows, 8pt gauges, 15pt values), not to shrinking.
+static const CGFloat kW = 380, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
+// One instrument row. Every row has the same lead (symbol + name column), so the
+// gauge, value and datum share an x. Every row names itself (Storage, Battery, Claude…):
+// a blank name column read as wasted space, and the word identifies the row. The panel
+// grew by that column; the gauge stayed 102pt. kDatumX + kDatumW == kW - kPad.
 static const CGFloat kRowH = 30, kSoundH = 40;
 static const CGFloat kLeadSymbol = 22;
-static const CGFloat kFooterSymbol = 16;   // inside a 36×28 toggle: the glyph needs margin, not 22pt
-static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6: the symbol, not the word "Cursor"
-static const CGFloat kGaugeX = 50, kGaugeW = 102, kGaugeH = 8; // kPad + kLeadW + 6; the reclaimed name width
-static const CGFloat kValueX = 156, kValueW = 48;              // "100%" at 15pt, same x as before
-static const CGFloat kDatumX = 212, kDatumW = 92;              // "220 GB free"
-static const CGFloat kToggleW = 36, kToggleH = 28, kToggleGap = 8;
+static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the footer pill
+static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
+static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW + 4; "Claude" at 13pt plus the label inset
+static const CGFloat kGaugeX = 110, kGaugeW = 102, kGaugeH = 8; // kAINameX + kAINameW + 6
+static const CGFloat kValueX = 216, kValueW = 48;              // "100%" at 15pt
+static const CGFloat kDatumX = 272, kDatumW = 92;              // "resets 21:00"
+static const CGFloat kToggleH = 28, kToggleGap = 8;
+static const CGFloat kKeepW = 112, kLowW = 104;                // 16pt glyph + 12pt "Keep Awake" / "Low Power"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
 // The details document follows the resizable window. It is only touched on the
 // main thread; keeping the active width here avoids threading a layout argument
@@ -3809,6 +3756,11 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     double _barChromeWidth;            // shell padding around the rendered image (16pt live)
     BOOL _barChromeKnown;
     NSDate *_lastMachineRefresh, *_lastAIRefresh;
+    NSString *_chargeMode;          // "limit80" | "full"; nil until read from defaults
+    NSDate *_chargeModeAt;
+    BOOL _chargeModeLoaded, _chargeShortcutInFlight;
+    BOOL _chargeShortcutsKnown, _chargeShortcutsPresent, _chargeShortcutsChecking;
+    CFAbsoluteTime _chargeShortcutsCheckedAt;
     NSDate *_lastVolumeSuccess;
     NSScrollView *_popoverScroll;
     NSArray<NSDictionary *> *_audioDevices;    // last settled device set, including input-only
@@ -4941,7 +4893,10 @@ static BOOL AIWindowElapsed(AIUsage *u) {
         int pct = [self rootDiskPct];
         double frac = pct >= 0 ? pct / 100.0 : 0;
         NSColor *driveTextColor = pct >= 0 && frac >= 0.85 ? DiskColor(frac) : fg;
-        [segments addObject:@{@"image": DriveMeterIcon(frac, fg, fg),
+        Volume *boot = [self primaryVolume];
+        NSString *driveSymbol = (boot && !boot.isInternal) ? @"externaldrive" : @"internaldrive";
+        // The symbol stays the menu-bar foreground. Only the percent takes the warning tint.
+        [segments addObject:@{@"image": BarFittedSymbol(driveSymbol, fg, 17),
                               @"text": pct >= 0 ? [NSString stringWithFormat:@"%d%%", pct] : @"—",
                               @"color": driveTextColor}];
     }
@@ -4971,7 +4926,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
                 lidAwakeShown = YES;
             } else {
                 NSColor *fill = lowBattery ? BattBarColor(_bat.percent) : fg;
-                seg[@"image"] = BatteryMeterIcon(_bat, fg, fill);
+                seg[@"image"] = BarFittedSymbol(BatterySymbolName(_bat.percent, _bat.acConnected), fill, 24);
             }
         }
         [segments addObject:seg];
@@ -5530,16 +5485,17 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [v addSubview:heading];
     return v;
 }
-// Icon-only pill. The words live on the tooltip and accessibility label; the glyph is the
-// same one the menu bar uses for that mode. Push-on/push-off so VoiceOver reports a toggle.
+// Icon and a short label, side by side. The pill fill is the on/off state. Push-on/push-off
+// so VoiceOver reports a toggle. The glyph matches the menu bar.
 - (NSButton *)powerToggle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
-    PillButton *b = [PillButton buttonWithTitle:@"" target:self action:action];
+    PillButton *b = [PillButton buttonWithTitle:title target:self action:action];
     [b setButtonType:NSButtonTypePushOnPushOff];
     b.bordered = NO;   // PillButton draws the background itself
-    b.imagePosition = NSImageOnly;
+    b.imagePosition = NSImageLeft;
     b.imageScaling = NSImageScaleProportionallyDown;
+    b.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kFooterSymbol
-                                                                                     weight:NSFontWeightRegular];
+                                                                                     weight:NSFontWeightMedium];
     b.image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:title]
                imageWithSymbolConfiguration:cfg];
     b.accessibilityLabel = title;
@@ -5550,7 +5506,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (!b) return;   // popover not built yet (a Low Power change can arrive before first open)
     b.state = on ? NSControlStateValueOn : NSControlStateValueOff;
     if ([b isKindOfClass:PillButton.class]) ((PillButton *)b).onColor = tint;
-    b.contentTintColor = on ? ink : NSColor.secondaryLabelColor;
+    // Off is a normal, available control, not a disabled one: full label colour.
+    NSColor *inkNow = on ? ink : NSColor.labelColor;
+    b.contentTintColor = inkNow;
+    b.attributedTitle = [[NSAttributedString alloc] initWithString:b.title ?: @"" attributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:12 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: inkNow}];
     b.needsDisplay = YES;
 }
 // The footer shows exactly what the menu bar shows, from the same live state: the cup
@@ -5569,9 +5530,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                 awakeState, KeepAwakeTooltip(PmsetRuleInstalled())];
     _lowPowerButton.toolTip = [NSString stringWithFormat:@"Low Power — %@\n%@",
                                lowState, @"System Low Power Mode."];
-    // Fixed icon buttons: the title no longer changes the width.
-    _keepAwakeButton.frame = NSMakeRect(kPad, 0, kToggleW, kToggleH);
-    _lowPowerButton.frame = NSMakeRect(kPad + kToggleW + kToggleGap, 0, kToggleW, kToggleH);
+    _keepAwakeButton.frame = NSMakeRect(kPad, 0, kKeepW, kToggleH);
+    _lowPowerButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap, 0, kLowW, kToggleH);
 }
 - (NSBox *)dividerAt:(CGFloat)y {
     NSBox *b = [[NSBox alloc] initWithFrame:NSMakeRect(kPad, y, kW-2*kPad, 1)];
@@ -5708,8 +5668,135 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return [parts componentsJoinedByString:@" · "];
 }
 
+- (void)ensureChargeModeLoaded {
+    if (_chargeModeLoaded) return;
+    _chargeModeLoaded = YES;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (!_chargeMode) {
+        id mode = [ud objectForKey:@"glancebarChargeMode"];
+        if ([mode isKindOfClass:NSString.class]) _chargeMode = mode;
+    }
+    if (!_chargeModeAt) {
+        id at = [ud objectForKey:@"glancebarChargeModeAt"];
+        if ([at isKindOfClass:NSDate.class]) _chargeModeAt = at;
+    }
+}
+- (NSString *)effectiveChargeMode {
+    [self ensureChargeModeLoaded];
+    return ChargeModeEffective(_chargeMode, _chargeModeAt, NSDate.date);
+}
+- (NSString *)chargeFullUntilText {
+    if (!_chargeModeAt) return @"tomorrow";
+    NSDate *until = [_chargeModeAt dateByAddingTimeInterval:24 * 60 * 60];
+    NSCalendar *cal = NSCalendar.currentCalendar;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.calendar = cal;
+    fmt.timeZone = cal.timeZone;
+    fmt.dateFormat = [cal isDate:until inSameDayAsDate:NSDate.date] ? @"HH:mm" : @"EEE HH:mm";
+    return [fmt stringFromDate:until] ?: @"tomorrow";
+}
+- (NSString *)chargeLimitTooltip {
+    if (_chargeShortcutsKnown && !_chargeShortcutsPresent)
+        return @"Charge limit: add the shortcuts 'Glancebar Charge 80' and 'Glancebar Charge Full' (Set Charge Limit action) to control it from here";
+    if ([[self effectiveChargeMode] isEqualToString:@"full"])
+        return [NSString stringWithFormat:@"Charging to full until %@ — click to limit to 80%%",
+                [self chargeFullUntilText]];
+    return @"Charge limit 80% — click to charge to full until tomorrow";
+}
+- (void)refreshChargeShortcutsIfStale {
+    if (!_musicProbesEnabled || _chargeShortcutsChecking) return;
+    if (_chargeShortcutsKnown && CFAbsoluteTimeGetCurrent() - _chargeShortcutsCheckedAt < 60) return;
+    _chargeShortcutsChecking = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *out = RunTaskOutput(@"/usr/bin/shortcuts", @[@"list"]);
+        BOOL has80 = NO, hasFull = NO;
+        for (NSString *line in [out componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+            NSString *name = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([name isEqualToString:@"Glancebar Charge 80"]) has80 = YES;
+            if ([name isEqualToString:@"Glancebar Charge Full"]) hasFull = YES;
+        }
+        BOOL present = out != nil && has80 && hasFull;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL changed = !self->_chargeShortcutsKnown || present != self->_chargeShortcutsPresent;
+            self->_chargeShortcutsChecking = NO;
+            self->_chargeShortcutsKnown = YES;
+            self->_chargeShortcutsPresent = present;
+            self->_chargeShortcutsCheckedAt = CFAbsoluteTimeGetCurrent();
+            if (changed && self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+- (void)runChargeShortcut:(NSString *)name mode:(NSString *)mode {
+    if (_chargeShortcutInFlight || !name.length || !mode.length) return;
+    _chargeShortcutInFlight = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/shortcuts"];
+        task.arguments = @[@"run", name];
+        task.standardInput = NSFileHandle.fileHandleWithNullDevice;
+        task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        task.standardError = NSFileHandle.fileHandleWithNullDevice;
+        if (![task launchAndReturnError:NULL]) {
+            dispatch_async(dispatch_get_main_queue(), ^{ self->_chargeShortcutInFlight = NO; });
+            return;
+        }
+        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:10];
+        [task waitUntilExit];
+        [watchdog disarm];
+        BOOL ok = task.terminationReason == NSTaskTerminationReasonExit && task.terminationStatus == 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_chargeShortcutInFlight = NO;
+            if (!ok) return;
+            self->_chargeMode = mode;
+            self->_chargeModeAt = NSDate.date;
+            self->_chargeModeLoaded = YES;
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            [ud setObject:mode forKey:@"glancebarChargeMode"];
+            [ud setObject:self->_chargeModeAt forKey:@"glancebarChargeModeAt"];
+            if (self->_popover.isShown) [self rebuildContent];
+            if (self->_detailsWindow.isVisible) [self rebuildDetails];
+        });
+    });
+}
+- (void)toggleChargeLimit:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    BOOL fresh = _chargeShortcutsKnown && CFAbsoluteTimeGetCurrent() - _chargeShortcutsCheckedAt < 60;
+    void (^act)(BOOL) = ^(BOOL present) {
+        if (!present) {
+            NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Battery-Settings.extension"];
+            if (url) [NSWorkspace.sharedWorkspace openURL:url];
+            if (self->_popover.isShown) [self rebuildContent];
+            return;
+        }
+        BOOL toFull = ![[self effectiveChargeMode] isEqualToString:@"full"];
+        [self runChargeShortcut:(toFull ? @"Glancebar Charge Full" : @"Glancebar Charge 80")
+                           mode:(toFull ? @"full" : @"limit80")];
+    };
+    if (fresh) { act(_chargeShortcutsPresent); return; }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *out = RunTaskOutput(@"/usr/bin/shortcuts", @[@"list"]);
+        BOOL has80 = NO, hasFull = NO;
+        for (NSString *line in [out componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+            NSString *name = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([name isEqualToString:@"Glancebar Charge 80"]) has80 = YES;
+            if ([name isEqualToString:@"Glancebar Charge Full"]) hasFull = YES;
+        }
+        BOOL present = out != nil && has80 && hasFull;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_chargeShortcutsKnown = YES;
+            self->_chargeShortcutsPresent = present;
+            self->_chargeShortcutsCheckedAt = CFAbsoluteTimeGetCurrent();
+            self->_chargeShortcutsChecking = NO;
+            act(present);
+        });
+    });
+}
 - (NSString *)batteryDatumText {
     if (!_bat.valid) return @"";
+    if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
+        return @"held 80%";
     NSString *datum = @"AC";
     if (!_bat.acConnected) {
         if (_bat.percent <= 20) datum = @"…";
@@ -5766,6 +5853,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return iv;
 }
 
+- (NSImageView *)instrumentLogo:(NSImage *)image identifier:(NSString *)identifier in:(NSView *)row {
+    NSImageView *iv = [NSImageView imageViewWithImage:image];
+    iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+    iv.imageAlignment = NSImageAlignCenter;
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
+    iv.accessibilityIdentifier = identifier;
+    [row addSubview:iv];
+    return iv;
+}
+
+- (NSTextField *)instrumentName:(NSString *)text identifier:(NSString *)identifier in:(NSView *)row {
+    NSTextField *field = [self text:text font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                              color:NSColor.labelColor
+                                 at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16)
+                              align:NSTextAlignmentLeft];
+    field.accessibilityIdentifier = identifier;
+    field.maximumNumberOfLines = 1;
+    [row addSubview:field];
+    return field;
+}
+
 - (NSTextField *)instrumentValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
                               color:color at:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
@@ -5783,6 +5891,44 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return field;
 }
 
+// The installed app's own icon, cached once per launch. Nil when the app is absent;
+// callers then keep the SF Symbol. No logo files are stored in the repo.
+static NSImage *CachedBundleIcon(NSString *bundleID, NSString *fallbackPath) {
+    static NSMutableDictionary<NSString *, id> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *key = [NSString stringWithFormat:@"%@|%@", bundleID ?: @"", fallbackPath ?: @""];
+    id hit = cache[key];
+    if (hit) return hit == NSNull.null ? nil : hit;
+    NSWorkspace *ws = NSWorkspace.sharedWorkspace;
+    NSURL *url = bundleID.length ? [ws URLForApplicationWithBundleIdentifier:bundleID] : nil;
+    if (!url && fallbackPath.length && [NSFileManager.defaultManager fileExistsAtPath:fallbackPath])
+        url = [NSURL fileURLWithPath:fallbackPath];
+    NSImage *icon = url ? [ws iconForFile:url.path] : nil;
+    cache[key] = icon ?: NSNull.null;
+    return icon;
+}
+static NSImage *AIProviderIcon(NSString *provider) {
+    if ([provider isEqualToString:@"Claude"])
+        return CachedBundleIcon(@"com.anthropic.claudefordesktop", @"/Applications/Claude.app");
+    if ([provider isEqualToString:@"Cursor"])
+        return CachedBundleIcon(@"com.todesktop.230313mzl4w4u92", @"/Applications/Cursor.app");
+    if ([provider isEqualToString:@"Codex"]) {
+        NSImage *codex = CachedBundleIcon(@"com.openai.codex", nil);
+        if (codex) return codex;
+        return CachedBundleIcon(@"com.openai.chat", @"/Applications/ChatGPT.app");
+    }
+    return nil;
+}
+static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
+    NSImage *icon = AIProviderIcon(provider);
+    if (!icon) return nil;
+    NSImage *sized = [icon copy];
+    sized.size = NSMakeSize(pt, pt);
+    sized.template = NO;
+    return sized;
+}
+
 // The lead glyph for a provider. Missing symbols (older than the OS that shipped them)
 // fall back to a dashed circle so the column still lines up.
 - (NSString *)aiSymbolName:(NSString *)provider {
@@ -5797,7 +5943,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // Claude's row: the gauge and the number are the WEEKLY allowance across all models.
 // The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
 // indexing) takes the datum column; the reset clock is the datum otherwise.
-// The provider's name is not drawn: it leads the tooltip, same as storage and battery.
+// The provider's name sits beside its logo. The tooltip still leads with the name.
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
     (void)width; (void)pad;
     NSString *name = u.name.length ? u.name : @"AI";
@@ -5812,10 +5958,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
-    // Lead is the symbol, tinted with the value once that colour is known. The name stays
-    // on popover.ai.<slug>.name so focus restoration still finds this column.
-    NSImageView *mark = [self instrumentSymbol:[self aiSymbolName:name] tint:valueColor
-                                   identifier:[NSString stringWithFormat:@"popover.ai.%@.name", slug] in:row];
+    // The logo (or the SF Symbol, if the app is not installed) plus the provider name.
+    // popover.ai.<slug>.name stays on the text so focus restoration still finds it.
+    NSString *symbolID = [NSString stringWithFormat:@"popover.ai.%@.symbol", slug];
+    NSImage *logo = AIProviderLogo(name, kLeadSymbol);
+    NSImageView *mark = logo ? [self instrumentLogo:logo identifier:symbolID in:row]
+        : [self instrumentSymbol:[self aiSymbolName:name] tint:valueColor identifier:symbolID in:row];
+    NSTextField *nameField = [self instrumentName:name
+                                     identifier:[NSString stringWithFormat:@"popover.ai.%@.name", slug] in:row];
     ClaudeGauge *meter = nil;
     Gauge *plainGauge = nil;
     if (claudeMeter) {
@@ -5854,9 +6004,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [row addSubview:plainGauge];
     }
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
-    mark.contentTintColor = valueColor;
+    if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
     mark.accessibilityLabel = named;
+    nameField.toolTip = named;
+    nameField.accessibilityLabel = name;
     if (meter) meter.toolTip = named;
     if (plainGauge) plainGauge.toolTip = named;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
@@ -5906,6 +6058,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 }
 
 - (void)rebuildContent {
+    [self refreshChargeShortcutsIfStale];
     NSView *previousView = _popover.contentViewController.view;
     NSWindow *popoverWindow = previousView.window;
     NSDictionary *focusSnapshot = [self focusSnapshotForWindow:popoverWindow rootView:previousView];
@@ -5950,6 +6103,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                                               : DiskColor(v.fraction);
         [self instrumentSymbol:(v.isInternal ? @"internaldrive" : @"externaldrive")
                          tint:symbolTint identifier:@"popover.storage.symbol" in:row];
+        [self instrumentName:@"Storage" identifier:@"popover.storage.name" in:row];
         Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
         g.fraction = v.fraction;
         g.color = DiskColor(v.fraction);
@@ -5980,10 +6134,26 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         row.toolTip = tip;
         row.accessibilityLabel = tip;
         if (_bat.valid) {
-            [self instrumentSymbol:BatterySymbolName(_bat.percent, _bat.acConnected)
-                             tint:BattBarColor(_bat.percent) identifier:@"popover.battery.symbol" in:row];
+            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol
+                                                                                            weight:NSFontWeightRegular];
+            NSString *batterySymbol = BatterySymbolName(_bat.percent, _bat.acConnected);
+            NSImage *batteryImage = [[NSImage imageWithSystemSymbolName:batterySymbol accessibilityDescription:@"Charge limit"]
+                                     imageWithSymbolConfiguration:cfg];
+            NSButton *symbol = [NSButton buttonWithImage:batteryImage target:self action:@selector(toggleChargeLimit:)];
+            symbol.title = @"";
+            symbol.bordered = NO;
+            symbol.imagePosition = NSImageOnly;
+            symbol.imageScaling = NSImageScaleProportionallyDown;
+            symbol.contentTintColor = BattBarColor(_bat.percent);
+            symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
+            symbol.accessibilityIdentifier = @"popover.battery.symbol";
+            symbol.toolTip = [self chargeLimitTooltip];
+            symbol.accessibilityLabel = symbol.toolTip;
+            [row addSubview:symbol];
+            [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
             Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
             g.fraction = _bat.percent / 100.0;
+            g.markerFraction = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 0.80 : -1;
             g.color = BattBarColor(_bat.percent);
             g.metricLabel = @"Battery charge";
             g.accessibilityIdentifier = @"popover.battery.gauge";
@@ -5999,6 +6169,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         } else {
             [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
                        identifier:@"popover.battery.symbol" in:row];
+        [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
             NSTextField *value = [self instrumentValue:@"—" color:NSColor.tertiaryLabelColor
                                            identifier:@"popover.battery.value" in:row];
             value.toolTip = tip;
@@ -6020,6 +6191,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         row.accessibilityLabel = summary;
         [self instrumentSymbol:@"cpu" tint:SystemPressureColor(sysLevel)
                    identifier:@"popover.system.symbol" in:row];
+        [self instrumentName:@"System" identifier:@"popover.system.name" in:row];
         NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
         readout.frame = NSMakeRect(kGaugeX, (kRowH - kValueH) / 2.0, kW - kPad - kGaugeX, kValueH);
         readout.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -6218,13 +6390,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self settingsItem:m title:@"Claude transcript token totals" symbol:@"doc.text"
                     action:@selector(toggleClaudeTranscripts:)
                     on:[ud boolForKey:@"useClaudeTranscripts"]];
-    [self settingsItem:m title:@"Claude account via Keychain/API…" symbol:@"sparkle"
+    NSMenuItem *claudeAccount = [self settingsItem:m title:@"Claude account via Keychain/API…" symbol:@"sparkle"
                     action:@selector(toggleClaudeAccount:)
                     on:[ud boolForKey:@"useClaudeAccount"]];
-    if (CursorServicePresent(GBHomeDirectory()))
-        [self settingsItem:m title:@"Cursor account via local session/API…" symbol:@"cursorarrow.rays"
+    NSImage *claudeLogo = AIProviderLogo(@"Claude", 16);
+    if (claudeLogo) claudeAccount.image = claudeLogo;
+    if (CursorServicePresent(GBHomeDirectory())) {
+        NSMenuItem *cursorAccount = [self settingsItem:m title:@"Cursor account via local session/API…" symbol:@"cursorarrow.rays"
                         action:@selector(toggleCursorAccount:)
                         on:[ud boolForKey:@"useCursorAccount"]];
+        NSImage *cursorLogo = AIProviderLogo(@"Cursor", 16);
+        if (cursorLogo) cursorAccount.image = cursorLogo;
+    }
 
     [m addItem:NSMenuItem.separatorItem];
     SMAppServiceStatus loginStatus = SMAppService.mainAppService.status;
@@ -6547,10 +6724,16 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     CGFloat textX = kDetailPad;
     CGFloat textY = *y;
     NSString *symbol = [self detailHeadingSymbolForTitle:title key:sectionKey];
-    if (symbol.length) {
-        NSImageView *mark = [NSImageView imageViewWithImage:[self menuSymbol:symbol]];
+    NSString *provider = nil;
+    NSString *headingKey = sectionKey.lowercaseString ?: @"";
+    if ([headingKey hasSuffix:@".claude"] || [title isEqualToString:@"Claude"]) provider = @"Claude";
+    else if ([headingKey hasSuffix:@".codex"] || [title isEqualToString:@"Codex"]) provider = @"Codex";
+    else if ([headingKey hasSuffix:@".cursor"] || [title isEqualToString:@"Cursor"]) provider = @"Cursor";
+    NSImage *providerLogo = provider ? AIProviderLogo(provider, 16) : nil;
+    if (symbol.length || providerLogo) {
+        NSImageView *mark = [NSImageView imageViewWithImage:(providerLogo ?: [self menuSymbol:symbol])];
         mark.imageScaling = NSImageScaleProportionallyDown;
-        mark.contentTintColor = tint ?: NSColor.secondaryLabelColor;
+        mark.contentTintColor = providerLogo ? nil : (tint ?: NSColor.secondaryLabelColor);
         mark.frame = NSMakeRect(kDetailPad, *y, 16, 16);
         mark.accessibilityElement = NO;   // the heading text is the accessible name
         if (tip.length) mark.toolTip = tip;
@@ -6645,7 +6828,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if ([identifier isEqualToString:@"storage"]) return @"internaldrive";
     if ([identifier isEqualToString:@"battery"]) return @"battery.100";
     if ([identifier isEqualToString:@"system"]) return @"cpu";
-    if ([identifier isEqualToString:@"ai"]) return @"sparkle";
+    if ([identifier isEqualToString:@"ai"]) return @"sparkle";   // the section, not one provider
     return @"circle.dashed";
 }
 
@@ -6659,6 +6842,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     item.identifier = identifier;
     item.label = title;
     item.image = [self menuSymbol:[self detailTabSymbol:identifier]];
+    // The AI tab is the section. Its image is not one provider's logo; each provider
+    // row inside the tab carries that app's icon.
     return item;
 }
 
@@ -6680,10 +6865,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return controller;
 }
 
-// Details columns, shared by every tab. The gauge takes the width left between the
-// lead (symbol, or an indented window label) and the fixed value and datum columns.
-// Storage spends some of that gauge on a volume name; capacity and the reveal button
-// sit in the trailing part of the datum column, so values still share an x.
+// Details columns, shared by every tab. Lead is the symbol plus a name column
+// ("Macintosh HD", "Battery", "Claude"); the gauge starts after that name so every
+// instrument lines up. Window labels sit in the same name column. Capacity and the
+// reveal button sit in the trailing part of the datum column, so values still share an x.
 static const CGFloat kDetailRowH = 32;
 static const CGFloat kDetailGaugeH = 10;
 static const CGFloat kDetailBarH = 4;
@@ -6711,9 +6896,10 @@ static DetailColumns DetailLayout(CGFloat width) {
     c.freeW = 116;
     c.capW = 56;
     c.revealW = 24;
-    c.labelX = kDetailPad + 14;
-    c.labelW = 78;   // "Fable", "bengalfox": the window label has to fit on one line
-    c.gaugeX = c.labelX + c.labelW + c.gap;
+    c.nameX = kDetailPad + kLeadW + 6;
+    c.nameW = 120;   // "Macintosh HD" at 13pt, and "bengalfox" on a window row
+    c.labelX = c.nameX;
+    c.labelW = c.nameW;
     CGFloat right = width - kDetailPad;
     c.revealX = right - c.revealW;
     c.capX = c.revealX - 6 - c.capW;
@@ -6722,11 +6908,10 @@ static DetailColumns DetailLayout(CGFloat width) {
     c.trailW = right - c.datumX;   // storage keeps freeW; every other datum runs to the margin
     c.valueX = c.datumX - c.gap - c.valueW;
     c.gaugeRight = c.valueX - c.gap;
-    c.gaugeW = MAX(32.0, c.gaugeRight - c.gaugeX);
-    c.nameX = kDetailPad + kLeadW + 6;
-    c.nameW = 120;
     c.storageGaugeX = c.nameX + c.nameW + c.gap;
-    c.storageGaugeW = MAX(32.0, c.gaugeRight - c.storageGaugeX);
+    c.gaugeX = c.storageGaugeX;
+    c.gaugeW = MAX(32.0, c.gaugeRight - c.gaugeX);
+    c.storageGaugeW = c.gaugeW;
     c.barNameX = kDetailPad;
     c.barNameW = 172;
     c.barX = c.barNameX + c.barNameW + c.gap;
@@ -6928,6 +7113,8 @@ static NSColor *HealthColor(double fraction) {
 // appended here the way the narrow popover datum sometimes does.
 - (NSString *)batteryDetailDatum {
     if (!_bat.valid) return @"";
+    if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
+        return @"held 80%";
     if (!_bat.acConnected) {
         if (_bat.percent <= 20) return @"reserve";
         int minutes = MinutesTo20(_bat, [self avgAmp]);
@@ -6993,11 +7180,22 @@ static NSColor *HealthColor(double fraction) {
         named = [named stringByAppendingFormat:@"\n%@", u.statusSource];
 
     NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:named in:root];
-    NSImageView *mark = [self detailSymbol:[self aiSymbolName:name] size:c.symbol tint:valueColor
-                                     frame:DetailLeadRect(c)
-                                identifier:[stem stringByAppendingString:@".symbol"] in:row];
+    NSImage *logo = AIProviderLogo(name, c.symbol);
+    NSImageView *mark = logo
+        ? [self detailSymbol:[self aiSymbolName:name] size:c.symbol tint:nil frame:DetailLeadRect(c)
+                  identifier:[stem stringByAppendingString:@".symbol"] in:row]
+        : [self detailSymbol:[self aiSymbolName:name] size:c.symbol tint:valueColor frame:DetailLeadRect(c)
+                  identifier:[stem stringByAppendingString:@".symbol"] in:row];
+    if (logo) { mark.image = logo; mark.contentTintColor = nil; }
     mark.toolTip = named;
     mark.accessibilityLabel = named;
+    NSTextField *providerName = [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                           color:NSColor.labelColor
+                                           frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                           align:NSTextAlignmentLeft
+                                      identifier:[stem stringByAppendingString:@".name"] in:row];
+    providerName.toolTip = named;
+    providerName.accessibilityLabel = name;
     if (claudeMeter) {
         ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:DetailGaugeRect(c)];
         meter.opus = week;   // weekly all-models figure; Fable stays off this gauge
@@ -7024,7 +7222,8 @@ static NSColor *HealthColor(double fraction) {
         NSDate *reset = u.resetAt;
         if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
             reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
-        datum = CompactResetClock(reset, NSDate.date) ?: @"";
+        NSString *clock = CompactResetClock(reset, NSDate.date);
+        datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
     }
     [self detailDatum:datum color:datumColor identifier:[stem stringByAppendingString:@".datum"] tip:named in:row cols:c];
     return y + c.rowH;
@@ -7034,12 +7233,6 @@ static NSColor *HealthColor(double fraction) {
     NSString *slug = (u.name.length ? u.name : @"AI").lowercaseString;
     NSArray *windows = u.limitWindows ?: @[];
     NSArray<NSString *> *labels = DetailWindowLabels(windows);
-    NSString *problem = [self aiProblemText:u];
-    NSColor *problemColor = nil;
-    if (problem.length) {
-        BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
-        problemColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
-    }
     for (NSUInteger i = 0; i < windows.count; i++) {
         NSDictionary *w = [windows[i] isKindOfClass:NSDictionary.class] ? windows[i] : @{};
         NSString *label = i < labels.count ? labels[i] : @"—";
@@ -7051,10 +7244,13 @@ static NSColor *HealthColor(double fraction) {
         NSString *pct = hasFrac ? [NSString stringWithFormat:@"%d%%", (int)lround(frac * 100.0)] : @"—";
         NSDate *resetDate = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? [NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]] : nil;
-        NSString *reset = CompactResetClock(resetDate, NSDate.date) ?: @"";
-        NSColor *color = problemColor ?: (hasFrac ? [self windowColor:frac] : NSColor.tertiaryLabelColor);
+        NSString *clock = CompactResetClock(resetDate, NSDate.date);
+        NSString *reset = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
+        // Each window is coloured by its own remaining fraction. A full window stays
+        // green even when the provider row is amber or red.
+        NSColor *color = hasFrac ? AIQuotaColor(MIN(1.0, MAX(0.0, frac))) : NSColor.tertiaryLabelColor;
         NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@ left", full, pct];
-        if (reset.length) [tip appendFormat:@" · resets %@", reset];
+        if (clock.length) [tip appendFormat:@" · resets %@", clock];
         else if ([w[@"fresh"] boolValue]) [tip appendString:@" · not started"];
         NSString *rowID = [NSString stringWithFormat:@"details.ai.window.%@.%lu", slug, (unsigned long)i];
         NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
@@ -7068,7 +7264,7 @@ static NSColor *HealthColor(double fraction) {
             [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
                    identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
         [self detailValue:pct color:color identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
-        [self detailDatum:reset color:(problemColor ?: NSColor.secondaryLabelColor)
+        [self detailDatum:reset color:NSColor.secondaryLabelColor
                identifier:[rowID stringByAppendingString:@".datum"] tip:tip in:row cols:c];
         y += c.rowH;
     }
@@ -7112,8 +7308,11 @@ static NSColor *HealthColor(double fraction) {
     NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
     CGFloat mark = 16;
     NSRect symbol = NSMakeRect(kDetailPad + (kLeadW - mark) / 2.0, (c.rowH - mark) / 2.0, mark, mark);
-    NSImageView *glyph = [self detailSymbol:[self aiSymbolName:u.name] size:mark tint:NSColor.tertiaryLabelColor
+    NSImage *logo = AIProviderLogo(u.name, mark);
+    NSImageView *glyph = [self detailSymbol:[self aiSymbolName:u.name] size:mark
+                                       tint:(logo ? nil : NSColor.tertiaryLabelColor)
                                       frame:symbol identifier:[rowID stringByAppendingString:@".symbol"] in:row];
+    if (logo) { glyph.image = logo; glyph.contentTintColor = nil; }
     glyph.toolTip = tip;
     glyph.accessibilityLabel = tip;
     NSString *todayText = u.todayTokens > 0 ? FmtCompact(u.todayTokens) : @"—";
@@ -7194,6 +7393,13 @@ static NSColor *HealthColor(double fraction) {
                                           size:c.symbol tint:tint frame:DetailLeadRect(c)
                                     identifier:@"details.overview.storage.symbol" in:row];
         mark.toolTip = tip;
+        NSTextField *volumeName = [self detailText:(v.name.length ? v.name : @"Disk")
+                                               font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                              color:NSColor.labelColor
+                                              frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                              align:NSTextAlignmentLeft
+                                         identifier:@"details.overview.storage.name" in:row];
+        volumeName.toolTip = tip;
         [self detailGauge:DetailGaugeRect(c) fraction:v.fraction color:DiskColor(v.fraction)
                     label:[NSString stringWithFormat:@"%@ storage used", v.name]
                identifier:@"details.overview.storage.gauge" tip:tip in:row];
@@ -7212,8 +7418,16 @@ static NSColor *HealthColor(double fraction) {
                                               tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
                                         identifier:@"details.overview.battery.symbol" in:row];
             mark.toolTip = tip;
-            [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
+            NSTextField *batteryName = [self detailText:@"Battery"
+                                                    font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                                   color:NSColor.labelColor
+                                                   frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                                   align:NSTextAlignmentLeft
+                                              identifier:@"details.overview.battery.name" in:row];
+            batteryName.toolTip = tip;
+            Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
                         label:@"Battery charge" identifier:@"details.overview.battery.gauge" tip:tip in:row];
+            if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
             [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
                    identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
             [self detailDatum:[self batteryDatumText] color:NSColor.secondaryLabelColor
@@ -7221,6 +7435,10 @@ static NSColor *HealthColor(double fraction) {
         } else {
             [self detailSymbol:@"battery.0" size:c.symbol tint:NSColor.tertiaryLabelColor frame:DetailLeadRect(c)
                     identifier:@"details.overview.battery.symbol" in:row];
+            [self detailText:@"Battery" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                       color:NSColor.labelColor
+                       frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                       align:NSTextAlignmentLeft identifier:@"details.overview.battery.name" in:row];
             [self detailValue:@"—" color:NSColor.tertiaryLabelColor
                    identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
         }
@@ -7234,6 +7452,13 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:@"cpu" size:c.symbol tint:SystemPressureColor(level)
                                          frame:DetailLeadRect(c) identifier:@"details.overview.system.symbol" in:row];
         mark.toolTip = tip;
+        NSTextField *systemName = [self detailText:@"System"
+                                               font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                              color:NSColor.labelColor
+                                              frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                              align:NSTextAlignmentLeft
+                                         identifier:@"details.overview.system.name" in:row];
+        systemName.toolTip = tip;
         NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
         readout.frame = NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, c.width - kDetailPad - c.gaugeX, c.valueH);
         readout.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -7398,8 +7623,9 @@ static NSColor *HealthColor(double fraction) {
                                           tint:BattBarColor(_bat.percent) frame:DetailLeadRect(c)
                                     identifier:@"details.battery.charge.symbol" in:row];
         mark.toolTip = tip;
-        [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
+        Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
                     label:@"Battery charge" identifier:@"details.battery.charge.gauge" tip:tip in:row];
+        if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
         [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
                identifier:@"details.battery.charge.value" tip:tip in:row cols:c];
         [self detailDatum:[self batteryDetailDatum] color:NSColor.secondaryLabelColor

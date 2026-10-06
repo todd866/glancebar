@@ -1697,6 +1697,29 @@ int main(void) {
             check([CompactResetClock(at(21, 9, 0), now) isEqual:@"21 Jun"],
                   @"reset clock: past this week is the day and month, not a weekday");
         }
+        {
+            NSDate *now = [NSDate dateWithTimeIntervalSince1970:1700000000];
+            NSDate *recent = [now dateByAddingTimeInterval:-3600];
+            NSDate *just = [now dateByAddingTimeInterval:-(24 * 60 * 60) + 1];
+            NSDate *expired = [now dateByAddingTimeInterval:-(24 * 60 * 60)];
+            check([ChargeModeEffective(nil, nil, now) isEqual:@"limit80"],
+                  @"charge mode: unknown is the 80% limit");
+            check([ChargeModeEffective(@"limit80", expired, now) isEqual:@"limit80"],
+                  @"charge mode: limit80 does not expire");
+            check([ChargeModeEffective(@"full", recent, now) isEqual:@"full"] &&
+                  [ChargeModeEffective(@"full", just, now) isEqual:@"full"],
+                  @"charge mode: full holds until 24 hours");
+            check([ChargeModeEffective(@"full", expired, now) isEqual:@"limit80"] &&
+                  [ChargeModeEffective(@"full", nil, now) isEqual:@"limit80"],
+                  @"charge mode: full expires after 24 hours, or with no timestamp");
+            check([ChargeModeEffective(@"other", recent, now) isEqual:@"limit80"],
+                  @"charge mode: an unrecognised value is the 80% limit");
+            check(ChargeHeld(YES, NO, 80, @"limit80") && ChargeHeld(YES, NO, 79, @"limit80"),
+                  @"charge held: plugged, idle, and at least 79%");
+            check(!ChargeHeld(YES, NO, 78, @"limit80") && !ChargeHeld(YES, YES, 90, @"limit80") &&
+                  !ChargeHeld(NO, NO, 100, @"limit80") && !ChargeHeld(YES, NO, 100, @"full"),
+                  @"charge held: charging, unplugged, below 79, or full mode is not the hold");
+        }
         check([CompactByteCount(220250000000LL) isEqual:@"220 GB"],
               @"storage: free space at or above 100 GB has no decimal");
         check([CompactByteCount(89400000000LL) isEqual:@"89.4 GB"],

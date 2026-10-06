@@ -245,6 +245,8 @@ int main(int argc, const char **argv) {
             fabs(lowOpus.greenComponent-amber.greenComponent)>0.03 ||
             fabs(lowOpus.blueComponent-amber.blueComponent)>0.03) return Fail(__LINE__);
         Controller *c = [Controller new];
+        [c setValue:@"limit80" forKey:@"chargeMode"];
+        [c setValue:@YES forKey:@"chargeModeLoaded"];
         NSPopover *p = [NSPopover new];
         p.contentViewController = [NSViewController new];
         [c setValue:p forKey:@"popover"];
@@ -325,26 +327,54 @@ int main(int argc, const char **argv) {
             fabs(FindIdentifier(root, @"popover.storage.value").frame.origin.x - kValueX) > 0.5 ||
             fabs(FindIdentifier(root, @"popover.storage.datum").frame.origin.x - kDatumX) > 0.5)
             return Fail(__LINE__);
-        // Provider names are the lead symbol, not a text field. The name leads the tooltip.
+        // Machine rows stay symbol-only. AI rows add the provider name beside the logo,
+        // and every symbol still shares the lead column.
         NSView *storageSymbol = FindIdentifier(root, @"popover.storage.symbol");
-        NSArray *leads = @[
+        NSButton *batterySymbol = (NSButton *)FindIdentifier(root, @"popover.battery.symbol");
+        NSArray *symbols = @[
             storageSymbol,
-            FindIdentifier(root, @"popover.battery.symbol"),
+            batterySymbol,
             FindIdentifier(root, @"popover.system.symbol"),
-            FindIdentifier(root, @"popover.ai.claude.name"),
-            FindIdentifier(root, @"popover.ai.codex.name"),
-            FindIdentifier(root, @"popover.ai.cursor.name"),
+            FindIdentifier(root, @"popover.ai.claude.symbol"),
+            FindIdentifier(root, @"popover.ai.codex.symbol"),
+            FindIdentifier(root, @"popover.ai.cursor.symbol"),
         ];
-        for (NSView *lead in leads) {
-            if (![lead isKindOfClass:NSImageView.class] || !SameColumn(storageSymbol, lead) ||
-                !SameSize(storageSymbol, lead)) return Fail(__LINE__);
+        for (NSView *lead in symbols) {
+            if (!lead || !SameColumn(storageSymbol, lead) || !SameSize(storageSymbol, lead)) return Fail(__LINE__);
         }
+        if (![storageSymbol isKindOfClass:NSImageView.class]) return Fail(__LINE__);
+        if (![batterySymbol isKindOfClass:NSButton.class] || batterySymbol.action == NULL) return Fail(__LINE__);
+        NSPoint symbolMid = [batterySymbol convertPoint:NSMakePoint(NSMidX(batterySymbol.bounds),
+                                                                     NSMidY(batterySymbol.bounds))
+                                                  toView:batterySymbol.superview.superview];
+        NSView *symbolHit = [batterySymbol.superview hitTest:symbolMid];
+        if (symbolHit != batterySymbol) return Fail(__LINE__);
+        Gauge *batteryMeter = (Gauge *)batteryGauge;
+        if (![batteryMeter isKindOfClass:Gauge.class] || fabs(batteryMeter.markerFraction - 0.80) > 0.001)
+            return Fail(__LINE__);
         if (fabs(storageSymbol.frame.origin.x - kPad) > 0.5 ||
             fabs(storageSymbol.frame.size.width - kLeadW) > 0.5 ||
             fabs(storageSymbol.frame.size.height - kLeadSymbol) > 0.5) return Fail(__LINE__);
-        if (HasText(root, @"Claude") || HasText(root, @"Codex") || HasText(root, @"Cursor") ||
-            !HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
+        NSTextField *claudeName = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.name");
+        NSTextField *codexName = (NSTextField *)FindIdentifier(root, @"popover.ai.codex.name");
+        NSTextField *cursorName = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.name");
+        if (![claudeName isKindOfClass:NSTextField.class] || ![claudeName.stringValue isEqual:@"Claude"] ||
+            ![codexName.stringValue isEqual:@"Codex"] || ![cursorName.stringValue isEqual:@"Cursor"] ||
+            !SameColumn(claudeName, codexName) || !SameColumn(claudeName, cursorName) ||
+            fabs(claudeName.frame.origin.x - kAINameX) > 0.5)
             return Fail(__LINE__);
+        // Every row names itself, in one column with the AI names.
+        NSTextField *popStorageName = (NSTextField *)FindIdentifier(root, @"popover.storage.name");
+        NSTextField *popBatteryName = (NSTextField *)FindIdentifier(root, @"popover.battery.name");
+        NSTextField *popSystemName = (NSTextField *)FindIdentifier(root, @"popover.system.name");
+        if (![popStorageName.stringValue isEqual:@"Storage"] || ![popBatteryName.stringValue isEqual:@"Battery"] ||
+            ![popSystemName.stringValue isEqual:@"System"] || !SameColumn(popStorageName, claudeName) ||
+            !SameColumn(popBatteryName, claudeName) || !SameColumn(popSystemName, claudeName))
+            return Fail(__LINE__);
+        if (!HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
+            return Fail(__LINE__);
+        NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");
+        if (![claudeDatum.stringValue hasPrefix:@"resets "]) return Fail(__LINE__);
         NSView *output = FindIdentifier(root, @"popover.sound");
         if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) ||
             ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
@@ -356,12 +386,14 @@ int main(int argc, const char **argv) {
         NSButton *keepButton = (NSButton *)keep, *lowButton = (NSButton *)low, *moreButton = (NSButton *)more;
         if (![keepButton isKindOfClass:NSButton.class] || ![lowButton isKindOfClass:NSButton.class] ||
             ![moreButton isKindOfClass:NSButton.class]) return Fail(__LINE__);
-        if (keepButton.title.length || lowButton.title.length || moreButton.title.length ||
-            !keepButton.image || !lowButton.image || !moreButton.image) return Fail(__LINE__);
+        if (![keepButton.title isEqual:@"Keep Awake"] || ![lowButton.title isEqual:@"Low Power"] ||
+            moreButton.title.length || !keepButton.image || !lowButton.image || !moreButton.image)
+            return Fail(__LINE__);
         if (fabs(keepButton.frame.origin.x - kPad) > 0.5 ||
             fabs(NSMinX(lowButton.frame) - NSMaxX(keepButton.frame) - kToggleGap) > 0.5 ||
             fabs(NSMaxX(moreButton.frame) - (kW - kPad)) > 0.5 ||
-            fabs(keepButton.frame.size.width - kToggleW) > 0.5 ||
+            fabs(keepButton.frame.size.width - kKeepW) > 0.5 ||
+            fabs(lowButton.frame.size.width - kLowW) > 0.5 ||
             fabs(keepButton.frame.size.height - kToggleH) > 0.5) return Fail(__LINE__);
         if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
             !FitsChildren(keep.superview)) return Fail(__LINE__);
@@ -444,6 +476,32 @@ int main(int argc, const char **argv) {
                 return Fail(__LINE__);
         }
         if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
+        NSTextField *volumeName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.storage.name");
+        NSTextField *batteryName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.battery.name");
+        NSTextField *systemName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.system.name");
+        if (![volumeName.stringValue isEqual:@"Macintosh HD"] || ![batteryName.stringValue isEqual:@"Battery"] ||
+            ![systemName.stringValue isEqual:@"System"] || !SameColumn(volumeName, batteryName) ||
+            !SameColumn(volumeName, systemName)) return Fail(__LINE__);
+        NSTextField *detailClaude = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.claude.name");
+        NSTextField *overviewClaude = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.ai.claude.name");
+        if (![detailClaude.stringValue isEqual:@"Claude"] || ![overviewClaude.stringValue isEqual:@"Claude"] ||
+            !SameColumn(volumeName, detailClaude) || !SameColumn(volumeName, overviewClaude))
+            return Fail(__LINE__);
+        NSTextField *windowDatum = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.window.claude.0.datum");
+        NSTextField *providerDatum = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.claude.datum");
+        if (![windowDatum.stringValue hasPrefix:@"resets "] || ![providerDatum.stringValue hasPrefix:@"resets "])
+            return Fail(__LINE__);
+        Gauge *fullWindow = (Gauge *)FindIdentifier(ai.documentView, @"details.ai.window.codex.1.gauge");
+        Gauge *lowWindow = (Gauge *)FindIdentifier(ai.documentView, @"details.ai.window.codex.0.gauge");
+        Gauge *overviewCharge = (Gauge *)FindIdentifier(overview.documentView, @"details.overview.battery.gauge");
+        if (![fullWindow isKindOfClass:Gauge.class] || ![lowWindow isKindOfClass:Gauge.class] ||
+            fabs(overviewCharge.markerFraction - 0.80) > 0.001) return Fail(__LINE__);
+        __block BOOL fullGreen = NO, lowRed = NO;
+        [[NSAppearance appearanceNamed:NSAppearanceNameAqua] performAsCurrentDrawingAppearance:^{
+            fullGreen = Green([fullWindow.color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace]);
+            lowRed = Red([lowWindow.color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace]);
+        }];
+        if (!fullGreen || !lowRed) return Fail(__LINE__);
         for (NSString *ident in @[@"details.overview.row.storage", @"details.overview.row.battery",
                                   @"details.overview.row.system", @"details.overview.row.ai.claude",
                                   @"details.overview.row.ai.codex", @"details.overview.row.ai.cursor"])

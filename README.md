@@ -13,11 +13,13 @@
 ## Overview
 
 Glancebar puts the numbers that ruin your day in one compact menu bar item
-(`💾 61%  🔋 76%` by default). Click it for a single native popover laid out like
-an instrument panel: one row each for storage, battery, and system, a mini player,
-and one quota row per AI provider. Every row leads with the same SF Symbol.
-Colour, that symbol, and the gauge carry the state; names, dates, and breakdowns
-sit on the row's tooltip.
+(`💾 61%  🔋 76%` by default). The bar draws the same SF Symbols as the popover:
+internal or external drive, `battery.N` (with a bolt while plugged in), and `cpu`,
+at menu-bar size. Click it for a single native popover laid out like an instrument
+panel: one row each for storage, battery, and system, a mini player, and one quota
+row per AI provider. Machine rows lead with the symbol. AI rows lead with that
+provider's own app icon and its name. Colour, the symbol, and the gauge carry the
+state; the longer explanation sits on the row's tooltip.
 A **Details…** window repeats those symbols on its tabs and section headings, and
 keeps the fuller lists there without crowding the popover.
 
@@ -31,11 +33,11 @@ opt-in) `/usr/bin/security`.
 ## Features
 
 - **Storage** — one row for the boot volume: percent used, a gauge (orange past 85%, red past 95%), and free space in short units. Finder-accurate free space counts purgeable data as free. Another mount over 85% full tints the symbol and is named on the tooltip, which also carries the volume name, capacity, and purgeable share. The row opens the Storage tab; every other volume stays in Details.
-- **Battery** — one row: charge percent, a gauge, and either time until 20% (`2:43 to 20%`, or `…` while estimating), charging watts (`+1.4 W`, hidden when Current draw is off), or `AC` when plugged in and not charging. The symbol is the charge level, with a bolt while plugged in. Health and cycle count are on the tooltip; with Health on, the datum also gains `· 93%` when the column fits. The row opens the Battery tab, where sampled energy impact still lives.
+- **Battery** — one row: charge percent, a gauge, and either time until 20% (`2:43 to 20%`, or `…` while estimating), charging watts (`+1.4 W`, hidden when Current draw is off), or `AC` when plugged in and not charging. The symbol is the charge level, with a bolt while plugged in. While the charge limit is held at 80% the gauge has a tick at 80%, and a plugged-in battery that has stopped there reads `held 80%`. Clicking the battery symbol runs the Shortcuts actions `Glancebar Charge 80` and `Glancebar Charge Full` (macOS 26 Set Charge Limit; full lasts until tomorrow). If those shortcuts are not installed, the click opens Battery settings. Health and cycle count are on the row's tooltip; with Health on, the datum also gains `· 93%` when the column fits. The rest of the row opens the Battery tab, where sampled energy impact still lives.
 - **Sound** — one control-bar row, not a device name. Previous, play, and next sit on the left and the current output's symbol on the right, centred in the row; the track (or "Liked Music" before anything is loaded) and a subtitle sit in the middle. A click cycles to the next output, in the same order as the device menu (virtual devices stay off the list unless they are already the default); a right-click or Option-click opens that menu, and so does a click when there is only one output. Choosing one sets the system output and the alert sound. **Switch to new outputs** (on by default, under ⋯) makes a newly connected Bluetooth, USB, or HDMI/DisplayPort device the default, including a Bluetooth speaker that appears as an input a moment before its output. Headphones are headphones or AirPods only; a Bluetooth speaker stays a speaker; HDMI is a display. Sound is not a menu bar segment.
 - **Play music** — play starts your YouTube Music Liked Music, shuffled, from a random song, in the signed-in Google Chrome profile and without bringing Chrome forward. Previous and next are always there, dimmed until a track is loaded. The subtitle is `Artist · 1:23 / 4:03` while something is playing (the clock advances once a second from the last reading) and, when nothing is loaded, `Shuffle · YouTube Music`, `Shuffle · N offline`, or `No offline music`. While the popover is open, Glancebar re-reads the tab every few seconds. Shuffle is turned on when Glancebar starts playback, not on every refresh. If Chrome is not set to allow JavaScript from Apple Events, the buttons fall back to the system media key and one line under the row says how to turn that on. If Glancebar is not allowed to control Chrome, it says so and will not keep opening tabs. Offline, or if Chrome cannot open, the same buttons play the m4a files in `~/Music/YouTube Liked/` through Glancebar’s own player, shuffled. Glancebar does not fetch YouTube itself.
 - **System** — one row: CPU percent, memory pressure (the kernel's own verdict, not a heuristic), and swap, with the symbol and the pressure word coloured by that verdict. The full sentence is the tooltip. The row opens the System tab, which keeps the process breakdowns. Memory and swap are reported in binary units and by Activity Monitor's own "used" formula, so the figures match the tool you would check them against.
-- **AI status** — one row per provider (Claude, Codex, Cursor): the provider's symbol in the lead column, tinted the same colour as the percent left, then a gauge, that percent, and a compact reset (`21:00` today, `Sat` or `Sat 07:02` this week, `3 Nov` later). The name leads the tooltip (`Claude — …`). Codex's official remaining-quota percentage comes from its own session logs, kept apart per allowance bucket so a spent plan window is never hidden behind an untouched side bucket; where requests bill once the plan is spent stays on the tooltip ("Requests now bill to credits · none available"). Claude keeps its dual meter for the weekly allowance across all models (the 5-hour window is on the tooltip and in Details, never a second number). Cursor is the opt-in included-plan gauge. A problem takes the datum instead — `signed out`, `rate limited`, `stale 2h`, `indexing 95%` — in amber or red, with the full reason on the tooltip. Live per-day token totals, sessions, messages, tool calls and the per-model split stay in Details.
+- **AI status** — one row per provider (Claude, Codex, Cursor): the provider's own app icon (Claude, Cursor, or Codex / ChatGPT, read from the installed app; the old SF Symbol if it is not installed), then the name, a gauge, the percent left, and a reset that says what it is (`resets 21:00`, `resets Wed`, `resets 3 Nov`). The same icon and name are used on the Details rows and on the AI items in the ⋯ menu. Codex's official remaining-quota percentage comes from its own session logs, kept apart per allowance bucket so a spent plan window is never hidden behind an untouched side bucket; where requests bill once the plan is spent stays on the tooltip ("Requests now bill to credits · none available"). Claude keeps its dual meter for the weekly allowance across all models (the 5-hour window is on the tooltip and in Details, never a second number). Each window in Details is coloured by its own remaining fraction, so a full window stays green when another window is spent. Cursor is the opt-in included-plan gauge. A problem takes the datum instead — `signed out`, `rate limited`, `stale 2h` — in amber or red, with the full reason on the tooltip. Live per-day token totals, sessions, messages, tool calls and the per-model split stay in Details.
 - **Configurable glance** — choose which menu-bar segments appear: storage, battery,
   and/or system. AI status is deliberately not among them: a single percentage in the bar
   cannot say which pool it belongs to, and the pool with the least left is rarely the one
@@ -48,9 +50,9 @@ opt-in) `/usr/bin/security`.
   the hover tooltip always carry the full summary at every width.
   Recovery includes free space before neighboring status items, which macOS moves
   left as Glancebar grows, so a packed row cannot trap it in the collapsed state.
-- **Keep Awake and Low Power** — the popover's footer holds two icon toggles, the cup and the
-  tortoise, the same symbols the menu bar uses for those modes. The words and on/off state
-  are on each tooltip. They always match the menu bar because both read the same live system setting.
+- **Keep Awake and Low Power** — the popover's footer holds two labelled toggles, icon beside
+  the words "Keep Awake" and "Low Power", the same symbols the menu bar uses for those modes.
+  The pill fill shows on or off; the longer explanation is on each tooltip. They always match the menu bar because both read the same live system setting.
   *Keep Awake* stops the Mac sleeping at all — idle or with the lid closed (the display
   still sleeps) — by setting `pmset disablesleep`; a cup replaces the battery glyph while it's
   on, and Glancebar switches it off when it quits. *Low Power* flips macOS Low Power Mode for
@@ -66,7 +68,7 @@ opt-in) `/usr/bin/security`.
   helper, and no network requests unless you opt in. The only `sudo`-level actions are the
   Keep Awake and Low Power switches, through the optional four-command rule or the standard admin prompt.
 
-The main popover is one row per instrument: boot-volume storage, battery, CPU / memory / swap, the mini player, and one quota row per AI provider. Claude's gauge is still the weekly allowance across all models, drawn as two full-height fills on the same scale. Within three percentage points it uses thin lanes: Fable above, Opus below. Each changes colour independently; both are green after a full reset. A subtle boundary keeps different endpoints visible when both have the same colour. When no separate Opus quota is reported, its fill uses the shared allowance (identified on hover). A storage, battery, or system row opens the matching Details tab. Those tabs, and each instrument's section heading inside them, use the same symbol as the popover row. **Details…** keeps every volume, process breakdowns, every quota window, and diagnostics. The ⋯ button's tooltip includes the last refresh times, and each item in that menu carries its symbol.
+The main popover is one row per instrument: boot-volume storage, battery, CPU / memory / swap, the mini player, and one quota row per AI provider. Claude's gauge is still the weekly allowance across all models, drawn as two full-height fills on the same scale. Within three percentage points it uses thin lanes: Fable above, Opus below. Each changes colour independently; both are green after a full reset. A subtle boundary keeps different endpoints visible when both have the same colour. When no separate Opus quota is reported, its fill uses the shared allowance (identified on hover). A storage, battery, or system row opens the matching Details tab; the battery symbol itself toggles the charge limit. Those tabs use the same symbols as the popover. Overview names the boot volume, Battery, and System in the lead column; AI rows name the provider beside its app icon. **Details…** keeps every volume, process breakdowns, every quota window, and diagnostics. The ⋯ button's tooltip includes the last refresh times, and each item in that menu carries its symbol — the provider's own icon on the AI account items.
 
 ## Build & Install
 
@@ -142,7 +144,11 @@ stale account refresh is reported as `ai.account` and is strict-partial.
   (`availableBytes`, `physicalAvailableBytes`, `purgeableBytes`).
 - **Battery** — the IORegistry `AppleSmartBattery` entry (charge, charging state, raw mAh
   capacity, amperage, voltage, cycle count, smoothed time-to-empty). The menu bar updates
-  instantly on plug/unplug via an `IOPSNotification`, otherwise every 15s.
+  instantly on plug/unplug via an `IOPSNotification`, otherwise every 15s. The 80% charge
+  limit is not a private API: Glancebar runs two Shortcuts you create with the macOS 26
+  "Set Charge Limit" action, `Glancebar Charge 80` and `Glancebar Charge Full`, via
+  `/usr/bin/shortcuts`. It remembers which one ran last. Full is treated as expired after
+  24 hours, which is as long as "until tomorrow" lasts.
 - **Time until 20%** — macOS's smoothed minutes-to-empty scaled by `(charge − 20)/charge`,
   with an amperage-based fallback.
 - **Sampled energy impact** — `top -l 2 -stats pid,command,power`, reading the second sample,

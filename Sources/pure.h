@@ -520,6 +520,11 @@ NSString *NextOutputUID(NSArray<NSDictionary *> *menuDevices, NSString *currentU
 // changes width with the locale: "21:00" today, "Sat" at midnight or "Sat 07:02"
 // within six days, "3 Nov" after that. Nil when resetAt is nil.
 NSString *CompactResetClock(NSDate *resetAt, NSDate *now);
+// Last charge-limit command, after Apple's "until tomorrow" expiry. "full" lasts 24h
+// from storedAt; missing, unknown, or an expired full reads as "limit80".
+NSString *ChargeModeEffective(NSString *storedMode, NSDate *storedAt, NSDate *now);
+// Plugged in, not charging, held at the 80% limit, and still at that plateau.
+BOOL ChargeHeld(BOOL plugged, BOOL charging, int percent, NSString *mode);
 // "220 GB" at or above 100 of the unit, "89.4 GB" below. Decimal, like Finder.
 NSString *CompactByteCount(long long bytes);
 // "1.77 TB", "2 TB", "220.25 GB". Up to two decimals; trailing zeros dropped.
