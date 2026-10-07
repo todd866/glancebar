@@ -702,9 +702,7 @@ int main(void) {
                 @"includedSpend": @23222,
                 @"remaining": @16778,
                 @"limit": @40000,
-                @"totalPercentUsed": @58.055,
-                @"apiPercentUsed": @46.444,
-                @"autoPercentUsed": @0
+                @"totalPercentUsed": @58.055
             }
         };
         NSDictionary *cursorPick = PickCursorLimitWindow(cursorPlan, 1770000000.0);
@@ -757,6 +755,7 @@ int main(void) {
         NSDictionary *cursorPools = @{
             @"billingCycleStart": @"1791030271000",
             @"billingCycleEnd": @"1793708671000",
+            @"autoBucketModels": @[@"grok-4", @"cursor-grok-4", @"grok-4", @42, @"", @"  composer-2.5  "],
             @"planUsage": @{@"totalSpend": @121695, @"includedSpend": @40000, @"bonusSpend": @81695,
                             @"limit": @40000, @"remainingBonus": @NO,
                             @"autoPercentUsed": @30.373666666666665, @"apiPercentUsed": @61.148,
@@ -767,12 +766,56 @@ int main(void) {
         };
         NSArray *poolWins = CursorLimitWindows(cursorPools, 1791246033.0);
         check(poolWins.count == 2 && [poolWins[0][@"window"] isEqual:@"API models"]
-                  && [poolWins[1][@"window"] isEqual:@"Auto"], @"cursor pools surface API and Auto windows");
+                  && [poolWins[1][@"window"] isEqual:@"Cursor models"]
+                  && [poolWins[0][@"pool"] isEqual:@"api"] && [poolWins[1][@"pool"] isEqual:@"cursor"],
+              @"cursor pools surface API and Cursor windows with stable pool keys");
+        check([poolWins[1][@"models"] isEqual:@[@"grok-4", @"cursor-grok-4", @"composer-2.5"]],
+              @"cursor pool carries deduplicated model membership");
         NSDictionary *poolPick = PickCursorLimitWindow(cursorPools, 1791246033.0);
         check([poolPick[@"window"] isEqual:@"API models"]
                   && fabs([poolPick[@"remainingFraction"] doubleValue] - (1 - 0.61148)) < 0.001,
               @"cursor gauge follows the more-spent pool, not the blended total");
         check(fabs([poolPick[@"resetsAt"] doubleValue] - 1793708671.0) < 0.001, @"cursor pool keeps cycle end");
+
+        NSDictionary *splitStale = @{ @"billingCycleEnd": @1790000000000.0,
+                                      @"planUsage": @{ @"apiPercentUsed": @100.0,
+                                                        @"autoPercentUsed": @10.0,
+                                                        @"remaining": @9999, @"limit": @10000 } };
+        NSArray *stalePools = CursorStaleLimitWindows(splitStale, 1791246033.0);
+        check(stalePools.count == 2 && [stalePools[0][@"pool"] isEqual:@"api"] &&
+                  [stalePools[1][@"pool"] isEqual:@"cursor"] &&
+                  [stalePools[0][@"remainingFraction"] doubleValue] == 0.0,
+              @"cursor split pools preserve unequal stale readings");
+        NSDictionary *onePool = @{ @"billingCycleEnd": @1793708671000.0,
+                                   @"planUsage": @{ @"apiPercentUsed": @0.0,
+                                                     @"remaining": @1, @"limit": @2 } };
+        NSArray *onePoolWins = CursorLimitWindows(onePool, 1791246033.0);
+        check(onePoolWins.count == 1 && [onePoolWins[0][@"pool"] isEqual:@"api"] &&
+                  [onePoolWins[0][@"remainingFraction"] doubleValue] == 1.0,
+              @"cursor missing pool does not invent an aggregate");
+        NSDictionary *clampedPools = @{ @"billingCycleEnd": @1793708671000.0,
+                                        @"planUsage": @{ @"apiPercentUsed": @120.0,
+                                                          @"autoPercentUsed": @-5.0 } };
+        NSArray *clamped = CursorLimitWindows(clampedPools, 1791246033.0);
+        check(clamped.count == 2 && [clamped[0][@"remainingFraction"] doubleValue] == 0.0 &&
+                  [clamped[1][@"remainingFraction"] doubleValue] == 1.0,
+              @"cursor genuine overrange percentages clamp to bounds");
+        NSDictionary *malformedPools = @{ @"billingCycleEnd": @1793708671000.0,
+                                          @"planUsage": @{ @"apiPercentUsed": @YES,
+                                                            @"autoPercentUsed": @(NAN) } };
+        check(CursorLimitWindows(malformedPools, 1791246033.0).count == 0,
+              @"cursor bool and nonfinite pool values are rejected");
+        NSDictionary *badSplitWithLegacy = @{ @"billingCycleEnd": @1793708671000.0,
+                                              @"planUsage": @{ @"apiPercentUsed": @YES,
+                                                                @"remaining": @9900, @"limit": @10000 } };
+        check(CursorLimitWindows(badSplitWithLegacy, 1791246033.0).count == 0,
+              @"cursor malformed split does not fall back to a healthy aggregate");
+        NSDictionary *legacyStillWorks = @{ @"billingCycleEnd": @1793708671000.0,
+                                            @"planUsage": @{ @"remaining": @25, @"limit": @100,
+                                                              @"totalPercentUsed": @90 } };
+        NSArray *legacyWins = CursorLimitWindows(legacyStillWorks, 1791246033.0);
+        check(legacyWins.count == 1 && fabs([legacyWins[0][@"remainingFraction"] doubleValue] - 0.25) < 0.001,
+              @"cursor legacy aggregate remains unchanged");
 
         // --- ClaudeUsageOverlayingStatusline ---
         NSDictionary *apiBody = @{@"limits": @[

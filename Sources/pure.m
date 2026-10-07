@@ -634,19 +634,42 @@ static double CursorEpochSeconds(id value) {
     return 0;
 }
 
-static NSDictionary *CursorWindow(NSString *name, double remainingFrac, double resets) {
+static NSDictionary *CursorWindow(NSString *name, NSString *pool, double remainingFrac, double resets) {
     remainingFrac = remainingFrac < 0 ? 0 : remainingFrac > 1 ? 1 : remainingFrac;
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"window"] = name;
+    if (pool.length) d[@"pool"] = pool;
     d[@"remainingFraction"] = @(remainingFrac);
     if (resets > 0) d[@"resetsAt"] = @(resets);
     return d;
 }
 
+static NSNumber *CursorFiniteNumber(id value) {
+    if (![value isKindOfClass:NSNumber.class]) return nil;
+    // NSNumber also represents JSON booleans. Treating false as 0% used would make a
+    // malformed quota look healthy, so only accept actual numeric values.
+    if (CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return nil;
+    double n = [value doubleValue];
+    return isfinite(n) ? (NSNumber *)value : nil;
+}
+
+static NSArray<NSString *> *CursorAutoBucketModels(NSDictionary *usage) {
+    NSArray *raw = [usage[@"autoBucketModels"] isKindOfClass:NSArray.class] ? usage[@"autoBucketModels"] : nil;
+    if (!raw.count) return nil;
+    NSMutableArray *models = [NSMutableArray array];
+    for (id value in raw) {
+        if (![value isKindOfClass:NSString.class]) continue;
+        NSString *model = [(NSString *)value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (model.length && ![models containsObject:model]) [models addObject:model];
+    }
+    return models.count ? models : nil;
+}
+
 // GetCurrentPeriodUsage has changed shape before: early bodies carried remaining/limit;
-// current ones (seen 2026-10) drop `remaining` and split the allowance into an Auto pool
-// and an API pool for named models, each with its own percentage. totalPercentUsed blends
-// the two and hides a nearly spent API pool, so the pools win over it when present.
+// current ones (seen 2026-10) split the allowance into an API pool for third-party models and
+// a Cursor pool (the historical wire name is autoPercentUsed), each with its own
+// percentage. totalPercentUsed blends the two and hides a nearly spent API pool, so the
+// pools win over it whenever either valid split field is present.
 static NSArray<NSDictionary *> *CursorPlanWindowsFiltered(NSDictionary *usage, double nowEpoch, BOOL elapsedOnly) {
     NSDictionary *plan = [usage[@"planUsage"] isKindOfClass:NSDictionary.class] ? usage[@"planUsage"] : nil;
     if (!plan) return @[];
@@ -657,23 +680,30 @@ static NSArray<NSDictionary *> *CursorPlanWindowsFiltered(NSDictionary *usage, d
         return @[];
     }
 
-    NSNumber *remaining = [plan[@"remaining"] isKindOfClass:NSNumber.class] ? plan[@"remaining"] : nil;
-    NSNumber *limit = [plan[@"limit"] isKindOfClass:NSNumber.class] ? plan[@"limit"] : nil;
-    if (remaining && limit && limit.doubleValue > 0)
-        return @[CursorWindow(@"billing period", remaining.doubleValue / limit.doubleValue, resets)];
-
-    NSNumber *api = [plan[@"apiPercentUsed"] isKindOfClass:NSNumber.class] ? plan[@"apiPercentUsed"] : nil;
-    NSNumber *autoPool = [plan[@"autoPercentUsed"] isKindOfClass:NSNumber.class] ? plan[@"autoPercentUsed"] : nil;
-    if (api || autoPool) {
+    NSNumber *api = CursorFiniteNumber(plan[@"apiPercentUsed"]);
+    NSNumber *autoPool = CursorFiniteNumber(plan[@"autoPercentUsed"]);
+    BOOL splitFieldsPresent = plan[@"apiPercentUsed"] != nil || plan[@"autoPercentUsed"] != nil;
+    if (splitFieldsPresent) {
         NSMutableArray *pools = [NSMutableArray array];
-        if (api) [pools addObject:CursorWindow(@"API models", 1.0 - api.doubleValue / 100.0, resets)];
-        if (autoPool) [pools addObject:CursorWindow(@"Auto", 1.0 - autoPool.doubleValue / 100.0, resets)];
+        if (api) [pools addObject:CursorWindow(@"API models", @"api", 1.0 - api.doubleValue / 100.0, resets)];
+        if (autoPool) {
+            NSMutableDictionary *cursor = [CursorWindow(@"Cursor models", @"cursor", 1.0 - autoPool.doubleValue / 100.0, resets) mutableCopy];
+            NSArray *models = CursorAutoBucketModels(usage);
+            if (models) cursor[@"models"] = models;
+            [pools addObject:cursor];
+        }
         return pools;
     }
-    if ([plan[@"totalPercentUsed"] isKindOfClass:NSNumber.class])
-        return @[CursorWindow(@"billing period", 1.0 - [plan[@"totalPercentUsed"] doubleValue] / 100.0, resets)];
-    if ([plan[@"includedSpend"] isKindOfClass:NSNumber.class] && limit && limit.doubleValue > 0)
-        return @[CursorWindow(@"billing period", 1.0 - [plan[@"includedSpend"] doubleValue] / limit.doubleValue, resets)];
+    NSNumber *remaining = CursorFiniteNumber(plan[@"remaining"]);
+    NSNumber *limit = CursorFiniteNumber(plan[@"limit"]);
+    if (remaining && limit && limit.doubleValue > 0)
+        return @[CursorWindow(@"billing period", nil, remaining.doubleValue / limit.doubleValue, resets)];
+    NSNumber *totalPercent = CursorFiniteNumber(plan[@"totalPercentUsed"]);
+    if (totalPercent)
+        return @[CursorWindow(@"billing period", nil, 1.0 - totalPercent.doubleValue / 100.0, resets)];
+    NSNumber *includedSpend = CursorFiniteNumber(plan[@"includedSpend"]);
+    if (includedSpend && limit && limit.doubleValue > 0)
+        return @[CursorWindow(@"billing period", nil, 1.0 - includedSpend.doubleValue / limit.doubleValue, resets)];
     return @[];
 }
 

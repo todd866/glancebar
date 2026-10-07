@@ -9,13 +9,13 @@
 #pragma clang diagnostic pop
 
 static NSUInteger CountGauges(NSView *view) {
-    NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:ClaudeGauge.class]) ? 1 : 0;
+    NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) ? 1 : 0;
     for (NSView *child in view.subviews) count += CountGauges(child);
     return count;
 }
-static ClaudeGauge *FindClaudeMeter(NSView *view) {
-    if ([view isKindOfClass:ClaudeGauge.class]) return (ClaudeGauge *)view;
-    for (NSView *child in view.subviews) { ClaudeGauge *m = FindClaudeMeter(child); if (m) return m; }
+static QuotaPairGauge *FindClaudeMeter(NSView *view) {
+    if ([view isKindOfClass:QuotaPairGauge.class]) return (QuotaPairGauge *)view;
+    for (NSView *child in view.subviews) { QuotaPairGauge *m = FindClaudeMeter(child); if (m) return m; }
     return nil;
 }
 static BOOL HasText(NSView *view, NSString *text) {
@@ -120,7 +120,7 @@ static BOOL FitsChildren(NSView *view) {
     }
     return YES;
 }
-static NSColor *MeterPixel(ClaudeGauge *meter, CGFloat x, CGFloat y) {
+static NSColor *MeterPixel(QuotaPairGauge *meter, CGFloat x, CGFloat y) {
     meter.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
     NSBitmapImageRep *rep = [meter bitmapImageRepForCachingDisplayInRect:meter.bounds];
     [meter cacheDisplayInRect:meter.bounds toBitmapImageRep:rep];
@@ -155,7 +155,7 @@ static BOOL RenderedImagesDiffer(NSImage *a, NSImage *b) {
     return memcmp(ra.bitmapData, rb.bitmapData, (size_t)ra.bytesPerRow * (size_t)h) != 0;
 }
 static NSView *FirstGauge(NSView *view) {
-    if ([view isKindOfClass:Gauge.class] || [view isKindOfClass:ClaudeGauge.class]) return view;
+    if ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) return view;
     for (NSView *child in view.subviews) { NSView *g = FirstGauge(child); if (g) return g; }
     return nil;
 }
@@ -233,22 +233,22 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        ClaudeGauge *probe = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(0,0,100,8)];
-        probe.fable = 0.06; probe.opus = 0.8;
+        QuotaPairGauge *probe = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(0,0,100,8)];
+        probe.firstFraction = 0.06; probe.secondFraction = 0.8;
         if (!Red(MeterPixel(probe,3,1)) || !Green(MeterPixel(probe,40,1)) ||
             !Green(MeterPixel(probe,40,6))) return Fail(__LINE__);
-        probe.fable = 0.8; probe.opus = 0.06;
+        probe.firstFraction = 0.8; probe.secondFraction = 0.06;
         if (!Green(MeterPixel(probe,40,4)) || !Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
-        probe.fable = 0;
+        probe.firstFraction = 0;
         if (!Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
         // A full reset and near-ties use lanes, with each endpoint independently visible.
-        probe.fable = probe.opus = 1;
+        probe.firstFraction = probe.secondFraction = 1;
         if (!Green(MeterPixel(probe,90,1)) || !Green(MeterPixel(probe,90,6))) return Fail(__LINE__);
-        if (!ClaudeQuotasClose(.30,.33) || ClaudeQuotasClose(.30,.34) || ClaudeQuotasClose(-1,0)) return Fail(__LINE__);
-        probe.fable = .30; probe.opus = .32;
+        if (!QuotaFractionsClose(.30,.33) || QuotaFractionsClose(.30,.34) || QuotaFractionsClose(-1,0)) return Fail(__LINE__);
+        probe.firstFraction = .30; probe.secondFraction = .32;
         if (!Red(MeterPixel(probe,20,1)) || !Red(MeterPixel(probe,20,6))) return Fail(__LINE__);
         // Two healthy quotas: solid green to the shorter (50%), a lighter green to 71%.
-        probe.fable = .50; probe.opus = .71;
+        probe.firstFraction = .50; probe.secondFraction = .71;
         {
             NSColor *solid = MeterPixel(probe,30,4), *tint = MeterPixel(probe,62,4), *track = MeterPixel(probe,90,4);
             if (!Green(solid) || !Green(tint) || Green(track)) return Fail(__LINE__);
@@ -259,7 +259,7 @@ int main(int argc, const char **argv) {
                 return Fail(__LINE__);   // the extension must be visibly lighter than the solid fill
         }
         // User example: full-height amber to 30%, green from there to 60%.
-        probe.fable = .30; probe.opus = .60;
+        probe.firstFraction = .30; probe.secondFraction = .60;
         if (!Green(MeterPixel(probe,45,1)) || !Green(MeterPixel(probe,45,6))) return Fail(__LINE__);
         NSColor *lowOpus = MeterPixel(probe,20,4);
         __block NSColor *amber;
@@ -339,7 +339,7 @@ int main(int argc, const char **argv) {
         NSView *batteryGauge = FindIdentifier(root, @"popover.battery.gauge");
         NSView *codexGauge = FindIdentifier(root, @"popover.ai.codex.gauge");
         NSView *cursorGauge = FindIdentifier(root, @"popover.ai.cursor.gauge");
-        ClaudeGauge *meter = FindClaudeMeter(root);
+        QuotaPairGauge *meter = FindClaudeMeter(root);
         if (!SameColumn(storageGauge, batteryGauge) || !SameColumn(storageGauge, meter) ||
             !SameColumn(storageGauge, codexGauge) || !SameColumn(storageGauge, cursorGauge)) return Fail(__LINE__);
         if (fabs(storageGauge.frame.size.width - batteryGauge.frame.size.width) > 0.5 ||
@@ -452,7 +452,7 @@ int main(int argc, const char **argv) {
             !FitsChildren(keep.superview)) return Fail(__LINE__);
         // One figure: the account weekly across all models (33%). No Fable figure, and the
         // 5-hour window never caps it. The weekly reset is on the tooltip, not a caption.
-        if (!meter || meter.fable >= 0 || fabs(meter.opus-0.33)>0.001 || !HasText(root,@"33%") ||
+        if (!meter || meter.firstFraction >= 0 || fabs(meter.secondFraction-0.33)>0.001 || !HasText(root,@"33%") ||
             HasText(root,@"Fable") || HasText(root, @"5-hour") || HasText(root, @" left")) return Fail(__LINE__);
         if (!HasTip(root, @"Week resets tomorrow")) return Fail(__LINE__);
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
@@ -647,6 +647,84 @@ int main(int argc, const char **argv) {
                 item.view = [c detailViewForIdentifier:@"overview"];
             }
         }
+        // Cursor keeps both pools in one compact instrument on every surface.
+        AIUsage *cursor = usage.lastObject;
+        NSArray *legacyWindows = cursor.limitWindows;
+        cursor.limitWindows = CursorLimitWindows(@{
+            @"billingCycleEnd": @(NSDate.date.timeIntervalSince1970 + 27*86400),
+            @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, NSDate.date.timeIntervalSince1970);
+        [c rebuildContent];
+        root = p.contentViewController.view;
+        if (CountGauges(root) != 5 || FirstScrollView(root) || !FitsChildren(root) ||
+            root.bounds.size.height > 304 || !InstrumentRowsFit(root)) return Fail(__LINE__);
+        NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
+        NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
+        for (NSUInteger i = 0; i < compactDocs.count; i++) {
+            NSView *doc = compactDocs[i]; NSString *stem = compactStems[i];
+            QuotaPairGauge *pair = (QuotaPairGauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+            NSTextField *name = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".name"]);
+            NSView *values = FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
+            NSTextField *api = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value.api"]);
+            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value.cursor"]);
+            NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
+            NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".value"]);
+            if (![pair isKindOfClass:QuotaPairGauge.class] || fabs(pair.firstFraction - .17) > .001 ||
+                fabs(pair.secondFraction - .41) > .001 || ![name.stringValue isEqual:@"Cursor"] ||
+                !pair.fixedLanes || ![api.stringValue isEqual:@"17%"] || ![grok.stringValue isEqual:@"41%"] ||
+                NSMinY(api.frame) <= NSMinY(grok.frame) || !SameColumn(values, reference) ||
+                fabs(NSWidth(values.frame) - NSWidth(reference.frame)) > .5 ||
+                ![datum.stringValue hasPrefix:@"resets "] || !HasTip(doc, @"API models: 17% left") ||
+                !HasTip(doc, @"Grok + Composer: 41% left") ||
+                ![pair.accessibilityValue containsString:@"API models 17%"] ||
+                ![pair.accessibilityValue containsString:@"Grok + Composer 41%"] ||
+                CountIdentifier(doc, @"details.ai.window.cursor.0") ||
+                CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
+        }
+        cursor.limitStale = YES; cursor.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-7200];
+        cursor.limitRefreshError = @"Signed out — sign in to Cursor";
+        [c rebuildContent];
+        for (NSString *scope in @[@"popover.ai", @"details.ai", @"details.overview.ai"]) {
+            NSView *doc = [scope isEqual:@"popover.ai"] ? p.contentViewController.view
+                : [scope isEqual:@"details.ai"] ? [c aiDetailsView].documentView : [c overviewDetailsView].documentView;
+            NSTextField *datum = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.datum"]);
+            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.value.cursor"]);
+            if (![datum.stringValue isEqual:@"signed out"] || ![grok.stringValue isEqual:@"41%"] ||
+                FindIdentifier(doc, [scope stringByAppendingString:@".cursor.status"]) || !FitsChildren(doc)) return Fail(__LINE__);
+        }
+        if (argc > 1) {
+            NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-signed-out.png"];
+            if (!RenderOffscreen(p.contentViewController.view, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        cursor.limitRefreshError = nil;
+        [c rebuildContent];
+        NSTextField *staleDatum = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.datum");
+        if (![staleDatum.stringValue hasPrefix:@"stale"]) return Fail(__LINE__);
+        cursor.limitStale = NO; cursor.limitUpdatedAt = NSDate.date;
+        NSArray *bothPools = cursor.limitWindows;
+        // The two values retain the standard column, even at 100%.
+        cursor.limitWindows = CursorLimitWindows(@{@"planUsage": @{@"apiPercentUsed": @0, @"autoPercentUsed": @0}}, NSDate.date.timeIntervalSince1970);
+        [c rebuildContent];
+        for (NSString *key in @[@"api", @"cursor"]) {
+            NSTextField *full = (NSTextField *)FindIdentifier(p.contentViewController.view, [@"popover.ai.cursor.value." stringByAppendingString:key]);
+            if (![full.stringValue isEqual:@"100%"] || full.attributedStringValue.size.width > full.bounds.size.width - 4 ||
+                full.font.pointSize < 13) return Fail(__LINE__);
+        }
+        cursor.limitWindows = bothPools;
+        for (NSUInteger missing = 0; missing < 2; missing++) {
+            cursor.limitWindows = @[bothPools[missing]];
+            [c rebuildContent];
+            QuotaPairGauge *single = (QuotaPairGauge *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.gauge");
+            if (![single isKindOfClass:QuotaPairGauge.class] || CountGauges(p.contentViewController.view) != 5 ||
+                ![single.accessibilityValue containsString:@"not reported"] ||
+                (missing == 0 ? single.secondFraction >= 0 : single.firstFraction >= 0)) return Fail(__LINE__);
+            NSTextField *api = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value.api");
+            NSTextField *grok = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value.cursor");
+            if (![api.stringValue isEqual:(missing == 0 ? @"17%" : @"—")] ||
+                ![grok.stringValue isEqual:(missing == 0 ? @"—" : @"41%")]) return Fail(__LINE__);
+        }
+        cursor.limitWindows = bothPools;
+        [c rebuildContent];
+        root = p.contentViewController.view;
         const char *detailsPrefix = getenv("GLANCEBAR_RENDER_DETAILS");
         if (detailsPrefix && detailsPrefix[0]) {
             NSAppearanceName appearance = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
@@ -665,6 +743,7 @@ int main(int argc, const char **argv) {
             [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}]
                 writeToFile:[NSString stringWithUTF8String:argv[1]] atomically:YES];
         }
+        cursor.limitWindows = legacyWindows;
         // Rebuild in place must keep navigation reachable and not accumulate rows.
         [c rebuildContent];
         if (CountGauges(p.contentViewController.view) != 5) return Fail(__LINE__);
@@ -682,9 +761,9 @@ int main(int argc, const char **argv) {
         AIUsage *claude = usage[0];
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
         [c rebuildContent];
-        ClaudeGauge *updated = FindClaudeMeter(p.contentViewController.view);
+        QuotaPairGauge *updated = FindClaudeMeter(p.contentViewController.view);
         // Only a Fable window reported: no all-models weekly figure, so no fill at all (never Fable's).
-        if (updated != meter || updated.fable >= 0 || updated.opus != -1) return Fail(__LINE__);
+        if (updated != meter || updated.firstFraction >= 0 || updated.secondFraction != -1) return Fail(__LINE__);
         claude.limitWindows = @[];
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 4 ||

@@ -171,6 +171,38 @@ int main(void) {
         check(!IsJSONBoolean(@1) && !IsJSONBoolean(@0),
               @"schema guard rejects numeric 0/1 masquerading as booleans");
 
+        // Expired overrides are ignored atomically, including their gauge and metadata.
+        AIUsage *overrideUsage = [AIUsage new];
+        overrideUsage.name = @"Cursor";
+        overrideUsage.remainingFraction = 0.73;
+        overrideUsage.limitStatusAvailable = YES;
+        overrideUsage.limitWindows = @[@{@"pool": @"api", @"remainingFraction": @0.73}];
+        overrideUsage.statusSource = @"provider";
+        overrideUsage.resetAt = [NSDate dateWithTimeIntervalSinceNow:3600];
+        ApplyAIStatusFile(overrideUsage, @{@"Cursor": @{@"remainingPercent": @2,
+            @"resetAt": ISODateString([NSDate dateWithTimeIntervalSinceNow:-60])}}, @"override");
+        check(fabs(overrideUsage.remainingFraction - 0.73) < 0.001 &&
+              overrideUsage.limitWindows.count == 1 && [overrideUsage.statusSource isEqual:@"provider"] &&
+              overrideUsage.resetAt.timeIntervalSinceNow > 0,
+              @"expired override leaves the complete provider snapshot untouched");
+        ApplyAIStatusFile(overrideUsage, @{@"Cursor": @{@"remainingPercent": @2,
+            @"resetAt": ISODateString([NSDate dateWithTimeIntervalSinceNow:7200])}}, @"override");
+        check(fabs(overrideUsage.remainingFraction - 0.02) < 0.001 && !overrideUsage.limitWindows.count &&
+              !CursorPoolQuotas(overrideUsage), @"current override replaces pools with one explicit aggregate");
+
+        Controller *historyController = [Controller new];
+        AIUsage *sessionHistory = [AIUsage new];
+        sessionHistory.name = @"Codex";
+        sessionHistory.todaySessions = 2;
+        sessionHistory.weekSessions = 9;
+        sessionHistory.models = @[@{@"name": @"gpt-6-astra", @"sessions": @9}];
+        NSString *historyTip = [historyController detailHistoryTip:sessionHistory];
+        check([historyTip containsString:@"gpt-6-astra · 9 sessions"] && ![historyTip containsString:@"0 tokens"],
+              @"session model counts are not mislabelled as zero tokens");
+        FlippedView *historyRoot = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 200)];
+        check([historyController addDetailHistory:sessionHistory to:historyRoot y:0 cols:DetailLayout(kDetailW)] > 0,
+              @"session-only activity retains a history row");
+
         Controller *barController = [Controller new];
         NSArray *fullBar = @[
             @{@"symbol": @"externaldrive", @"text": @"72%"},

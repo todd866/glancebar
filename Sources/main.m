@@ -795,6 +795,11 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSDictionary *entry = AIStatusEntry(root, u.name);
     if (!entry) return;
 
+    // Validate the override's window before changing any part of the provider snapshot.
+    NSString *resetAt = StatusStringForKeys(entry, @[@"resetAt", @"resetTime", @"resetsAt"]);
+    NSDate *resetDate = DateFromStatusString(resetAt);
+    if (resetDate && resetDate.timeIntervalSinceNow <= 0) return;
+
     // Interpret by key, not magnitude: a "guess the unit" heuristic misreads 0.9%
     // remaining as 90% — exactly when the number matters most.
     NSNumber *fraction = StatusNumberForKeys(entry, @[@"remainingFraction", @"fractionRemaining"]);
@@ -807,11 +812,8 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     }
 
     NSString *reset = StatusStringForKeys(entry, @[@"resetText", @"reset", @"resets"]);
-    NSString *resetAt = StatusStringForKeys(entry, @[@"resetAt", @"resetTime", @"resetsAt"]);
-    NSDate *resetDate = DateFromStatusString(resetAt);
     // A dated override is a statement about one window. Once that window has reset the
     // file is stale, and the provider's own figure is the truth again.
-    if (resetDate && resetDate.timeIntervalSinceNow <= 0) return;
     if (resetDate) reset = ResetTextFromDate(resetDate);
     if (reset.length && (replacedGauge || (u.limitStatusAvailable && u.remainingFraction >= 0))) {
         u.resetText = reset;
@@ -832,6 +834,50 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
     NSString *reason = StatusStringForKeys(entry, @[@"status", @"detail", @"reason"]);
     u.statusSource = source;
     u.statusReason = reason.length ? reason : @"Limit status from local status file";
+}
+
+// Keep Cursor's pools in one provider instrument. Missing pools stay unreported.
+static NSDictionary *CursorPoolQuotas(AIUsage *u) {
+    if (![u.name isEqual:@"Cursor"] || !u.limitStatusAvailable) return nil;
+    NSMutableDictionary *pools = [NSMutableDictionary dictionary];
+    for (NSDictionary *window in u.limitWindows) {
+        NSString *pool = window[@"pool"];
+        if ([pool isEqual:@"api"] || [pool isEqual:@"cursor"]) pools[pool] = window;
+    }
+    return pools.count ? pools : nil;
+}
+static double CursorPoolFraction(NSDictionary *pools, NSString *key) {
+    NSNumber *value = pools[key][@"remainingFraction"];
+    return [value isKindOfClass:NSNumber.class] ? value.doubleValue : -1;
+}
+static double CursorLowestFraction(NSDictionary *pools) {
+    double api = CursorPoolFraction(pools, @"api"), grok = CursorPoolFraction(pools, @"cursor");
+    return api < 0 ? grok : grok < 0 ? api : MIN(api, grok);
+}
+static NSDate *CursorPoolReset(NSDictionary *pools) {
+    NSDate *reset = nil;
+    for (NSDictionary *window in pools.allValues) {
+        NSNumber *epoch = window[@"resetsAt"];
+        if (![epoch isKindOfClass:NSNumber.class]) continue;
+        NSDate *date = [NSDate dateWithTimeIntervalSince1970:epoch.doubleValue];
+        if (!reset || [date compare:reset] == NSOrderedAscending) reset = date;
+    }
+    return reset;
+}
+static NSString *CursorPoolTip(NSDictionary *pools) {
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSString *key in @[@"api", @"cursor"]) {
+        double value = CursorPoolFraction(pools, key);
+        NSString *label = [key isEqual:@"api"] ? @"API models" : @"Grok + Composer";
+        if (value < 0) { [parts addObject:[label stringByAppendingString:@": not reported"]]; continue; }
+        NSNumber *epoch = pools[key][@"resetsAt"];
+        NSString *clock = [epoch isKindOfClass:NSNumber.class]
+            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:epoch.doubleValue], NSDate.date) : nil;
+        [parts addObject:[NSString stringWithFormat:@"%@: %.0f%% left%@", label, value * 100,
+            clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+    }
+    [parts addObject:@"Upper lane: API models. Lower lane: Grok + Composer."];
+    return [parts componentsJoinedByString:@"\n"];
 }
 
 static AIUsage *ReadClaudeUsage(NSString *homeDirectory) {
@@ -2966,64 +3012,82 @@ static NSColor *AIQuotaColor(double fraction) {
 }
 
 // Overlay distinct endpoints; use fixed lanes only when they are nearly equal.
-static BOOL ClaudeQuotasClose(double fable, double opus) {
-    return fable >= 0 && opus >= 0 && fabs(fable-opus) <= 0.030000001;
+static BOOL QuotaFractionsClose(double first, double second) {
+    return first >= 0 && second >= 0 && fabs(first-second) <= 0.030000001;
 }
 static NSColor *ClaudeQuotaColor(double fraction) {
     return fraction > 0.35 ? NSColor.systemGreenColor : AIQuotaColor(fraction);
 }
-@interface ClaudeGauge : NSView
-@property (nonatomic) double fable, opus; // negative = not reported
+@interface QuotaPairGauge : NSView
+@property (nonatomic) double firstFraction, secondFraction; // negative = not reported
+@property (nonatomic, copy) NSString *firstLabel, *secondLabel;
+@property (nonatomic) BOOL standardQuotaColors, fixedLanes;
 @end
-@implementation ClaudeGauge
+@implementation QuotaPairGauge
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        _fable = _opus = -1;
+        _firstFraction = _secondFraction = -1;
+        _firstLabel = @"Fable"; _secondLabel = @"Opus";
         [self setAccessibilityElement:YES];
         self.accessibilityRole = NSAccessibilityImageRole;
-        self.accessibilityLabel = @"Claude quota remaining: Fable and Opus";
-        self.accessibilityIdentifier = @"popover.claude.meter";
+        self.accessibilityLabel = @"Quota remaining";
     }
     return self;
 }
 - (void)refreshValues {
-    NSString *f = _fable < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _fable*100];
-    NSString *o = _opus < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _opus*100];
-    self.accessibilityValue = _fable < 0 ? [o stringByAppendingString:@" remaining"]   // single weekly figure
-        : [NSString stringWithFormat:@"Fable %@, Opus %@ remaining", f, o];
+    NSString *f = _firstFraction < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _firstFraction*100];
+    NSString *o = _secondFraction < 0 ? @"not reported" : [NSString stringWithFormat:@"%.0f%%", _secondFraction*100];
+    self.accessibilityValue = _firstFraction < 0 && !_standardQuotaColors ? [o stringByAppendingString:@" remaining"]   // single weekly figure
+        : [NSString stringWithFormat:@"%@ %@, %@ %@ remaining", _firstLabel, f, _secondLabel, o];
     self.needsDisplay = YES;
 }
-- (void)setFable:(double)value { _fable = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
-- (void)setOpus:(double)value { _opus = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)setFirstFraction:(double)value { _firstFraction = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)setSecondFraction:(double)value { _secondFraction = value < 0 ? -1 : MIN(1, MAX(0, value)); [self refreshValues]; }
+- (void)setFirstLabel:(NSString *)value { _firstLabel = [value copy]; [self refreshValues]; }
+- (void)setSecondLabel:(NSString *)value { _secondLabel = [value copy]; [self refreshValues]; }
+- (void)setStandardQuotaColors:(BOOL)value { _standardQuotaColors = value; [self refreshValues]; }
+- (void)setFixedLanes:(BOOL)value { _fixedLanes = value; self.needsDisplay = YES; }
+- (NSColor *)quotaColor:(double)value { return _standardQuotaColors ? AIQuotaColor(value) : ClaudeQuotaColor(value); }
 - (void)drawRect:(NSRect)dirty {
     NSRect r = self.bounds;
-    BOOL lanes = ClaudeQuotasClose(_fable, _opus);
-    CGFloat laneHeight = MAX(0, (r.size.height-1)/2);
+    BOOL lanes = _fixedLanes || QuotaFractionsClose(_firstFraction, _secondFraction);
+    CGFloat laneGap = _fixedLanes ? 12 : 1;
+    CGFloat laneHeight = MAX(0, (r.size.height-laneGap)/2);
     NSBezierPath *wholeTrack = [NSBezierPath bezierPathWithRoundedRect:r xRadius:r.size.height/2 yRadius:r.size.height/2];
     if (!lanes) { [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [wholeTrack fill]; }
     for (int i=0; i<2; i++) {
-        // Draw longer first in overlay mode, but keep Fable above in lane mode.
-        BOOL fable = lanes ? i == 0 : (i == 0 ? _fable > _opus : _fable <= _opus);
-        double value = fable ? _fable : _opus;
-        NSRect lane = lanes ? NSMakeRect(r.origin.x, r.origin.y + (fable ? laneHeight+1 : 0), r.size.width, laneHeight) : r;
+        // Draw longer first in overlay mode, but keep the first pool above in lane mode.
+        BOOL first = lanes ? i == 0 : (i == 0 ? _firstFraction > _secondFraction : _firstFraction <= _secondFraction);
+        double value = first ? _firstFraction : _secondFraction;
+        NSRect lane = lanes ? NSMakeRect(r.origin.x, r.origin.y + (first ? laneHeight+laneGap : 0), r.size.width, laneHeight) : r;
         CGFloat radius = lane.size.height/2;
         NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:lane xRadius:radius yRadius:radius];
         if (lanes) { [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill]; }
         if (value <= 0) continue;
         [NSGraphicsContext saveGraphicsState]; [track addClip];
         NSRect fill = lane; fill.size.width *= value;
-        NSColor *color = ClaudeQuotaColor(value);
+        NSColor *color = [self quotaColor:value];
         // Overlay: the longer fill is drawn first. When both fills would share one colour
         // the longer one is a lighter tint, so the solid part reads "both models have this
         // much" and the tinted extension "only the larger one does" — a one-pixel divider
         // was not legible.
-        if (!lanes && i == 0 && _fable > 0 && _opus > 0 && [color isEqual:ClaudeQuotaColor(MIN(_fable, _opus))])
+        if (!lanes && i == 0 && _firstFraction > 0 && _secondFraction > 0 && [color isEqual:[self quotaColor:MIN(_firstFraction, _secondFraction)]])
             color = [color colorWithAlphaComponent:0.4];
         [color setFill]; NSRectFill(fill);
         [NSGraphicsContext restoreGraphicsState];
     }
 }
 @end
+
+static void ConfigureCursorGauge(QuotaPairGauge *gauge, NSDictionary *pools) {
+    gauge.standardQuotaColors = YES;
+    gauge.fixedLanes = YES;
+    gauge.firstLabel = @"API models";
+    gauge.secondLabel = @"Grok + Composer";
+    gauge.firstFraction = CursorPoolFraction(pools, @"api");
+    gauge.secondFraction = CursorPoolFraction(pools, @"cursor");
+    gauge.accessibilityLabel = @"Cursor allowance remaining: API models and Grok + Composer";
+}
 
 // The whole instrument row is the control. hitTest returns self so the labels
 // do not eat the click that opens Details.
@@ -3286,9 +3350,12 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         NSImageView *old = (NSImageView *)existing, *new = (NSImageView *)fresh;
         old.image = new.image;
         old.contentTintColor = new.contentTintColor;
-    } else if ([existing isKindOfClass:ClaudeGauge.class]) {
-        ClaudeGauge *old = (ClaudeGauge *)existing, *new = (ClaudeGauge *)fresh;
-        old.fable = new.fable; old.opus = new.opus;
+    } else if ([existing isKindOfClass:QuotaPairGauge.class]) {
+        QuotaPairGauge *old = (QuotaPairGauge *)existing, *new = (QuotaPairGauge *)fresh;
+        old.standardQuotaColors = new.standardQuotaColors;
+        old.fixedLanes = new.fixedLanes;
+        old.firstLabel = new.firstLabel; old.secondLabel = new.secondLabel;
+        old.firstFraction = new.firstFraction; old.secondFraction = new.secondFraction;
     } else if ([existing isKindOfClass:Gauge.class]) {
         Gauge *old = (Gauge *)existing, *new = (Gauge *)fresh;
         old.fraction = new.fraction;
@@ -3498,6 +3565,7 @@ static const CGFloat kW = 380, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
 // a blank name column read as wasted space, and the word identifies the row. The panel
 // grew by that column; the gauge stayed 102pt. kDatumX + kDatumW == kW - kPad.
 static const CGFloat kRowH = 30, kSoundH = 40;
+static const CGFloat kCursorRowH = 32, kCursorGaugeH = 20;
 static const CGFloat kLeadSymbol = 22;
 static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the footer pill
 static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
@@ -6098,7 +6166,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSImageView *iv = [NSImageView imageViewWithImage:image];
     iv.imageScaling = NSImageScaleProportionallyDown;
     iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
-    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
+    iv.frame = NSMakeRect(kPad, (NSHeight(row.bounds) - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
     iv.accessibilityIdentifier = identifier;
     [row addSubview:iv];
     return iv;
@@ -6108,7 +6176,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSImageView *iv = [NSImageView imageViewWithImage:image];
     iv.imageScaling = NSImageScaleProportionallyUpOrDown;
     iv.imageAlignment = NSImageAlignCenter;
-    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
+    iv.frame = NSMakeRect(kPad, (NSHeight(row.bounds) - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
     iv.accessibilityIdentifier = identifier;
     [row addSubview:iv];
     return iv;
@@ -6117,7 +6185,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSTextField *)instrumentName:(NSString *)text identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                               color:NSColor.labelColor
-                                 at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16)
+                                 at:NSMakeRect(kAINameX, (NSHeight(row.bounds) - 16) / 2.0, kAINameW, 16)
                               align:NSTextAlignmentLeft];
     field.accessibilityIdentifier = identifier;
     field.maximumNumberOfLines = 1;
@@ -6127,16 +6195,41 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 - (NSTextField *)instrumentValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
-                              color:color at:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
+                              color:color at:NSMakeRect(kValueX, (NSHeight(row.bounds) - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
     field.accessibilityIdentifier = identifier;
     [row addSubview:field];
     return field;
 }
 
+// Fixed API-above-Grok readouts align with the two gauge lanes and retain the
+// ordinary value column. Both numbers stay visible without consuming the reset.
+- (NSView *)cursorPoolValues:(NSDictionary *)pools stale:(BOOL)stale frame:(NSRect)frame
+                 identifier:(NSString *)identifier tip:(NSString *)tip in:(NSView *)row {
+    NSView *values = [[NSView alloc] initWithFrame:frame];
+    values.accessibilityIdentifier = identifier;
+    values.toolTip = tip;
+    for (NSString *key in @[@"api", @"cursor"]) {
+        BOOL api = [key isEqual:@"api"];
+        double fraction = CursorPoolFraction(pools, key);
+        NSString *value = fraction < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", fraction * 100];
+        NSColor *color = fraction < 0 ? NSColor.tertiaryLabelColor
+            : stale ? NSColor.systemOrangeColor : AIQuotaColor(fraction);
+        CGFloat height = NSHeight(values.bounds) / 2;
+        NSTextField *field = [self text:value font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
+            color:color at:NSMakeRect(0, api ? height : 0, NSWidth(values.bounds), height) align:NSTextAlignmentRight];
+        field.accessibilityIdentifier = [identifier stringByAppendingFormat:@".%@", key];
+        field.accessibilityLabel = api ? @"Cursor API models remaining" : @"Cursor Grok + Composer remaining";
+        field.toolTip = tip;
+        [values addSubview:field];
+    }
+    [row addSubview:values];
+    return values;
+}
+
 - (NSTextField *)instrumentDatum:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text ?: @"" font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                               color:color ?: NSColor.secondaryLabelColor
-                                 at:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH) align:NSTextAlignmentLeft];
+                                 at:NSMakeRect(kDatumX, (NSHeight(row.bounds) - kDatumH) / 2.0, kDatumW, kDatumH) align:NSTextAlignmentLeft];
     field.accessibilityIdentifier = identifier;
     [row addSubview:field];
     return field;
@@ -6199,13 +6292,15 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     (void)width; (void)pad;
     NSString *name = u.name.length ? u.name : @"AI";
     NSString *slug = name.lowercaseString;
-    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+    NSDictionary *cursorPools = CursorPoolQuotas(u);
+    CGFloat rowH = cursorPools ? kCursorRowH : kRowH;
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
     row.accessibilityIdentifier = [@"popover.row.ai." stringByAppendingString:slug];
     NSDictionary *quotas = [name isEqualToString:@"Claude"] && !u.overageActive && u.limitStatusAvailable
         ? ClaudeModelQuotas(u.limitWindows) : nil;
     double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
     BOOL claudeMeter = quotas != nil;
-    BOOL hasGauge = claudeMeter || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0);
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
@@ -6217,7 +6312,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         : [self instrumentSymbol:[self aiSymbolName:name] tint:valueColor identifier:symbolID in:row];
     NSTextField *nameField = [self instrumentName:name
                                      identifier:[NSString stringWithFormat:@"popover.ai.%@.name", slug] in:row];
-    ClaudeGauge *meter = nil;
+    QuotaPairGauge *meter = nil;
     Gauge *plainGauge = nil;
     if (claudeMeter) {
         pct = week < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", week * 100];
@@ -6239,10 +6334,19 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
             }
         if (tip.length) [parts addObject:tip];
         tip = [parts componentsJoinedByString:@"\n"];
-        meter = [[ClaudeGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
-        meter.opus = week;
+        meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        meter.secondFraction = week;
         meter.accessibilityIdentifier = @"popover.ai.claude.gauge";
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
+        [row addSubview:meter];
+    } else if (cursorPools) {
+        double lowest = CursorLowestFraction(cursorPools);
+        pct = lowest < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", lowest * 100];
+        valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(lowest);
+        tip = [NSString stringWithFormat:@"%@\n%@", CursorPoolTip(cursorPools), tip];
+        meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (rowH - kCursorGaugeH) / 2.0, kGaugeW, kCursorGaugeH)];
+        ConfigureCursorGauge(meter, cursorPools);
+        meter.accessibilityIdentifier = @"popover.ai.cursor.gauge";
         [row addSubview:meter];
     } else if (hasGauge) {
         pct = [self aiPercentText:u];
@@ -6254,17 +6358,22 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
         [row addSubview:plainGauge];
     }
-    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
+    NSString *title = name;
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", title, tip] : title;
     if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
     mark.accessibilityLabel = named;
     nameField.toolTip = named;
-    nameField.accessibilityLabel = name;
+    nameField.accessibilityLabel = title;
     if (meter) meter.toolTip = named;
     if (plainGauge) plainGauge.toolTip = named;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
         : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
-    NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
+    NSView *value = cursorPools
+        ? [self cursorPoolValues:cursorPools stale:[self aiSnapshotStaleWarns:u]
+                          frame:NSMakeRect(kValueX, 0, kValueW, rowH)
+                     identifier:valueID tip:named in:row]
+        : [self instrumentValue:pct color:valueColor identifier:valueID in:row];
     value.toolTip = named;
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
@@ -6275,7 +6384,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
-        NSDate *reset = u.resetAt;
+        NSDate *reset = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
         if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
             reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
         // A bare "21:00" beside a bar could mean anything; one word says what it is.
@@ -6289,7 +6398,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     row.toolTip = named;
     row.accessibilityLabel = named;
     [root addSubview:row];
-    return y + kRowH;
+    return y + rowH;
 }
 
 - (NSString *)aiOverviewText {
@@ -7399,7 +7508,8 @@ static NSColor *HealthColor(double fraction) {
         ? ClaudeModelQuotas(u.limitWindows) : nil;
     double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
     BOOL claudeMeter = quotas != nil;
-    BOOL hasGauge = claudeMeter || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    NSDictionary *cursorPools = CursorPoolQuotas(u);
+    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0);
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
@@ -7423,11 +7533,17 @@ static NSColor *HealthColor(double fraction) {
             }
         if (tip.length) [parts addObject:tip];
         tip = [parts componentsJoinedByString:@"\n"];
+    } else if (cursorPools) {
+        double lowest = CursorLowestFraction(cursorPools);
+        pct = lowest < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", lowest * 100];
+        valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(lowest);
+        tip = [NSString stringWithFormat:@"%@\n%@", CursorPoolTip(cursorPools), tip];
     } else if (hasGauge) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
     }
-    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
+    NSString *title = name;
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", title, tip] : title;
     if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
         named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
     if (u.billingNote.length && ![named containsString:u.billingNote])
@@ -7453,21 +7569,31 @@ static NSColor *HealthColor(double fraction) {
                                            align:NSTextAlignmentLeft
                                       identifier:[stem stringByAppendingString:@".name"] in:row];
     providerName.toolTip = named;
-    providerName.accessibilityLabel = name;
+    providerName.accessibilityLabel = title;
     if (claudeMeter) {
-        ClaudeGauge *meter = [[ClaudeGauge alloc] initWithFrame:DetailGaugeRect(c)];
-        meter.opus = week;   // weekly all-models figure; Fable stays off this gauge
+        QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:DetailGaugeRect(c)];
+        meter.secondFraction = week;   // weekly all-models figure; Fable stays off this gauge
         meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
         meter.toolTip = named;
         [row addSubview:meter];
+    } else if (cursorPools) {
+        QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(c.gaugeX, (c.rowH - kCursorGaugeH) / 2, c.gaugeW, kCursorGaugeH)];
+        ConfigureCursorGauge(meter, cursorPools);
+        meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+        meter.toolTip = named;
+        [row addSubview:meter];
     } else if (hasGauge) {
         [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
-                    label:[NSString stringWithFormat:@"%@ quota remaining", name]
+                    label:[NSString stringWithFormat:@"%@ quota remaining", title]
                identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
     }
-    NSTextField *value = [self detailValue:pct color:valueColor
-                                 identifier:[stem stringByAppendingString:@".value"] tip:named in:row cols:c];
+    NSView *value = cursorPools
+        ? [self cursorPoolValues:cursorPools stale:[self aiSnapshotStaleWarns:u]
+                          frame:NSMakeRect(c.valueX, 0, c.valueW, c.rowH)
+                     identifier:[stem stringByAppendingString:@".value"] tip:named in:row]
+        : [self detailValue:pct color:valueColor
+                 identifier:[stem stringByAppendingString:@".value"] tip:named in:row cols:c];
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
     NSColor *datumColor = NSColor.secondaryLabelColor;
@@ -7477,7 +7603,7 @@ static NSColor *HealthColor(double fraction) {
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
-        NSDate *reset = u.resetAt;
+        NSDate *reset = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
         if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
             reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
         NSString *clock = CompactResetClock(reset, NSDate.date);
@@ -7488,6 +7614,7 @@ static NSColor *HealthColor(double fraction) {
 }
 
 - (CGFloat)addDetailWindows:(AIUsage *)u to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    if (CursorPoolQuotas(u)) return y;   // both named percentages share the provider instrument
     NSString *slug = (u.name.length ? u.name : @"AI").lowercaseString;
     NSArray *windows = u.limitWindows ?: @[];
     NSArray<NSString *> *labels = DetailWindowLabels(windows);
@@ -7547,9 +7674,11 @@ static NSColor *HealthColor(double fraction) {
                           u.todayMessages, u.todayToolCalls]];
     for (NSDictionary *model in u.models) {
         NSString *raw = [model[@"name"] isKindOfClass:NSString.class] ? model[@"name"] : nil;
-        long long tokens = [model[@"tokens"] isKindOfClass:NSNumber.class] ? [model[@"tokens"] longLongValue] : 0;
         if (!raw.length) continue;
-        [parts addObject:[NSString stringWithFormat:@"%@ · %@", ShortModelName(raw), FmtTokenCount(tokens)]];
+        if ([model[@"tokens"] isKindOfClass:NSNumber.class])
+            [parts addObject:[NSString stringWithFormat:@"%@ · %@", ShortModelName(raw), FmtTokenCount([model[@"tokens"] longLongValue])]];
+        else if ([model[@"sessions"] isKindOfClass:NSNumber.class])
+            [parts addObject:[NSString stringWithFormat:@"%@ · %lld sessions", ShortModelName(raw), [model[@"sessions"] longLongValue]]];
     }
     if (u.lastActivity) [parts addObject:[NSString stringWithFormat:@"Updated %@", ClockText(u.lastActivity)]];
     NSString *source = u.source ?: @"";
@@ -7558,7 +7687,9 @@ static NSColor *HealthColor(double fraction) {
 }
 
 - (CGFloat)addDetailHistory:(AIUsage *)u to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
-    BOOL hasData = u.todayTokens > 0 || u.weekTokens > 0 || u.todayTokensAll > 0 || u.weekTokensAll > 0;
+    BOOL hasTokens = u.todayTokens > 0 || u.weekTokens > 0 || u.todayTokensAll > 0 || u.weekTokensAll > 0;
+    BOOL hasSessions = u.todaySessions > 0 || u.weekSessions > 0;
+    BOOL hasData = hasTokens || hasSessions || u.todayMessages > 0 || u.todayToolCalls > 0;
     if (!hasData) return y;
     NSString *slug = (u.name.length ? u.name : @"AI").lowercaseString;
     NSString *tip = [self detailHistoryTip:u];
@@ -7573,15 +7704,21 @@ static NSColor *HealthColor(double fraction) {
     if (logo) { glyph.image = logo; glyph.contentTintColor = nil; }
     glyph.toolTip = tip;
     glyph.accessibilityLabel = tip;
-    NSString *todayText = u.todayTokens > 0 ? FmtCompact(u.todayTokens) : @"—";
-    NSString *weekText = u.weekTokens > 0 ? FmtCompact(u.weekTokens) : @"—";
+    NSString *metric = hasTokens ? @"Tokens" : hasSessions ? @"Sessions" : u.todayMessages > 0 ? @"Messages" : @"Tools";
+    long long todayCount = hasTokens ? u.todayTokens : hasSessions ? u.todaySessions : u.todayMessages > 0 ? u.todayMessages : u.todayToolCalls;
+    long long weekCount = hasTokens ? u.weekTokens : hasSessions ? u.weekSessions : 0;
+    [self detailText:metric font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+              color:NSColor.secondaryLabelColor frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+              align:NSTextAlignmentLeft identifier:[rowID stringByAppendingString:@".metric"] in:row].toolTip = tip;
+    NSString *todayText = FmtCompact(todayCount);
+    NSString *weekText = (hasTokens || hasSessions) ? FmtCompact(weekCount) : @"—";
     CGFloat tagW = 46;
     CGFloat todayTagX = c.valueX - c.gap - tagW;
     CGFloat todayValueW = MAX(36.0, todayTagX - 4 - c.gaugeX);
     NSFont *figure = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold];
     NSFont *tag = [NSFont systemFontOfSize:kDatumFont weight:NSFontWeightRegular];
     NSTextField *today = [self detailText:todayText font:figure
-                                     color:(u.todayTokens > 0 ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+                                     color:NSColor.labelColor
                                      frame:NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, todayValueW, c.valueH)
                                      align:NSTextAlignmentRight
                                 identifier:[rowID stringByAppendingString:@".today"] in:row];
@@ -7591,7 +7728,7 @@ static NSColor *HealthColor(double fraction) {
                                         align:NSTextAlignmentLeft
                                    identifier:[rowID stringByAppendingString:@".todayLabel"] in:row];
     todayTag.toolTip = tip;
-    [self detailValue:weekText color:(u.weekTokens > 0 ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+    [self detailValue:weekText color:((hasTokens || hasSessions) ? NSColor.labelColor : NSColor.tertiaryLabelColor)
            identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
     NSTextField *weekTag = [self detailText:@"7d" font:tag color:NSColor.tertiaryLabelColor
                                        frame:DetailDatumRect(c) align:NSTextAlignmentLeft

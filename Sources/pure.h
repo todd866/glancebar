@@ -186,7 +186,10 @@ NSString *ClaudeLimitStatusReason(NSDictionary *usage, NSString *fetchedAtISO, d
 // request buckets). Same output shape as PickLimitWindow. planUsage wins when both
 // shapes are present. Returns nil when nothing usable/current remains.
 NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
-// All current Cursor windows for the dual meter (usually one). Empty when none apply.
+// All current Cursor windows for the dual meter (usually one). Split planUsage responses
+// use window labels "API models"/"Cursor models" and stable pool keys "api"/"cursor";
+// Cursor pool entries may include a sanitized "models" array from autoBucketModels.
+// Empty when none apply.
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
 
 // Elapsed Cursor windows (billing cycle ended, or auth buckets with a past cycle marker).
