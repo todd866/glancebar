@@ -3004,6 +3004,90 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
+// Kernel memory pressure as three pips, filled to the level: position, not colour alone.
+@interface PressurePips : NSView
+@property (nonatomic) NSInteger level;   // 0 unknown, 1 low, 2 medium, 3 high
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation PressurePips
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setAccessibilityElement:YES];
+        self.accessibilityRole = NSAccessibilityLevelIndicatorRole;
+        self.accessibilityLabel = @"Memory pressure";
+    }
+    return self;
+}
+- (void)setLevel:(NSInteger)level {
+    _level = MAX(0, MIN(3, level));
+    self.accessibilityValue = @[@"unknown", @"low", @"medium", @"high"][_level];
+    self.needsDisplay = YES;
+}
+- (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
+- (void)drawRect:(NSRect)dirty {
+    // Rising bars, like signal strength: the filled count is the level.
+    NSRect r = self.bounds;
+    CGFloat gap = 2, w = (NSWidth(r) - 2 * gap) / 3;
+    for (NSInteger i = 0; i < 3; i++) {
+        CGFloat h = NSHeight(r) * (0.5 + 0.25 * i);
+        NSRect bar = NSMakeRect(NSMinX(r) + i * (w + gap), NSMinY(r), w, h);
+        if (self.isFlipped) bar.origin.y = NSMaxY(r) - h;
+        [(i < _level ? (_color ?: NSColor.secondaryLabelColor)
+                     : [NSColor.labelColor colorWithAlphaComponent:0.15]) setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:1 yRadius:1] fill];
+    }
+}
+@end
+
+static NSInteger PressurePipLevel(NSString *level) {
+    if ([level isEqualToString:@"High"]) return 3;
+    if ([level isEqualToString:@"Medium"]) return 2;
+    if ([level isEqualToString:@"Low"]) return 1;
+    return 0;
+}
+
+// Where the charger's watts go, on one bar: system draw (grey), then charge into the
+// battery (green). When the battery tops up a short charger, its share is orange past
+// the input. The empty track is unused charger headroom.
+@interface PowerFlowGauge : NSView
+@property (nonatomic) double scaleWatts, systemWatts, batteryWatts, inputWatts;
+@end
+@implementation PowerFlowGauge
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setAccessibilityElement:YES];
+        self.accessibilityRole = NSAccessibilityImageRole;
+        self.accessibilityLabel = @"Power flow";
+    }
+    return self;
+}
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds; CGFloat rad = NSHeight(r) / 2;
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
+    double scale = MAX(_scaleWatts, MAX(_systemWatts, _inputWatts));
+    if (scale <= 0) return;
+    [NSGraphicsContext saveGraphicsState]; [track addClip];
+    __block CGFloat x = NSMinX(r);
+    void (^segment)(double, NSColor *) = ^(double watts, NSColor *color) {
+        if (watts <= 0) return;
+        CGFloat w = NSWidth(r) * MIN(watts / scale, 1.0);
+        [color setFill]; NSRectFill(NSMakeRect(x, NSMinY(r), w, NSHeight(r)));
+        x += w;
+    };
+    if (_batteryWatts >= 0) {
+        segment(_systemWatts, NSColor.systemGrayColor);
+        x += _systemWatts > 0 && _batteryWatts > 0 ? 1 : 0;   // hairline between flows
+        segment(_batteryWatts, NSColor.systemGreenColor);
+    } else {
+        segment(MIN(_inputWatts, _systemWatts), NSColor.systemGrayColor);
+        x += 1;
+        segment(-_batteryWatts, NSColor.systemOrangeColor);
+    }
+    [NSGraphicsContext restoreGraphicsState];
+}
+@end
+
 static NSColor *AIQuotaColor(double fraction) {
     if (fraction <= 0.15) return NSColor.systemRedColor;
     if (fraction <= 0.35) return NSColor.systemOrangeColor;
@@ -3364,6 +3448,14 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
         [old setAccessibilityElement:new.isAccessibilityElement];
+    } else if ([existing isKindOfClass:PressurePips.class]) {
+        PressurePips *old = (PressurePips *)existing, *new = (PressurePips *)fresh;
+        old.level = new.level; old.color = new.color;
+    } else if ([existing isKindOfClass:PowerFlowGauge.class]) {
+        PowerFlowGauge *old = (PowerFlowGauge *)existing, *new = (PowerFlowGauge *)fresh;
+        old.scaleWatts = new.scaleWatts; old.systemWatts = new.systemWatts;
+        old.batteryWatts = new.batteryWatts; old.inputWatts = new.inputWatts;
+        old.needsDisplay = YES;
     } else if ([existing isKindOfClass:NSBox.class]) {
         ((NSBox *)existing).boxType = ((NSBox *)fresh).boxType;
     }
@@ -6136,27 +6228,59 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return design ? [text stringByAppendingFormat:@" (design %@)", design] : text;
 }
 
-- (NSAttributedString *)systemReadout {
-    NSFont *label = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    NSFont *value = [NSFont monospacedDigitSystemFontOfSize:14 weight:NSFontWeightSemibold];
-    NSColor *tertiary = NSColor.tertiaryLabelColor;
-    NSColor *ink = NSColor.labelColor;
-    NSMutableAttributedString *line = [NSMutableAttributedString new];
-    void (^add)(NSString *, NSColor *, NSFont *) = ^(NSString *text, NSColor *color, NSFont *font) {
-        if (!text.length) return;
-        [line appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:@{
-            NSFontAttributeName: font, NSForegroundColorAttributeName: color ?: ink}]];
-    };
-    add(@"CPU ", tertiary, label);
-    add(_sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(_sys.cpu * 100)] : @"—", ink, value);
+// The System instrument at any scale: a CPU gauge and percent, then memory pressure as
+// the memory-chip symbol plus rising pips. A swap glyph appears only while swapping.
+- (void)addSystemInstrumentTo:(NSView *)row gauge:(NSRect)gaugeFrame value:(NSRect)valueFrame
+                        datum:(NSRect)datumFrame stem:(NSString *)stem tip:(NSString *)tip {
+    double cpu = _sys.cpuValid ? _sys.cpu : 0;
+    NSColor *cpuColor = _sys.cpuValid ? CPUColor(cpu) : NSColor.tertiaryLabelColor;
+    NSString *cpuTip = CPUStatusText(_sys);
+    Gauge *g = [[Gauge alloc] initWithFrame:gaugeFrame];
+    g.fraction = MIN(cpu, 1.0);
+    g.color = cpuColor;
+    g.metricLabel = @"CPU";
+    g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+    g.toolTip = tip;
+    [row addSubview:g];
+    NSTextField *value = [self text:(_sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(cpu * 100)] : @"—")
+                               font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                              color:cpuColor at:valueFrame align:NSTextAlignmentRight];
+    value.accessibilityIdentifier = [stem stringByAppendingString:@".value"];
+    value.accessibilityLabel = cpuTip;
+    value.toolTip = tip;
+    [row addSubview:value];
+
     NSString *level = MemoryPressureLevel(_sys);
-    add(@"   MEM ", tertiary, label);
-    add(level.lowercaseString, SystemPressureColor(level), value);
-    add(@"   SWAP ", tertiary, label);
-    NSString *swap = @"—";
-    if (_sys.swapValid) swap = _sys.swapUsed == 0 ? @"0 GB" : FmtMemBytes((long long)_sys.swapUsed);
-    add(swap, ink, value);
-    return line;
+    NSColor *memColor = SystemPressureColor(level);
+    NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
+    CGFloat midY = NSMidY(datumFrame), x = NSMinX(datumFrame);
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
+    NSImageView *chip = [NSImageView imageViewWithImage:
+        [[NSImage imageWithSystemSymbolName:@"memorychip" accessibilityDescription:@"Memory"] imageWithSymbolConfiguration:cfg]];
+    chip.imageScaling = NSImageScaleProportionallyDown;
+    chip.contentTintColor = memColor;
+    chip.frame = NSMakeRect(x, midY - 9, 20, 18);
+    chip.accessibilityIdentifier = [stem stringByAppendingString:@".memory.symbol"];
+    chip.accessibilityLabel = memTip;
+    chip.toolTip = memTip;
+    [row addSubview:chip];
+    PressurePips *pips = [[PressurePips alloc] initWithFrame:NSMakeRect(x + 24, midY - 6, 17, 12)];
+    pips.level = PressurePipLevel(level);
+    pips.color = memColor;
+    pips.accessibilityIdentifier = [stem stringByAppendingString:@".memory.pips"];
+    pips.toolTip = memTip;
+    [row addSubview:pips];
+    if (_sys.swapValid && _sys.swapUsed > 0) {
+        NSImageView *swap = [NSImageView imageViewWithImage:
+            [[NSImage imageWithSystemSymbolName:@"arrow.left.arrow.right" accessibilityDescription:@"Swap"] imageWithSymbolConfiguration:cfg]];
+        swap.imageScaling = NSImageScaleProportionallyDown;
+        swap.contentTintColor = NSColor.secondaryLabelColor;
+        swap.frame = NSMakeRect(x + 50, midY - 9, 20, 18);
+        swap.accessibilityIdentifier = [stem stringByAppendingString:@".swap.symbol"];
+        swap.accessibilityLabel = SwapStatusText(_sys);
+        swap.toolTip = memTip;
+        [row addSubview:swap];
+    }
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
@@ -6358,13 +6482,12 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
         [row addSubview:plainGauge];
     }
-    NSString *title = name;
-    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", title, tip] : title;
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
     mark.accessibilityLabel = named;
     nameField.toolTip = named;
-    nameField.accessibilityLabel = title;
+    nameField.accessibilityLabel = name;
     if (meter) meter.toolTip = named;
     if (plainGauge) plainGauge.toolTip = named;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
@@ -6551,13 +6674,11 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         [self instrumentSymbol:@"cpu" tint:SystemPressureColor(sysLevel)
                    identifier:@"popover.system.symbol" in:row];
         [self instrumentName:@"System" identifier:@"popover.system.name" in:row];
-        NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
-        readout.frame = NSMakeRect(kGaugeX, (kRowH - kValueH) / 2.0, kW - kPad - kGaugeX, kValueH);
-        readout.lineBreakMode = NSLineBreakByTruncatingTail;
-        readout.accessibilityIdentifier = @"popover.system.readout";
-        readout.accessibilityLabel = summary;
-        readout.toolTip = summary;
-        [row addSubview:readout];
+        [self addSystemInstrumentTo:row
+                              gauge:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)
+                              value:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH)
+                              datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
+                               stem:@"popover.system" tip:summary];
         [root addSubview:row];
         y += kRowH;
     }
@@ -7447,10 +7568,12 @@ static NSColor *HealthColor(double fraction) {
     NSDictionary *info = ProcessDisplayInfo(h);
     NSString *title = info[@"title"] ?: @"Process";
     NSString *detail = info[@"detail"] ?: @"";
-    NSString *shown = context.length ? context : detail;
-    NSString *tip = detail.length && ![detail isEqualToString:shown]
-        ? [NSString stringWithFormat:@"%@ · %@\n%@", title, value ?: @"", detail]
-        : [NSString stringWithFormat:@"%@ · %@", title, value ?: @""];
+    // The process description lives on the tooltip; a mixed list (Overview) names its
+    // metric with the same symbol the System and Battery tabs use, not a word.
+    NSString *metric = context.length ? [NSString stringWithFormat:@" %@", context] : @"";
+    NSString *tip = detail.length
+        ? [NSString stringWithFormat:@"%@ · %@%@\n%@", title, value ?: @"", metric, detail]
+        : [NSString stringWithFormat:@"%@ · %@%@", title, value ?: @"", metric];
     NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
     NSTextField *name = [self detailText:title font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
                                     color:NSColor.labelColor
@@ -7462,11 +7585,15 @@ static NSColor *HealthColor(double fraction) {
     [self detailGauge:bar fraction:fraction color:color label:tip
            identifier:[identifier stringByAppendingString:@".bar"] tip:tip in:row];
     [self detailValue:value color:color identifier:[identifier stringByAppendingString:@".value"] tip:tip in:row cols:c];
-    NSTextField *note = [self detailText:shown font:[NSFont systemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                                    color:NSColor.tertiaryLabelColor
-                                    frame:DetailDatumRect(c) align:NSTextAlignmentLeft
-                               identifier:[identifier stringByAppendingString:@".context"] in:row];
-    note.toolTip = tip;
+    NSString *symbol = @{@"energy": @"bolt", @"CPU": @"cpu", @"memory": @"memorychip"}[context ?: @""];
+    if (symbol) {
+        NSRect datum = DetailDatumRect(c);
+        NSImageView *mark = [self detailSymbol:symbol size:15 tint:NSColor.tertiaryLabelColor
+                                         frame:NSMakeRect(NSMinX(datum), (c.rowH - 18) / 2.0, 20, 18)
+                                    identifier:[identifier stringByAppendingString:@".context"] in:row];
+        mark.toolTip = tip;
+        mark.accessibilityLabel = context;
+    }
     return y + c.rowH;
 }
 
@@ -7542,8 +7669,7 @@ static NSColor *HealthColor(double fraction) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
     }
-    NSString *title = name;
-    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", title, tip] : title;
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
         named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
     if (u.billingNote.length && ![named containsString:u.billingNote])
@@ -7569,7 +7695,7 @@ static NSColor *HealthColor(double fraction) {
                                            align:NSTextAlignmentLeft
                                       identifier:[stem stringByAppendingString:@".name"] in:row];
     providerName.toolTip = named;
-    providerName.accessibilityLabel = title;
+    providerName.accessibilityLabel = name;
     if (claudeMeter) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:DetailGaugeRect(c)];
         meter.secondFraction = week;   // weekly all-models figure; Fable stays off this gauge
@@ -7585,7 +7711,7 @@ static NSColor *HealthColor(double fraction) {
         [row addSubview:meter];
     } else if (hasGauge) {
         [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
-                    label:[NSString stringWithFormat:@"%@ quota remaining", title]
+                    label:[NSString stringWithFormat:@"%@ quota remaining", name]
                identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
     }
     NSView *value = cursorPools
@@ -7855,14 +7981,8 @@ static NSColor *HealthColor(double fraction) {
                                               align:NSTextAlignmentLeft
                                          identifier:@"details.overview.system.name" in:row];
         systemName.toolTip = tip;
-        NSTextField *readout = [NSTextField labelWithAttributedString:[self systemReadout]];
-        readout.frame = NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, c.width - kDetailPad - c.gaugeX, c.valueH);
-        readout.lineBreakMode = NSLineBreakByTruncatingTail;
-        readout.maximumNumberOfLines = 1;
-        readout.accessibilityIdentifier = @"details.overview.system.readout";
-        readout.toolTip = tip;
-        readout.accessibilityLabel = tip;
-        [row addSubview:readout];
+        [self addSystemInstrumentTo:row gauge:DetailGaugeRect(c) value:DetailValueRect(c)
+                              datum:DetailDatumRect(c) stem:@"details.overview.system" tip:tip];
         y += c.rowH;
     }
 
@@ -8076,48 +8196,42 @@ static NSColor *HealthColor(double fraction) {
         }
         if (_showWatts) {
             NSString *flowTip = [self batteryPowerFlowText];
+            double bw = BatteryWatts(_bat);
+            double loadW = _bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN ? _bat.systemLoad_mW / 1000.0 : 0;
             if (_bat.acConnected && _bat.systemPowerIn_mW > 0 && _bat.systemPowerIn_mW != LONG_MIN) {
+                // One flow bar replaces Input / System / Battery rows: grey is the Mac,
+                // green is charge going in, and the empty track is charger headroom.
                 double inW = _bat.systemPowerIn_mW / 1000.0;
                 NSView *inRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.input" tip:flowTip in:root];
                 [self detailSymbol:@"powerplug" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
                         identifier:@"details.battery.input.symbol" in:inRow].toolTip = flowTip;
-            [self detailRowName:@"Input" cols:c identifier:@"details.battery.input.name" in:inRow];
-                if (_bat.adapterWatts > 0) {
-                    // How hard the charger is working: a maxed-out charger is why charging is slow.
-                    double use = MIN(inW / (double)_bat.adapterWatts, 1.0);
-                    [self detailGauge:DetailGaugeRect(c) fraction:use
-                                color:use > 0.9 ? NSColor.systemOrangeColor : NSColor.systemGreenColor
-                                label:@"Charger load" identifier:@"details.battery.input.gauge" tip:flowTip in:inRow];
-                }
+                [self detailRowName:@"Power" cols:c identifier:@"details.battery.input.name" in:inRow];
+                PowerFlowGauge *flow = [[PowerFlowGauge alloc] initWithFrame:DetailGaugeRect(c)];
+                flow.scaleWatts = _bat.adapterWatts > 0 ? _bat.adapterWatts : inW;
+                flow.inputWatts = inW;
+                flow.systemWatts = loadW;
+                flow.batteryWatts = isnan(bw) ? 0 : bw;
+                flow.accessibilityIdentifier = @"details.battery.input.gauge";
+                flow.accessibilityValue = flowTip;
+                flow.toolTip = flowTip;
+                [inRow addSubview:flow];
                 [self detailValue:[NSString stringWithFormat:@"%.1f W", inW] color:NSColor.labelColor
                        identifier:@"details.battery.input.value" tip:flowTip in:inRow cols:c];
-                [self detailDatum:_bat.adapterWatts > 0 ? [NSString stringWithFormat:@"in · %ld W charger", _bat.adapterWatts] : @"in"
-                            color:NSColor.secondaryLabelColor identifier:@"details.battery.input.datum" tip:flowTip in:inRow cols:c];
+                if (_bat.adapterWatts > 0)
+                    [self detailDatum:[NSString stringWithFormat:@"of %ld W", _bat.adapterWatts]
+                                color:NSColor.secondaryLabelColor identifier:@"details.battery.input.datum" tip:flowTip in:inRow cols:c];
                 y += c.rowH;
-            }
-            if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN) {
+            } else if (loadW > 0) {
+                // On battery the Charge row already carries the signed watts; this is the Mac's draw.
                 NSView *loadRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.load" tip:flowTip in:root];
                 [self detailSymbol:@"laptopcomputer" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
                         identifier:@"details.battery.load.symbol" in:loadRow].toolTip = flowTip;
-            [self detailRowName:@"System" cols:c identifier:@"details.battery.load.name" in:loadRow];
-                [self detailValue:[NSString stringWithFormat:@"%.1f W", _bat.systemLoad_mW / 1000.0] color:NSColor.labelColor
+                [self detailRowName:@"System" cols:c identifier:@"details.battery.load.name" in:loadRow];
+                [self detailValue:[NSString stringWithFormat:@"%.1f W", loadW] color:NSColor.labelColor
                        identifier:@"details.battery.load.value" tip:flowTip in:loadRow cols:c];
-                [self detailDatum:@"system draw" color:NSColor.secondaryLabelColor
-                       identifier:@"details.battery.load.datum" tip:flowTip in:loadRow cols:c];
                 y += c.rowH;
             }
-            double bw = BatteryWatts(_bat);
             if (!isnan(bw)) {
-                NSColor *color = bw > 0.05 ? NSColor.systemGreenColor : bw < -0.05 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
-                NSView *battRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.power" tip:flowTip in:root];
-                [self detailSymbol:@"bolt" size:c.symbol tint:color frame:DetailLeadRect(c)
-                        identifier:@"details.battery.power.symbol" in:battRow].toolTip = flowTip;
-            [self detailRowName:@"Battery" cols:c identifier:@"details.battery.power.name" in:battRow];
-                [self detailValue:FormatSignedWatts(bw) color:color
-                       identifier:@"details.battery.power.value" tip:flowTip in:battRow cols:c];
-                [self detailDatum:bw > 0.05 ? @"into battery" : bw < -0.05 ? @"from battery" : @"battery idle"
-                            color:NSColor.secondaryLabelColor identifier:@"details.battery.power.datum" tip:flowTip in:battRow cols:c];
-                y += c.rowH;
                 int target = [self chargeTargetPercent];
                 int minutes = ChargeMinutesToTarget(_bat, target);
                 if (minutes >= 0) {
@@ -8129,9 +8243,6 @@ static NSColor *HealthColor(double fraction) {
                     [self detailRowName:etaName cols:c identifier:@"details.battery.eta.name" in:etaRow];
                     [self detailValue:FmtDuration(minutes) color:NSColor.labelColor
                            identifier:@"details.battery.eta.value" tip:etaTip in:etaRow cols:c];
-                    [self detailDatum:[NSString stringWithFormat:@"at %@", FormatSignedWatts(bw)]
-                                color:NSColor.secondaryLabelColor identifier:@"details.battery.eta.datum"
-                                  tip:etaTip in:etaRow cols:c];
                     y += c.rowH;
                 }
             }

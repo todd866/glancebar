@@ -321,7 +321,7 @@ int main(int argc, const char **argv) {
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
-        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 5 ||
+        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 6 ||
             HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
         // Token indexing is internal machinery: it never reaches an instrument (2026-10-06).
         [c setValue:@YES forKey:@"_aiTotalsIncomplete"];
@@ -531,11 +531,24 @@ int main(int argc, const char **argv) {
         if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
         NSTextField *etaName = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.name");
         NSTextField *etaValue = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.value");
-        NSTextField *etaDatum = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.datum");
+        // The charge wattage is said once, on the Charge row: no "at +12 W" echo here, and
+        // the Mac's draw and charge share one flow bar instead of three text rows.
         if (![etaName.stringValue isEqual:@"To 80%"] || ![etaValue.stringValue isEqual:FmtDuration(etaMin)] ||
-            ![etaDatum.stringValue hasPrefix:@"at +"] || ![etaDatum.stringValue containsString:@"W"])
+            FindIdentifier(battery.documentView, @"details.battery.eta.datum") ||
+            FindIdentifier(battery.documentView, @"details.battery.row.power") ||
+            FindIdentifier(battery.documentView, @"details.battery.row.load"))
             return Fail(__LINE__);
-        NSArray *etaFields = @[etaName, etaValue, etaDatum];
+        PowerFlowGauge *flowBar = (PowerFlowGauge *)FindIdentifier(battery.documentView, @"details.battery.input.gauge");
+        if (flowBar && (![flowBar isKindOfClass:PowerFlowGauge.class] || !flowBar.toolTip.length)) return Fail(__LINE__);
+        // System is an instrument, not a sentence: CPU gauge plus memory-pressure pips.
+        for (NSView *doc in @[root, overview.documentView]) {
+            NSString *stem = doc == root ? @"popover.system" : @"details.overview.system";
+            PressurePips *pips = (PressurePips *)FindIdentifier(doc, [stem stringByAppendingString:@".memory.pips"]);
+            if (![pips isKindOfClass:PressurePips.class] || pips.level < 1 ||
+                ![FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]) isKindOfClass:Gauge.class] ||
+                HasText(doc, @"SWAP") || HasText(doc, @"MEM")) return Fail(__LINE__);
+        }
+        NSArray *etaFields = @[etaName, etaValue];
         for (NSTextField *field in etaFields) {
             if (![field isKindOfClass:NSTextField.class]) return Fail(__LINE__);
             CGFloat textW = [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
@@ -655,7 +668,7 @@ int main(int argc, const char **argv) {
             @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, NSDate.date.timeIntervalSince1970);
         [c rebuildContent];
         root = p.contentViewController.view;
-        if (CountGauges(root) != 5 || FirstScrollView(root) || !FitsChildren(root) ||
+        if (CountGauges(root) != 6 || FirstScrollView(root) || !FitsChildren(root) ||
             root.bounds.size.height > 304 || !InstrumentRowsFit(root)) return Fail(__LINE__);
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
@@ -714,7 +727,7 @@ int main(int argc, const char **argv) {
             cursor.limitWindows = @[bothPools[missing]];
             [c rebuildContent];
             QuotaPairGauge *single = (QuotaPairGauge *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.gauge");
-            if (![single isKindOfClass:QuotaPairGauge.class] || CountGauges(p.contentViewController.view) != 5 ||
+            if (![single isKindOfClass:QuotaPairGauge.class] || CountGauges(p.contentViewController.view) != 6 ||
                 ![single.accessibilityValue containsString:@"not reported"] ||
                 (missing == 0 ? single.secondFraction >= 0 : single.firstFraction >= 0)) return Fail(__LINE__);
             NSTextField *api = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value.api");
@@ -746,7 +759,7 @@ int main(int argc, const char **argv) {
         cursor.limitWindows = legacyWindows;
         // Rebuild in place must keep navigation reachable and not accumulate rows.
         [c rebuildContent];
-        if (CountGauges(p.contentViewController.view) != 5) return Fail(__LINE__);
+        if (CountGauges(p.contentViewController.view) != 6) return Fail(__LINE__);
         AIUsage *codex = usage[1]; codex.billingNote = @"Requests now bill to credits · balance 20";
         [c rebuildContent];
         if (!HasTip(p.contentViewController.view, @"Using credits")) return Fail(__LINE__);
@@ -754,7 +767,7 @@ int main(int argc, const char **argv) {
         AIUsage *missing = usage.lastObject; missing.limitStatusAvailable = NO;
         missing.remainingFraction = -1; missing.resetAt = nil; missing.statusReason = @"Account unavailable";
         [c rebuildContent];
-        if (CountGauges(p.contentViewController.view) != 4 ||
+        if (CountGauges(p.contentViewController.view) != 5 ||
             !HasTip(p.contentViewController.view, @"Account unavailable") ||
             !HasText(p.contentViewController.view, @"unavailable")) return Fail(__LINE__);
         meter = FindClaudeMeter(p.contentViewController.view);
@@ -766,7 +779,7 @@ int main(int argc, const char **argv) {
         if (updated != meter || updated.firstFraction >= 0 || updated.secondFraction != -1) return Fail(__LINE__);
         claude.limitWindows = @[];
         [c rebuildContent];
-        if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 4 ||
+        if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 5 ||
             !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
         claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
         claude.limitWindows = @[@{@"remainingFraction":@1, @"window":@"weekly Fable"},
