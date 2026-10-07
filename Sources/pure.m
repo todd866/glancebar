@@ -429,6 +429,7 @@ NSDictionary *PickLimitWindow(NSDictionary *rateLimits, double nowEpoch) {
         d[@"window"] = mins == 10080 ? @"weekly" : mins == 300 ? @"5-hour"
                      : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
         if (resets > 0) d[@"resetsAt"] = @(resets);
+        if (mins > 0) d[@"windowSeconds"] = @(mins * 60.0);
         if ([rateLimits[@"plan_type"] isKindOfClass:NSString.class]) d[@"plan"] = rateLimits[@"plan_type"];
         NSString *observed = CodexMeterObservedAt(w, nil);
         if (observed.length) d[@"observedAt"] = observed;   // a carried-forward window is older than its snapshot
@@ -469,6 +470,7 @@ NSArray<NSDictionary *> *CodexLimitWindows(NSDictionary *rateLimits, double nowE
                      : mins > 0 ? [NSString stringWithFormat:@"%ld-minute", mins] : @"usage";
         d[@"remainingFraction"] = @(remaining);
         if (resets > 0) d[@"resetsAt"] = @(resets);
+        if (mins > 0) d[@"windowSeconds"] = @(mins * 60.0);
         if (plan) d[@"plan"] = plan;
         NSString *observed = CodexMeterObservedAt(w, nil);
         if (observed.length) d[@"observedAt"] = observed;
@@ -743,9 +745,23 @@ static NSArray<NSDictionary *> *CursorAuthWindows(NSDictionary *usage, double no
     return out;
 }
 
+// A plan window spans the billing cycle; its length lets the gauge show pace.
+static NSArray<NSDictionary *> *CursorWithCycleLength(NSArray<NSDictionary *> *windows, NSDictionary *usage) {
+    double start = CursorEpochSeconds(usage[@"billingCycleStart"]);
+    double end = CursorEpochSeconds(usage[@"billingCycleEnd"]);
+    if (!(start > 0 && end > start) || !windows.count) return windows;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *w in windows) {
+        NSMutableDictionary *d = [w mutableCopy];
+        d[@"windowSeconds"] = @(end - start);
+        [out addObject:d];
+    }
+    return out;
+}
+
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch) {
     if (![usage isKindOfClass:NSDictionary.class]) return @[];
-    NSArray<NSDictionary *> *plan = CursorPlanWindowsFiltered(usage, nowEpoch, NO);
+    NSArray<NSDictionary *> *plan = CursorWithCycleLength(CursorPlanWindowsFiltered(usage, nowEpoch, NO), usage);
     if (plan.count) return plan;
     return CursorAuthWindows(usage, nowEpoch);
 }
@@ -2011,4 +2027,22 @@ int ChargeMinutesToTarget(BatteryState b, int targetPercent) {
     double needWh = ((double)(targetPercent - b.percent) / 100.0) * fullWh;
     if (needWh <= 0) return -1;
     return (int)lround(needWh / watts * 60.0);
+}
+
+double QuotaWindowSeconds(NSDictionary *window) {
+    if (![window isKindOfClass:NSDictionary.class]) return 0;
+    NSNumber *explicitLength = [window[@"windowSeconds"] isKindOfClass:NSNumber.class] ? window[@"windowSeconds"] : nil;
+    if (explicitLength.doubleValue > 0) return explicitLength.doubleValue;
+    NSString *label = [window[@"window"] isKindOfClass:NSString.class] ? window[@"window"] : @"";
+    if ([label isEqualToString:@"weekly"] || [label hasPrefix:@"weekly "]) return 7 * 86400.0;
+    if ([label isEqualToString:@"5-hour"]) return 5 * 3600.0;
+    return 0;
+}
+
+double QuotaPaceFraction(NSDictionary *window, double nowEpoch) {
+    double length = QuotaWindowSeconds(window);
+    NSNumber *resets = [window[@"resetsAt"] isKindOfClass:NSNumber.class] ? window[@"resetsAt"] : nil;
+    if (length <= 0 || !resets || resets.doubleValue <= nowEpoch) return -1;
+    double left = (resets.doubleValue - nowEpoch) / length;
+    return left < 0 ? 0 : left > 1 ? 1 : left;
 }

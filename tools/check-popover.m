@@ -693,6 +693,31 @@ int main(int argc, const char **argv) {
                 CountIdentifier(doc, @"details.ai.window.cursor.0") ||
                 CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
         }
+        // Pace bug: Cursor at 17% with most of the cycle to run is spending faster than time.
+        {
+            NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+            NSArray *saved = cursor.limitWindows;
+            cursor.limitWindows = CursorLimitWindows(@{@"billingCycleStart": @((now - 3*86400) * 1000),
+                @"billingCycleEnd": @((now + 27*86400) * 1000),
+                @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, now);
+            [c rebuildContent];
+            for (NSView *doc in @[p.contentViewController.view, [c aiDetailsView].documentView]) {
+                NSString *stem = doc == p.contentViewController.view ? @"popover.ai.cursor" : @"details.ai.cursor";
+                PaceCaret *caret = (PaceCaret *)FindIdentifier(doc, [stem stringByAppendingString:@".pace"]);
+                NSView *pair = FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+                double expectX = NSMinX(pair.frame) + NSWidth(pair.frame) * 0.9;
+                if (![caret isKindOfClass:PaceCaret.class] || caret.hidden || !caret.behind ||
+                    fabs(NSMidX(caret.frame) - expectX) > 1.5 || NSMinY(caret.frame) < NSMaxY(pair.frame) ||
+                    NSMaxY(caret.frame) > NSHeight(caret.superview.bounds) ||
+                    !HasTip(doc, @"spending faster than time")) return Fail(__LINE__);
+            }
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-pace.png"];
+                if (!RenderOffscreen(p.contentViewController.view, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            cursor.limitWindows = saved;
+            [c rebuildContent];
+        }
         cursor.limitStale = YES; cursor.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-7200];
         cursor.limitRefreshError = @"Signed out — sign in to Cursor";
         [c rebuildContent];

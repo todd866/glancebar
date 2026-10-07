@@ -817,6 +817,30 @@ int main(void) {
         check(legacyWins.count == 1 && fabs([legacyWins[0][@"remainingFraction"] doubleValue] - 0.25) < 0.001,
               @"cursor legacy aggregate remains unchanged");
 
+        // --- QuotaPaceFraction ---
+        double paceNow = 1791246033.0;
+        check(fabs(QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow + 2 * 86400)}, paceNow) - 2.0 / 7.0) < 0.001,
+              @"pace: two days left of a weekly window is 2/7");
+        check(fabs(QuotaPaceFraction(@{@"window": @"5-hour", @"resetsAt": @(paceNow + 3600)}, paceNow) - 0.2) < 0.001,
+              @"pace: one hour left of a 5-hour window is 20%");
+        check(fabs(QuotaPaceFraction(@{@"window": @"weekly Fable", @"resetsAt": @(paceNow + 7 * 86400)}, paceNow) - 1.0) < 0.001,
+              @"pace: a model-scoped weekly window is a week long");
+        check(QuotaPaceFraction(@{@"window": @"usage", @"resetsAt": @(paceNow + 60)}, paceNow) < 0,
+              @"pace: an unknown window length draws no mark");
+        check(QuotaPaceFraction(@{@"window": @"weekly"}, paceNow) < 0 &&
+              QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow - 1)}, paceNow) < 0,
+              @"pace: no reset, or an elapsed one, draws no mark");
+        check(QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow + 30 * 86400)}, paceNow) == 1.0,
+              @"pace: clamps to the full bar");
+        NSArray *codexPace = CodexLimitWindows(@{@"primary": @{@"used_percent": @50, @"window_minutes": @300,
+                                                                @"resets_at": @(paceNow + 9000)}}, paceNow);
+        check(codexPace.count == 1 && fabs(QuotaPaceFraction(codexPace[0], paceNow) - 0.5) < 0.001,
+              @"pace: Codex windows carry their length from window_minutes");
+        NSArray *cursorPace = CursorLimitWindows(cursorPools, paceNow);
+        check(cursorPace.count == 2 && fabs(QuotaPaceFraction(cursorPace[0], paceNow) -
+                  (1793708671.0 - paceNow) / (1793708671.0 - 1791030271.0)) < 0.001,
+              @"pace: Cursor windows span the billing cycle");
+
         // --- ClaudeUsageOverlayingStatusline ---
         NSDictionary *apiBody = @{@"limits": @[
             @{@"kind": @"session", @"percent": @4, @"resets_at": @"2026-10-06T03:40:00Z"},

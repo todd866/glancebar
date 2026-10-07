@@ -864,6 +864,35 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
     }
     return reset;
 }
+// The pace of the window the gauge shows: Claude's weekly all-models window, Cursor's
+// billing cycle, or the window whose reset the row reports. -1 when unknown.
+static double AIUsagePace(AIUsage *u, NSDictionary *claudeQuotas, NSDictionary *cursorPools, double now) {
+    if (u.overageActive) return -1;
+    if (claudeQuotas) return QuotaPaceFraction(claudeQuotas[@"opusWindow"], now);
+    if (cursorPools) {
+        for (NSString *key in @[@"api", @"cursor"]) {
+            double pace = QuotaPaceFraction(cursorPools[key], now);
+            if (pace >= 0) return pace;
+        }
+        return -1;
+    }
+    if (!u.resetAt) return -1;
+    for (NSDictionary *w in u.limitWindows) {
+        NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
+        if (resets && fabs(resets.doubleValue - u.resetAt.timeIntervalSince1970) < 1) {
+            double pace = QuotaPaceFraction(w, now);
+            if (pace >= 0) return pace;
+        }
+    }
+    return -1;
+}
+static BOOL PaceBehind(double fill, double pace) { return fill >= 0 && pace >= 0 && fill < pace - 0.02; }
+static NSString *PaceTip(double fill, double pace) {
+    if (pace < 0) return nil;
+    return [NSString stringWithFormat:@"Pace mark: %.0f%% of the window's time left · %@", pace * 100,
+            PaceBehind(fill, pace) ? @"spending faster than time; runs out before the reset" : @"on track to last to the reset"];
+}
+
 static NSString *CursorPoolTip(NSDictionary *pools) {
     NSMutableArray *parts = [NSMutableArray array];
     for (NSString *key in @[@"api", @"cursor"]) {
@@ -3088,6 +3117,28 @@ static NSInteger PressurePipLevel(NSString *level) {
 }
 @end
 
+// The pace bug on a quota tape: a small caret above the gauge at the fraction of the
+// window's time still to run. A fill that stops short of it is burning faster than the
+// clock and will run dry before the reset; the caret turns orange then.
+@interface PaceCaret : NSView
+@property (nonatomic) BOOL behind;
+@end
+@implementation PaceCaret
+- (void)setBehind:(BOOL)behind { _behind = behind; self.needsDisplay = YES; }
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds;
+    BOOL down = !self.superview.isFlipped;   // point at the bar below
+    NSBezierPath *p = [NSBezierPath bezierPath];
+    CGFloat tipY = down ? NSMinY(r) : NSMaxY(r), baseY = down ? NSMaxY(r) : NSMinY(r);
+    [p moveToPoint:NSMakePoint(NSMidX(r), tipY)];
+    [p lineToPoint:NSMakePoint(NSMinX(r), baseY)];
+    [p lineToPoint:NSMakePoint(NSMaxX(r), baseY)];
+    [p closePath];
+    [(_behind ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor) setFill];
+    [p fill];
+}
+@end
+
 static NSColor *AIQuotaColor(double fraction) {
     if (fraction <= 0.15) return NSColor.systemRedColor;
     if (fraction <= 0.35) return NSColor.systemOrangeColor;
@@ -3448,6 +3499,8 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
         [old setAccessibilityElement:new.isAccessibilityElement];
+    } else if ([existing isKindOfClass:PaceCaret.class]) {
+        ((PaceCaret *)existing).behind = ((PaceCaret *)fresh).behind;
     } else if ([existing isKindOfClass:PressurePips.class]) {
         PressurePips *old = (PressurePips *)existing, *new = (PressurePips *)fresh;
         old.level = new.level; old.color = new.color;
@@ -6412,6 +6465,26 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
 // The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
 // indexing) takes the datum column; the reset clock is the datum otherwise.
 // The provider's name sits beside its logo. The tooltip still leads with the name.
+- (PaceCaret *)addPaceCaret:(double)pace fill:(double)fill over:(NSView *)gauge
+                identifier:(NSString *)identifier tip:(NSString *)tip in:(NSView *)row {
+    // Always present (hidden without a pace) so the view tree keeps its shape and a
+    // refresh updates the row in place rather than replacing it.
+    if (!gauge) return nil;
+    CGFloat w = 8, h = 5;
+    CGFloat x = round(NSMinX(gauge.frame) + NSWidth(gauge.frame) * MAX(pace, 0) - w / 2);
+    CGFloat y = row.isFlipped ? NSMinY(gauge.frame) - h - 1 : NSMaxY(gauge.frame) + 1;
+    PaceCaret *caret = [[PaceCaret alloc] initWithFrame:NSMakeRect(x, y, w, h)];
+    caret.behind = PaceBehind(fill, pace);
+    caret.accessibilityIdentifier = identifier;
+    [caret setAccessibilityElement:YES];
+    caret.accessibilityRole = NSAccessibilityImageRole;
+    caret.accessibilityLabel = tip;
+    caret.toolTip = tip;
+    caret.hidden = pace < 0;
+    [row addSubview:caret];
+    return caret;
+}
+
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
     (void)width; (void)pad;
     NSString *name = u.name.length ? u.name : @"AI";
@@ -6482,6 +6555,12 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
         [row addSubview:plainGauge];
     }
+    double fill = claudeMeter ? week : cursorPools ? CursorLowestFraction(cursorPools) : u.remainingFraction;
+    double pace = hasGauge ? AIUsagePace(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : -1;
+    NSString *paceTip = PaceTip(fill, pace);
+    if (paceTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, paceTip] : paceTip;
+    [self addPaceCaret:pace fill:fill over:(meter ?: plainGauge)
+            identifier:[NSString stringWithFormat:@"popover.ai.%@.pace", slug] tip:paceTip in:row];
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
@@ -7669,6 +7748,10 @@ static NSColor *HealthColor(double fraction) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
     }
+    double fill = claudeMeter ? week : cursorPools ? CursorLowestFraction(cursorPools) : u.remainingFraction;
+    double pace = hasGauge ? AIUsagePace(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : -1;
+    NSString *paceTip = PaceTip(fill, pace);
+    if (paceTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, paceTip] : paceTip;
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
         named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
@@ -7696,6 +7779,7 @@ static NSColor *HealthColor(double fraction) {
                                       identifier:[stem stringByAppendingString:@".name"] in:row];
     providerName.toolTip = named;
     providerName.accessibilityLabel = name;
+    NSView *gauge = nil;
     if (claudeMeter) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:DetailGaugeRect(c)];
         meter.secondFraction = week;   // weekly all-models figure; Fable stays off this gauge
@@ -7703,17 +7787,20 @@ static NSColor *HealthColor(double fraction) {
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
         meter.toolTip = named;
         [row addSubview:meter];
+        gauge = meter;
     } else if (cursorPools) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(c.gaugeX, (c.rowH - kCursorGaugeH) / 2, c.gaugeW, kCursorGaugeH)];
         ConfigureCursorGauge(meter, cursorPools);
         meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
         meter.toolTip = named;
         [row addSubview:meter];
+        gauge = meter;
     } else if (hasGauge) {
-        [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
-                    label:[NSString stringWithFormat:@"%@ quota remaining", name]
-               identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+        gauge = [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
+                            label:[NSString stringWithFormat:@"%@ quota remaining", name]
+                       identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
     }
+    [self addPaceCaret:pace fill:fill over:gauge identifier:[stem stringByAppendingString:@".pace"] tip:paceTip in:row];
     NSView *value = cursorPools
         ? [self cursorPoolValues:cursorPools stale:[self aiSnapshotStaleWarns:u]
                           frame:NSMakeRect(c.valueX, 0, c.valueW, c.rowH)
@@ -7763,6 +7850,9 @@ static NSColor *HealthColor(double fraction) {
         NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@ left", full, pct];
         if (clock.length) [tip appendFormat:@" · resets %@", clock];
         else if ([w[@"fresh"] boolValue]) [tip appendString:@" · not started"];
+        double pace = hasFrac ? QuotaPaceFraction(w, NSDate.date.timeIntervalSince1970) : -1;
+        NSString *paceTip = PaceTip(frac, pace);
+        if (paceTip) [tip appendFormat:@"\n%@", paceTip];
         NSString *rowID = [NSString stringWithFormat:@"details.ai.window.%@.%lu", slug, (unsigned long)i];
         NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
         NSTextField *lab = [self detailText:label font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
@@ -7771,9 +7861,11 @@ static NSColor *HealthColor(double fraction) {
                                        align:NSTextAlignmentLeft
                                   identifier:[rowID stringByAppendingString:@".label"] in:row];
         lab.toolTip = tip;
-        if (hasFrac && frac >= 0)
-            [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
-                   identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
+        if (hasFrac && frac >= 0) {
+            Gauge *g = [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
+                              identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
+            [self addPaceCaret:pace fill:frac over:g identifier:[rowID stringByAppendingString:@".pace"] tip:paceTip in:row];
+        }
         [self detailValue:pct color:color identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
         [self detailDatum:reset color:NSColor.secondaryLabelColor
                identifier:[rowID stringByAppendingString:@".datum"] tip:tip in:row cols:c];

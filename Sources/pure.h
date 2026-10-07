@@ -192,6 +192,13 @@ NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
 // Empty when none apply.
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
 
+// Pace: the fraction of a quota window's time still to run (0…1), or -1 when the window's
+// length or reset is unknown. A gauge whose remaining quota sits left of this mark is being
+// spent faster than time and runs out before the reset. Length comes from "windowSeconds"
+// (Codex window_minutes, Cursor billing cycle) or a "weekly"/"5-hour" label.
+double QuotaWindowSeconds(NSDictionary *window);
+double QuotaPaceFraction(NSDictionary *window, double nowEpoch);
+
 // Elapsed Cursor windows (billing cycle ended, or auth buckets with a past cycle marker).
 // Same role as ClaudeStaleLimitWindows. Empty when nothing elapsed-and-usable remains.
 NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double nowEpoch);
