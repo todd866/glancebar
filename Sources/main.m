@@ -6395,27 +6395,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     value.toolTip = tip;
     [row addSubview:value];
 
-    NSString *level = MemoryPressureLevel(_sys);
-    NSColor *memColor = SystemPressureColor(level);
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
-    // Memory says nothing while it is fine, which is almost always. Under the kernel's
-    // memory pressure it says how much is left, in words that name it, tinted by the level.
-    NSString *memText = @"";
-    if ([level isEqualToString:@"Medium"] || [level isEqualToString:@"High"]) {
-        double gb = _sys.memAvailable / 1073741824.0;   // whole GB so "free" fits; below 1 GB keep one decimal
-        NSString *free = !_sys.memValid ? nil : gb >= 1 ? [NSString stringWithFormat:@"%.0f GB", floor(gb)]
-                                                        : [NSString stringWithFormat:@"%.1f GB", gb];
-        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-        NSString *full = free ? [NSString stringWithFormat:@"RAM %@ free", free] : @"RAM tight";
-        memText = [full sizeWithAttributes:@{NSFontAttributeName: font}].width <= NSWidth(datumFrame) - 4
-            ? full : [NSString stringWithFormat:@"RAM %@", free ?: @"tight"];
-    }
-    NSTextField *mem = [self text:memText font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                            color:memColor at:datumFrame align:NSTextAlignmentLeft];
-    mem.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
-    mem.accessibilityLabel = memTip;
-    mem.toolTip = memTip;
-    [row addSubview:mem];
+    // Memory in use is the thin line riding inside the CPU bar, the same secondary-reading
+    // language as Cursor's API pool. Pressure tints the row's symbol; figures are on hover.
+    if (_sys.memValid && _sys.memTotal > 0) g.innerFraction = MIN(1.0, (double)_sys.memUsed / (double)_sys.memTotal);
+    g.toolTip = [NSString stringWithFormat:@"%@\n%@\nBar: CPU. Line inside: memory in use.", tip, memTip];
+    (void)datumFrame;
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {

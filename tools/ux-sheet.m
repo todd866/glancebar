@@ -144,12 +144,13 @@ static NSView *SheetPanel(NSString *title, PaceStyle style, NSAppearanceName loo
 
 // Lays variant panels out as a grid: one row per variant, light on the left, dark on the right.
 static BOOL WriteSheet(NSArray<NSView *(^)(NSAppearanceName)> *builders, NSString *path) {
-    CGFloat gap = 16, colW = kW, rowH = 0;
+    CGFloat gap = 16, colW = 0, rowH = 0;
     NSMutableArray *panels = [NSMutableArray array];
     for (NSView *(^build)(NSAppearanceName) in builders) {
         NSView *light = build(NSAppearanceNameAqua), *dark = build(NSAppearanceNameDarkAqua);
         [panels addObject:@[light, dark]];
         rowH = MAX(rowH, NSHeight(light.frame));
+        colW = MAX(colW, NSWidth(light.frame));
     }
     FlippedView *sheet = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, gap + 2 * (colW + gap), gap + panels.count * (rowH + gap))];
     sheet.wantsLayer = YES;
@@ -300,7 +301,7 @@ static BOOL PowerSheet(NSString *path) {
 
 #pragma mark - System row sheet
 
-typedef NS_ENUM(NSInteger, SysStyle) { SysToday, SysMemBar, SysMemBarQuiet, SysLanes };
+typedef NS_ENUM(NSInteger, SysStyle) { SysToday, SysMemBar, SysMemBarQuiet, SysLanes, SysInnerLine, SysInnerQuiet };
 
 // Memory as a mini bar in the datum column: fill = memory in use, tinted by the kernel's
 // pressure verdict; swap, when there is any, is a red overflow at the right end.
@@ -350,6 +351,21 @@ static NSView *SystemRow(Controller *c, double cpu, int pressure, double memUsed
                           color:memColor at:NSMakeRect(kValueX, 0, kValueW, h / 2) align:NSTextAlignmentRight]];
         return row;
     }
+    if (style == SysInnerLine || style == SysInnerQuiet) {
+        // CPU is the bar; memory in use is the thin line inside it, as Cursor's API pool is.
+        // Under memory pressure the line takes the pressure colour.
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (h - 10) / 2, kGaugeW, 10)];
+        g.fraction = cpu; g.color = CPUColor(cpu);
+        if (style == SysInnerLine || pressure > 1) g.innerFraction = memUsed;
+        [row addSubview:g];
+        if (pressure > 1) {   // recolour the line: draw over it
+            NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(kGaugeX + 2, h / 2 - 1, MAX(2, (kGaugeW - 2) * memUsed - 2), 2)];
+            line.wantsLayer = YES; line.layer.backgroundColor = memColor.CGColor; [row addSubview:line];
+        }
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", cpu * 100] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                          color:CPUColor(cpu) at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+        return row;
+    }
     Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)];
     g.fraction = cpu; g.color = CPUColor(cpu); [row addSubview:g];
     [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", cpu * 100] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
@@ -365,10 +381,9 @@ static BOOL SystemSheet(NSString *path) {
     Controller *c = [Controller new];
     // cpu, kernel pressure (1 low, 2 medium, 4 high), memory in use, swap GB
     NSArray *states = @[@[@0.24, @1, @0.50, @0], @[@0.54, @1, @0.72, @0.6], @[@0.70, @2, @0.88, @3], @[@1.0, @4, @0.97, @9]];
-    NSArray *variants = @[@[@"A  today: chip, pressure pips, swap arrows", @(SysToday)],
-                          @[@"B  memory as a mini bar beside CPU; swap = red end", @(SysMemBar)],
-                          @[@"C  B, but nothing while memory is fine", @(SysMemBarQuiet)],
-                          @[@"D  two lanes: CPU above, memory below", @(SysLanes)]];
+    NSArray *variants = @[@[@"G  memory = line inside the CPU bar (Cursor's language); pressure tints it", @(SysInnerLine)],
+                          @[@"H  G, but the line appears only under memory pressure", @(SysInnerQuiet)],
+                          @[@"C  memory as a mini bar in the datum, only under pressure", @(SysMemBarQuiet)]];
     NSMutableArray *builders = [NSMutableArray array];
     for (NSArray *v in variants) {
         [builders addObject:^NSView *(NSAppearanceName look) {
@@ -621,6 +636,108 @@ static BOOL CursorSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Energybar coherence sheet (Energybar geometry: panel 400, gauge 68, value 74, datum 122)
+
+typedef NS_ENUM(NSInteger, EnergyStyle) { EnergyToday, EnergyMerged, EnergyMergedTrue };
+static const CGFloat ebW = 400, ebGaugeX = 110, ebGaugeW = 68, ebValueX = 182, ebValueW = 74, ebDatumX = 262, ebDatumW = 122;
+
+static NSView *EnergyRow(Controller *c, NSString *symbol, NSColor *tint, NSString *name, double fraction, NSColor *barColor,
+                         double signedFlow, NSString *value, NSColor *valueInk, NSString *datum,
+                         double arrowFrom, double arrowTo, NSAppearanceName __unused look) {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, ebW, kRowH)];
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
+    NSImageView *iv = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg]];
+    iv.imageScaling = NSImageScaleProportionallyDown; iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2, kLeadW, kLeadSymbol); [row addSubview:iv];
+    [row addSubview:[c text:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                         at:NSMakeRect(48, (kRowH - 16) / 2, 60, 16) align:NSTextAlignmentLeft]];
+    NSRect gf = NSMakeRect(ebGaugeX, (kRowH - kGaugeH) / 2, ebGaugeW, kGaugeH);
+    if (!isnan(signedFlow)) {
+        // Energybar today: centre-zero, import left, export right.
+        PowerFlowGauge *dummy = nil; (void)dummy;
+        FlowSketch *f = [[FlowSketch alloc] initWithFrame:gf];
+        f.balance = YES; f.scale = 1; f.inW = MAX(signedFlow, 0); f.loadW = MAX(-signedFlow, 0);
+        [row addSubview:f];
+    } else if (fraction >= 0) {
+        Gauge *g = [[Gauge alloc] initWithFrame:gf]; g.fraction = fraction; g.color = barColor; [row addSubview:g];
+        if (arrowFrom >= 0 && fabs(arrowTo - arrowFrom) > 0.001) {
+            TrendArrow *a = [[TrendArrow alloc] initWithFrame:NSMakeRect(NSMinX(gf) - 5, NSMidY(gf) - 5, NSWidth(gf) + 10, 10)];
+            a.from = arrowFrom; a.to = arrowTo; [row addSubview:a];
+        }
+    }
+    [row addSubview:[c text:value font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold] color:valueInk ?: NSColor.labelColor
+                         at:NSMakeRect(ebValueX, (kRowH - kValueH) / 2, ebValueW, kValueH) align:NSTextAlignmentRight]];
+    [row addSubview:[c text:datum font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular] color:NSColor.secondaryLabelColor
+                         at:NSMakeRect(ebDatumX + 6, (kRowH - kDatumH) / 2, ebDatumW - 6, kDatumH) align:NSTextAlignmentLeft]];
+    return row;
+}
+
+static NSView *EnergyPanel(Controller *c, NSString *title, NSArray<NSView *> *rows, NSAppearanceName look) {
+    CGFloat y = 8;
+    PopoverRootView *panel = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, ebW, 400)];
+    panel.appearance = [NSAppearance appearanceNamed:look];
+    [panel addSubview:[c text:title font:[NSFont systemFontOfSize:12 weight:NSFontWeightBold] color:NSColor.secondaryLabelColor
+                           at:NSMakeRect(kPad, y, ebW - 2 * kPad, 16) align:NSTextAlignmentLeft]];
+    y += 22;
+    NSFont *cap = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    [panel addSubview:[c text:@"Now" font:cap color:NSColor.secondaryLabelColor at:NSMakeRect(ebValueX, y, ebValueW, 14) align:NSTextAlignmentRight]];
+    [panel addSubview:[c text:@"Today" font:cap color:NSColor.secondaryLabelColor at:NSMakeRect(ebDatumX + 6, y, 60, 14) align:NSTextAlignmentLeft]];
+    y += 16;
+    for (NSView *row in rows) { NSRect f = row.frame; f.origin.y = y; row.frame = f; [panel addSubview:row]; y += NSHeight(f); }
+    NSRect pf = panel.frame; pf.size.height = y + 8; panel.frame = pf;
+    return panel;
+}
+
+static BOOL EnergySheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSColor *orange = NSColor.systemOrangeColor, *green = NSColor.systemGreenColor, *red = NSColor.systemRedColor, *blue = NSColor.systemBlueColor;
+    double scale = 5.0, packKWh = 57.5;
+    // situation: solar kW, grid kW (+ export), car kW, SoC %, solar today, grid today, car today
+    NSArray *situations = @[@[@"charging on solar", @4.8, @0.1, @2.6, @62, @"8.2 kWh", @"0.0 kWh", @"1.9 kWh"],
+                            @[@"big export", @4.6, @3.4, @0.0, @80, @"18.4 kWh", @"9.6 kWh", @"—"],
+                            @[@"night, importing", @0.0, @-0.6, @0.0, @71, @"24.9 kWh", @"2.1 kWh", @"—"]];
+    NSArray *variants = @[@[@"A  today: grid centre-zero, car kW and battery % as two rows", @(EnergyToday)],
+                          @[@"B  car = battery bar + trend arrow (1 h, min 10 pt), grid = plain bar", @(EnergyMerged)],
+                          @[@"C  B with the arrow at true 1 h length", @(EnergyMergedTrue)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        EnergyStyle style = [v[1] integerValue];
+        for (NSArray *st in situations) {
+            [builders addObject:^NSView *(NSAppearanceName look) {
+                double pv = [st[1] doubleValue], grid = [st[2] doubleValue], car = [st[3] doubleValue], soc = [st[4] doubleValue] / 100.0;
+                BOOL exporting = grid > 0.05, importing = grid < -0.05;
+                NSString *gridName = importing ? @"Import" : @"Export";
+                NSColor *gridInk = importing ? red : exporting ? green : nil;
+                NSMutableArray *rows = [NSMutableArray array];
+                [rows addObject:EnergyRow(c, @"sun.max.fill", pv > 0.05 ? orange : nil, @"Solar", pv / scale, orange, NAN,
+                                          [NSString stringWithFormat:@"%.1f kW", pv], pv > 0.05 ? orange : nil, st[5], -1, -1, look)];
+                if (style == EnergyToday)
+                    [rows addObject:EnergyRow(c, @"powerplug", gridInk, gridName, -1, nil, grid / scale,
+                                              [NSString stringWithFormat:@"%.1f kW", fabs(grid)], gridInk, st[6], -1, -1, look)];
+                else
+                    [rows addObject:EnergyRow(c, @"powerplug", gridInk, gridName, fabs(grid) / scale, gridInk ?: NSColor.secondaryLabelColor, NAN,
+                                              [NSString stringWithFormat:@"%.1f kW", fabs(grid)], gridInk, st[6], -1, -1, look)];
+                if (style == EnergyToday) {
+                    [rows addObject:EnergyRow(c, @"car.fill", car > 0.05 ? blue : nil, @"Car", car / scale, blue, NAN,
+                                              [NSString stringWithFormat:@"%.1f kW", car], car > 0.05 ? blue : nil, st[7], -1, -1, look)];
+                    [rows addObject:EnergyRow(c, @"battery.75", soc >= 0.5 ? green : orange, @"Battery", soc, soc >= 0.5 ? green : orange, NAN,
+                                              [NSString stringWithFormat:@"%.0f%%", soc * 100], nil, @"", -1, -1, look)];
+                } else {
+                    double perHour = car / packKWh;
+                    double to = soc + perHour;
+                    if (style == EnergyMerged && car > 0.05) to = MAX(to, soc + 10.0 / ebGaugeW);
+                    [rows addObject:EnergyRow(c, @"car.fill", car > 0.05 ? blue : nil, @"Car", soc, soc >= 0.5 ? green : orange, NAN,
+                                              [NSString stringWithFormat:@"%.1f kW", car], car > 0.05 ? blue : nil, st[7],
+                                              car > 0.05 ? soc : -1, MIN(to, 1.0), look)];
+                }
+                return EnergyPanel(c, [NSString stringWithFormat:@"%@ — %@", v[0], st[0]], rows, look);
+            }];
+        }
+    }
+    // three situations per variant: lay them out light-only for compactness
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -631,6 +748,7 @@ int main(int argc, const char **argv) {
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "trend")) return TrendSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "cursor")) return CursorSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "energy")) return EnergySheet(path) ? 0 : 1;
         Controller *c = [Controller new];
         NSArray *variants = @[@[@"A  today (no pace)", @(PaceNone)],
                               @[@"B  time bug: vertical bar at time left", @(PaceTick)],

@@ -553,28 +553,15 @@ int main(int argc, const char **argv) {
             return Fail(__LINE__);
         PowerFlowGauge *flowBar = (PowerFlowGauge *)FindIdentifier(battery.documentView, @"details.battery.input.gauge");
         if (flowBar && (![flowBar isKindOfClass:PowerFlowGauge.class] || !flowBar.toolTip.length)) return Fail(__LINE__);
-        // System is a CPU instrument; memory is silent at low pressure and speaks, in words that
-        // name it, only under pressure. No unexplained glyphs (chip, pips, swap arrows).
+        // System: CPU is the bar; memory in use is the thin line inside it (Cursor's language).
+        // No words or unexplained glyphs beside it.
         for (NSView *doc in @[root, overview.documentView]) {
             NSString *stem = doc == root ? @"popover.system" : @"details.overview.system";
-            NSTextField *mem = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
-            if (![FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]) isKindOfClass:Gauge.class] ||
-                ![mem isKindOfClass:NSTextField.class] || mem.stringValue.length ||
-                FindIdentifier(doc, [stem stringByAppendingString:@".memory.symbol"]) ||
-                FindIdentifier(doc, [stem stringByAppendingString:@".swap.symbol"])) return Fail(__LINE__);
-        }
-        {
-            SystemState tight = sys; tight.kernPressure = 2; tight.memAvailable = 2254857830ULL; tight.swapUsed = 3221225472ULL;
-            [c setValue:[NSValue valueWithBytes:&tight objCType:@encode(SystemState)] forKey:@"sys"];
-            [c rebuildContent];
-            NSTextField *mem = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.system.datum");
-            if (![mem.stringValue isEqual:@"RAM 2 GB free"] || ![mem.textColor isEqual:NSColor.systemOrangeColor] ||
-                !FitsChildren(p.contentViewController.view)) { fprintf(stderr, "mem: %s\n", mem.stringValue.UTF8String); return Fail(__LINE__); }
-            if (argc > 1 && !RenderOffscreen(p.contentViewController.view, [[[NSString stringWithUTF8String:argv[1]]
-                    stringByDeletingPathExtension] stringByAppendingString:@"-ramtight.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua))
-                return Fail(__LINE__);
-            [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
-            [c rebuildContent];
+            Gauge *cpuBar = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+            if (![cpuBar isKindOfClass:Gauge.class] || fabs(cpuBar.innerFraction - 0.5) > 0.001 ||
+                ![cpuBar.toolTip containsString:@"Line inside: memory in use"] ||
+                FindIdentifier(doc, [stem stringByAppendingString:@".datum"]) ||
+                FindIdentifier(doc, [stem stringByAppendingString:@".memory.symbol"])) return Fail(__LINE__);
         }
         NSArray *etaFields = @[etaName, etaValue];
         for (NSTextField *field in etaFields) {
