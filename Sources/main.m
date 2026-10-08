@@ -331,6 +331,25 @@ static unsigned long long FootprintForPid(pid_t pid) {
     return 0;
 }
 
+// Every readable process's cumulative energy (nanojoules) from the kernel's own counter:
+// no child process and no privilege, ~2 ms. Root-owned processes (WindowServer,
+// kernel_task) are unreadable; their share lands in "Screen + system".
+static NSDictionary<NSNumber *, NSNumber *> *SnapshotProcessEnergy(void) {
+    int count = proc_listallpids(NULL, 0);
+    if (count <= 0) return @{};
+    pid_t *pids = calloc((size_t)count * 2, sizeof(pid_t));
+    if (!pids) return @{};
+    count = proc_listallpids(pids, (int)(sizeof(pid_t) * (size_t)count * 2));
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)MAX(count, 0)];
+    for (int i = 0; i < count; i++) {
+        struct rusage_info_v6 ri;
+        if (pids[i] > 0 && proc_pid_rusage(pids[i], RUSAGE_INFO_V6, (rusage_info_t *)&ri) == 0)
+            out[@(pids[i])] = @((double)ri.ri_energy_nj);
+    }
+    free(pids);
+    return out;
+}
+
 static NSDictionary<NSString *, NSArray<NSDictionary *> *> *SampleProcessStats(int topN) {
     NSString *out = RunTaskOutput(@"/bin/ps", @[@"-axo", @"pid=,pcpu=,rss=,comm="]);
     return ParseProcessStats(out ? out : @"", topN,
@@ -864,33 +883,39 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
     }
     return reset;
 }
-// The pace of the window the gauge shows: Claude's weekly all-models window, Cursor's
-// billing cycle, or the window whose reset the row reports. -1 when unknown.
-static double AIUsagePace(AIUsage *u, NSDictionary *claudeQuotas, NSDictionary *cursorPools, double now) {
-    if (u.overageActive) return -1;
-    if (claudeQuotas) return QuotaPaceFraction(claudeQuotas[@"opusWindow"], now);
-    if (cursorPools) {
-        for (NSString *key in @[@"api", @"cursor"]) {
-            double pace = QuotaPaceFraction(cursorPools[key], now);
-            if (pace >= 0) return pace;
+// Fuel-out for the window the gauge shows: Claude's weekly all-models window, the
+// earlier of Cursor's two pools, or the window whose reset the row reports. nil when the
+// window lasts to its reset at the average rate (or cannot be forecast).
+static NSDate *AIUsageDryDate(AIUsage *u, NSDictionary *claudeQuotas, NSDictionary *cursorPools, double now) {
+    if (u.overageActive) return nil;
+    double dry = 0;
+    if (claudeQuotas) {
+        NSMutableDictionary *w = [claudeQuotas[@"opusWindow"] mutableCopy];
+        if (w && [claudeQuotas[@"opus"] isKindOfClass:NSNumber.class]) w[@"remainingFraction"] = claudeQuotas[@"opus"];
+        dry = QuotaDryEpoch(w, now);
+    } else if (cursorPools) {
+        for (NSDictionary *w in cursorPools.allValues) {
+            double d = QuotaDryEpoch(w, now);
+            if (d > 0 && (dry == 0 || d < dry)) dry = d;
         }
-        return -1;
-    }
-    if (!u.resetAt) return -1;
-    for (NSDictionary *w in u.limitWindows) {
-        NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
-        if (resets && fabs(resets.doubleValue - u.resetAt.timeIntervalSince1970) < 1) {
-            double pace = QuotaPaceFraction(w, now);
-            if (pace >= 0) return pace;
+    } else if (u.resetAt) {
+        for (NSDictionary *w in u.limitWindows) {
+            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
+            if (resets && fabs(resets.doubleValue - u.resetAt.timeIntervalSince1970) < 1) {
+                dry = QuotaDryEpoch(w, now);
+                if (dry > 0) break;
+            }
         }
     }
-    return -1;
+    return dry > 0 ? [NSDate dateWithTimeIntervalSince1970:dry] : nil;
 }
-static BOOL PaceBehind(double fill, double pace) { return fill >= 0 && pace >= 0 && fill < pace - 0.02; }
-static NSString *PaceTip(double fill, double pace) {
-    if (pace < 0) return nil;
-    return [NSString stringWithFormat:@"Pace mark: %.0f%% of the window's time left · %@", pace * 100,
-            PaceBehind(fill, pace) ? @"spending faster than time; runs out before the reset" : @"on track to last to the reset"];
+static NSString *DryTip(NSDate *dry, NSDate *reset) {
+    if (!dry) return nil;
+    NSString *when = ResetClockText(dry, NSDate.date);
+    NSString *resetText = reset ? ResetClockText(reset, NSDate.date) : nil;
+    return resetText.length
+        ? [NSString stringWithFormat:@"At this window's average rate it runs dry %@, before the reset %@", when, resetText]
+        : [NSString stringWithFormat:@"At this window's average rate it runs dry %@, before the reset", when];
 }
 
 static NSString *CursorPoolTip(NSDictionary *pools) {
@@ -3117,25 +3142,39 @@ static NSInteger PressurePipLevel(NSString *level) {
 }
 @end
 
-// The pace bug on a quota tape: a small caret above the gauge at the fraction of the
-// window's time still to run. A fill that stops short of it is burning faster than the
-// clock and will run dry before the reset; the caret turns orange then.
-@interface PaceCaret : NSView
-@property (nonatomic) BOOL behind;
+// Segments laid end to end on one track: @{@"w": watts, @"color": NSColor}, against
+// `scale` watts. The battery Burn instrument: apps in orange shades, screen + system grey.
+@interface StackedGauge : NSView
+@property (nonatomic, copy) NSArray<NSDictionary *> *segments;
+@property (nonatomic) double scale;
 @end
-@implementation PaceCaret
-- (void)setBehind:(BOOL)behind { _behind = behind; self.needsDisplay = YES; }
+@implementation StackedGauge
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setAccessibilityElement:YES];
+        self.accessibilityRole = NSAccessibilityImageRole;
+    }
+    return self;
+}
+- (void)setSegments:(NSArray<NSDictionary *> *)segments { _segments = [segments copy]; self.needsDisplay = YES; }
+- (void)setScale:(double)scale { _scale = scale; self.needsDisplay = YES; }
 - (void)drawRect:(NSRect)dirty {
-    NSRect r = self.bounds;
-    BOOL down = !self.superview.isFlipped;   // point at the bar below
-    NSBezierPath *p = [NSBezierPath bezierPath];
-    CGFloat tipY = down ? NSMinY(r) : NSMaxY(r), baseY = down ? NSMaxY(r) : NSMinY(r);
-    [p moveToPoint:NSMakePoint(NSMidX(r), tipY)];
-    [p lineToPoint:NSMakePoint(NSMinX(r), baseY)];
-    [p lineToPoint:NSMakePoint(NSMaxX(r), baseY)];
-    [p closePath];
-    [(_behind ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor) setFill];
-    [p fill];
+    NSRect r = self.bounds; CGFloat rad = NSHeight(r) / 2;
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
+    if (_scale <= 0) return;
+    [NSGraphicsContext saveGraphicsState]; [track addClip];
+    CGFloat x = NSMinX(r);
+    for (NSDictionary *seg in _segments) {
+        double w = [seg[@"w"] doubleValue];
+        if (w <= 0 || x >= NSMaxX(r)) continue;
+        CGFloat width = MIN(NSWidth(r) * w / _scale, NSMaxX(r) - x);
+        [(NSColor *)seg[@"color"] setFill];
+        // A 1pt hairline separates apps, but a sliver keeps its whole width rather than vanish.
+        NSRectFill(NSMakeRect(x, NSMinY(r), width >= 4 ? width - 1 : width, NSHeight(r)));
+        x += width;
+    }
+    [NSGraphicsContext restoreGraphicsState];
 }
 @end
 
@@ -3499,8 +3538,9 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
         [old setAccessibilityElement:new.isAccessibilityElement];
-    } else if ([existing isKindOfClass:PaceCaret.class]) {
-        ((PaceCaret *)existing).behind = ((PaceCaret *)fresh).behind;
+    } else if ([existing isKindOfClass:StackedGauge.class]) {
+        StackedGauge *old = (StackedGauge *)existing, *new = (StackedGauge *)fresh;
+        old.segments = new.segments; old.scale = new.scale;
     } else if ([existing isKindOfClass:PressurePips.class]) {
         PressurePips *old = (PressurePips *)existing, *new = (PressurePips *)fresh;
         old.level = new.level; old.color = new.color;
@@ -4028,6 +4068,15 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSString *_aiCatchUpStatus;
     BOOL _aiTotalsIncomplete;
     NSArray<NSDictionary *> *_hogs;
+    // Battery burn by app, on battery only. The baseline is one energy snapshot taken when
+    // the Mac is unplugged (or at launch on battery); live samples run only while a panel is open.
+    NSDictionary<NSNumber *, NSNumber *> *_energyBaseline, *_energyPrev;
+    NSDate *_energyBaselineAt;
+    BOOL _energyBaselineAtUnplug, _energySampling;
+    double _energyBaselineWh;
+    CFAbsoluteTime _energyPrevAt;
+    NSArray<NSDictionary *> *_burnRows;
+    NSMutableDictionary<NSNumber *, NSString *> *_burnGroupCache;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
     NSMutableArray<NSNumber *> *_ampHistory;
     NSUInteger _sampleGen;
@@ -4128,6 +4177,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                            @"useCursorAccount": @NO, @"switchToNewOutputs": @YES}];
     _bat = ReadBattery();
+    [self noteEnergyBaseline:NO];
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
@@ -5030,7 +5080,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 
 - (void)refresh {
     [self refreshVolumesAsync];
+    BOOL wasOnAC = _bat.valid && _bat.acConnected;
     _bat = ReadBattery();
+    [self noteEnergyBaseline:wasOnAC];
     // refresh fires from three uncoordinated sources (15s timer, IOPS notification
     // bursts, popover open); only advance the CPU tick baseline when the window is
     // wide enough to be meaningful, and reuse the last good reading otherwise.
@@ -5736,8 +5788,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                         fresh.percent != _bat.percent;
     BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
                         fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
+    BOOL wasOnAC = _bat.acConnected;
     _bat = fresh;
     _powerTicks++;
+    [self noteEnergyBaseline:wasOnAC];
+    if (!_bat.acConnected && _powerTicks % 2 == 0) [self sampleBurnAsync];
     if (stateChanged) {
         if (popover) [self rebuildContent];
         if (details) [self rebuildDetails];
@@ -5781,9 +5836,81 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (!_detailsWindow.isVisible) [self stopPowerTick];
 }
 
+// Unplugging takes one energy snapshot so "since unplug" has a starting point; plugging
+// in drops it. Launching on battery starts the count from launch instead.
+- (void)noteEnergyBaseline:(BOOL)wasOnAC {
+    if (!_bat.valid) return;
+    if (_bat.acConnected) {
+        _energyBaseline = nil; _energyPrev = nil; _energyBaselineAt = nil; _burnRows = nil;
+        [_burnGroupCache removeAllObjects];
+        return;
+    }
+    if (_energyBaseline || _energySampling) return;
+    _energySampling = YES;
+    _energyBaselineAtUnplug = wasOnAC;
+    _energyBaselineWh = BatteryWattHours(_bat.rawCurrent_mAh, _bat.voltage_mV);
+    NSDate *at = NSDate.date;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *snap = SnapshotProcessEnergy();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_energySampling = NO;
+            if (self->_bat.acConnected) return;   // plugged back in meanwhile
+            self->_energyBaseline = snap;
+            self->_energyBaselineAt = at;
+        });
+    });
+}
+
+// The Mac's whole draw on battery: Apple's system-load telemetry, else the discharge.
+- (double)burnDrawWatts {
+    if (!_bat.valid || _bat.acConnected) return -1;
+    if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN) return _bat.systemLoad_mW / 1000.0;
+    double bw = BatteryWatts(_bat);
+    return !isnan(bw) && bw < 0 ? -bw : -1;
+}
+
+// Battery Wh used since the baseline, from the battery's own charge.
+- (double)burnSinceBaselineWh {
+    if (!_energyBaselineAt || isnan(_energyBaselineWh)) return -1;
+    double now = BatteryWattHours(_bat.rawCurrent_mAh, _bat.voltage_mV);
+    return isnan(now) ? -1 : MAX(0, _energyBaselineWh - now);
+}
+
+// One live energy sample (panel open, on battery). The first only seeds the delta.
+- (void)sampleBurnAsync {
+    if (!_bat.valid || _bat.acConnected || _energySampling) return;
+    _energySampling = YES;
+    NSDictionary *prev = _energyPrev, *baseline = _energyBaseline;
+    CFAbsoluteTime prevAt = _energyPrevAt;
+    if (!_burnGroupCache) _burnGroupCache = [NSMutableDictionary dictionary];
+    NSMutableDictionary *cache = _burnGroupCache;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *cur = SnapshotProcessEnergy();
+        CFAbsoluteTime at = CFAbsoluteTimeGetCurrent();
+        NSMutableDictionary *names = [NSMutableDictionary dictionary];
+        @synchronized (cache) { [names addEntriesFromDictionary:cache]; }
+        NSArray *rows = BurnRows(prev, cur, baseline, prev ? at - prevAt : 0, ^NSString *(pid_t pid) {
+            NSString *name = names[@(pid)];
+            if (!name) { name = AppGroupForPid(pid) ?: @""; names[@(pid)] = name; }
+            return name;
+        });
+        @synchronized (cache) { [cache addEntriesFromDictionary:names]; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_energySampling = NO;
+            if (self->_bat.acConnected) return;
+            self->_energyPrev = cur;
+            self->_energyPrevAt = at;
+            if (prev) { self->_burnRows = rows; [self refreshVisibleSurfaces]; }
+        });
+    });
+}
+
 // Starts both process samplers, invalidating any still-in-flight results: top takes
 // >1s, so a close/reopen can otherwise interleave an old sample over a newer one.
 - (void)beginSampling {
+    // A stale previous sample would average over the time the panel was closed.
+    if (CFAbsoluteTimeGetCurrent() - _energyPrevAt > 5) { _energyPrev = nil; _burnRows = nil; }
+    [self sampleBurnAsync];
     _sampleGen++;
     _lastSampleTime = CFAbsoluteTimeGetCurrent();
     [self sampleHogsAsync];
@@ -6251,7 +6378,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         int minutes = MinutesTo20(_bat, [self avgAmp]);
         if (minutes >= 0) time = FmtDuration(minutes);
     }
-    if (!watts) return time ? [time stringByAppendingString:@" to 20%"] : @"…";
+    // The Burn row below carries the watts on battery; here the time is the reading.
+    if (!watts || [self burnDrawWatts] >= 0) return time ? [time stringByAppendingString:@" to 20%"] : @"…";
     if (!time) return watts;
     NSString *both = [NSString stringWithFormat:@"%@ · %@", watts, time];
     NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
@@ -6465,24 +6593,98 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
 // The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
 // indexing) takes the datum column; the reset clock is the datum otherwise.
 // The provider's name sits beside its logo. The tooltip still leads with the name.
-- (PaceCaret *)addPaceCaret:(double)pace fill:(double)fill over:(NSView *)gauge
-                identifier:(NSString *)identifier tip:(NSString *)tip in:(NSView *)row {
-    // Always present (hidden without a pace) so the view tree keeps its shape and a
-    // refresh updates the row in place rather than replacing it.
-    if (!gauge) return nil;
-    CGFloat w = 8, h = 5;
-    CGFloat x = round(NSMinX(gauge.frame) + NSWidth(gauge.frame) * MAX(pace, 0) - w / 2);
-    CGFloat y = row.isFlipped ? NSMinY(gauge.frame) - h - 1 : NSMaxY(gauge.frame) + 1;
-    PaceCaret *caret = [[PaceCaret alloc] initWithFrame:NSMakeRect(x, y, w, h)];
-    caret.behind = PaceBehind(fill, pace);
-    caret.accessibilityIdentifier = identifier;
-    [caret setAccessibilityElement:YES];
-    caret.accessibilityRole = NSAccessibilityImageRole;
-    caret.accessibilityLabel = tip;
-    caret.toolTip = tip;
-    caret.hidden = pace < 0;
-    [row addSubview:caret];
-    return caret;
+// The burn split for the bar: the top three apps in orange shades, the other apps faint,
+// and whatever the apps do not account for (screen, chip, root services) in grey.
+- (NSArray<NSDictionary *> *)burnSegmentsForDraw:(double)draw {
+    NSMutableArray *segments = [NSMutableArray array];
+    double apps = 0, rest = 0;
+    NSArray *alphas = @[@1.0, @0.7, @0.45];
+    for (NSUInteger i = 0; i < _burnRows.count; i++) {
+        double w = [_burnRows[i][@"watts"] doubleValue];
+        apps += w;
+        if (i < alphas.count)
+            [segments addObject:@{@"w": @(w), @"color": [NSColor.systemOrangeColor colorWithAlphaComponent:[alphas[i] doubleValue]]}];
+        else rest += w;
+    }
+    if (rest > 0) [segments addObject:@{@"w": @(rest), @"color": [NSColor.systemOrangeColor colorWithAlphaComponent:0.25]}];
+    if (draw > apps) [segments addObject:@{@"w": @(draw - apps), @"color": [NSColor.systemGrayColor colorWithAlphaComponent:0.7]}];
+    return segments;
+}
+
+- (NSString *)burnSinceLabel {
+    if (!_energyBaselineAt) return nil;
+    return _energyBaselineAtUnplug ? @"Since unplug" : [@"Since " stringByAppendingString:ClockText(_energyBaselineAt)];
+}
+
+- (NSString *)burnTip:(double)draw {
+    NSMutableArray *lines = [NSMutableArray array];
+    BOOL hasWh = _energyBaselineAt != nil;
+    double apps = 0, appsWh = 0;
+    for (NSDictionary *row in _burnRows) {
+        double w = [row[@"watts"] doubleValue], wh = [row[@"wh"] doubleValue];
+        apps += w; appsWh += wh;
+        [lines addObject:hasWh ? [NSString stringWithFormat:@"%@ %.1f W · %.2f Wh", row[@"name"], w, wh]
+                               : [NSString stringWithFormat:@"%@ %.1f W", row[@"name"], w]];
+    }
+    double since = [self burnSinceBaselineWh];
+    if (draw > 0) {
+        NSString *screen = [NSString stringWithFormat:@"Screen + system %.1f W", MAX(0, draw - apps)];
+        if (hasWh && since >= 0) screen = [screen stringByAppendingFormat:@" · %.2f Wh", MAX(0, since - appsWh)];
+        [lines addObject:screen];
+    }
+    if (hasWh && since >= 0) {
+        int minutes = (int)lround(-_energyBaselineAt.timeIntervalSinceNow / 60.0);
+        [lines addObject:[NSString stringWithFormat:@"%@: %.1f Wh over %@", [self burnSinceLabel], since, FmtDuration(minutes)]];
+    }
+    if (!_burnRows) [lines addObject:@"Measuring which apps are drawing power…"];
+    [lines addObject:@"Apps from the kernel's per-process energy counters; screen + system is the rest of the measured draw."];
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+// On battery only: one row, the Mac's draw split by app, with the heaviest app named.
+- (CGFloat)addBurnRowTo:(NSView *)root at:(CGFloat)y {
+    double draw = [self burnDrawWatts];
+    if (draw < 0) return y;
+    ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+    row.target = self;
+    row.action = @selector(showBatteryDetails:);
+    row.accessibilityRole = NSAccessibilityButtonRole;
+    row.accessibilityIdentifier = @"popover.row.burn";
+    NSString *tip = [self burnTip:draw];
+    row.toolTip = tip;
+    row.accessibilityLabel = tip;
+    [self instrumentSymbol:@"flame" tint:NSColor.systemOrangeColor identifier:@"popover.burn.symbol" in:row].toolTip = tip;
+    [self instrumentName:@"Burn" identifier:@"popover.burn.name" in:row].toolTip = tip;
+    StackedGauge *bar = [[StackedGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    bar.scale = MAX(20.0, draw);   // a fixed 20 W tape so the bar's length means something
+    bar.segments = [self burnSegmentsForDraw:draw];
+    bar.accessibilityIdentifier = @"popover.burn.gauge";
+    bar.accessibilityLabel = @"Battery draw by app";
+    bar.toolTip = tip;
+    [row addSubview:bar];
+    NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%.1f W", draw]
+                                         color:NSColor.labelColor identifier:@"popover.burn.value" in:row];
+    value.toolTip = tip;
+    NSString *datum = @"…";
+    NSColor *datumColor = NSColor.tertiaryLabelColor;
+    NSDictionary *top = _burnRows.firstObject;
+    if (top) {
+        NSString *watts = [NSString stringWithFormat:@" %.1f W", [top[@"watts"] doubleValue]];
+        NSString *name = top[@"name"];
+        for (NSString *vendor in @[@"Google ", @"Microsoft ", @"Adobe "])   // "Chrome" is what people call it
+            if ([name hasPrefix:vendor] && name.length > vendor.length) name = [name substringFromIndex:vendor.length];
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+        NSDictionary *attrs = @{NSFontAttributeName: font};
+        while (name.length > 1 && [[name stringByAppendingString:watts] sizeWithAttributes:attrs].width > kDatumW - 6)
+            name = [[name substringToIndex:name.length - 2] stringByAppendingString:@"…"];
+        datum = [name stringByAppendingString:watts];
+        datumColor = NSColor.secondaryLabelColor;
+    } else if (_burnRows) {
+        datum = @"screen";   // measured, and no app is drawing: it is all screen and system
+    }
+    [self instrumentDatum:datum color:datumColor identifier:@"popover.burn.datum" in:row].toolTip = tip;
+    [root addSubview:row];
+    return y + kRowH;
 }
 
 - (CGFloat)addAICard:(AIUsage *)u toView:(NSView *)root width:(CGFloat)width pad:(CGFloat)pad at:(CGFloat)y {
@@ -6555,12 +6757,12 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
         [row addSubview:plainGauge];
     }
-    double fill = claudeMeter ? week : cursorPools ? CursorLowestFraction(cursorPools) : u.remainingFraction;
-    double pace = hasGauge ? AIUsagePace(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : -1;
-    NSString *paceTip = PaceTip(fill, pace);
-    if (paceTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, paceTip] : paceTip;
-    [self addPaceCaret:pace fill:fill over:(meter ?: plainGauge)
-            identifier:[NSString stringWithFormat:@"popover.ai.%@.pace", slug] tip:paceTip in:row];
+    NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
+    if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
+        resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+    NSDate *dry = hasGauge ? AIUsageDryDate(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : nil;
+    NSString *dryTip = DryTip(dry, resetDate);
+    if (dryTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, dryTip] : dryTip;
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
@@ -6585,10 +6787,12 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (dry) {
+        // Endurance, not a deadline: the fuel runs out before the reset at this window's rate.
+        datum = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
+        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
-        NSDate *reset = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
-        if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
-            reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+        NSDate *reset = resetDate;
         // A bare "21:00" beside a bar could mean anything; one word says what it is.
         NSString *clock = CompactResetClock(reset, NSDate.date);
         datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
@@ -6739,6 +6943,8 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         [root addSubview:row];
         y += kRowH;
     }
+
+    y = [self addBurnRowTo:root at:y];
 
     {
         NSString *sysLevel = SystemPressureLevel(_sys);
@@ -7748,10 +7954,12 @@ static NSColor *HealthColor(double fraction) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
     }
-    double fill = claudeMeter ? week : cursorPools ? CursorLowestFraction(cursorPools) : u.remainingFraction;
-    double pace = hasGauge ? AIUsagePace(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : -1;
-    NSString *paceTip = PaceTip(fill, pace);
-    if (paceTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, paceTip] : paceTip;
+    NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
+    if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
+        resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+    NSDate *dry = hasGauge ? AIUsageDryDate(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : nil;
+    NSString *dryTip = DryTip(dry, resetDate);
+    if (dryTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, dryTip] : dryTip;
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
         named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
@@ -7779,7 +7987,6 @@ static NSColor *HealthColor(double fraction) {
                                       identifier:[stem stringByAppendingString:@".name"] in:row];
     providerName.toolTip = named;
     providerName.accessibilityLabel = name;
-    NSView *gauge = nil;
     if (claudeMeter) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:DetailGaugeRect(c)];
         meter.secondFraction = week;   // weekly all-models figure; Fable stays off this gauge
@@ -7787,20 +7994,17 @@ static NSColor *HealthColor(double fraction) {
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
         meter.toolTip = named;
         [row addSubview:meter];
-        gauge = meter;
     } else if (cursorPools) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(c.gaugeX, (c.rowH - kCursorGaugeH) / 2, c.gaugeW, kCursorGaugeH)];
         ConfigureCursorGauge(meter, cursorPools);
         meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
         meter.toolTip = named;
         [row addSubview:meter];
-        gauge = meter;
     } else if (hasGauge) {
-        gauge = [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
-                            label:[NSString stringWithFormat:@"%@ quota remaining", name]
-                       identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+        [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
+                    label:[NSString stringWithFormat:@"%@ quota remaining", name]
+               identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
     }
-    [self addPaceCaret:pace fill:fill over:gauge identifier:[stem stringByAppendingString:@".pace"] tip:paceTip in:row];
     NSView *value = cursorPools
         ? [self cursorPoolValues:cursorPools stale:[self aiSnapshotStaleWarns:u]
                           frame:NSMakeRect(c.valueX, 0, c.valueW, c.rowH)
@@ -7815,10 +8019,12 @@ static NSColor *HealthColor(double fraction) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (dry) {
+        // Endurance, not a deadline: the fuel runs out before the reset at this window's rate.
+        datum = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
+        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
-        NSDate *reset = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
-        if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
-            reset = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+        NSDate *reset = resetDate;
         NSString *clock = CompactResetClock(reset, NSDate.date);
         datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
     }
@@ -7850,9 +8056,11 @@ static NSColor *HealthColor(double fraction) {
         NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@ left", full, pct];
         if (clock.length) [tip appendFormat:@" · resets %@", clock];
         else if ([w[@"fresh"] boolValue]) [tip appendString:@" · not started"];
-        double pace = hasFrac ? QuotaPaceFraction(w, NSDate.date.timeIntervalSince1970) : -1;
-        NSString *paceTip = PaceTip(frac, pace);
-        if (paceTip) [tip appendFormat:@"\n%@", paceTip];
+        double dryEpoch = hasFrac ? QuotaDryEpoch(w, NSDate.date.timeIntervalSince1970) : 0;
+        NSDate *dry = dryEpoch > 0 ? [NSDate dateWithTimeIntervalSince1970:dryEpoch] : nil;
+        NSString *dryTip = DryTip(dry, resetDate);
+        if (dryTip) [tip appendFormat:@"\n%@", dryTip];
+        if (dry) reset = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
         NSString *rowID = [NSString stringWithFormat:@"details.ai.window.%@.%lu", slug, (unsigned long)i];
         NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
         NSTextField *lab = [self detailText:label font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
@@ -7861,13 +8069,11 @@ static NSColor *HealthColor(double fraction) {
                                        align:NSTextAlignmentLeft
                                   identifier:[rowID stringByAppendingString:@".label"] in:row];
         lab.toolTip = tip;
-        if (hasFrac && frac >= 0) {
-            Gauge *g = [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
-                              identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
-            [self addPaceCaret:pace fill:frac over:g identifier:[rowID stringByAppendingString:@".pace"] tip:paceTip in:row];
-        }
+        if (hasFrac && frac >= 0)
+            [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
+                   identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
         [self detailValue:pct color:color identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
-        [self detailDatum:reset color:NSColor.secondaryLabelColor
+        [self detailDatum:reset color:(dry ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor)
                identifier:[rowID stringByAppendingString:@".datum"] tip:tip in:row cols:c];
         y += c.rowH;
     }
@@ -8214,6 +8420,64 @@ static NSColor *HealthColor(double fraction) {
                  identifier:identifier in:row];
 }
 
+// The Battery tab's burn list on battery: each app's live watts and its Wh since unplug,
+// then the screen-and-system remainder, then the total since unplug.
+- (CGFloat)addBurnDetailsTo:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    double draw = [self burnDrawWatts];
+    if (draw < 0) return y;
+    [self addDetailHeading:@"Burn" key:@"burn" to:root y:&y width:kDetailW];
+    if (!_burnRows)
+        return [self addDetailNoticeTo:root y:y cols:c identifier:@"details.battery.burn.empty"
+                                   tip:@"Measuring which apps are drawing power…" problem:NO];
+    BOOL hasWh = _energyBaselineAt != nil;
+    double scale = MAX(draw, 0.1), apps = 0, appsWh = 0;
+    void (^addRow)(CGFloat, NSString *, double, double, NSColor *, NSString *) =
+        ^(CGFloat y, NSString *name, double watts, double wh, NSColor *color, NSString *identifier) {
+        NSString *tip = hasWh ? [NSString stringWithFormat:@"%@ · %.1f W now · %.2f Wh %@", name, watts, wh,
+                                 self->_energyBaselineAtUnplug ? @"since unplug" : @"since launch"]
+                              : [NSString stringWithFormat:@"%@ · %.1f W now", name, watts];
+        NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
+        [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium] color:NSColor.labelColor
+                   frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16) align:NSTextAlignmentLeft
+              identifier:[identifier stringByAppendingString:@".name"] in:row].toolTip = tip;
+        [self detailGauge:NSMakeRect(c.barX, (c.rowH - c.barH) / 2.0, c.barW, c.barH) fraction:MIN(watts / scale, 1.0)
+                    color:color label:tip identifier:[identifier stringByAppendingString:@".bar"] tip:tip in:row];
+        [self detailValue:[NSString stringWithFormat:@"%.1f W", watts] color:NSColor.labelColor
+               identifier:[identifier stringByAppendingString:@".value"] tip:tip in:row cols:c];
+        if (hasWh)
+            [self detailDatum:[NSString stringWithFormat:@"%.1f Wh", wh] color:NSColor.secondaryLabelColor
+                   identifier:[identifier stringByAppendingString:@".datum"] tip:tip in:row cols:c];
+    };
+    NSUInteger index = 0;
+    for (NSDictionary *r in _burnRows) {
+        double w = [r[@"watts"] doubleValue], wh = [r[@"wh"] doubleValue];
+        apps += w; appsWh += wh;
+        if (index >= 6) continue;   // the long tail stays in the remainder's company, on the tooltip
+        addRow(y, r[@"name"], w, wh, NSColor.systemOrangeColor,
+               [NSString stringWithFormat:@"details.battery.burn.%lu", (unsigned long)index]);
+        y += c.rowH; index++;
+    }
+    double since = [self burnSinceBaselineWh];
+    addRow(y, @"Screen + system", MAX(0, draw - apps), hasWh && since >= 0 ? MAX(0, since - appsWh) : 0,
+           NSColor.systemGrayColor, @"details.battery.burn.system");
+    y += c.rowH;
+    if (hasWh && since >= 0) {
+        int minutes = (int)lround(-_energyBaselineAt.timeIntervalSinceNow / 60.0);
+        NSString *label = [self burnSinceLabel];
+        NSString *tip = [NSString stringWithFormat:@"%@: %.1f Wh from the battery over %@", label, since, FmtDuration(minutes)];
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.battery.burn.since" tip:tip in:root];
+        [self detailText:label font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                   frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16) align:NSTextAlignmentLeft
+              identifier:@"details.battery.burn.since.name" in:row].toolTip = tip;
+        [self detailValue:[NSString stringWithFormat:@"%.1f Wh", since] color:NSColor.labelColor
+               identifier:@"details.battery.burn.since.value" tip:tip in:row cols:c];
+        [self detailDatum:[@"over " stringByAppendingString:FmtDuration(minutes)] color:NSColor.secondaryLabelColor
+               identifier:@"details.battery.burn.since.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    return y;
+}
+
 - (NSScrollView *)batteryDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 520)];
     root.accessibilityIdentifier = @"details.battery";
@@ -8341,7 +8605,9 @@ static NSColor *HealthColor(double fraction) {
         }
     }
 
-    if (_hogsLoading) {
+    if ([self burnDrawWatts] >= 0) {
+        y = [self addBurnDetailsTo:root y:y cols:c];
+    } else if (_hogsLoading) {
         y = [self addDetailNoticeTo:root y:y cols:c identifier:@"details.battery.energy.empty"
                                 tip:@"Measuring top apps…" problem:NO];
     } else if (_hogsUnavailable && !_hogs.count) {

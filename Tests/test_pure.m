@@ -817,29 +817,49 @@ int main(void) {
         check(legacyWins.count == 1 && fabs([legacyWins[0][@"remainingFraction"] doubleValue] - 0.25) < 0.001,
               @"cursor legacy aggregate remains unchanged");
 
-        // --- QuotaPaceFraction ---
-        double paceNow = 1791246033.0;
-        check(fabs(QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow + 2 * 86400)}, paceNow) - 2.0 / 7.0) < 0.001,
-              @"pace: two days left of a weekly window is 2/7");
-        check(fabs(QuotaPaceFraction(@{@"window": @"5-hour", @"resetsAt": @(paceNow + 3600)}, paceNow) - 0.2) < 0.001,
-              @"pace: one hour left of a 5-hour window is 20%");
-        check(fabs(QuotaPaceFraction(@{@"window": @"weekly Fable", @"resetsAt": @(paceNow + 7 * 86400)}, paceNow) - 1.0) < 0.001,
-              @"pace: a model-scoped weekly window is a week long");
-        check(QuotaPaceFraction(@{@"window": @"usage", @"resetsAt": @(paceNow + 60)}, paceNow) < 0,
-              @"pace: an unknown window length draws no mark");
-        check(QuotaPaceFraction(@{@"window": @"weekly"}, paceNow) < 0 &&
-              QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow - 1)}, paceNow) < 0,
-              @"pace: no reset, or an elapsed one, draws no mark");
-        check(QuotaPaceFraction(@{@"window": @"weekly", @"resetsAt": @(paceNow + 30 * 86400)}, paceNow) == 1.0,
-              @"pace: clamps to the full bar");
-        NSArray *codexPace = CodexLimitWindows(@{@"primary": @{@"used_percent": @50, @"window_minutes": @300,
-                                                                @"resets_at": @(paceNow + 9000)}}, paceNow);
-        check(codexPace.count == 1 && fabs(QuotaPaceFraction(codexPace[0], paceNow) - 0.5) < 0.001,
-              @"pace: Codex windows carry their length from window_minutes");
-        NSArray *cursorPace = CursorLimitWindows(cursorPools, paceNow);
-        check(cursorPace.count == 2 && fabs(QuotaPaceFraction(cursorPace[0], paceNow) -
-                  (1793708671.0 - paceNow) / (1793708671.0 - 1791030271.0)) < 0.001,
-              @"pace: Cursor windows span the billing cycle");
+        // --- QuotaDryEpoch (fuel-out) ---
+        double paceNow = 1791246033.0, dryDay = 86400;
+        // 2 days into a week, 50% used: 25%/day, so the remaining 50% lasts 2 more days.
+        NSDictionary *burning = @{@"window": @"weekly", @"remainingFraction": @0.5, @"resetsAt": @(paceNow + 5 * dryDay)};
+        check(fabs(QuotaDryEpoch(burning, paceNow) - (paceNow + 2 * dryDay)) < 1,
+              @"fuel-out: half used in two days runs dry two days later");
+        check(QuotaDryEpoch(@{@"window": @"weekly", @"remainingFraction": @0.8, @"resetsAt": @(paceNow + 5 * dryDay)}, paceNow) == 0,
+              @"fuel-out: a window that lasts to the reset has no dry time");
+        check(QuotaDryEpoch(@{@"window": @"weekly", @"remainingFraction": @0.5, @"resetsAt": @(paceNow + 6.5 * dryDay)}, paceNow) == 0,
+              @"fuel-out: under 10% of the window elapsed is too early to forecast");
+        check(QuotaDryEpoch(@{@"window": @"usage", @"remainingFraction": @0.1, @"resetsAt": @(paceNow + 60)}, paceNow) == 0 &&
+              QuotaDryEpoch(@{@"window": @"weekly", @"remainingFraction": @0.0, @"resetsAt": @(paceNow + dryDay)}, paceNow) == 0 &&
+              QuotaDryEpoch(@{@"window": @"weekly", @"remainingFraction": @1.0, @"resetsAt": @(paceNow + dryDay)}, paceNow) == 0,
+              @"fuel-out: unknown length, already empty, or untouched has no forecast");
+        NSArray *codexDry = CodexLimitWindows(@{@"primary": @{@"used_percent": @80, @"window_minutes": @300,
+                                                               @"resets_at": @(paceNow + 9000)}}, paceNow);
+        check(codexDry.count == 1 && fabs(QuotaDryEpoch(codexDry[0], paceNow) - (paceNow + 2250)) < 1,
+              @"fuel-out: Codex windows carry their length from window_minutes");
+        NSArray *cursorDry = CursorLimitWindows(cursorPools, paceNow);
+        check(cursorDry.count == 2 && QuotaWindowSeconds(cursorDry[0]) == 1793708671.0 - 1791030271.0,
+              @"fuel-out: Cursor windows span the billing cycle");
+
+        // --- BurnRows ---
+        {
+            NSString *(^group)(pid_t) = ^NSString *(pid_t pid) { return pid == 1 || pid == 2 ? @"Chrome" : pid == 3 ? @"node" : nil; };
+            NSDictionary *base = @{@1: @0, @2: @1e9, @3: @5e9};
+            NSDictionary *prev = @{@1: @10e9, @2: @11e9, @3: @50e9, @4: @9e9};
+            NSDictionary *cur  = @{@1: @14e9, @2: @13e9, @3: @51e9, @4: @1e9, @5: @3.6e12};
+            NSArray *rows = BurnRows(prev, cur, base, 2.0, group);
+            NSDictionary *chrome = rows.firstObject;
+            check([chrome[@"name"] isEqual:@"Chrome"] && fabs([chrome[@"watts"] doubleValue] - 3.0) < 1e-6,
+                  @"burn: helpers group into their app and watts come from the sample delta");
+            check(fabs([chrome[@"wh"] doubleValue] - (14e9 + 12e9) / 3.6e12) < 1e-9,
+                  @"burn: Wh count from the unplug baseline");
+            NSDictionary *other = nil;
+            for (NSDictionary *r in rows) if ([r[@"name"] isEqual:@"Other"]) other = r;
+            check(other && fabs([other[@"wh"] doubleValue] - (1.0 + 1e9 / 3.6e12)) < 1e-6 &&
+                  fabs([other[@"watts"] doubleValue] - 0.5) < 1e-6,
+                  @"burn: a process born after unplug counts in full; a recycled pid restarts from zero");
+            check(BurnRows(nil, cur, nil, 0, group).count == 0, @"burn: no previous sample and no baseline is no data");
+            NSArray *liveOnly = BurnRows(prev, cur, nil, 2.0, group);
+            check(liveOnly.count >= 2 && [liveOnly[0][@"wh"] doubleValue] == 0, @"burn: without a baseline rows carry live watts only");
+        }
 
         // --- ClaudeUsageOverlayingStatusline ---
         NSDictionary *apiBody = @{@"limits": @[

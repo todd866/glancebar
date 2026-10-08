@@ -192,12 +192,22 @@ NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
 // Empty when none apply.
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
 
-// Pace: the fraction of a quota window's time still to run (0…1), or -1 when the window's
-// length or reset is unknown. A gauge whose remaining quota sits left of this mark is being
-// spent faster than time and runs out before the reset. Length comes from "windowSeconds"
-// (Codex window_minutes, Cursor billing cycle) or a "weekly"/"5-hour" label.
+// Fuel-out: when the window runs dry if this window's average burn so far continues, as an
+// epoch; 0 when it lasts to the reset, the window is under 10% elapsed, nothing is used yet,
+// or the length is unknown. Length comes from "windowSeconds" (Codex window_minutes, Cursor
+// billing cycle) or a "weekly"/"5-hour" label.
 double QuotaWindowSeconds(NSDictionary *window);
-double QuotaPaceFraction(NSDictionary *window, double nowEpoch);
+double QuotaDryEpoch(NSDictionary *window, double nowEpoch);
+
+// Who is burning the battery, by app. Snapshots map pid -> cumulative energy in nanojoules
+// (proc_pid_rusage ri_energy_nj). Live watts come from prev -> cur over dtSeconds (0 when
+// prev is nil); Wh come from baseline -> cur, where a pid missing from the baseline started
+// after it and counts in full. groupFor names the app a pid belongs to. Rows are
+// @{name, watts, wh}, heaviest live burner first; negligible rows are dropped.
+NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
+                                  NSDictionary<NSNumber *, NSNumber *> *cur,
+                                  NSDictionary<NSNumber *, NSNumber *> *baseline,
+                                  double dtSeconds, NSString *(^groupFor)(pid_t pid));
 
 // Elapsed Cursor windows (billing cycle ended, or auth buckets with a past cycle marker).
 // Same role as ClaudeStaleLimitWindows. Empty when nothing elapsed-and-usable remains.

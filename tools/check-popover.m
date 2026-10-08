@@ -693,7 +693,8 @@ int main(int argc, const char **argv) {
                 CountIdentifier(doc, @"details.ai.window.cursor.0") ||
                 CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
         }
-        // Pace bug: Cursor at 17% with most of the cycle to run is spending faster than time.
+        // Fuel-out: Cursor's API pool at 17% three days into a 30-day cycle runs dry long
+        // before the reset, so the datum is the dry date in orange, not "resets".
         {
             NSTimeInterval now = NSDate.date.timeIntervalSince1970;
             NSArray *saved = cursor.limitWindows;
@@ -703,20 +704,64 @@ int main(int argc, const char **argv) {
             [c rebuildContent];
             for (NSView *doc in @[p.contentViewController.view, [c aiDetailsView].documentView]) {
                 NSString *stem = doc == p.contentViewController.view ? @"popover.ai.cursor" : @"details.ai.cursor";
-                PaceCaret *caret = (PaceCaret *)FindIdentifier(doc, [stem stringByAppendingString:@".pace"]);
-                NSView *pair = FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
-                double expectX = NSMinX(pair.frame) + NSWidth(pair.frame) * 0.9;
-                if (![caret isKindOfClass:PaceCaret.class] || caret.hidden || !caret.behind ||
-                    fabs(NSMidX(caret.frame) - expectX) > 1.5 || NSMinY(caret.frame) < NSMaxY(pair.frame) ||
-                    NSMaxY(caret.frame) > NSHeight(caret.superview.bounds) ||
-                    !HasTip(doc, @"spending faster than time")) return Fail(__LINE__);
+                NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
+                if (![datum.stringValue hasPrefix:@"dry "] || ![datum.textColor isEqual:NSColor.systemOrangeColor] ||
+                    !HasTip(doc, @"runs dry") || !FitsChildren(doc)) return Fail(__LINE__);
             }
             if (argc > 1) {
-                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-pace.png"];
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-dry.png"];
                 if (!RenderOffscreen(p.contentViewController.view, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
             }
             cursor.limitWindows = saved;
             [c rebuildContent];
+        }
+        // On battery: a Burn row splits the draw by app and names the heaviest; the Battery
+        // tab lists each app's watts and Wh since unplug, the screen + system rest, and the total.
+        {
+            BatteryState onBattery = b;
+            onBattery.acConnected = NO; onBattery.isCharging = NO; onBattery.amperage_mA = -780;
+            onBattery.systemPowerIn_mW = 0; onBattery.systemLoad_mW = 9400; onBattery.adapterWatts = 0;
+            [c setValue:[NSValue valueWithBytes:&onBattery objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:@[@{@"name": @"Google Chrome", @"watts": @2.1, @"wh": @1.4},
+                          @{@"name": @"node", @"watts": @1.3, @"wh": @0.9},
+                          @{@"name": @"Codex", @"watts": @0.6, @"wh": @0.4},
+                          @{@"name": @"Mail", @"watts": @0.2, @"wh": @0.1}] forKey:@"burnRows"];
+            [c setValue:[NSDate dateWithTimeIntervalSinceNow:-102 * 60] forKey:@"energyBaselineAt"];
+            [c setValue:@YES forKey:@"energyBaselineAtUnplug"];
+            [c setValue:@(BatteryWattHours(onBattery.rawCurrent_mAh, onBattery.voltage_mV) + 6.1) forKey:@"energyBaselineWh"];
+            [c rebuildContent];
+            NSView *pop = p.contentViewController.view;
+            NSTextField *burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
+            NSTextField *burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
+            StackedGauge *burnBar = (StackedGauge *)FindIdentifier(pop, @"popover.burn.gauge");
+            if (![burnValue.stringValue isEqual:@"9.4 W"] || ![burnDatum.stringValue hasSuffix:@" 2.1 W"] ||
+                ![burnDatum.stringValue isEqual:@"Chrome 2.1 W"] ||
+                [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds) ||
+                ![burnBar isKindOfClass:StackedGauge.class] || burnBar.segments.count != 5 ||
+                !SameColumn(burnBar, FindIdentifier(pop, @"popover.battery.gauge")) ||
+                !HasTip(pop, @"Since unplug: 6.1 Wh over 1:42") || !FitsChildren(pop) || FirstScrollView(pop)) {
+                fprintf(stderr, "burn: value=%s datum=%s segs=%lu same=%d tip=%d fits=%d\n", burnValue.stringValue.UTF8String,
+                        burnDatum.stringValue.UTF8String, (unsigned long)burnBar.segments.count,
+                        SameColumn(burnBar, FindIdentifier(pop, @"popover.battery.gauge")),
+                        HasTip(pop, @"Since unplug: 6.1 Wh over 1:42"), FitsChildren(pop));
+                return Fail(__LINE__);
+            }
+            NSView *batteryDoc = [c batteryDetailsView].documentView;
+            NSTextField *since = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.since.value");
+            NSTextField *chromeWh = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.0.datum");
+            NSTextField *rest = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.system.value");
+            if (![since.stringValue isEqual:@"6.1 Wh"] || ![chromeWh.stringValue isEqual:@"1.4 Wh"] ||
+                ![rest.stringValue isEqual:@"5.2 W"] || FindIdentifier(batteryDoc, @"details.battery.bar.energy.0")) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(pop, [stem stringByAppendingString:@"-burn.png"], look) ||
+                    !RenderOffscreen(batteryDoc, [stem stringByAppendingString:@"-burn-details.png"], look)) return Fail(__LINE__);
+            }
+            [c setValue:nil forKey:@"burnRows"]; [c setValue:nil forKey:@"energyBaselineAt"];
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.burn")) return Fail(__LINE__);   // plugged in: gone
         }
         cursor.limitStale = YES; cursor.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-7200];
         cursor.limitRefreshError = @"Signed out — sign in to Cursor";

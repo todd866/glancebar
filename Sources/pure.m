@@ -2039,10 +2039,50 @@ double QuotaWindowSeconds(NSDictionary *window) {
     return 0;
 }
 
-double QuotaPaceFraction(NSDictionary *window, double nowEpoch) {
+double QuotaDryEpoch(NSDictionary *window, double nowEpoch) {
     double length = QuotaWindowSeconds(window);
     NSNumber *resets = [window[@"resetsAt"] isKindOfClass:NSNumber.class] ? window[@"resetsAt"] : nil;
-    if (length <= 0 || !resets || resets.doubleValue <= nowEpoch) return -1;
-    double left = (resets.doubleValue - nowEpoch) / length;
-    return left < 0 ? 0 : left > 1 ? 1 : left;
+    NSNumber *left = [window[@"remainingFraction"] isKindOfClass:NSNumber.class] ? window[@"remainingFraction"] : nil;
+    if (length <= 0 || !resets || !left || resets.doubleValue <= nowEpoch) return 0;
+    double elapsed = length - (resets.doubleValue - nowEpoch);
+    double remaining = left.doubleValue, used = 1.0 - remaining;
+    // Too early in the window, nothing used, or already empty: no endurance to forecast.
+    if (elapsed < 0.10 * length || used <= 0.001 || remaining <= 0) return 0;
+    double dry = nowEpoch + remaining * elapsed / used;   // the window's average burn, held
+    return dry < resets.doubleValue ? dry : 0;
+}
+
+NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
+                                  NSDictionary<NSNumber *, NSNumber *> *cur,
+                                  NSDictionary<NSNumber *, NSNumber *> *baseline,
+                                  double dtSeconds, NSString *(^groupFor)(pid_t pid)) {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
+    for (NSNumber *pid in cur) {
+        double now = cur[pid].doubleValue;
+        NSNumber *before = prev[pid], *base = baseline[pid];
+        // A counter that went backwards is a recycled pid: a new process from zero.
+        double watts = 0;
+        if (prev && dtSeconds > 0) {
+            double delta = before && now >= before.doubleValue ? now - before.doubleValue : (before ? now : 0);
+            watts = delta / 1e9 / dtSeconds;
+        }
+        // Absent from the baseline means the process started after it: all of its energy counts.
+        double wh = 0;
+        if (baseline) wh = (base && now >= base.doubleValue ? now - base.doubleValue : now) / 3.6e12;
+        if (watts < 0.005 && wh < 0.0005) continue;
+        NSString *name = groupFor ? groupFor(pid.intValue) : nil;
+        if (!name.length) name = @"Other";
+        NSMutableDictionary *g = groups[name];
+        if (!g) groups[name] = g = [@{@"name": name, @"watts": @0.0, @"wh": @0.0} mutableCopy];
+        g[@"watts"] = @([g[@"watts"] doubleValue] + watts);
+        g[@"wh"] = @([g[@"wh"] doubleValue] + wh);
+    }
+    NSArray *rows = [groups.allValues filteredArrayUsingPredicate:
+        [NSPredicate predicateWithFormat:@"watts >= 0.05 OR wh >= 0.01"]];
+    return [rows sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        double wa = [a[@"watts"] doubleValue], wb = [b[@"watts"] doubleValue];
+        if (fabs(wa - wb) > 1e-9) return wa > wb ? NSOrderedAscending : NSOrderedDescending;
+        double ha = [a[@"wh"] doubleValue], hb = [b[@"wh"] doubleValue];
+        return ha > hb ? NSOrderedAscending : ha < hb ? NSOrderedDescending : [a[@"name"] compare:b[@"name"]];
+    }];
 }
