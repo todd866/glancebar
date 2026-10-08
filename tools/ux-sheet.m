@@ -485,15 +485,124 @@ static BOOL TrendSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Cursor two-pool sheet
+
+typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows };
+
+@interface PoolSketch : NSView
+@property (nonatomic) double a, b;   // API, Grok/Composer remaining
+@property (nonatomic) PoolStyle style;
+@end
+@implementation PoolSketch
+- (void)lane:(NSRect)lane value:(double)v color:(NSColor *)color {
+    CGFloat rad = NSHeight(lane) / 2;
+    NSBezierPath *t = [NSBezierPath bezierPathWithRoundedRect:lane xRadius:rad yRadius:rad];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [t fill];
+    [NSGraphicsContext saveGraphicsState]; [t addClip];
+    [color setFill]; NSRectFill(NSMakeRect(NSMinX(lane), NSMinY(lane), MAX(NSHeight(lane), NSWidth(lane) * v), NSHeight(lane)));
+    [NSGraphicsContext restoreGraphicsState];
+}
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds; CGFloat w = NSWidth(r), mid = NSMidY(r);
+    double lo = MIN(_a, _b), hi = MAX(_a, _b);
+    switch (_style) {
+        case PoolToday:
+            [self lane:NSMakeRect(0, mid + 4, w, 4) value:_a color:AIQuotaColor(_a)];
+            [self lane:NSMakeRect(0, mid - 8, w, 4) value:_b color:AIQuotaColor(_b)];
+            break;
+        case PoolTight:
+            [self lane:NSMakeRect(0, mid + 0.5, w, 3.5) value:_a color:AIQuotaColor(_a)];
+            [self lane:NSMakeRect(0, mid - 4, w, 3.5) value:_b color:AIQuotaColor(_b)];
+            break;
+        case PoolOverlay: {
+            NSRect bar = NSMakeRect(0, mid - 4, w, 8);
+            [self lane:bar value:hi color:[AIQuotaColor(hi) colorWithAlphaComponent:0.4]];
+            NSBezierPath *t = [NSBezierPath bezierPathWithRoundedRect:bar xRadius:4 yRadius:4];
+            [NSGraphicsContext saveGraphicsState]; [t addClip];
+            [AIQuotaColor(lo) setFill]; NSRectFill(NSMakeRect(0, mid - 4, MAX(8, w * lo), 8));
+            [NSGraphicsContext restoreGraphicsState];
+            break;
+        }
+        case PoolMarker:
+        case PoolTwoRows:
+            [self lane:NSMakeRect(0, mid - 4, w, 8) value:_a color:AIQuotaColor(_a)];
+            if (_style == PoolMarker) {
+                [NSColor.labelColor setFill];
+                NSRectFill(NSMakeRect(round(w * _b) - 1, mid - 6, 2, 12));
+            }
+            break;
+    }
+}
+@end
+
+static NSView *QuotaRowSketch(Controller *c, NSString *name, NSString *label, double a, double b, NSString *datum, PoolStyle style) {
+    BOOL pair = b >= 0 && (style == PoolToday || style == PoolTight);
+    CGFloat h = style == PoolToday && b >= 0 ? kCursorRowH : kRowH;
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, h)];
+    if (name) {
+        NSImageView *logo = [NSImageView imageViewWithImage:AIProviderLogo(name, kLeadSymbol) ?: [NSImage new]];
+        logo.frame = NSMakeRect(kPad, (h - kLeadSymbol) / 2, kLeadW, kLeadSymbol);
+        [row addSubview:logo];
+    }
+    [row addSubview:[c text:label font:[NSFont systemFontOfSize:(name ? 13 : 12) weight:(name ? NSFontWeightSemibold : NSFontWeightMedium)]
+                      color:(name ? NSColor.labelColor : NSColor.secondaryLabelColor)
+                         at:NSMakeRect(kAINameX, (h - 16) / 2, kAINameW + 4, 16) align:NSTextAlignmentLeft]];
+    PoolSketch *g = [[PoolSketch alloc] initWithFrame:NSMakeRect(kGaugeX, (h - 20) / 2, kGaugeW, 20)];
+    g.a = a; g.b = b < 0 ? a : b; g.style = b < 0 ? PoolTwoRows : style;
+    [row addSubview:g];
+    NSFont *big = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold];
+    if (pair) {
+        NSFont *small = [NSFont monospacedDigitSystemFontOfSize:(style == PoolTight ? 11 : 13) weight:NSFontWeightSemibold];
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", a * 100] font:small color:AIQuotaColor(a)
+                             at:NSMakeRect(kValueX, h / 2 - (style == PoolTight ? 1 : 0), kValueW, h / 2) align:NSTextAlignmentRight]];
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", b * 100] font:small color:AIQuotaColor(b)
+                             at:NSMakeRect(kValueX, (style == PoolTight ? 1 : 0), kValueW, h / 2) align:NSTextAlignmentRight]];
+    } else {
+        double shown = b < 0 ? a : style == PoolMarker ? a : MIN(a, b);
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", shown * 100] font:big color:AIQuotaColor(shown)
+                             at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    }
+    if (datum) [row addSubview:[c text:datum font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                 color:NSColor.secondaryLabelColor at:NSMakeRect(kDatumX, (h - kDatumH) / 2, kDatumW, kDatumH) align:NSTextAlignmentLeft]];
+    return row;
+}
+
+static BOOL CursorSheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSArray *variants = @[@[@"A  today: two thin lanes, two numbers", @(PoolToday)],
+                          @[@"B  one bar: solid = tighter pool, pale = the other", @(PoolOverlay)],
+                          @[@"C  two lanes squeezed into one bar's height", @(PoolTight)],
+                          @[@"D  API bar, Grok as a tick", @(PoolMarker)],
+                          @[@"E  a second plain row for Grok/Composer", @(PoolTwoRows)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        PoolStyle style = [v[1] integerValue];
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray arrayWithObjects:
+                QuotaRowSketch(c, @"Claude", @"Claude", 0.44, -1, @"resets Tue", style),
+                QuotaRowSketch(c, @"Codex", @"Codex", 0.51, -1, @"resets Wed", style), nil];
+            if (style == PoolTwoRows) {
+                [rows addObject:QuotaRowSketch(c, @"Cursor", @"Cursor", 0.17, -1, @"resets 3 Nov", style)];
+                [rows addObject:QuotaRowSketch(c, nil, @"Grok", 0.41, -1, nil, style)];
+            } else {
+                [rows addObject:QuotaRowSketch(c, @"Cursor", @"Cursor", 0.17, 0.41, @"resets 3 Nov", style)];
+            }
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|cursor out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "trend")) return TrendSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "cursor")) return CursorSheet(path) ? 0 : 1;
         Controller *c = [Controller new];
         NSArray *variants = @[@[@"A  today (no pace)", @(PaceNone)],
                               @[@"B  time bug: vertical bar at time left", @(PaceTick)],
