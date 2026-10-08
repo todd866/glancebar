@@ -673,7 +673,8 @@ int main(int argc, const char **argv) {
                 item.view = [c detailViewForIdentifier:@"overview"];
             }
         }
-        // Cursor keeps both pools in one compact instrument on every surface.
+        // Cursor is an ordinary one-bar row showing Grok + Composer (Cursor's own models);
+        // the API pool is on the tooltip and gets its own window row on the AI tab.
         AIUsage *cursor = usage.lastObject;
         NSArray *legacyWindows = cursor.limitWindows;
         cursor.limitWindows = CursorLimitWindows(@{
@@ -687,24 +688,23 @@ int main(int argc, const char **argv) {
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {
             NSView *doc = compactDocs[i]; NSString *stem = compactStems[i];
-            QuotaPairGauge *pair = (QuotaPairGauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
-            NSTextField *name = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".name"]);
-            NSView *values = FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
-            NSTextField *api = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value.api"]);
-            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value.cursor"]);
+            Gauge *bar = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+            NSTextField *value = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
             NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
-            NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".value"]);
-            if (![pair isKindOfClass:QuotaPairGauge.class] || fabs(pair.firstFraction - .17) > .001 ||
-                fabs(pair.secondFraction - .41) > .001 || ![name.stringValue isEqual:@"Cursor"] ||
-                !pair.fixedLanes || ![api.stringValue isEqual:@"17%"] || ![grok.stringValue isEqual:@"41%"] ||
-                NSMinY(api.frame) <= NSMinY(grok.frame) || !SameColumn(values, reference) ||
-                fabs(NSWidth(values.frame) - NSWidth(reference.frame)) > .5 ||
-                ![datum.stringValue hasPrefix:@"resets "] || !HasTip(doc, @"API models: 17% left") ||
-                !HasTip(doc, @"Grok + Composer: 41% left") ||
-                ![pair.accessibilityValue containsString:@"API models 17%"] ||
-                ![pair.accessibilityValue containsString:@"Grok + Composer 41%"] ||
-                CountIdentifier(doc, @"details.ai.window.cursor.0") ||
-                CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
+            NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".gauge"]);
+            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || ![value.stringValue isEqual:@"41%"] ||
+                !SameColumn(bar, reference) || fabs(NSHeight(bar.frame) - NSHeight(reference.frame)) > .5 ||
+                ![datum.stringValue hasPrefix:@"resets "] || !HasTip(doc, @"Grok + Composer: 41% left") ||
+                !HasTip(doc, @"API models: 17% left") || HasText(doc, @"17%") != (i == 2)) return Fail(__LINE__);
+        }
+        NSView *aiDoc = [c aiDetailsView].documentView;
+        if (![((NSTextField *)FindIdentifier(aiDoc, @"details.ai.window.cursor.0.label")).stringValue isEqual:@"Grok"] ||
+            ![((NSTextField *)FindIdentifier(aiDoc, @"details.ai.window.cursor.1.label")).stringValue isEqual:@"API"]) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-cursor.png"], look) ||
+                !RenderOffscreen([c aiDetailsView].documentView, [stem stringByAppendingString:@"-cursor-ai.png"], look)) return Fail(__LINE__);
         }
         // Every battery state renders without cut-off text: charging fast, held at the limit,
         // plugged but draining (the 2026-10-08 "−7.9 W plug…" bug), no power in, and on battery.
@@ -800,7 +800,7 @@ int main(int argc, const char **argv) {
             NSView *doc = [scope isEqual:@"popover.ai"] ? p.contentViewController.view
                 : [scope isEqual:@"details.ai"] ? [c aiDetailsView].documentView : [c overviewDetailsView].documentView;
             NSTextField *datum = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.datum"]);
-            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.value.cursor"]);
+            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.value"]);
             if (![datum.stringValue isEqual:@"signed out"] || ![grok.stringValue isEqual:@"41%"] ||
                 FindIdentifier(doc, [scope stringByAppendingString:@".cursor.status"]) || !FitsChildren(doc)) return Fail(__LINE__);
         }
@@ -814,26 +814,18 @@ int main(int argc, const char **argv) {
         if (![staleDatum.stringValue hasPrefix:@"stale"]) return Fail(__LINE__);
         cursor.limitStale = NO; cursor.limitUpdatedAt = NSDate.date;
         NSArray *bothPools = cursor.limitWindows;
-        // The two values retain the standard column, even at 100%.
+        // 100% fits the ordinary value column.
         cursor.limitWindows = CursorLimitWindows(@{@"planUsage": @{@"apiPercentUsed": @0, @"autoPercentUsed": @0}}, NSDate.date.timeIntervalSince1970);
         [c rebuildContent];
-        for (NSString *key in @[@"api", @"cursor"]) {
-            NSTextField *full = (NSTextField *)FindIdentifier(p.contentViewController.view, [@"popover.ai.cursor.value." stringByAppendingString:key]);
-            if (![full.stringValue isEqual:@"100%"] || full.attributedStringValue.size.width > full.bounds.size.width - 4 ||
-                full.font.pointSize < 13) return Fail(__LINE__);
-        }
-        cursor.limitWindows = bothPools;
+        NSTextField *full = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value");
+        if (![full.stringValue isEqual:@"100%"] || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        // One pool missing: the bar shows what is reported (Grok, else API) and never invents the other.
         for (NSUInteger missing = 0; missing < 2; missing++) {
             cursor.limitWindows = @[bothPools[missing]];
             [c rebuildContent];
-            QuotaPairGauge *single = (QuotaPairGauge *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.gauge");
-            if (![single isKindOfClass:QuotaPairGauge.class] || CountGauges(p.contentViewController.view) != 6 ||
-                ![single.accessibilityValue containsString:@"not reported"] ||
-                (missing == 0 ? single.secondFraction >= 0 : single.firstFraction >= 0)) return Fail(__LINE__);
-            NSTextField *api = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value.api");
-            NSTextField *grok = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value.cursor");
-            if (![api.stringValue isEqual:(missing == 0 ? @"17%" : @"—")] ||
-                ![grok.stringValue isEqual:(missing == 0 ? @"—" : @"41%")]) return Fail(__LINE__);
+            NSTextField *shown = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value");
+            if (![shown.stringValue isEqual:(missing == 0 ? @"17%" : @"41%")] ||
+                !HasTip(p.contentViewController.view, @"not reported")) return Fail(__LINE__);
         }
         cursor.limitWindows = bothPools;
         [c rebuildContent];

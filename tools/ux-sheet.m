@@ -10,6 +10,8 @@
 #undef main
 #pragma clang diagnostic pop
 
+static const CGFloat kCursorRowH = 32, kCursorGaugeH = 20;   // the retired two-lane geometry, for comparison sheets
+
 typedef NS_ENUM(NSInteger, PaceStyle) { PaceNone, PaceTick, PaceDeficit, PaceTrend, PaceUsed, PaceShortfallOnly };
 
 // One lane or a pair of lanes, drawn with one of the candidate pace treatments.
