@@ -72,6 +72,8 @@ The main popover is one row per instrument: boot-volume storage, battery, CPU / 
 
 Tooltips are terse: one line of figures the row doesn't already show, never repeated, no internal machinery. The popover test fails on any tooltip over 70 characters.
 
+Power readings are live: while the popover or Details is open, the watts (power in, the Mac's draw, and the battery's charge or drain) come from the SMC's per-second sensors (`PDTR`, `PSTR`, `SBAP`; no privilege), not the battery's IORegistry telemetry, which only refreshes about every 20 seconds. Macs without those keys fall back to the IORegistry figures.
+
 ## Build & Install
 
 ```bash

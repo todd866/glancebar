@@ -136,6 +136,54 @@ static long NumFor(NSDictionary *d, NSString *k) {
     id v = d[k]; return [v isKindOfClass:NSNumber.class] ? [v longValue] : LONG_MIN;
 }
 
+// Real-time power from the SMC. The battery's IORegistry telemetry only refreshes every
+// ~20 s; these sensors update every second and need no privilege. Keys: PDTR = power in
+// from the adapter, PSTR = the whole system's draw, SBAP = battery power (negative while
+// charging). Read with the AppleSMC user client the way every fan/power monitor does.
+typedef struct { char major, minor, build, reserved; UInt16 release; } GBSMCVersion;
+typedef struct { UInt16 version, length; UInt32 cpuPLimit, gpuPLimit, memPLimit; } GBSMCPLimit;
+typedef struct { UInt32 dataSize, dataType; char dataAttributes; } GBSMCKeyInfo;
+typedef struct {
+    UInt32 key; GBSMCVersion vers; GBSMCPLimit pLimitData; GBSMCKeyInfo keyInfo;
+    char result, status, data8; UInt32 data32; char bytes[32];
+} GBSMCParam;
+static io_connect_t GBSMCConnection(void) {
+    static io_connect_t conn = IO_OBJECT_NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
+        if (svc) { if (IOServiceOpen(svc, mach_task_self(), 0, &conn) != KERN_SUCCESS) conn = IO_OBJECT_NULL; IOObjectRelease(svc); }
+    });
+    return conn;
+}
+static BOOL GBSMCReadFloat(const char *key, double *out) {
+    io_connect_t conn = GBSMCConnection();
+    if (!conn || strlen(key) != 4) return NO;
+    GBSMCParam in = {0}, res = {0};
+    in.key = ((UInt32)key[0] << 24) | ((UInt32)key[1] << 16) | ((UInt32)key[2] << 8) | (UInt32)key[3];
+    in.data8 = 9;   // key info
+    size_t size = sizeof(GBSMCParam);
+    if (IOConnectCallStructMethod(conn, 2, &in, sizeof in, &res, &size) != KERN_SUCCESS || res.result) return NO;
+    if (res.keyInfo.dataType != (('f' << 24) | ('l' << 16) | ('t' << 8) | ' ') || res.keyInfo.dataSize != 4) return NO;
+    in.keyInfo.dataSize = 4; in.data8 = 5;   // read bytes
+    memset(&res, 0, sizeof res); size = sizeof(GBSMCParam);
+    if (IOConnectCallStructMethod(conn, 2, &in, sizeof in, &res, &size) != KERN_SUCCESS || res.result) return NO;
+    float f; memcpy(&f, res.bytes, 4);
+    if (!isfinite(f) || fabsf(f) > 500) return NO;
+    *out = f;
+    return YES;
+}
+// Lay the live SMC watts over the slow IORegistry figures; anything unreadable keeps its value.
+static void ApplyLivePower(BatteryState *b) {
+    if (!b->valid) return;
+    double in, load, batt;
+    if (b->acConnected && GBSMCReadFloat("PDTR", &in) && in >= 0) b->systemPowerIn_mW = lround(in * 1000);
+    if (!b->acConnected) b->systemPowerIn_mW = 0;
+    if (GBSMCReadFloat("PSTR", &load) && load > 0) b->systemLoad_mW = lround(load * 1000);
+    if (GBSMCReadFloat("SBAP", &batt) && b->voltage_mV > 0)
+        b->amperage_mA = lround(-batt * 1e6 / b->voltage_mV);   // SBAP < 0 = into the battery
+}
+
 static BatteryState ReadBattery(void) {
     BatteryState b = {0};
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"));
@@ -168,6 +216,7 @@ static BatteryState ReadBattery(void) {
         b.minutesToEmpty = (tr == LONG_MIN || tr >= 65535) ? -1 : tr;
     }
     IOObjectRelease(svc);
+    ApplyLivePower(&b);
     return b;
 }
 
