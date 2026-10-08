@@ -883,41 +883,6 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
     }
     return reset;
 }
-// Fuel-out for the window the gauge shows: Claude's weekly all-models window, the
-// earlier of Cursor's two pools, or the window whose reset the row reports. nil when the
-// window lasts to its reset at the average rate (or cannot be forecast).
-static NSDate *AIUsageDryDate(AIUsage *u, NSDictionary *claudeQuotas, NSDictionary *cursorPools, double now) {
-    if (u.overageActive) return nil;
-    double dry = 0;
-    if (claudeQuotas) {
-        NSMutableDictionary *w = [claudeQuotas[@"opusWindow"] mutableCopy];
-        if (w && [claudeQuotas[@"opus"] isKindOfClass:NSNumber.class]) w[@"remainingFraction"] = claudeQuotas[@"opus"];
-        dry = QuotaDryEpoch(w, now);
-    } else if (cursorPools) {
-        for (NSDictionary *w in cursorPools.allValues) {
-            double d = QuotaDryEpoch(w, now);
-            if (d > 0 && (dry == 0 || d < dry)) dry = d;
-        }
-    } else if (u.resetAt) {
-        for (NSDictionary *w in u.limitWindows) {
-            NSNumber *resets = [w[@"resetsAt"] isKindOfClass:NSNumber.class] ? w[@"resetsAt"] : nil;
-            if (resets && fabs(resets.doubleValue - u.resetAt.timeIntervalSince1970) < 1) {
-                dry = QuotaDryEpoch(w, now);
-                if (dry > 0) break;
-            }
-        }
-    }
-    return dry > 0 ? [NSDate dateWithTimeIntervalSince1970:dry] : nil;
-}
-static NSString *DryTip(NSDate *dry, NSDate *reset) {
-    if (!dry) return nil;
-    NSString *when = ResetClockText(dry, NSDate.date);
-    NSString *resetText = reset ? ResetClockText(reset, NSDate.date) : nil;
-    return resetText.length
-        ? [NSString stringWithFormat:@"At this window's average rate it runs dry %@, before the reset %@", when, resetText]
-        : [NSString stringWithFormat:@"At this window's average rate it runs dry %@, before the reset", when];
-}
-
 static NSString *CursorPoolTip(NSDictionary *pools) {
     NSMutableArray *parts = [NSMutableArray array];
     for (NSString *key in @[@"api", @"cursor"]) {
@@ -6760,9 +6725,6 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
     if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
         resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
-    NSDate *dry = hasGauge ? AIUsageDryDate(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : nil;
-    NSString *dryTip = DryTip(dry, resetDate);
-    if (dryTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, dryTip] : dryTip;
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (!logo) mark.contentTintColor = valueColor;
     mark.toolTip = named;
@@ -6787,10 +6749,6 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
-    } else if (dry) {
-        // Endurance, not a deadline: the fuel runs out before the reset at this window's rate.
-        datum = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
-        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
         NSDate *reset = resetDate;
         // A bare "21:00" beside a bar could mean anything; one word says what it is.
@@ -7957,9 +7915,6 @@ static NSColor *HealthColor(double fraction) {
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
     if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
         resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
-    NSDate *dry = hasGauge ? AIUsageDryDate(u, quotas, cursorPools, NSDate.date.timeIntervalSince1970) : nil;
-    NSString *dryTip = DryTip(dry, resetDate);
-    if (dryTip) tip = tip.length ? [NSString stringWithFormat:@"%@\n%@", tip, dryTip] : dryTip;
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
     if (u.limitRefreshError.length && ![named containsString:u.limitRefreshError])
         named = [named stringByAppendingFormat:@"\n%@", u.limitRefreshError];
@@ -8019,10 +7974,6 @@ static NSColor *HealthColor(double fraction) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
-    } else if (dry) {
-        // Endurance, not a deadline: the fuel runs out before the reset at this window's rate.
-        datum = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
-        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
         NSDate *reset = resetDate;
         NSString *clock = CompactResetClock(reset, NSDate.date);
@@ -8056,11 +8007,6 @@ static NSColor *HealthColor(double fraction) {
         NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@ left", full, pct];
         if (clock.length) [tip appendFormat:@" · resets %@", clock];
         else if ([w[@"fresh"] boolValue]) [tip appendString:@" · not started"];
-        double dryEpoch = hasFrac ? QuotaDryEpoch(w, NSDate.date.timeIntervalSince1970) : 0;
-        NSDate *dry = dryEpoch > 0 ? [NSDate dateWithTimeIntervalSince1970:dryEpoch] : nil;
-        NSString *dryTip = DryTip(dry, resetDate);
-        if (dryTip) [tip appendFormat:@"\n%@", dryTip];
-        if (dry) reset = [@"dry " stringByAppendingString:CompactResetClock(dry, NSDate.date)];
         NSString *rowID = [NSString stringWithFormat:@"details.ai.window.%@.%lu", slug, (unsigned long)i];
         NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
         NSTextField *lab = [self detailText:label font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
@@ -8073,7 +8019,7 @@ static NSColor *HealthColor(double fraction) {
             [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
                    identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
         [self detailValue:pct color:color identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
-        [self detailDatum:reset color:(dry ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor)
+        [self detailDatum:reset color:NSColor.secondaryLabelColor
                identifier:[rowID stringByAppendingString:@".datum"] tip:tip in:row cols:c];
         y += c.rowH;
     }

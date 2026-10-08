@@ -693,28 +693,6 @@ int main(int argc, const char **argv) {
                 CountIdentifier(doc, @"details.ai.window.cursor.0") ||
                 CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
         }
-        // Fuel-out: Cursor's API pool at 17% three days into a 30-day cycle runs dry long
-        // before the reset, so the datum is the dry date in orange, not "resets".
-        {
-            NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-            NSArray *saved = cursor.limitWindows;
-            cursor.limitWindows = CursorLimitWindows(@{@"billingCycleStart": @((now - 3*86400) * 1000),
-                @"billingCycleEnd": @((now + 27*86400) * 1000),
-                @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, now);
-            [c rebuildContent];
-            for (NSView *doc in @[p.contentViewController.view, [c aiDetailsView].documentView]) {
-                NSString *stem = doc == p.contentViewController.view ? @"popover.ai.cursor" : @"details.ai.cursor";
-                NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
-                if (![datum.stringValue hasPrefix:@"dry "] || ![datum.textColor isEqual:NSColor.systemOrangeColor] ||
-                    !HasTip(doc, @"runs dry") || !FitsChildren(doc)) return Fail(__LINE__);
-            }
-            if (argc > 1) {
-                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-dry.png"];
-                if (!RenderOffscreen(p.contentViewController.view, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
-            }
-            cursor.limitWindows = saved;
-            [c rebuildContent];
-        }
         // On battery: a Burn row splits the draw by app and names the heaviest; the Battery
         // tab lists each app's watts and Wh since unplug, the screen + system rest, and the total.
         {

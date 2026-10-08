@@ -192,12 +192,9 @@ NSDictionary *PickCursorLimitWindow(NSDictionary *usage, double nowEpoch);
 // Empty when none apply.
 NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch);
 
-// Fuel-out: when the window runs dry if this window's average burn so far continues, as an
-// epoch; 0 when it lasts to the reset, the window is under 10% elapsed, nothing is used yet,
-// or the length is unknown. Length comes from "windowSeconds" (Codex window_minutes, Cursor
-// billing cycle) or a "weekly"/"5-hour" label.
+// A quota window's length in seconds, from "windowSeconds" (Codex window_minutes, Cursor
+// billing cycle) or a "weekly"/"5-hour" label; 0 when unknown.
 double QuotaWindowSeconds(NSDictionary *window);
-double QuotaDryEpoch(NSDictionary *window, double nowEpoch);
 
 // Who is burning the battery, by app. Snapshots map pid -> cumulative energy in nanojoules
 // (proc_pid_rusage ri_energy_nj). Live watts come from prev -> cur over dtSeconds (0 when

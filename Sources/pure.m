@@ -2039,19 +2039,6 @@ double QuotaWindowSeconds(NSDictionary *window) {
     return 0;
 }
 
-double QuotaDryEpoch(NSDictionary *window, double nowEpoch) {
-    double length = QuotaWindowSeconds(window);
-    NSNumber *resets = [window[@"resetsAt"] isKindOfClass:NSNumber.class] ? window[@"resetsAt"] : nil;
-    NSNumber *left = [window[@"remainingFraction"] isKindOfClass:NSNumber.class] ? window[@"remainingFraction"] : nil;
-    if (length <= 0 || !resets || !left || resets.doubleValue <= nowEpoch) return 0;
-    double elapsed = length - (resets.doubleValue - nowEpoch);
-    double remaining = left.doubleValue, used = 1.0 - remaining;
-    // Too early in the window, nothing used, or already empty: no endurance to forecast.
-    if (elapsed < 0.10 * length || used <= 0.001 || remaining <= 0) return 0;
-    double dry = nowEpoch + remaining * elapsed / used;   // the window's average burn, held
-    return dry < resets.doubleValue ? dry : 0;
-}
-
 NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
                                   NSDictionary<NSNumber *, NSNumber *> *cur,
                                   NSDictionary<NSNumber *, NSNumber *> *baseline,
