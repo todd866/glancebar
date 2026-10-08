@@ -504,7 +504,7 @@ static BOOL TrendSheet(NSString *path) {
 
 #pragma mark - Cursor two-pool sheet
 
-typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows, PoolInnerLine, PoolUnderline, PoolGrokOverlay };
+typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows, PoolInnerLine, PoolUnderline, PoolGrokOverlay, PoolApiRow, PoolApiDatum, PoolSplit };
 
 @interface PoolSketch : NSView
 @property (nonatomic) double a, b;   // API, Grok/Composer remaining
@@ -562,6 +562,17 @@ typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolM
             [NSGraphicsContext restoreGraphicsState];
             break;
         }
+        case PoolSplit: {
+            // Two separate short gauges in the one column: Grok wide on the left, API narrow on the right.
+            CGFloat gw = round(w * 0.64), aw = w - gw - 6;
+            [self lane:NSMakeRect(0, mid - 4, gw, 8) value:_b color:AIQuotaColor(_b)];
+            [self lane:NSMakeRect(gw + 6, mid - 4, aw, 8) value:_a color:AIQuotaColor(_a)];
+            break;
+        }
+        case PoolApiRow:
+        case PoolApiDatum:
+            [self lane:NSMakeRect(0, mid - 4, w, 8) value:_b color:AIQuotaColor(_b)];
+            break;
         case PoolMarker:
         case PoolTwoRows:
             [self lane:NSMakeRect(0, mid - 4, w, 8) value:_a color:AIQuotaColor(_a)];
@@ -597,12 +608,16 @@ static NSView *QuotaRowSketch(Controller *c, NSString *name, NSString *label, do
         [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", b * 100] font:small color:AIQuotaColor(b)
                              at:NSMakeRect(kValueX, (style == PoolTight ? 1 : 0), kValueW, h / 2) align:NSTextAlignmentRight]];
     } else {
-        BOOL grokFirst = style == PoolInnerLine || style == PoolUnderline || style == PoolGrokOverlay;
+        BOOL grokFirst = style == PoolInnerLine || style == PoolUnderline || style == PoolGrokOverlay ||
+                         style == PoolApiDatum || style == PoolSplit;
         double shown = b < 0 ? a : style == PoolMarker ? a : grokFirst ? b : MIN(a, b);
         [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", shown * 100] font:big color:AIQuotaColor(shown)
                              at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
     }
-    if (datum) [row addSubview:[c text:datum font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+    if (style == PoolApiDatum && b >= 0)
+        [row addSubview:[c text:[NSString stringWithFormat:@"API %.0f%%", a * 100] font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                          color:AIQuotaColor(a) at:NSMakeRect(kDatumX, (h - kDatumH) / 2, kDatumW, kDatumH) align:NSTextAlignmentLeft]];
+    else if (datum) [row addSubview:[c text:datum font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                                  color:NSColor.secondaryLabelColor at:NSMakeRect(kDatumX, (h - kDatumH) / 2, kDatumW, kDatumH) align:NSTextAlignmentLeft]];
     return row;
 }
@@ -614,9 +629,9 @@ static BOOL CursorSheet(NSString *path) {
                           @[@"C  two lanes squeezed into one bar's height", @(PoolTight)],
                           @[@"D  API bar, Grok as a tick", @(PoolMarker)],
                           @[@"E  a second plain row for Grok/Composer", @(PoolTwoRows)]]
-                        : @[@[@"F  Grok bar, API as a line riding inside it", @(PoolInnerLine)],
-                          @[@"G  Grok bar, API as a hairline tucked under it", @(PoolUnderline)],
-                          @[@"H  Grok bar pale to 41, API share solid to 17", @(PoolGrokOverlay)]];
+                        : @[@[@"P  two plain rows: Cursor (Grok), then API", @(PoolTwoRows)],
+                          @[@"Q  Grok bar; the datum says API 17%", @(PoolApiDatum)],
+                          @[@"R  split column: Grok bar, then a short API bar", @(PoolSplit)]];
     NSMutableArray *builders = [NSMutableArray array];
     for (NSArray *v in variants) {
         PoolStyle style = [v[1] integerValue];
@@ -626,7 +641,9 @@ static BOOL CursorSheet(NSString *path) {
                 QuotaRowSketch(c, @"Codex", @"Codex", 0.51, -1, @"resets Wed", style), nil];
             if (style == PoolTwoRows) {
                 [rows addObject:QuotaRowSketch(c, @"Cursor", @"Cursor", 0.17, -1, @"resets 3 Nov", style)];
-                [rows addObject:QuotaRowSketch(c, nil, @"Grok", 0.41, -1, nil, style)];
+                [rows removeLastObject];
+                [rows addObject:QuotaRowSketch(c, @"Cursor", @"Cursor", 0.41, -1, @"resets 3 Nov", style)];
+                [rows addObject:QuotaRowSketch(c, nil, @"API", 0.17, -1, nil, style)];
             } else {
                 [rows addObject:QuotaRowSketch(c, @"Cursor", @"Cursor", 0.17, 0.41, @"resets 3 Nov", style)];
             }

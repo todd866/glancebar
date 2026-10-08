@@ -579,8 +579,13 @@ static NSString *SwapStatusText(SystemState s) {
 }
 
 static NSString *SystemSummaryText(SystemState s) {
-    return [NSString stringWithFormat:@"%@ · %@ · %@",
-            CPUStatusText(s), MemoryStatusText(s), SwapStatusText(s)];
+    NSMutableArray *parts = [NSMutableArray array];
+    if (s.memValid) [parts addObject:[NSString stringWithFormat:@"RAM %@ free", FmtMemBytes(s.memAvailable)]];
+    NSString *level = MemoryPressureLevel(s);
+    if ([level isEqualToString:@"Medium"] || [level isEqualToString:@"High"])
+        [parts addObject:[NSString stringWithFormat:@"pressure %@", level.lowercaseString]];
+    if (s.swapValid) [parts addObject:s.swapUsed == 0 ? @"no swap" : [NSString stringWithFormat:@"swap %@", FmtMemBytes(s.swapUsed)]];
+    return parts.count ? [parts componentsJoinedByString:@" · "] : CPUStatusText(s);
 }
 
 static NSColor *CPUColor(double cpu) {
@@ -885,21 +890,6 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
         if (!reset || [date compare:reset] == NSOrderedAscending) reset = date;
     }
     return reset;
-}
-static NSString *CursorPoolTip(NSDictionary *pools) {
-    NSMutableArray *parts = [NSMutableArray array];
-    for (NSString *key in @[@"cursor", @"api"]) {
-        double value = CursorPoolFraction(pools, key);
-        NSString *label = [key isEqual:@"api"] ? @"API models" : @"Grok + Composer";
-        if (value < 0) { [parts addObject:[label stringByAppendingString:@": not reported"]]; continue; }
-        NSNumber *epoch = pools[key][@"resetsAt"];
-        NSString *clock = [epoch isKindOfClass:NSNumber.class]
-            ? ResetClockText([NSDate dateWithTimeIntervalSince1970:epoch.doubleValue], NSDate.date) : nil;
-        [parts addObject:[NSString stringWithFormat:@"%@: %.0f%% left%@%@", label, value * 100,
-            clock.length ? [@", resets " stringByAppendingString:clock] : @"",
-            [key isEqual:@"api"] ? @" (the line inside the bar)" : @" (the bar)"]];
-    }
-    return [parts componentsJoinedByString:@"\n"];
 }
 
 static AIUsage *ReadClaudeUsage(NSString *homeDirectory) {
@@ -5975,10 +5965,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *lowState = lowPower ? @"on" : @"off";
     _keepAwakeButton.accessibilityLabel = [NSString stringWithFormat:@"Keep Awake — %@", awakeState];
     _lowPowerButton.accessibilityLabel = [NSString stringWithFormat:@"Low Power — %@", lowState];
-    _keepAwakeButton.toolTip = [NSString stringWithFormat:@"Keep Awake — %@\n%@",
-                                awakeState, KeepAwakeTooltip(PmsetRuleInstalled())];
-    _lowPowerButton.toolTip = [NSString stringWithFormat:@"Low Power — %@\n%@",
-                               lowState, @"System Low Power Mode."];
+    // The pill already shows its name and state; the tooltip says only what it does.
+    _keepAwakeButton.toolTip = PmsetRuleInstalled() ? @"No sleep, even with the lid closed"
+                                                    : @"No sleep, even with the lid closed · asks for your password";
+    _lowPowerButton.toolTip = @"macOS Low Power Mode";
     _keepAwakeButton.frame = NSMakeRect(kPad, 0, kKeepW, kToggleH);
     _lowPowerButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap, 0, kLowW, kToggleH);
     if (_chargeButton) {
@@ -6067,7 +6057,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // One line, one job: when does this quota come back. Diagnostics only get the line when
 // there is no reset to report — otherwise they push the answer off the end of the row.
 - (NSString *)aiStatusSubtext:(AIUsage *)u {
-    NSString *note = [self aiStalenessNote:u capitalized:NO];
+    NSString *note = nil;   // staleness is the datum's job ("stale 1h"); no "cached" machinery here
     // Overage has no reset to report — the paid budget is not a window that rolls over.
     NSString *lead = u.overageActive ? nil : [self compactResetText:u];
     // A signed-out account will not refresh on its own; the fix outranks the reset clock,
@@ -6115,24 +6105,27 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return nil;
 }
 
+// Tooltips are terse: only figures the row doesn't already show, never repeated, no machinery.
 - (NSString *)batteryPopoverTip {
-    if (!_bat.valid) return @"No battery detected";
-    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:[self batteryStatusText]];
+    if (!_bat.valid) return @"No battery";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
     NSString *eta = [self chargeETAText];
-    if (eta.length) [parts addObject:eta];
-    if (PowerFlowFor(_bat) == PowerFlowPaused)
-        [parts addObject:(_bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000)
-            ? @"Plugged in but no power is arriving — macOS (or a battery tool) has paused the charger, or the cable or charger isn't delivering"
-            : @"Plugged in but the charger can't cover the load — the battery is still draining"];
-    NSString *flow = [self batteryPowerFlowText];
-    if (flow.length) [parts addObject:flow];
-    NSString *energy = [self batteryEnergyText];
-    if (energy.length) [parts addObject:energy];
-    if (_bat.designCap_mAh > 0) {
-        int health = (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh);
-        [parts addObject:[NSString stringWithFormat:@"Health %d%% · %ld cycles", health, (long)_bat.cycleCount]];
+    if (!eta.length && !_bat.acConnected && _bat.percent > 20) {
+        int minutes = MinutesTo20(_bat, [self avgAmp]);
+        if (minutes >= 0) eta = [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)];
     }
-    return [parts componentsJoinedByString:@" · "];
+    if (eta.length) [parts addObject:eta];
+    if (_bat.acConnected && _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW >= 0) {
+        NSString *in = _bat.adapterWatts > 0
+            ? [NSString stringWithFormat:@"in %.0f of %ld W", _bat.systemPowerIn_mW / 1000.0, _bat.adapterWatts]
+            : [NSString stringWithFormat:@"in %.0f W", _bat.systemPowerIn_mW / 1000.0];
+        [parts addObject:in];
+    }
+    if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN)
+        [parts addObject:[NSString stringWithFormat:@"Mac %.0f W", _bat.systemLoad_mW / 1000.0]];
+    if (_bat.designCap_mAh > 0)
+        [parts addObject:[NSString stringWithFormat:@"health %d%%", (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh)]];
+    return parts.count ? [parts componentsJoinedByString:@" · "] : @"Battery";
 }
 
 - (void)ensureChargeModeLoaded {
@@ -6165,11 +6158,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 }
 - (NSString *)chargeLimitTooltip {
     if (_chargeShortcutsKnown && !_chargeShortcutsPresent)
-        return @"Charge limit: add the shortcuts 'Glancebar Charge 80' and 'Glancebar Charge Full' (Set Charge Limit action) to control it from here";
+        return @"Needs the Glancebar Charge 80 / Full shortcuts";
     if ([[self effectiveChargeMode] isEqualToString:@"full"])
-        return [NSString stringWithFormat:@"Charging to full until %@ — click to limit to 80%%",
-                [self chargeFullUntilText]];
-    return @"Charge limit 80% — click to charge to full until tomorrow";
+        return [NSString stringWithFormat:@"Full until %@ · click for 80%%", [self chargeFullUntilText]];
+    return @"Click to charge to full until tomorrow";
 }
 - (void)refreshChargeShortcutsIfStale {
     if (!_musicProbesEnabled || _chargeShortcutsChecking) return;
@@ -6396,10 +6388,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [row addSubview:value];
 
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
-    // Memory in use is the thin line riding inside the CPU bar, the same secondary-reading
-    // language as Cursor's API pool. Pressure tints the row's symbol; figures are on hover.
-    if (_sys.memValid && _sys.memTotal > 0) g.innerFraction = MIN(1.0, (double)_sys.memUsed / (double)_sys.memTotal);
-    g.toolTip = [NSString stringWithFormat:@"%@\n%@\nBar: CPU. Line inside: memory in use.", tip, memTip];
+    // CPU only. Memory pressure tints the row's symbol; memory figures live in the System tab.
+    (void)memTip;
     (void)datumFrame;
 }
 
@@ -6634,19 +6624,19 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
             : (week < 0 ? NSColor.tertiaryLabelColor : AIQuotaColor(week));
         NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        NSMutableArray *parts = [NSMutableArray arrayWithObject:
-            [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
-        if (weekClock.length) [parts addObject:[@"Week resets " stringByAppendingString:weekClock]];
+        // Week figure is on the row; the tooltip adds only the week's reset and the 5-hour window.
+        NSMutableArray *parts = [NSMutableArray array];
+        if (weekClock.length) [parts addObject:[@"week resets " stringByAppendingString:weekClock]];
         for (NSDictionary *w in u.limitWindows)
             if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
                 NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
-                    ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-                [parts addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
-                    [w[@"remainingFraction"] doubleValue] * 100,
+                    ? CompactResetClock([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+                [parts addObject:[NSString stringWithFormat:@"5 h %.0f%%%@", [w[@"remainingFraction"] doubleValue] * 100,
                     clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
             }
-        if (tip.length) [parts addObject:tip];
-        tip = [parts componentsJoinedByString:@"\n"];
+        if (!weekClock.length && tip.length) [parts addObject:tip];
+        if (u.limitRefreshError.length) [parts addObject:u.limitRefreshError];
+        tip = [parts componentsJoinedByString:@" · "];
         meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
         meter.secondFraction = week;
         meter.accessibilityIdentifier = @"popover.ai.claude.gauge";
@@ -6656,12 +6646,11 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         double primary = CursorPrimaryFraction(cursorPools);
         pct = primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100];
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
-        tip = [NSString stringWithFormat:@"%@\n%@", CursorPoolTip(cursorPools), tip];
+
         plainGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
         plainGauge.fraction = MAX(primary, 0);
         plainGauge.color = valueColor;
         plainGauge.metricLabel = @"Cursor Grok + Composer remaining";
-        if (CursorPoolFraction(cursorPools, @"cursor") >= 0) plainGauge.innerFraction = CursorPoolFraction(cursorPools, @"api");
         plainGauge.accessibilityIdentifier = @"popover.ai.cursor.gauge";
         [row addSubview:plainGauge];
     } else if (hasGauge) {
@@ -6677,18 +6666,19 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
     if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
         resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
-    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;
+    NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;   // spoken
+    NSString *shortTip = tip.length ? tip : name;   // shown: the row already names itself
     if (!logo) mark.contentTintColor = valueColor;
-    mark.toolTip = named;
+    mark.toolTip = shortTip;
     mark.accessibilityLabel = named;
-    nameField.toolTip = named;
+    nameField.toolTip = shortTip;
     nameField.accessibilityLabel = name;
-    if (meter) meter.toolTip = named;
-    if (plainGauge) plainGauge.toolTip = named;
+    if (meter) meter.toolTip = shortTip;
+    if (plainGauge) plainGauge.toolTip = shortTip;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
         : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
     NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
-    value.toolTip = named;
+    value.toolTip = shortTip;
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
     NSColor *datumColor = NSColor.secondaryLabelColor;
@@ -6705,12 +6695,38 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     }
     NSTextField *datumField = [self instrumentDatum:datum color:datumColor
                                         identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];
-    datumField.toolTip = named;
+    datumField.toolTip = shortTip;
     datumField.accessibilityLabel = named.length ? named : datum;
-    row.toolTip = named;
+    row.toolTip = shortTip;
     row.accessibilityLabel = named;
     [root addSubview:row];
-    return y + rowH;
+    y += rowH;
+    // Cursor's API pool is its own plain row under the Grok row: same bar, same column,
+    // nothing to decode. Only when Grok is the row above (both pools reported).
+    double api = cursorPools ? CursorPoolFraction(cursorPools, @"api") : -1;
+    if (api >= 0 && CursorPoolFraction(cursorPools, @"cursor") >= 0) {
+        NSView *apiRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        apiRow.accessibilityIdentifier = @"popover.row.ai.cursor.api";
+        NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
+        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %.0f%% left", api * 100];
+        NSTextField *apiName = [self text:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+                                    color:NSColor.secondaryLabelColor
+                                       at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
+        apiName.accessibilityIdentifier = @"popover.ai.cursor.api.name";
+        [apiRow addSubview:apiName];
+        Gauge *apiBar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        apiBar.fraction = api; apiBar.color = ink;
+        apiBar.metricLabel = @"Cursor API remaining";
+        apiBar.accessibilityIdentifier = @"popover.ai.cursor.api.gauge";
+        [apiRow addSubview:apiBar];
+        [self instrumentValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
+                   identifier:@"popover.ai.cursor.api.value" in:apiRow];
+        apiRow.toolTip = apiTip;
+        for (NSView *sub in apiRow.subviews) sub.toolTip = apiTip;
+        [root addSubview:apiRow];
+        y += kRowH;
+    }
+    return y;
 }
 
 - (NSString *)aiOverviewText {
@@ -6762,12 +6778,10 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         row.action = @selector(showStorageDetails:);
         row.accessibilityRole = NSAccessibilityButtonRole;
         row.accessibilityIdentifier = @"popover.row.storage";
-        NSMutableString *tip = [StorageVolumeTooltip(v.name, v.total, v.available, v.purgeable) mutableCopy];
+        NSMutableString *tip = [NSMutableString stringWithFormat:@"%@ · %@", v.name ?: @"Disk", CompactByteCount(v.total)];
+        if (v.purgeable > 0) [tip appendFormat:@" · %@ purgeable", CompactByteCount(v.purgeable)];
         if ([secondaryNotice[@"text"] isKindOfClass:NSString.class])
-            [tip appendFormat:@" · %@", secondaryNotice[@"text"]];
-        if (_volumesUnavailable)
-            [tip appendFormat:@" · Cached %@ · scan unavailable",
-                _lastVolumeSuccess ? [self shortAgeForDate:_lastVolumeSuccess] : @"reading"];
+            [tip appendFormat:@"\n%@", secondaryNotice[@"text"]];
         row.toolTip = tip;
         row.accessibilityLabel = tip;
         // A second mount over 85% full is the alarm: it tints the symbol and is named above.
@@ -7821,24 +7835,24 @@ static NSColor *HealthColor(double fraction) {
             : (week < 0 ? NSColor.tertiaryLabelColor : AIQuotaColor(week));
         NSString *weekClock = [quotas[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-        NSMutableArray *parts = [NSMutableArray arrayWithObject:
-            [NSString stringWithFormat:@"This week, all models: %@ left", pct]];
-        if (weekClock.length) [parts addObject:[@"Week resets " stringByAppendingString:weekClock]];
+        // Week figure is on the row; the tooltip adds only the week's reset and the 5-hour window.
+        NSMutableArray *parts = [NSMutableArray array];
+        if (weekClock.length) [parts addObject:[@"week resets " stringByAppendingString:weekClock]];
         for (NSDictionary *w in u.limitWindows)
             if ([w[@"window"] isEqual:@"5-hour"] && [w[@"remainingFraction"] isKindOfClass:NSNumber.class]) {
                 NSString *clock = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
-                    ? ResetClockText([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
-                [parts addObject:[NSString stringWithFormat:@"5-hour session: %.0f%% left%@",
-                    [w[@"remainingFraction"] doubleValue] * 100,
+                    ? CompactResetClock([NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]], NSDate.date) : nil;
+                [parts addObject:[NSString stringWithFormat:@"5 h %.0f%%%@", [w[@"remainingFraction"] doubleValue] * 100,
                     clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
             }
-        if (tip.length) [parts addObject:tip];
-        tip = [parts componentsJoinedByString:@"\n"];
+        if (!weekClock.length && tip.length) [parts addObject:tip];
+        if (u.limitRefreshError.length) [parts addObject:u.limitRefreshError];
+        tip = [parts componentsJoinedByString:@" · "];
     } else if (cursorPools) {
         double primary = CursorPrimaryFraction(cursorPools);
         pct = primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100];
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
-        tip = [NSString stringWithFormat:@"%@\n%@", CursorPoolTip(cursorPools), tip];
+
     } else if (hasGauge) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
@@ -7881,10 +7895,9 @@ static NSColor *HealthColor(double fraction) {
         meter.toolTip = named;
         [row addSubview:meter];
     } else if (cursorPools) {
-        Gauge *bar = [self detailGauge:DetailGaugeRect(c) fraction:MAX(CursorPrimaryFraction(cursorPools), 0) color:valueColor
+        [self detailGauge:DetailGaugeRect(c) fraction:MAX(CursorPrimaryFraction(cursorPools), 0) color:valueColor
                                  label:@"Cursor Grok + Composer remaining"
                             identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
-        if (CursorPoolFraction(cursorPools, @"cursor") >= 0) bar.innerFraction = CursorPoolFraction(cursorPools, @"api");
     } else if (hasGauge) {
         [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
                     label:[NSString stringWithFormat:@"%@ quota remaining", name]
@@ -7906,7 +7919,22 @@ static NSColor *HealthColor(double fraction) {
         datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
     }
     [self detailDatum:datum color:datumColor identifier:[stem stringByAppendingString:@".datum"] tip:named in:row cols:c];
-    return y + c.rowH;
+    y += c.rowH;
+    double api = cursorPools ? CursorPoolFraction(cursorPools, @"api") : -1;
+    if (overview && api >= 0 && CursorPoolFraction(cursorPools, @"cursor") >= 0) {
+        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %.0f%% left", api * 100];
+        NSView *apiRow = [self detailRowAt:y cols:c identifier:[rowID stringByAppendingString:@".api"] tip:apiTip in:root];
+        NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
+        [self detailText:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium] color:NSColor.secondaryLabelColor
+                   frame:NSMakeRect(c.labelX, (c.rowH - 16) / 2.0, c.labelW, 16) align:NSTextAlignmentLeft
+              identifier:[stem stringByAppendingString:@".api.name"] in:apiRow].toolTip = apiTip;
+        [self detailGauge:DetailGaugeRect(c) fraction:api color:ink label:@"Cursor API remaining"
+               identifier:[stem stringByAppendingString:@".api.gauge"] tip:apiTip in:apiRow];
+        [self detailValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
+               identifier:[stem stringByAppendingString:@".api.value"] tip:apiTip in:apiRow cols:c];
+        y += c.rowH;
+    }
+    return y;
 }
 
 - (CGFloat)addDetailWindows:(AIUsage *)u to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {

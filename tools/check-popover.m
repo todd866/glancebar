@@ -23,6 +23,12 @@ static BOOL HasText(NSView *view, NSString *text) {
     for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
     return NO;
 }
+// Tooltips are terse: a short line of figures, never a paragraph.
+static NSView *WordyTip(NSView *view) {
+    if (view.toolTip.length > 70) return view;
+    for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
+    return nil;
+}
 static BOOL HasTip(NSView *view, NSString *text) {
     if ([view.toolTip containsString:text]) return YES;
     if ([view.accessibilityLabel containsString:text]) return YES;
@@ -467,7 +473,9 @@ int main(int argc, const char **argv) {
         // 5-hour window never caps it. The weekly reset is on the tooltip, not a caption.
         if (!meter || meter.firstFraction >= 0 || fabs(meter.secondFraction-0.33)>0.001 || !HasText(root,@"33%") ||
             HasText(root,@"Fable") || HasText(root, @"5-hour") || HasText(root, @" left")) return Fail(__LINE__);
-        if (!HasTip(root, @"Week resets tomorrow")) return Fail(__LINE__);
+        if (!HasTip(root, @"week resets tomorrow")) return Fail(__LINE__);
+        NSView *wordy = WordyTip(root);
+        if (wordy) { fprintf(stderr, "wordy tooltip on %s: %s\n", wordy.accessibilityIdentifier.UTF8String, wordy.toolTip.UTF8String); return Fail(__LINE__); }
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
         // a weekly reset named by weekday and date, and a cache-age note.
         AIUsage *longest = usage[0];
@@ -558,8 +566,7 @@ int main(int argc, const char **argv) {
         for (NSView *doc in @[root, overview.documentView]) {
             NSString *stem = doc == root ? @"popover.system" : @"details.overview.system";
             Gauge *cpuBar = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
-            if (![cpuBar isKindOfClass:Gauge.class] || fabs(cpuBar.innerFraction - 0.5) > 0.001 ||
-                ![cpuBar.toolTip containsString:@"Line inside: memory in use"] ||
+            if (![cpuBar isKindOfClass:Gauge.class] || cpuBar.innerFraction >= 0 ||
                 FindIdentifier(doc, [stem stringByAppendingString:@".datum"]) ||
                 FindIdentifier(doc, [stem stringByAppendingString:@".memory.symbol"])) return Fail(__LINE__);
         }
@@ -675,6 +682,13 @@ int main(int argc, const char **argv) {
                 item.view = [c detailViewForIdentifier:@"overview"];
             }
         }
+        if (getenv("GLANCEBAR_DUMP_TIPS")) {
+            for (NSString *rid in @[@"popover.row.storage", @"popover.row.battery", @"popover.row.system",
+                                    @"popover.row.ai.claude", @"popover.row.ai.codex", @"popover.row.ai.cursor"])
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).toolTip.UTF8String);
+            for (NSString *rid in @[@"popover.battery.symbol", @"popover.ai.claude.gauge"])
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).toolTip.UTF8String);
+        }
         // Cursor is an ordinary one-bar row showing Grok + Composer (Cursor's own models);
         // the API pool is on the tooltip and gets its own window row on the AI tab.
         AIUsage *cursor = usage.lastObject;
@@ -684,8 +698,8 @@ int main(int argc, const char **argv) {
             @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, NSDate.date.timeIntervalSince1970);
         [c rebuildContent];
         root = p.contentViewController.view;
-        if (CountGauges(root) != 6 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 304 || !InstrumentRowsFit(root)) return Fail(__LINE__);
+        if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
+            root.bounds.size.height > 334 || !InstrumentRowsFit(root)) return Fail(__LINE__);
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {
@@ -694,11 +708,17 @@ int main(int argc, const char **argv) {
             NSTextField *value = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
             NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
             NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".gauge"]);
-            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || fabs(bar.innerFraction - .17) > .001 ||
+            // Cursor = Grok row; the API pool is its own plain row beneath (popover and Overview),
+            // and a window row on the AI tab.
+            Gauge *api = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".api.gauge"]);
+            NSTextField *apiValue = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".api.value"]);
+            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || bar.innerFraction >= 0 ||
                 ![value.stringValue isEqual:@"41%"] ||
                 !SameColumn(bar, reference) || fabs(NSHeight(bar.frame) - NSHeight(reference.frame)) > .5 ||
-                ![datum.stringValue hasPrefix:@"resets "] || !HasTip(doc, @"Grok + Composer: 41% left") ||
-                !HasTip(doc, @"API models: 17% left") || HasText(doc, @"17%") != (i == 2)) return Fail(__LINE__);
+                ![datum.stringValue hasPrefix:@"resets "] ||
+                (i < 2 && (![api isKindOfClass:Gauge.class] || fabs(api.fraction - .17) > .001 ||
+                           ![apiValue.stringValue isEqual:@"17%"] || !SameColumn(api, bar))) ||
+                !HasText(doc, @"17%")) return Fail(__LINE__);
         }
         NSView *aiDoc = [c aiDetailsView].documentView;
         if (![((NSTextField *)FindIdentifier(aiDoc, @"details.ai.window.cursor.0.label")).stringValue isEqual:@"Grok"] ||
@@ -828,7 +848,7 @@ int main(int argc, const char **argv) {
             [c rebuildContent];
             NSTextField *shown = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value");
             if (![shown.stringValue isEqual:(missing == 0 ? @"17%" : @"41%")] ||
-                !HasTip(p.contentViewController.view, @"not reported")) return Fail(__LINE__);
+                FindIdentifier(p.contentViewController.view, @"popover.row.ai.cursor.api")) return Fail(__LINE__);
         }
         cursor.limitWindows = bothPools;
         [c rebuildContent];
