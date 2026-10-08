@@ -5769,11 +5769,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (popover) {
         NSView *root = _popover.contentViewController.view;
         NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(root, @"popover.battery.datum");
+        PowerFlowGauge *flowBar = (PowerFlowGauge *)ViewWithAccessibilityIdentifier(root, @"popover.battery.flow");
         if ([datum isKindOfClass:NSTextField.class]) {
-            datum.stringValue = [self batteryDatumText];
-            PowerFlow flow = PowerFlowFor(_bat);
-            datum.textColor = (flow == PowerFlowCharging || flow == PowerFlowPaused)
-                ? PowerFlowColor(_bat, NSColor.secondaryLabelColor) : NSColor.secondaryLabelColor;
+            datum.stringValue = [self batteryTimeText] ?: @"";
+            datum.textColor = [self batteryTimeColor];
+            if ([flowBar isKindOfClass:PowerFlowGauge.class]) { [self configurePowerFlow:flowBar]; flowBar.toolTip = [self batteryPopoverTip]; }
             NSButton *glyph = (NSButton *)ViewWithAccessibilityIdentifier(root, @"popover.battery.symbol");
             if ([glyph isKindOfClass:NSButton.class]) {
                 NSImage *batteryImage = [self liveBatteryGlyph];
@@ -6313,43 +6313,53 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     mark.image = glyph;
     mark.contentTintColor = glyph.template ? mark.contentTintColor : nil;
 }
-- (NSString *)batteryDatumText {
-    if (!_bat.valid) return @"";
-    if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
-        return @"held 80%";
-    if (PowerFlowFor(_bat) == PowerFlowPaused) {
-        // Plugged in but not charging: say so plainly — the reason is in the tooltip.
-        BOOL nothingIn = _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000;
-        NSString *w = FormatSignedWatts(BatteryWatts(_bat));
-        return nothingIn ? @"no power in" : (w ?: @"paused");   // the glyph already says plugged in
-    }
-    // Real units first: what the battery is doing, in signed watts. On battery the
-    // time to 20% rides along when it fits; while charging, the time to the limit does
-    // the same. The target ("to 80%" / "to full") stays on the tooltip.
-    NSString *watts = _showWatts ? FormatSignedWatts(BatteryWatts(_bat)) : nil;
+// The Battery row's datum is a picture: where the Mac's power comes from on one bar
+// (charger grey, battery orange, surplus into the battery green; the empty track is
+// charger headroom), and beside it the time only when there is one worth reading.
+- (void)configurePowerFlow:(PowerFlowGauge *)g {
+    double bw = BatteryWatts(_bat);
+    double in = _bat.acConnected && _bat.systemPowerIn_mW > 0 && _bat.systemPowerIn_mW != LONG_MIN
+        ? _bat.systemPowerIn_mW / 1000.0 : 0;
+    double load = _bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN ? _bat.systemLoad_mW / 1000.0
+        : MAX(0, in - (isnan(bw) ? 0 : bw));
+    g.inputWatts = in;
+    g.systemWatts = load;
+    g.batteryWatts = isnan(bw) ? 0 : bw;
+    g.scaleWatts = _bat.acConnected && _bat.adapterWatts > 0 ? _bat.adapterWatts : 30;
+    g.accessibilityValue = [self batteryPowerFlowText];
+    g.needsDisplay = YES;
+}
+- (NSString *)batteryTimeText {
+    if (!_bat.valid) return nil;
     if (PowerFlowFor(_bat) == PowerFlowCharging) {
         int minutes = ChargeMinutesToTarget(_bat, [self chargeTargetPercent]);
-        if (watts && minutes >= 0) {
-            NSString *both = [NSString stringWithFormat:@"%@ · %@", watts, FmtDuration(minutes)];
-            NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-            if ([both sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8)
-                return both;
-        }
-        return watts ?: @"AC";
+        return minutes >= 0 ? FmtDuration(minutes) : nil;
     }
-    if (_bat.acConnected) return watts ?: @"AC";
-    NSString *time = nil;
-    if (_bat.percent > 20) {
-        int minutes = MinutesTo20(_bat, [self avgAmp]);
-        if (minutes >= 0) time = FmtDuration(minutes);
-    }
-    // The Burn row below carries the watts on battery; here the time is the reading.
-    if (!watts || [self burnDrawWatts] >= 0) return time ? [time stringByAppendingString:@" to 20%"] : @"…";
-    if (!time) return watts;
-    NSString *both = [NSString stringWithFormat:@"%@ · %@", watts, time];
-    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-    return [both sizeWithAttributes:@{NSFontAttributeName: font}].width <= kDatumW - 8 ? both : watts;
+    if (_bat.acConnected || _bat.percent <= 20) return nil;
+    int minutes = MinutesTo20(_bat, [self avgAmp]);
+    return minutes >= 0 ? FmtDuration(minutes) : nil;
 }
+- (NSColor *)batteryTimeColor {
+    return PowerFlowFor(_bat) == PowerFlowCharging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+}
+- (void)addBatteryFlowTo:(NSView *)row datum:(NSRect)datum gaugeH:(CGFloat)gaugeH
+                    stem:(NSString *)stem tip:(NSString *)tip {
+    PowerFlowGauge *flow = [[PowerFlowGauge alloc] initWithFrame:
+        NSMakeRect(NSMinX(datum), NSMidY(datum) - gaugeH / 2, 50, gaugeH)];
+    [self configurePowerFlow:flow];
+    flow.accessibilityIdentifier = [stem stringByAppendingString:@".flow"];
+    flow.toolTip = tip;
+    [row addSubview:flow];
+    NSTextField *time = [self text:[self batteryTimeText] ?: @""
+                              font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                             color:[self batteryTimeColor]
+                                at:NSMakeRect(NSMinX(datum) + 56, NSMinY(datum), NSWidth(datum) - 56, NSHeight(datum))
+                             align:NSTextAlignmentLeft];
+    time.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
+    time.toolTip = tip;
+    [row addSubview:time];
+}
+
 // "Input 18.8 W (20 W charger) · system 14.9 W · battery +3.9 W", from Apple's telemetry.
 - (NSString *)batteryPowerFlowText {
     NSMutableArray *parts = [NSMutableArray array];
@@ -6883,12 +6893,8 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
                                                 color:BattBarColor(_bat.percent)
                                            identifier:@"popover.battery.value" in:row];
             value.toolTip = tip;
-            PowerFlow flow = PowerFlowFor(_bat);
-            NSColor *datumColor = (flow == PowerFlowCharging || flow == PowerFlowPaused)
-                ? PowerFlowColor(_bat, NSColor.secondaryLabelColor) : NSColor.secondaryLabelColor;
-            NSTextField *datum = [self instrumentDatum:[self batteryDatumText] color:datumColor
-                                           identifier:@"popover.battery.datum" in:row];
-            datum.toolTip = tip;
+            [self addBatteryFlowTo:row datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
+                            gaugeH:kGaugeH stem:@"popover.battery" tip:tip];
         } else {
             [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
                        identifier:@"popover.battery.symbol" in:row];
@@ -8196,8 +8202,8 @@ static NSColor *HealthColor(double fraction) {
             if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
             [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
                    identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
-            [self detailDatum:[self batteryDatumText] color:NSColor.secondaryLabelColor
-                   identifier:@"details.overview.battery.datum" tip:tip in:row cols:c];
+            [self addBatteryFlowTo:row datum:DetailDatumRect(c) gaugeH:c.gaugeH
+                              stem:@"details.overview.battery" tip:tip];
         } else {
             [self detailSymbol:@"battery.0" size:c.symbol tint:NSColor.tertiaryLabelColor frame:DetailLeadRect(c)
                     identifier:@"details.overview.battery.symbol" in:row];

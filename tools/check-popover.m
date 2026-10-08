@@ -377,9 +377,13 @@ int main(int argc, const char **argv) {
         }
         if (![storageSymbol isKindOfClass:NSImageView.class]) return Fail(__LINE__);
         if (![batterySymbol isKindOfClass:NSButton.class] || batterySymbol.action == NULL) return Fail(__LINE__);
+        // The datum is a picture: the power-flow bar, and the time to the charge target beside it.
         NSTextField *batteryDatum = (NSTextField *)FindIdentifier(root, @"popover.battery.datum");
-        if (![batteryDatum isKindOfClass:NSTextField.class] || ![batteryDatum.stringValue containsString:@"W"] ||
-            [batteryDatum.stringValue containsString:@"…"]) return Fail(__LINE__);
+        PowerFlowGauge *batteryFlow = (PowerFlowGauge *)FindIdentifier(root, @"popover.battery.flow");
+        if (![batteryDatum isKindOfClass:NSTextField.class] || [batteryDatum.stringValue containsString:@"W"] ||
+            ![batteryDatum.stringValue isEqual:FmtDuration(ChargeMinutesToTarget(b, 80))] ||
+            ![batteryFlow isKindOfClass:PowerFlowGauge.class] || batteryFlow.batteryWatts <= 0 ||
+            fabs(batteryFlow.inputWatts - 18.8) > 0.01 || !batteryFlow.toolTip.length) return Fail(__LINE__);
         NSString *levelName = BatterySymbolName(b.percent, NO);
         CGFloat levelPt = FittedSymbolPointSize(levelName, kLeadSymbol, kLeadW);
         NSImageSymbolConfiguration *plainCfg = [NSImageSymbolConfiguration configurationWithPointSize:levelPt
@@ -720,13 +724,14 @@ int main(int argc, const char **argv) {
                 [c rebuildContent];
                 NSView *pop = p.contentViewController.view;
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
-                if (!FitsChildren(pop) || [bd.stringValue containsString:@"plugged"]) {
+                if (!FitsChildren(pop) || [bd.stringValue containsString:@"W"] ||
+                    ![FindIdentifier(pop, @"popover.battery.flow") isKindOfClass:PowerFlowGauge.class]) {
                     fprintf(stderr, "battery state %zu: \"%s\"\n", i, bd.stringValue.UTF8String);
                     return Fail(__LINE__);
                 }
-                if (i == 2 && argc > 1 &&
+                if (argc > 1 &&
                     !RenderOffscreen(pop, [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
-                        stringByAppendingString:@"-paused.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua))
+                        stringByAppendingFormat:@"-battery%zu.png", i], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua))
                     return Fail(__LINE__);
             }
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
