@@ -113,9 +113,17 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
 static BOOL FitsChildren(NSView *view) {
     for (NSView *child in view.subviews) {
         if (!NSContainsRect(view.bounds, child.frame) || !FitsChildren(child)) return NO;
-        if ([child isKindOfClass:NSTextField.class] && [child.accessibilityIdentifier hasPrefix:@"popover.claude."]) {
+        // No cut-off text anywhere: every label's whole string fits its frame.
+        if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
             NSTextField *field = (NSTextField *)child;
-            if ([field.stringValue sizeWithAttributes:@{NSFontAttributeName:field.font}].width > field.bounds.size.width - 4) return NO;
+            CGFloat need = field.attributedStringValue.length
+                ? field.attributedStringValue.size.width
+                : [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
+            if (need > field.bounds.size.width - 4) {
+                fprintf(stderr, "truncated %s: \"%s\" needs %.1f of %.1f\n", field.accessibilityIdentifier.UTF8String,
+                        field.stringValue.UTF8String, need, field.bounds.size.width - 4);
+                return NO;
+            }
         }
     }
     return YES;
@@ -693,6 +701,41 @@ int main(int argc, const char **argv) {
                 CountIdentifier(doc, @"details.ai.window.cursor.0") ||
                 CountIdentifier(doc, [stem stringByAppendingString:@".api.gauge"])) return Fail(__LINE__);
         }
+        // Every battery state renders without cut-off text: charging fast, held at the limit,
+        // plugged but draining (the 2026-10-08 "−7.9 W plug…" bug), no power in, and on battery.
+        {
+            struct { BOOL ac, charging; int pct; long amps, in, load; } states[] = {
+                {YES, YES, 42, 2400, 60000, 9000},   // fast charge, time to target
+                {YES, NO, 80, 0, 9000, 9000},        // held at 80%
+                {YES, NO, 78, -660, 4000, 11900},    // plugged, battery still carrying load
+                {YES, NO, 78, -900, 0, 11000},       // charger recognised, nothing arriving
+                {NO, NO, 63, -1100, 0, 13200},       // on battery
+                {NO, NO, 12, -2400, 0, 28800},       // low and heavy
+            };
+            for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+                BatteryState sb = b;
+                sb.acConnected = states[i].ac; sb.isCharging = states[i].charging; sb.percent = states[i].pct;
+                sb.amperage_mA = states[i].amps; sb.systemPowerIn_mW = states[i].in; sb.systemLoad_mW = states[i].load;
+                [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
+                [c rebuildContent];
+                NSView *pop = p.contentViewController.view;
+                NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
+                if (!FitsChildren(pop) || [bd.stringValue containsString:@"plugged"]) {
+                    fprintf(stderr, "battery state %zu: \"%s\"\n", i, bd.stringValue.UTF8String);
+                    return Fail(__LINE__);
+                }
+                if (i == 2 && argc > 1 &&
+                    !RenderOffscreen(pop, [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
+                        stringByAppendingString:@"-paused.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua))
+                    return Fail(__LINE__);
+            }
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"ai"]) {
+                NSView *doc = ((NSScrollView *)[c detailViewForIdentifier:tab]).documentView;
+                if (!FitsChildren(doc)) { fprintf(stderr, "details tab %s\n", tab.UTF8String); return Fail(__LINE__); }
+            }
+        }
         // On battery: a Burn row splits the draw by app and names the heaviest; the Battery
         // tab lists each app's watts and Wh since unplug, the screen + system rest, and the total.
         {
@@ -712,7 +755,7 @@ int main(int argc, const char **argv) {
             NSTextField *burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
             NSTextField *burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
             StackedGauge *burnBar = (StackedGauge *)FindIdentifier(pop, @"popover.burn.gauge");
-            if (![burnValue.stringValue isEqual:@"9.4 W"] || ![burnDatum.stringValue hasSuffix:@" 2.1 W"] ||
+            if (![burnValue.stringValue isEqual:@"9 W"] || ![burnDatum.stringValue hasSuffix:@" 2.1 W"] ||
                 ![burnDatum.stringValue isEqual:@"Chrome 2.1 W"] ||
                 [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds) ||
                 ![burnBar isKindOfClass:StackedGauge.class] || burnBar.segments.count != 5 ||

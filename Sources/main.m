@@ -6321,7 +6321,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         // Plugged in but not charging: say so plainly — the reason is in the tooltip.
         BOOL nothingIn = _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW < 1000;
         NSString *w = FormatSignedWatts(BatteryWatts(_bat));
-        return nothingIn ? @"no power in" : (w ? [w stringByAppendingString:@" plugged"] : @"paused");
+        return nothingIn ? @"no power in" : (w ?: @"paused");   // the glyph already says plugged in
     }
     // Real units first: what the battery is doing, in signed watts. On battery the
     // time to 20% rides along when it fits; while charging, the time to the limit does
@@ -6627,7 +6627,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     bar.accessibilityLabel = @"Battery draw by app";
     bar.toolTip = tip;
     [row addSubview:bar];
-    NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%.1f W", draw]
+    NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%.0f W", draw]   // whole watts fit the column
                                          color:NSColor.labelColor identifier:@"popover.burn.value" in:row];
     value.toolTip = tip;
     NSString *datum = @"…";
