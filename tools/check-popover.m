@@ -377,13 +377,14 @@ int main(int argc, const char **argv) {
         }
         if (![storageSymbol isKindOfClass:NSImageView.class]) return Fail(__LINE__);
         if (![batterySymbol isKindOfClass:NSButton.class] || batterySymbol.action == NULL) return Fail(__LINE__);
-        // The datum is a picture: the power-flow bar, and the time to the charge target beside it.
+        // Quantity plus flow: a trend arrow above the charge bar from the level toward where it
+        // is heading (stopping at the 80% limit), and the signed rate as the datum.
         NSTextField *batteryDatum = (NSTextField *)FindIdentifier(root, @"popover.battery.datum");
-        PowerFlowGauge *batteryFlow = (PowerFlowGauge *)FindIdentifier(root, @"popover.battery.flow");
-        if (![batteryDatum isKindOfClass:NSTextField.class] || [batteryDatum.stringValue containsString:@"W"] ||
-            ![batteryDatum.stringValue isEqual:FmtDuration(ChargeMinutesToTarget(b, 80))] ||
-            ![batteryFlow isKindOfClass:PowerFlowGauge.class] || batteryFlow.batteryWatts <= 0 ||
-            fabs(batteryFlow.inputWatts - 18.8) > 0.01 || !batteryFlow.toolTip.length) return Fail(__LINE__);
+        TrendArrow *trend = (TrendArrow *)FindIdentifier(root, @"popover.battery.trend");
+        NSView *chargeGauge = FindIdentifier(root, @"popover.battery.gauge");
+        if (![batteryDatum.stringValue isEqual:@"+12 W"] || ![batteryDatum.textColor isEqual:NSColor.systemGreenColor] ||
+            ![trend isKindOfClass:TrendArrow.class] || trend.hidden || trend.to <= trend.from || trend.to > 0.8001 ||
+            NSMinY(trend.frame) < NSMaxY(chargeGauge.frame) || NSMaxY(trend.frame) > kRowH) return Fail(__LINE__);
         NSString *levelName = BatterySymbolName(b.percent, NO);
         CGFloat levelPt = FittedSymbolPointSize(levelName, kLeadSymbol, kLeadW);
         NSImageSymbolConfiguration *plainCfg = [NSImageSymbolConfiguration configurationWithPointSize:levelPt
@@ -724,8 +725,11 @@ int main(int argc, const char **argv) {
                 [c rebuildContent];
                 NSView *pop = p.contentViewController.view;
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
-                if (!FitsChildren(pop) || [bd.stringValue containsString:@"W"] ||
-                    ![FindIdentifier(pop, @"popover.battery.flow") isKindOfClass:PowerFlowGauge.class]) {
+                TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
+                BOOL moving = fabs(BatteryWatts(sb)) >= 0.3;
+                if (!FitsChildren(pop) || ![bd.stringValue hasSuffix:@" W"] || ![ta isKindOfClass:TrendArrow.class] ||
+                    (moving && sb.percent > 0 && ta.hidden && !(BatteryWatts(sb) > 0 && sb.percent >= 80)) ||
+                    (moving && !ta.hidden && (BatteryWatts(sb) > 0) != (ta.to > ta.from))) {
                     fprintf(stderr, "battery state %zu: \"%s\"\n", i, bd.stringValue.UTF8String);
                     return Fail(__LINE__);
                 }

@@ -379,14 +379,121 @@ static BOOL SystemSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Battery trend sheet (quantity + flow on one bar)
+
+typedef NS_ENUM(NSInteger, TrendStyle) { TrendGhost, TrendVector, TrendChevrons, TrendGhostChevrons };
+
+// The charge bar carries its own flow: where the level will be in an hour at this rate.
+@interface TrendSketch : NSView
+@property (nonatomic) double level, perHour, limit;   // fractions; perHour signed
+@property (nonatomic) TrendStyle style;
+@end
+@implementation TrendSketch
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds; CGFloat w = NSWidth(r), h = NSHeight(r), rad = h / 2;
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
+    double target = _perHour >= 0 ? MIN(_level + _perHour, _limit > 0 ? MAX(_limit, _level) : 1) : MAX(0, _level + _perHour);
+    BOOL charging = _perHour > 0.005, draining = _perHour < -0.005;
+    NSColor *base = BattBarColor((int)lround(_level * 100));
+    [NSGraphicsContext saveGraphicsState]; [track addClip];
+    BOOL ghost = _style == TrendGhost || _style == TrendGhostChevrons;
+    if (ghost && draining) {
+        // What the next hour takes: the end of the fill turns orange.
+        [base setFill]; NSRectFill(NSMakeRect(0, 0, w * target, h));
+        [NSColor.systemOrangeColor setFill]; NSRectFill(NSMakeRect(w * target, 0, w * (_level - target), h));
+    } else {
+        [base setFill]; NSRectFill(NSMakeRect(0, 0, MAX(h, w * _level), h));
+        if (ghost && charging) {   // what the next hour adds: a pale extension
+            [[NSColor.systemGreenColor colorWithAlphaComponent:0.35] setFill];
+            NSRectFill(NSMakeRect(w * _level, 0, w * (target - _level), h));
+        }
+    }
+    [NSGraphicsContext restoreGraphicsState];
+    if (_limit > 0) { [NSColor.labelColor setFill]; NSRectFill(NSMakeRect(w * _limit - 0.75, 0, 1.5, h)); }
+    if (_style == TrendVector && (charging || draining)) {
+        // Airspeed-tape trend vector: a line from the level to where it is heading, with a head.
+        CGFloat from = w * _level, to = w * target, y = h + 3;
+        NSColor *ink = charging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+        [ink setFill]; NSRectFill(NSMakeRect(MIN(from, to), y - 1, fabs(to - from), 2));
+        NSBezierPath *head = [NSBezierPath bezierPath];
+        CGFloat dir = charging ? 1 : -1;
+        [head moveToPoint:NSMakePoint(to + dir * 4, y)];
+        [head lineToPoint:NSMakePoint(to - dir * 1, y + 3.5)];
+        [head lineToPoint:NSMakePoint(to - dir * 1, y - 3.5)];
+        [head closePath]; [head fill];
+    }
+    if ((_style == TrendChevrons || _style == TrendGhostChevrons) && (charging || draining)) {
+        // Chevrons ride on the bar at the level, pointing the way it moves; more for faster.
+        int n = fabs(_perHour) > 0.30 ? 3 : fabs(_perHour) > 0.12 ? 2 : 1;
+        NSColor *ink = charging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+        CGFloat x0 = w * _level + (charging ? 4 : -4), step = 6;
+        NSBezierPath *p = [NSBezierPath bezierPath]; p.lineWidth = 1.8; p.lineCapStyle = NSLineCapStyleRound; p.lineJoinStyle = NSLineJoinStyleRound;
+        for (int i = 0; i < n; i++) {
+            CGFloat x = charging ? x0 + i * step : x0 - i * step, d = charging ? 3 : -3;
+            [p moveToPoint:NSMakePoint(x, h / 2 + 4)]; [p lineToPoint:NSMakePoint(x + d, h / 2)]; [p lineToPoint:NSMakePoint(x, h / 2 - 4)];
+        }
+        [(ghost ? NSColor.labelColor : ink) setStroke]; [p stroke];
+    }
+}
+@end
+
+static NSView *TrendRow(Controller *c, int pct, double watts, BOOL ac, NSString *time, TrendStyle style) {
+    BatteryState b = {.valid=YES, .percent=pct, .acConnected=ac, .isCharging=watts > 0.3, .rawCurrent_mAh=4500 * pct / 100,
+        .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=(long)(watts * 1000 / 12.0),
+        .systemPowerIn_mW=ac ? (long)((9 + MAX(watts, -5)) * 1000) : 0, .systemLoad_mW=9000, .adapterWatts=ac ? 30 : 0};
+    [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    NSImage *glyph = [c liveBatteryGlyph];
+    NSImageView *iv = [NSImageView imageViewWithImage:glyph];
+    iv.imageScaling = NSImageScaleProportionallyDown;
+    if (glyph.template) iv.contentTintColor = PowerFlowColor(b, NSColor.labelColor);
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2, kLeadW, kLeadSymbol);
+    [row addSubview:iv];
+    [row addSubview:[c text:@"Battery" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                         at:NSMakeRect(kAINameX, (kRowH - 16) / 2, kAINameW, 16) align:NSTextAlignmentLeft]];
+    TrendSketch *t = [[TrendSketch alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+    t.level = pct / 100.0; t.perHour = watts / 54.0; t.limit = ac ? 0.8 : 0; t.style = style;
+    [row addSubview:t];
+    [row addSubview:[c text:[NSString stringWithFormat:@"%d%%", pct] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                      color:BattBarColor(pct) at:NSMakeRect(kValueX, (kRowH - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    if (time) [row addSubview:[c text:time font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                color:watts > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor
+                                   at:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2, kDatumW, kDatumH) align:NSTextAlignmentLeft]];
+    return row;
+}
+
+static BOOL TrendSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // percent, battery watts (+ in), on AC, time
+    NSArray *states = @[@[@42, @17, @YES, @"0:51"], @[@80, @0, @YES, [NSNull null]], @[@78, @-8, @YES, [NSNull null]],
+                        @[@63, @-13, @NO, @"2:30"], @[@30, @-29, @NO, @"0:11"]];
+    NSArray *variants = @[@[@"A  ghost: next hour shown on the bar (pale = coming, orange = going)", @(TrendGhost)],
+                          @[@"B  trend vector: arrow from the level to where it'll be in an hour", @(TrendVector)],
+                          @[@"C  chevrons at the level: direction, and 1-3 for rate", @(TrendChevrons)],
+                          @[@"D  ghost + chevrons", @(TrendGhostChevrons)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states)
+                [rows addObject:TrendRow(c, [st[0] intValue], [st[1] doubleValue], [st[2] boolValue],
+                                         st[3] == [NSNull null] ? nil : st[3], [v[1] integerValue])];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "trend")) return TrendSheet(path) ? 0 : 1;
         Controller *c = [Controller new];
         NSArray *variants = @[@[@"A  today (no pace)", @(PaceNone)],
                               @[@"B  time bug: vertical bar at time left", @(PaceTick)],

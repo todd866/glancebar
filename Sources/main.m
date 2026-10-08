@@ -3107,6 +3107,30 @@ static NSInteger PressurePipLevel(NSString *level) {
 }
 @end
 
+// The airspeed-tape trend vector on the battery bar: a line from the charge level to
+// where it will be in an hour at this rate, with a head. Green in, orange out.
+@interface TrendArrow : NSView
+@property (nonatomic) double from, to;   // bar fractions
+@end
+@implementation TrendArrow
+- (void)setFrom:(double)from { _from = from; self.needsDisplay = YES; }
+- (void)setTo:(double)to { _to = to; self.needsDisplay = YES; }
+- (void)drawRect:(NSRect)dirty {
+    CGFloat inset = 5, w = NSWidth(self.bounds) - 2 * inset, y = NSMidY(self.bounds);
+    CGFloat a = inset + w * _from, b = inset + w * _to;
+    if (fabs(b - a) < 1) return;
+    BOOL up = b > a;
+    [(up ? NSColor.systemGreenColor : NSColor.systemOrangeColor) setFill];
+    NSRectFill(NSMakeRect(MIN(a, b), y - 1, fabs(b - a), 2));
+    CGFloat dir = up ? 1 : -1;
+    NSBezierPath *head = [NSBezierPath bezierPath];
+    [head moveToPoint:NSMakePoint(b + dir * 4, y)];
+    [head lineToPoint:NSMakePoint(b - dir * 1, y + 3.5)];
+    [head lineToPoint:NSMakePoint(b - dir * 1, y - 3.5)];
+    [head closePath]; [head fill];
+}
+@end
+
 // Segments laid end to end on one track: @{@"w": watts, @"color": NSColor}, against
 // `scale` watts. The battery Burn instrument: apps in orange shades, screen + system grey.
 @interface StackedGauge : NSView
@@ -3503,6 +3527,9 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
         [old setAccessibilityElement:new.isAccessibilityElement];
+    } else if ([existing isKindOfClass:TrendArrow.class]) {
+        TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
+        old.from = new.from; old.to = new.to;
     } else if ([existing isKindOfClass:StackedGauge.class]) {
         StackedGauge *old = (StackedGauge *)existing, *new = (StackedGauge *)fresh;
         old.segments = new.segments; old.scale = new.scale;
@@ -5769,11 +5796,12 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (popover) {
         NSView *root = _popover.contentViewController.view;
         NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(root, @"popover.battery.datum");
-        PowerFlowGauge *flowBar = (PowerFlowGauge *)ViewWithAccessibilityIdentifier(root, @"popover.battery.flow");
+        TrendArrow *arrow = (TrendArrow *)ViewWithAccessibilityIdentifier(root, @"popover.battery.trend");
+        NSView *chargeBar = ViewWithAccessibilityIdentifier(root, @"popover.battery.gauge");
         if ([datum isKindOfClass:NSTextField.class]) {
-            datum.stringValue = [self batteryTimeText] ?: @"";
-            datum.textColor = [self batteryTimeColor];
-            if ([flowBar isKindOfClass:PowerFlowGauge.class]) { [self configurePowerFlow:flowBar]; flowBar.toolTip = [self batteryPopoverTip]; }
+            datum.stringValue = [self batteryRateText];
+            datum.textColor = [self batteryRateColor];
+            if ([arrow isKindOfClass:TrendArrow.class] && chargeBar) [self configureTrend:arrow over:chargeBar];
             NSButton *glyph = (NSButton *)ViewWithAccessibilityIdentifier(root, @"popover.battery.symbol");
             if ([glyph isKindOfClass:NSButton.class]) {
                 NSImage *batteryImage = [self liveBatteryGlyph];
@@ -6313,51 +6341,43 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     mark.image = glyph;
     mark.contentTintColor = glyph.template ? mark.contentTintColor : nil;
 }
-// The Battery row's datum is a picture: where the Mac's power comes from on one bar
-// (charger grey, battery orange, surplus into the battery green; the empty track is
-// charger headroom), and beside it the time only when there is one worth reading.
-- (void)configurePowerFlow:(PowerFlowGauge *)g {
+// Battery = quantity plus flow. The bar is the charge; a trend arrow above it runs from
+// the level to where it will be in an hour at the current rate (stopping at the charge
+// limit), and the datum is the signed rate in watts.
+- (void)configureTrend:(TrendArrow *)arrow over:(NSView *)gauge {
     double bw = BatteryWatts(_bat);
-    double in = _bat.acConnected && _bat.systemPowerIn_mW > 0 && _bat.systemPowerIn_mW != LONG_MIN
-        ? _bat.systemPowerIn_mW / 1000.0 : 0;
-    double load = _bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN ? _bat.systemLoad_mW / 1000.0
-        : MAX(0, in - (isnan(bw) ? 0 : bw));
-    g.inputWatts = in;
-    g.systemWatts = load;
-    g.batteryWatts = isnan(bw) ? 0 : bw;
-    g.scaleWatts = _bat.acConnected && _bat.adapterWatts > 0 ? _bat.adapterWatts : 30;
-    g.accessibilityValue = [self batteryPowerFlowText];
-    g.needsDisplay = YES;
+    double fullWh = BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV);
+    double level = _bat.percent / 100.0;
+    BOOL moving = !isnan(bw) && fabs(bw) >= 0.3 && !isnan(fullWh) && fullWh > 0;
+    double cap = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? MAX(0.8, level) : 1.0;
+    double to = moving ? MIN(cap, MAX(0, level + bw / fullWh)) : level;
+    arrow.from = level; arrow.to = to;
+    arrow.hidden = !moving || fabs(to - level) < 0.01;
+    arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, NSMaxY(gauge.frame) + 1, NSWidth(gauge.frame) + 10, 8);
 }
-- (NSString *)batteryTimeText {
-    if (!_bat.valid) return nil;
-    if (PowerFlowFor(_bat) == PowerFlowCharging) {
-        int minutes = ChargeMinutesToTarget(_bat, [self chargeTargetPercent]);
-        return minutes >= 0 ? FmtDuration(minutes) : nil;
-    }
-    if (_bat.acConnected || _bat.percent <= 20) return nil;
-    int minutes = MinutesTo20(_bat, [self avgAmp]);
-    return minutes >= 0 ? FmtDuration(minutes) : nil;
+- (NSString *)batteryRateText {
+    double bw = BatteryWatts(_bat);
+    if (isnan(bw)) return @"";
+    return fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
 }
-- (NSColor *)batteryTimeColor {
-    return PowerFlowFor(_bat) == PowerFlowCharging ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+- (NSColor *)batteryRateColor {
+    double bw = BatteryWatts(_bat);
+    return isnan(bw) || fabs(bw) < 0.3 ? NSColor.secondaryLabelColor
+         : bw > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
 }
-- (void)addBatteryFlowTo:(NSView *)row datum:(NSRect)datum gaugeH:(CGFloat)gaugeH
-                    stem:(NSString *)stem tip:(NSString *)tip {
-    PowerFlowGauge *flow = [[PowerFlowGauge alloc] initWithFrame:
-        NSMakeRect(NSMinX(datum), NSMidY(datum) - gaugeH / 2, 50, gaugeH)];
-    [self configurePowerFlow:flow];
-    flow.accessibilityIdentifier = [stem stringByAppendingString:@".flow"];
-    flow.toolTip = tip;
-    [row addSubview:flow];
-    NSTextField *time = [self text:[self batteryTimeText] ?: @""
+- (void)addBatteryTrendTo:(NSView *)row gauge:(NSView *)gauge datum:(NSRect)datum
+                     stem:(NSString *)stem tip:(NSString *)tip {
+    TrendArrow *arrow = [[TrendArrow alloc] initWithFrame:NSZeroRect];
+    [self configureTrend:arrow over:gauge];
+    arrow.accessibilityIdentifier = [stem stringByAppendingString:@".trend"];
+    arrow.toolTip = tip;
+    [row addSubview:arrow];
+    NSTextField *rate = [self text:[self batteryRateText]
                               font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                             color:[self batteryTimeColor]
-                                at:NSMakeRect(NSMinX(datum) + 56, NSMinY(datum), NSWidth(datum) - 56, NSHeight(datum))
-                             align:NSTextAlignmentLeft];
-    time.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
-    time.toolTip = tip;
-    [row addSubview:time];
+                             color:[self batteryRateColor] at:datum align:NSTextAlignmentLeft];
+    rate.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
+    rate.toolTip = tip;
+    [row addSubview:rate];
 }
 
 // "Input 18.8 W (20 W charger) · system 14.9 W · battery +3.9 W", from Apple's telemetry.
@@ -6893,8 +6913,8 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
                                                 color:BattBarColor(_bat.percent)
                                            identifier:@"popover.battery.value" in:row];
             value.toolTip = tip;
-            [self addBatteryFlowTo:row datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
-                            gaugeH:kGaugeH stem:@"popover.battery" tip:tip];
+            [self addBatteryTrendTo:row gauge:g datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
+                               stem:@"popover.battery" tip:tip];
         } else {
             [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
                        identifier:@"popover.battery.symbol" in:row];
@@ -7852,23 +7872,6 @@ static NSColor *HealthColor(double fraction) {
     return YES;
 }
 
-// Charge-row datum only. Health is its own instrument on the Battery tab, so it is not
-// appended here the way the narrow popover datum sometimes does.
-- (NSString *)batteryDetailDatum {
-    if (!_bat.valid) return @"";
-    if (ChargeHeld(_bat.acConnected, _bat.isCharging, _bat.percent, [self effectiveChargeMode]))
-        return @"held 80%";
-    if (!_bat.acConnected) {
-        if (_bat.percent <= 20) return @"reserve";
-        int minutes = MinutesTo20(_bat, [self avgAmp]);
-        return minutes >= 0 ? [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)] : @"…";
-    }
-    double watts = 0;
-    if (_showWatts && _bat.isCharging && [self batteryWattsKnown:&watts])
-        return [NSString stringWithFormat:@"+%.1f W", watts];
-    return @"AC";
-}
-
 // The provider row the popover draws, at the Details column positions. Window rows and
 // token history are added by the AI tab; Overview stops at this one line per provider.
 - (CGFloat)addDetailProviderRow:(AIUsage *)u scope:(NSString *)scope
@@ -8202,8 +8205,8 @@ static NSColor *HealthColor(double fraction) {
             if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
             [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
                    identifier:@"details.overview.battery.value" tip:tip in:row cols:c];
-            [self addBatteryFlowTo:row datum:DetailDatumRect(c) gaugeH:c.gaugeH
-                              stem:@"details.overview.battery" tip:tip];
+            [self addBatteryTrendTo:row gauge:charge datum:DetailDatumRect(c)
+                               stem:@"details.overview.battery" tip:tip];
         } else {
             [self detailSymbol:@"battery.0" size:c.symbol tint:NSColor.tertiaryLabelColor frame:DetailLeadRect(c)
                     identifier:@"details.overview.battery.symbol" in:row];
@@ -8460,8 +8463,7 @@ static NSColor *HealthColor(double fraction) {
         if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
         [self detailValue:[NSString stringWithFormat:@"%d%%", _bat.percent] color:BattBarColor(_bat.percent)
                identifier:@"details.battery.charge.value" tip:tip in:row cols:c];
-        [self detailDatum:[self batteryDetailDatum] color:NSColor.secondaryLabelColor
-               identifier:@"details.battery.charge.datum" tip:tip in:row cols:c];
+        [self addBatteryTrendTo:row gauge:charge datum:DetailDatumRect(c) stem:@"details.battery.charge" tip:tip];
         y += c.rowH;
 
         if (health) {
