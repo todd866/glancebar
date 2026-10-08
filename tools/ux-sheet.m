@@ -489,7 +489,7 @@ static BOOL TrendSheet(NSString *path) {
 
 #pragma mark - Cursor two-pool sheet
 
-typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows };
+typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows, PoolInnerLine, PoolUnderline, PoolGrokOverlay };
 
 @interface PoolSketch : NSView
 @property (nonatomic) double a, b;   // API, Grok/Composer remaining
@@ -522,6 +522,28 @@ typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolM
             NSBezierPath *t = [NSBezierPath bezierPathWithRoundedRect:bar xRadius:4 yRadius:4];
             [NSGraphicsContext saveGraphicsState]; [t addClip];
             [AIQuotaColor(lo) setFill]; NSRectFill(NSMakeRect(0, mid - 4, MAX(8, w * lo), 8));
+            [NSGraphicsContext restoreGraphicsState];
+            break;
+        }
+        case PoolInnerLine: {
+            // Grok is the bar; API is a thin line riding inside it, centred.
+            [self lane:NSMakeRect(0, mid - 4, w, 8) value:_b color:AIQuotaColor(_b)];
+            [[NSColor.labelColor colorWithAlphaComponent:0.85] setFill];
+            NSRectFill(NSMakeRect(2, mid - 1, MAX(2, w * _a - 2), 2));
+            break;
+        }
+        case PoolUnderline:
+            // Grok is the bar; API is a hairline lane tucked right under it.
+            [self lane:NSMakeRect(0, mid - 2, w, 8) value:_b color:AIQuotaColor(_b)];
+            [self lane:NSMakeRect(0, mid - 6, w, 2) value:_a color:AIQuotaColor(_a)];
+            break;
+        case PoolGrokOverlay: {
+            // One bar to Grok's level; the API share of it is the solid, darker part.
+            NSRect bar = NSMakeRect(0, mid - 4, w, 8);
+            [self lane:bar value:_b color:[AIQuotaColor(_b) colorWithAlphaComponent:0.45]];
+            NSBezierPath *t = [NSBezierPath bezierPathWithRoundedRect:bar xRadius:4 yRadius:4];
+            [NSGraphicsContext saveGraphicsState]; [t addClip];
+            [AIQuotaColor(_a) setFill]; NSRectFill(NSMakeRect(0, mid - 4, MAX(8, w * _a), 8));
             [NSGraphicsContext restoreGraphicsState];
             break;
         }
@@ -560,7 +582,8 @@ static NSView *QuotaRowSketch(Controller *c, NSString *name, NSString *label, do
         [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", b * 100] font:small color:AIQuotaColor(b)
                              at:NSMakeRect(kValueX, (style == PoolTight ? 1 : 0), kValueW, h / 2) align:NSTextAlignmentRight]];
     } else {
-        double shown = b < 0 ? a : style == PoolMarker ? a : MIN(a, b);
+        BOOL grokFirst = style == PoolInnerLine || style == PoolUnderline || style == PoolGrokOverlay;
+        double shown = b < 0 ? a : style == PoolMarker ? a : grokFirst ? b : MIN(a, b);
         [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", shown * 100] font:big color:AIQuotaColor(shown)
                              at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
     }
@@ -571,11 +594,14 @@ static NSView *QuotaRowSketch(Controller *c, NSString *name, NSString *label, do
 
 static BOOL CursorSheet(NSString *path) {
     Controller *c = [Controller new];
-    NSArray *variants = @[@[@"A  today: two thin lanes, two numbers", @(PoolToday)],
+    NSArray *variants = getenv("SHEET_ALL") ? @[@[@"A  today: two thin lanes, two numbers", @(PoolToday)],
                           @[@"B  one bar: solid = tighter pool, pale = the other", @(PoolOverlay)],
                           @[@"C  two lanes squeezed into one bar's height", @(PoolTight)],
                           @[@"D  API bar, Grok as a tick", @(PoolMarker)],
-                          @[@"E  a second plain row for Grok/Composer", @(PoolTwoRows)]];
+                          @[@"E  a second plain row for Grok/Composer", @(PoolTwoRows)]]
+                        : @[@[@"F  Grok bar, API as a line riding inside it", @(PoolInnerLine)],
+                          @[@"G  Grok bar, API as a hairline tucked under it", @(PoolUnderline)],
+                          @[@"H  Grok bar pale to 41, API share solid to 17", @(PoolGrokOverlay)]];
     NSMutableArray *builders = [NSMutableArray array];
     for (NSArray *v in variants) {
         PoolStyle style = [v[1] integerValue];

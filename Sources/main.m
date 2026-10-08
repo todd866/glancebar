@@ -895,8 +895,9 @@ static NSString *CursorPoolTip(NSDictionary *pools) {
         NSNumber *epoch = pools[key][@"resetsAt"];
         NSString *clock = [epoch isKindOfClass:NSNumber.class]
             ? ResetClockText([NSDate dateWithTimeIntervalSince1970:epoch.doubleValue], NSDate.date) : nil;
-        [parts addObject:[NSString stringWithFormat:@"%@: %.0f%% left%@", label, value * 100,
-            clock.length ? [@", resets " stringByAppendingString:clock] : @""]];
+        [parts addObject:[NSString stringWithFormat:@"%@: %.0f%% left%@%@", label, value * 100,
+            clock.length ? [@", resets " stringByAppendingString:clock] : @"",
+            [key isEqual:@"api"] ? @" (the line inside the bar)" : @" (the bar)"]];
     }
     return [parts componentsJoinedByString:@"\n"];
 }
@@ -2981,6 +2982,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 @interface Gauge : NSView
 @property (nonatomic) double fraction;
 @property (nonatomic) double markerFraction; // negative: no tick. 0.8 draws the 80% charge-limit mark
+@property (nonatomic) double innerFraction;  // negative: none. A secondary reading as a thin line inside the bar
 @property (nonatomic, strong) NSColor *color;
 @property (nonatomic, copy) NSString *metricLabel;
 @end
@@ -2988,6 +2990,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 - (instancetype)initWithFrame:(NSRect)frame {
     if ((self = [super initWithFrame:frame])) {
         _markerFraction = -1;
+        _innerFraction = -1;
         [self setAccessibilityElement:YES];
         [self setAccessibilityRole:NSAccessibilityProgressIndicatorRole];
         [self setAccessibilityMinValue:@0.0];
@@ -3003,6 +3006,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 - (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
 - (void)setMarkerFraction:(double)markerFraction { _markerFraction = markerFraction; self.needsDisplay = YES; }
+- (void)setInnerFraction:(double)innerFraction { _innerFraction = innerFraction; self.needsDisplay = YES; }
 - (void)setMetricLabel:(NSString *)metricLabel {
     _metricLabel = [metricLabel copy];
     [self setAccessibilityLabel:_metricLabel.length ? _metricLabel : @"Progress"];
@@ -3016,6 +3020,12 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
     NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*self.fraction);
     [(self.color ?: NSColor.controlAccentColor) setFill];
     [[NSBezierPath bezierPathWithRoundedRect:f xRadius:rad yRadius:rad] fill];
+    if (self.innerFraction >= 0) {
+        // Cursor's API pool rides inside the Grok bar: same scale, visibly secondary.
+        CGFloat inset = 2, len = MAX(2, (NSWidth(r) - inset) * MIN(self.innerFraction, 1.0) - inset);
+        [[NSColor.labelColor colorWithAlphaComponent:0.85] setFill];
+        NSRectFill(NSMakeRect(NSMinX(r) + inset, NSMidY(r) - 1, len, 2));
+    }
     if (self.markerFraction >= 0 && self.markerFraction <= 1) {
         CGFloat tickW = 1.5;
         CGFloat x = NSMinX(r) + NSWidth(r) * self.markerFraction - tickW / 2.0;
@@ -3523,6 +3533,7 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         Gauge *old = (Gauge *)existing, *new = (Gauge *)fresh;
         old.fraction = new.fraction;
         old.markerFraction = new.markerFraction;
+        old.innerFraction = new.innerFraction;
         old.color = new.color;
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
@@ -6720,6 +6731,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         plainGauge.fraction = MAX(primary, 0);
         plainGauge.color = valueColor;
         plainGauge.metricLabel = @"Cursor Grok + Composer remaining";
+        if (CursorPoolFraction(cursorPools, @"cursor") >= 0) plainGauge.innerFraction = CursorPoolFraction(cursorPools, @"api");
         plainGauge.accessibilityIdentifier = @"popover.ai.cursor.gauge";
         [row addSubview:plainGauge];
     } else if (hasGauge) {
@@ -7939,9 +7951,10 @@ static NSColor *HealthColor(double fraction) {
         meter.toolTip = named;
         [row addSubview:meter];
     } else if (cursorPools) {
-        [self detailGauge:DetailGaugeRect(c) fraction:MAX(CursorPrimaryFraction(cursorPools), 0) color:valueColor
-                    label:@"Cursor Grok + Composer remaining"
-               identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+        Gauge *bar = [self detailGauge:DetailGaugeRect(c) fraction:MAX(CursorPrimaryFraction(cursorPools), 0) color:valueColor
+                                 label:@"Cursor Grok + Composer remaining"
+                            identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+        if (CursorPoolFraction(cursorPools, @"cursor") >= 0) bar.innerFraction = CursorPoolFraction(cursorPools, @"api");
     } else if (hasGauge) {
         [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
                     label:[NSString stringWithFormat:@"%@ quota remaining", name]

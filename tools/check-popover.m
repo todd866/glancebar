@@ -692,7 +692,8 @@ int main(int argc, const char **argv) {
             NSTextField *value = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
             NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
             NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".gauge"]);
-            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || ![value.stringValue isEqual:@"41%"] ||
+            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || fabs(bar.innerFraction - .17) > .001 ||
+                ![value.stringValue isEqual:@"41%"] ||
                 !SameColumn(bar, reference) || fabs(NSHeight(bar.frame) - NSHeight(reference.frame)) > .5 ||
                 ![datum.stringValue hasPrefix:@"resets "] || !HasTip(doc, @"Grok + Composer: 41% left") ||
                 !HasTip(doc, @"API models: 17% left") || HasText(doc, @"17%") != (i == 2)) return Fail(__LINE__);
