@@ -3120,14 +3120,21 @@ static NSInteger PressurePipLevel(NSString *level) {
     CGFloat a = inset + w * _from, b = inset + w * _to;
     if (fabs(b - a) < 1) return;
     BOOL up = b > a;
-    [(up ? NSColor.systemGreenColor : NSColor.systemOrangeColor) setFill];
-    NSRectFill(NSMakeRect(MIN(a, b), y - 1, fabs(b - a), 2));
     CGFloat dir = up ? 1 : -1;
-    NSBezierPath *head = [NSBezierPath bezierPath];
-    [head moveToPoint:NSMakePoint(b + dir * 4, y)];
-    [head lineToPoint:NSMakePoint(b - dir * 1, y + 3.5)];
-    [head lineToPoint:NSMakePoint(b - dir * 1, y - 3.5)];
-    [head closePath]; [head fill];
+    NSBezierPath *arrow = [NSBezierPath bezierPath];
+    [arrow appendBezierPathWithRect:NSMakeRect(MIN(a, b - dir), y - 1, fabs(b - dir - a), 2)];
+    [arrow moveToPoint:NSMakePoint(b + dir * 4, y)];
+    [arrow lineToPoint:NSMakePoint(b - dir * 1, y + 3.5)];
+    [arrow lineToPoint:NSMakePoint(b - dir * 1, y - 3.5)];
+    [arrow closePath];
+    // Riding on the bar, a thin halo in the panel's own colour keeps it legible over
+    // the green fill and the grey track alike.
+    [NSGraphicsContext saveGraphicsState];
+    [[NSColor.windowBackgroundColor colorWithAlphaComponent:0.9] setStroke];
+    arrow.lineWidth = 2; arrow.lineJoinStyle = NSLineJoinStyleRound; [arrow stroke];
+    [NSGraphicsContext restoreGraphicsState];
+    [(up ? NSColor.systemGreenColor : NSColor.systemOrangeColor) setFill];
+    [arrow fill];
 }
 @end
 
@@ -6353,7 +6360,11 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     double to = moving ? MIN(cap, MAX(0, level + bw / fullWh)) : level;
     arrow.from = level; arrow.to = to;
     arrow.hidden = !moving || fabs(to - level) < 0.01;
-    arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, NSMaxY(gauge.frame) + 1, NSWidth(gauge.frame) + 10, 8);
+    // In line with the bar, unless the head would run off its end (draining from very low):
+    // then it lifts just above.
+    BOOL roomInLine = NSWidth(gauge.frame) * to >= 6;
+    CGFloat y = roomInLine ? NSMidY(gauge.frame) - 5 : NSMaxY(gauge.frame) + 1;
+    arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, 10);
 }
 - (NSString *)batteryRateText {
     double bw = BatteryWatts(_bat);

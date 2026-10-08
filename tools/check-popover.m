@@ -384,7 +384,7 @@ int main(int argc, const char **argv) {
         NSView *chargeGauge = FindIdentifier(root, @"popover.battery.gauge");
         if (![batteryDatum.stringValue isEqual:@"+12 W"] || ![batteryDatum.textColor isEqual:NSColor.systemGreenColor] ||
             ![trend isKindOfClass:TrendArrow.class] || trend.hidden || trend.to <= trend.from || trend.to > 0.8001 ||
-            NSMinY(trend.frame) < NSMaxY(chargeGauge.frame) || NSMaxY(trend.frame) > kRowH) return Fail(__LINE__);
+            fabs(NSMidY(trend.frame) - NSMidY(chargeGauge.frame)) > 0.5) return Fail(__LINE__);   // in line with the bar
         NSString *levelName = BatterySymbolName(b.percent, NO);
         CGFloat levelPt = FittedSymbolPointSize(levelName, kLeadSymbol, kLeadW);
         NSImageSymbolConfiguration *plainCfg = [NSImageSymbolConfiguration configurationWithPointSize:levelPt
