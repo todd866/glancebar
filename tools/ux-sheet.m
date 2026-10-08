@@ -296,13 +296,97 @@ static BOOL PowerSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - System row sheet
+
+typedef NS_ENUM(NSInteger, SysStyle) { SysToday, SysMemBar, SysMemBarQuiet, SysLanes };
+
+// Memory as a mini bar in the datum column: fill = memory in use, tinted by the kernel's
+// pressure verdict; swap, when there is any, is a red overflow at the right end.
+@interface MemSketch : NSView
+@property (nonatomic) double used, swapFrac;
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation MemSketch
+- (void)drawRect:(NSRect)dirty {
+    NSRect r = self.bounds; CGFloat h = NSHeight(r), w = NSWidth(r);
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:h / 2 yRadius:h / 2];
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
+    [NSGraphicsContext saveGraphicsState]; [track addClip];
+    CGFloat swapW = MIN(_swapFrac, 0.4) * w;
+    [_color setFill]; NSRectFill(NSMakeRect(0, 0, MIN(_used, 1) * (w - swapW), h));
+    if (swapW > 0) { [NSColor.systemRedColor setFill]; NSRectFill(NSMakeRect(w - swapW, 0, swapW, h)); }
+    [NSGraphicsContext restoreGraphicsState];
+}
+@end
+
+static NSView *SystemRow(Controller *c, double cpu, int pressure, double memUsed, double swapGB, SysStyle style) {
+    SystemState sys = {.cpuValid=YES, .memValid=YES, .swapValid=YES, .cpu=cpu, .memTotal=34359738368,
+        .memUsed=(uint64_t)(memUsed * 34359738368.0), .memAvailable=(uint64_t)((1 - memUsed) * 34359738368.0),
+        .swapUsed=(uint64_t)(swapGB * 1073741824.0), .kernPressure=pressure};
+    [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, style == SysLanes ? kCursorRowH : kRowH)];
+    CGFloat h = NSHeight(row.frame);
+    NSString *level = MemoryPressureLevel(sys);
+    [c instrumentSymbol:@"cpu" tint:SystemPressureColor(SystemPressureLevel(sys)) identifier:@"s" in:row];
+    [c instrumentName:@"System" identifier:@"n" in:row];
+    if (style == SysToday) {
+        [c addSystemInstrumentTo:row gauge:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)
+                           value:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH)
+                           datum:NSMakeRect(kDatumX, (h - kDatumH) / 2, kDatumW, kDatumH) stem:@"x" tip:@""];
+        return row;
+    }
+    NSColor *memColor = SystemPressureColor(level);
+    if (style == SysLanes) {
+        // CPU above, memory below, as one instrument; both values in the value column.
+        Gauge *g1 = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, h / 2 + 4, kGaugeW, 4)];
+        g1.fraction = cpu; g1.color = CPUColor(cpu); [row addSubview:g1];
+        MemSketch *m = [[MemSketch alloc] initWithFrame:NSMakeRect(kGaugeX, h / 2 - 8, kGaugeW, 4)];
+        m.used = memUsed; m.swapFrac = swapGB / 16.0; m.color = memColor; [row addSubview:m];
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", cpu * 100] font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
+                          color:CPUColor(cpu) at:NSMakeRect(kValueX, h / 2, kValueW, h / 2) align:NSTextAlignmentRight]];
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", memUsed * 100] font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]
+                          color:memColor at:NSMakeRect(kValueX, 0, kValueW, h / 2) align:NSTextAlignmentRight]];
+        return row;
+    }
+    Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)];
+    g.fraction = cpu; g.color = CPUColor(cpu); [row addSubview:g];
+    [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", cpu * 100] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                      color:CPUColor(cpu) at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    if (style == SysMemBarQuiet && pressure <= 1 && swapGB == 0) return row;   // silent while memory is fine
+    MemSketch *m = [[MemSketch alloc] initWithFrame:NSMakeRect(kDatumX, (h - kGaugeH) / 2, 50, kGaugeH)];
+    m.used = memUsed; m.swapFrac = swapGB / 16.0; m.color = memColor;
+    [row addSubview:m];
+    return row;
+}
+
+static BOOL SystemSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // cpu, kernel pressure (1 low, 2 medium, 4 high), memory in use, swap GB
+    NSArray *states = @[@[@0.24, @1, @0.50, @0], @[@0.54, @1, @0.72, @0.6], @[@0.70, @2, @0.88, @3], @[@1.0, @4, @0.97, @9]];
+    NSArray *variants = @[@[@"A  today: chip, pressure pips, swap arrows", @(SysToday)],
+                          @[@"B  memory as a mini bar beside CPU; swap = red end", @(SysMemBar)],
+                          @[@"C  B, but nothing while memory is fine", @(SysMemBarQuiet)],
+                          @[@"D  two lanes: CPU above, memory below", @(SysLanes)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states)
+                [rows addObject:SystemRow(c, [st[0] doubleValue], [st[1] intValue], [st[2] doubleValue], [st[3] doubleValue], [v[1] integerValue])];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
         Controller *c = [Controller new];
         NSArray *variants = @[@[@"A  today (no pace)", @(PaceNone)],
                               @[@"B  time bug: vertical bar at time left", @(PaceTick)],
