@@ -3035,48 +3035,6 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
-// Kernel memory pressure as three pips, filled to the level: position, not colour alone.
-@interface PressurePips : NSView
-@property (nonatomic) NSInteger level;   // 0 unknown, 1 low, 2 medium, 3 high
-@property (nonatomic, strong) NSColor *color;
-@end
-@implementation PressurePips
-- (instancetype)initWithFrame:(NSRect)frame {
-    if ((self = [super initWithFrame:frame])) {
-        [self setAccessibilityElement:YES];
-        self.accessibilityRole = NSAccessibilityLevelIndicatorRole;
-        self.accessibilityLabel = @"Memory pressure";
-    }
-    return self;
-}
-- (void)setLevel:(NSInteger)level {
-    _level = MAX(0, MIN(3, level));
-    self.accessibilityValue = @[@"unknown", @"low", @"medium", @"high"][_level];
-    self.needsDisplay = YES;
-}
-- (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
-- (void)drawRect:(NSRect)dirty {
-    // Rising bars, like signal strength: the filled count is the level.
-    NSRect r = self.bounds;
-    CGFloat gap = 2, w = (NSWidth(r) - 2 * gap) / 3;
-    for (NSInteger i = 0; i < 3; i++) {
-        CGFloat h = NSHeight(r) * (0.5 + 0.25 * i);
-        NSRect bar = NSMakeRect(NSMinX(r) + i * (w + gap), NSMinY(r), w, h);
-        if (self.isFlipped) bar.origin.y = NSMaxY(r) - h;
-        [(i < _level ? (_color ?: NSColor.secondaryLabelColor)
-                     : [NSColor.labelColor colorWithAlphaComponent:0.15]) setFill];
-        [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:1 yRadius:1] fill];
-    }
-}
-@end
-
-static NSInteger PressurePipLevel(NSString *level) {
-    if ([level isEqualToString:@"High"]) return 3;
-    if ([level isEqualToString:@"Medium"]) return 2;
-    if ([level isEqualToString:@"Low"]) return 1;
-    return 0;
-}
-
 // Where the charger's watts go, on one bar: system draw (grey), then charge into the
 // battery (green). When the battery tops up a short charger, its share is orange past
 // the input. The empty track is unused charger headroom.
@@ -3544,9 +3502,6 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     } else if ([existing isKindOfClass:StackedGauge.class]) {
         StackedGauge *old = (StackedGauge *)existing, *new = (StackedGauge *)fresh;
         old.segments = new.segments; old.scale = new.scale;
-    } else if ([existing isKindOfClass:PressurePips.class]) {
-        PressurePips *old = (PressurePips *)existing, *new = (PressurePips *)fresh;
-        old.level = new.level; old.color = new.color;
     } else if ([existing isKindOfClass:PowerFlowGauge.class]) {
         PowerFlowGauge *old = (PowerFlowGauge *)existing, *new = (PowerFlowGauge *)fresh;
         old.scaleWatts = new.scaleWatts; old.systemWatts = new.systemWatts;
@@ -6443,34 +6398,24 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *level = MemoryPressureLevel(_sys);
     NSColor *memColor = SystemPressureColor(level);
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
-    CGFloat midY = NSMidY(datumFrame), x = NSMinX(datumFrame);
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
-    NSImageView *chip = [NSImageView imageViewWithImage:
-        [[NSImage imageWithSystemSymbolName:@"memorychip" accessibilityDescription:@"Memory"] imageWithSymbolConfiguration:cfg]];
-    chip.imageScaling = NSImageScaleProportionallyDown;
-    chip.contentTintColor = memColor;
-    chip.frame = NSMakeRect(x, midY - 9, 20, 18);
-    chip.accessibilityIdentifier = [stem stringByAppendingString:@".memory.symbol"];
-    chip.accessibilityLabel = memTip;
-    chip.toolTip = memTip;
-    [row addSubview:chip];
-    PressurePips *pips = [[PressurePips alloc] initWithFrame:NSMakeRect(x + 24, midY - 6, 17, 12)];
-    pips.level = PressurePipLevel(level);
-    pips.color = memColor;
-    pips.accessibilityIdentifier = [stem stringByAppendingString:@".memory.pips"];
-    pips.toolTip = memTip;
-    [row addSubview:pips];
-    if (_sys.swapValid && _sys.swapUsed > 0) {
-        NSImageView *swap = [NSImageView imageViewWithImage:
-            [[NSImage imageWithSystemSymbolName:@"arrow.left.arrow.right" accessibilityDescription:@"Swap"] imageWithSymbolConfiguration:cfg]];
-        swap.imageScaling = NSImageScaleProportionallyDown;
-        swap.contentTintColor = NSColor.secondaryLabelColor;
-        swap.frame = NSMakeRect(x + 50, midY - 9, 20, 18);
-        swap.accessibilityIdentifier = [stem stringByAppendingString:@".swap.symbol"];
-        swap.accessibilityLabel = SwapStatusText(_sys);
-        swap.toolTip = memTip;
-        [row addSubview:swap];
+    // Memory says nothing while it is fine, which is almost always. Under the kernel's
+    // memory pressure it says how much is left, in words that name it, tinted by the level.
+    NSString *memText = @"";
+    if ([level isEqualToString:@"Medium"] || [level isEqualToString:@"High"]) {
+        double gb = _sys.memAvailable / 1073741824.0;   // whole GB so "free" fits; below 1 GB keep one decimal
+        NSString *free = !_sys.memValid ? nil : gb >= 1 ? [NSString stringWithFormat:@"%.0f GB", floor(gb)]
+                                                        : [NSString stringWithFormat:@"%.1f GB", gb];
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+        NSString *full = free ? [NSString stringWithFormat:@"RAM %@ free", free] : @"RAM tight";
+        memText = [full sizeWithAttributes:@{NSFontAttributeName: font}].width <= NSWidth(datumFrame) - 4
+            ? full : [NSString stringWithFormat:@"RAM %@", free ?: @"tight"];
     }
+    NSTextField *mem = [self text:memText font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                            color:memColor at:datumFrame align:NSTextAlignmentLeft];
+    mem.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
+    mem.accessibilityLabel = memTip;
+    mem.toolTip = memTip;
+    [row addSubview:mem];
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
