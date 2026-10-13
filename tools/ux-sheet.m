@@ -755,12 +755,198 @@ static BOOL EnergySheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Burn attribution sheet
+
+// Only the sheet's arrow changes: retain the production head, halo and geometry.
+@interface BurnTailArrow : TrendArrow
+@property (nonatomic) double appShare;
+@end
+@implementation BurnTailArrow
+- (void)drawRect:(NSRect)dirty {
+    [super drawRect:dirty];
+    CGFloat w = NSWidth(self.bounds) - 10, a = 5 + w * self.from;
+    CGFloat length = w * (self.from - self.to) * self.appShare;
+    [[NSColor colorWithSRGBRed:0.90 green:0.22 blue:0.06 alpha:1] setFill];
+    NSRectFill(NSMakeRect(a - length, NSMidY(self.bounds) - 1, length, 2));
+}
+@end
+
+static double BurnMinutes(double draw) { return 60 * 54 * (0.61 - 0.20) / draw; }
+static NSString *BurnGain(double draw, double appW) {
+    return [NSString stringWithFormat:@"quit +%.0fm", BurnMinutes(draw - appW) - BurnMinutes(draw)];
+}
+static NSImage *BurnIcon(NSString *name) {
+    NSDictionary *bundles = @{@"Chrome": @"com.google.Chrome", @"Codex": @"com.openai.codex",
+                              @"Mail": @"com.apple.mail", @"Finder": @"com.apple.finder"};
+    NSDictionary *paths = @{@"Chrome": @"/Applications/Google Chrome.app",
+                            @"Codex": @"/Applications/Codex.app", @"Mail": @"/System/Applications/Mail.app",
+                            @"Finder": @"/System/Library/CoreServices/Finder.app"};
+    NSImage *icon = bundles[name] ? CachedBundleIcon(bundles[name], paths[name]) : nil;
+    // iconForFile can return an empty placeholder without an IconServices session.
+    // Decode the installed bundle's icon directly for this offscreen-only harness.
+    NSBundle *bundle = paths[name] ? [NSBundle bundleWithPath:paths[name]] : nil;
+    NSString *iconFile = [bundle objectForInfoDictionaryKey:@"CFBundleIconFile"];
+    if (iconFile.length) {
+        NSString *resource = [bundle.resourcePath stringByAppendingPathComponent:iconFile];
+        if (!resource.pathExtension.length) resource = [resource stringByAppendingPathExtension:@"icns"];
+        NSImage *decoded = [[NSImage alloc] initWithContentsOfFile:resource];
+        if (decoded) icon = decoded;
+    }
+    return icon ?: [NSImage imageWithSystemSymbolName:[name isEqualToString:@"node"] ? @"terminal" : @"app"
+                           accessibilityDescription:name];
+}
+static NSView *BurnBaseRow(Controller *c, NSString *symbol, NSString *name, double fraction,
+                           NSColor *color, NSString *value, NSString *datum) {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    [c instrumentSymbol:symbol tint:color identifier:nil in:row];
+    [c instrumentName:name identifier:nil in:row];
+    Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+    bar.fraction = fraction; bar.color = color; bar.markerFraction = -1;
+    [row addSubview:bar];
+    [c instrumentValue:value color:color identifier:nil in:row];
+    [c instrumentDatum:datum color:nil identifier:nil in:row];
+    return row;
+}
+
+static NSView *BurnPanel(NSInteger variant, NSDictionary *situation, NSAppearanceName look) {
+    Controller *c = [Controller new];
+    double draw = [situation[@"draw"] doubleValue];
+    NSArray *apps = situation[@"apps"];
+    NSString *name = apps[0][@"name"];
+    double appW = [apps[0][@"watts"] doubleValue], share = appW / draw;
+    BatteryState bat = {.valid=YES, .percent=61, .rawMax_mAh=4500, .rawCurrent_mAh=2745,
+                        .designCap_mAh=4500, .voltage_mV=12000, .amperage_mA=(long)lround(-draw * 1e6 / 12000),
+                        .systemLoad_mW=(long)lround(draw * 1000)};
+    [c setValue:[NSValue valueWithBytes:&bat objCType:@encode(BatteryState)] forKey:@"bat"];
+    [c setValue:apps forKey:@"burnRows"];
+    NSMutableArray *rows = [NSMutableArray array];
+    [rows addObject:BurnBaseRow(c, @"internaldrive", @"Storage", 0.42, DiskColor(0.42), @"42%", @"290 GB free")];
+    NSView *battery = BurnBaseRow(c, @"battery.75", @"Battery", 0.61, BattBarColor(61), @"61%", @"");
+    NSImageView *batteryIcon = (NSImageView *)battery.subviews[0];
+    batteryIcon.image = [c liveBatteryGlyph];
+    batteryIcon.contentTintColor = batteryIcon.image.template ? [c batteryRateColor] : nil;
+    Gauge *gauge = (Gauge *)battery.subviews[2];
+    // Use the real arrow configuration, including the low-level lift above the bar.
+    TrendArrow *arrow = variant == 3 ? [BurnTailArrow new] : [TrendArrow new];
+    [c configureTrend:arrow over:gauge];
+    if (variant == 3) ((BurnTailArrow *)arrow).appShare = share;
+    [battery addSubview:arrow];
+    [c instrumentDatum:FormatSignedWatts(-draw) color:NSColor.systemOrangeColor identifier:nil in:battery];
+    NSString *tip = [NSString stringWithFormat:@"%@ %.1f W · %@ · %@ to 20%%", name, appW,
+                     BurnGain(draw, appW), FmtDuration((int)lround(BurnMinutes(draw)))];
+    battery.toolTip = tip;
+    [rows addObject:battery];
+    if (variant == 0) {
+        NSView *holder = [NSView new];
+        [c addBurnRowTo:holder at:0];
+        [rows addObject:holder.subviews.firstObject];
+    } else if (variant == 1 || (variant == 2 && share >= 0.25 && appW >= 2)) {
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+        NSImageView *icon = [c instrumentLogo:BurnIcon(name) identifier:nil in:row];
+        if (icon.image.template) icon.contentTintColor = NSColor.secondaryLabelColor;
+        [c instrumentName:name identifier:nil in:row];
+        Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        bar.fraction = share; bar.color = NSColor.systemOrangeColor; bar.markerFraction = -1;
+        [row addSubview:bar];
+        // Match the app's rate precision rule so two-digit watts fit the 48pt value column.
+        NSString *watts = [NSString stringWithFormat:appW >= 10 ? @"%.0f W" : @"%.1f W", appW];
+        [c instrumentValue:watts color:variant == 2 && share >= 0.5 ? NSColor.systemRedColor : NSColor.labelColor
+               identifier:nil in:row];
+        [c instrumentDatum:BurnGain(draw, appW) color:nil identifier:nil in:row];
+        row.toolTip = tip;
+        [rows addObject:row];
+    } else if (variant == 4) {
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+        [c instrumentSymbol:@"flame" tint:NSColor.systemOrangeColor identifier:nil in:row];
+        [c instrumentName:@"Burn" identifier:nil in:row];
+        if (appW <= 0.3) {
+            [row addSubview:[c text:@"—" font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                             color:NSColor.secondaryLabelColor at:NSMakeRect(kGaugeX, (kRowH-kValueH)/2, 30, kValueH)
+                             align:NSTextAlignmentLeft]];
+        } else {
+            CGFloat pairW = (kDatumX + kDatumW - kGaugeX) / 3;
+            for (NSUInteger i = 0; i < MIN((NSUInteger)3, apps.count); i++) {
+                CGFloat x = kGaugeX + i * pairW;
+                NSImageView *icon = [NSImageView imageViewWithImage:BurnIcon(apps[i][@"name"])];
+                icon.frame = NSMakeRect(x, (kRowH-16)/2, 16, 16);
+                icon.imageScaling = NSImageScaleProportionallyUpOrDown;
+                if (icon.image.template) icon.contentTintColor = NSColor.secondaryLabelColor;
+                [row addSubview:icon];
+                NSString *watts = [NSString stringWithFormat:@"%.1f", [apps[i][@"watts"] doubleValue]];
+                [row addSubview:[c text:watts font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                                 color:NSColor.labelColor at:NSMakeRect(x+20, (kRowH-kValueH)/2, 44, kValueH)
+                                 align:NSTextAlignmentRight]];
+            }
+        }
+        [rows addObject:row];
+    }
+    double cpu = [situation[@"cpu"] doubleValue];
+    [rows addObject:BurnBaseRow(c, @"cpu", @"System", cpu, CPUColor(cpu),
+                               [NSString stringWithFormat:@"%.0f%%", cpu * 100], @"")];
+    NSArray *titles = @[@"A  today", @"B  top app", @"C  hog-only", @"D  battery tail", @"E  icon strip"];
+    NSView *panel = TitledPanel(titles[variant], rows, look, c);
+    if (variant == 3) {
+        // Review-only tooltip caption, outside the three-row popover group.
+        NSRect f = panel.frame; CGFloat y = NSHeight(f) + 2; f.size.height += 20; panel.frame = f;
+        NSTextField *caption = [c text:tip font:[NSFont systemFontOfSize:10] color:NSColor.secondaryLabelColor
+                                   at:NSMakeRect(kPad, y, kW - 2*kPad, 14) align:NSTextAlignmentLeft];
+        caption.maximumNumberOfLines = 1;
+        [panel addSubview:caption];
+    }
+    return panel;
+}
+
+static BOOL BurnSheet(NSString *path) {
+    NSArray *situations = @[
+        @{@"name": @"normal", @"draw": @9.4, @"cpu": @0.18, @"apps": @[
+            @{@"name": @"Chrome", @"watts": @2.1}, @{@"name": @"node", @"watts": @1.3},
+            @{@"name": @"Codex", @"watts": @0.6}, @{@"name": @"Mail", @"watts": @0.2}]},
+        @{@"name": @"runaway", @"draw": @21, @"cpu": @0.87, @"apps": @[
+            @{@"name": @"node", @"watts": @14.0}, @{@"name": @"Chrome", @"watts": @2.0},
+            @{@"name": @"Codex", @"watts": @0.5}]},
+        @{@"name": @"idle", @"draw": @4.1, @"cpu": @0.03, @"apps": @[
+            @{@"name": @"Finder", @"watts": @0.2}]}];
+    NSArray *looks = @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua];
+    NSString *darkPath = [[[path stringByDeletingPathExtension] stringByAppendingString:@"-dark"]
+                          stringByAppendingPathExtension:@"png"];
+    Controller *c = [Controller new];
+    BOOL ok = YES;
+    for (NSUInteger appearance = 0; appearance < looks.count; appearance++) {
+        // Like WriteSheet, cache an offscreen view hierarchy; here columns are situations.
+        CGFloat gap = 16, headerH = 36, cellH = 162;
+        FlippedView *sheet = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, gap + 3*(kW+gap), headerH + 5*(cellH+gap))];
+        sheet.appearance = [NSAppearance appearanceNamed:looks[appearance]];
+        sheet.wantsLayer = YES;
+        sheet.layer.backgroundColor = [NSColor colorWithWhite:appearance ? 0.16 : 0.88 alpha:1].CGColor;
+        for (NSUInteger col = 0; col < situations.count; col++) {
+            NSDictionary *s = situations[col];
+            NSString *heading = [NSString stringWithFormat:@"%@ · %@ to 20%%", s[@"name"],
+                                  FmtDuration((int)lround(BurnMinutes([s[@"draw"] doubleValue])))];
+            [sheet addSubview:[c text:heading font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+                               color:NSColor.labelColor at:NSMakeRect(gap+col*(kW+gap)+kPad, 10, kW-2*kPad, 16)
+                               align:NSTextAlignmentLeft]];
+            for (NSInteger variant = 0; variant < 5; variant++) {
+                NSView *panel = BurnPanel(variant, s, looks[appearance]);
+                NSRect f = panel.frame; f.origin = NSMakePoint(gap+col*(kW+gap), headerH+variant*(cellH+gap));
+                panel.frame = f; [sheet addSubview:panel];
+            }
+        }
+        NSBitmapImageRep *rep = [sheet bitmapImageRepForCachingDisplayInRect:sheet.bounds];
+        [sheet cacheDisplayInRect:sheet.bounds toBitmapImageRep:rep];
+        BOOL written = [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}]
+                         writeToFile:appearance ? darkPath : path atomically:YES];
+        ok = written && ok;
+    }
+    return ok;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|cursor out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|cursor|energy|burn out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
+        if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "trend")) return TrendSheet(path) ? 0 : 1;

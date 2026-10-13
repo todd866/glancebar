@@ -3147,42 +3147,6 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
-// Segments laid end to end on one track: @{@"w": watts, @"color": NSColor}, against
-// `scale` watts. The battery Burn instrument: apps in orange shades, screen + system grey.
-@interface StackedGauge : NSView
-@property (nonatomic, copy) NSArray<NSDictionary *> *segments;
-@property (nonatomic) double scale;
-@end
-@implementation StackedGauge
-- (instancetype)initWithFrame:(NSRect)frame {
-    if ((self = [super initWithFrame:frame])) {
-        [self setAccessibilityElement:YES];
-        self.accessibilityRole = NSAccessibilityImageRole;
-    }
-    return self;
-}
-- (void)setSegments:(NSArray<NSDictionary *> *)segments { _segments = [segments copy]; self.needsDisplay = YES; }
-- (void)setScale:(double)scale { _scale = scale; self.needsDisplay = YES; }
-- (void)drawRect:(NSRect)dirty {
-    NSRect r = self.bounds; CGFloat rad = NSHeight(r) / 2;
-    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad];
-    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill]; [track fill];
-    if (_scale <= 0) return;
-    [NSGraphicsContext saveGraphicsState]; [track addClip];
-    CGFloat x = NSMinX(r);
-    for (NSDictionary *seg in _segments) {
-        double w = [seg[@"w"] doubleValue];
-        if (w <= 0 || x >= NSMaxX(r)) continue;
-        CGFloat width = MIN(NSWidth(r) * w / _scale, NSMaxX(r) - x);
-        [(NSColor *)seg[@"color"] setFill];
-        // A 1pt hairline separates apps, but a sliver keeps its whole width rather than vanish.
-        NSRectFill(NSMakeRect(x, NSMinY(r), width >= 4 ? width - 1 : width, NSHeight(r)));
-        x += width;
-    }
-    [NSGraphicsContext restoreGraphicsState];
-}
-@end
-
 static NSColor *AIQuotaColor(double fraction) {
     if (fraction <= 0.15) return NSColor.systemRedColor;
     if (fraction <= 0.35) return NSColor.systemOrangeColor;
@@ -3538,9 +3502,6 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     } else if ([existing isKindOfClass:TrendArrow.class]) {
         TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
         old.from = new.from; old.to = new.to;
-    } else if ([existing isKindOfClass:StackedGauge.class]) {
-        StackedGauge *old = (StackedGauge *)existing, *new = (StackedGauge *)fresh;
-        old.segments = new.segments; old.scale = new.scale;
     } else if ([existing isKindOfClass:PowerFlowGauge.class]) {
         PowerFlowGauge *old = (PowerFlowGauge *)existing, *new = (PowerFlowGauge *)fresh;
         old.scaleWatts = new.scaleWatts; old.systemWatts = new.systemWatts;
@@ -6546,22 +6507,36 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
 // The 5-hour window stays in the tooltip and Details. A problem (signed out, stale,
 // indexing) takes the datum column; the reset clock is the datum otherwise.
 // The provider's name sits beside its logo. The tooltip still leads with the name.
-// The burn split for the bar: the top three apps in orange shades, the other apps faint,
-// and whatever the apps do not account for (screen, chip, root services) in grey.
-- (NSArray<NSDictionary *> *)burnSegmentsForDraw:(double)draw {
-    NSMutableArray *segments = [NSMutableArray array];
-    double apps = 0, rest = 0;
-    NSArray *alphas = @[@1.0, @0.7, @0.45];
-    for (NSUInteger i = 0; i < _burnRows.count; i++) {
-        double w = [_burnRows[i][@"watts"] doubleValue];
-        apps += w;
-        if (i < alphas.count)
-            [segments addObject:@{@"w": @(w), @"color": [NSColor.systemOrangeColor colorWithAlphaComponent:[alphas[i] doubleValue]]}];
-        else rest += w;
+static NSString *BurnShortName(NSString *name) {
+    for (NSString *vendor in @[@"Google ", @"Microsoft ", @"Adobe "])
+        if ([name hasPrefix:vendor] && name.length > vendor.length) return [name substringFromIndex:vendor.length];
+    return name;
+}
+
+// Resolve live group members, caching images by outer bundle path, never by reusable pid.
+static NSImage *BurnAppIcon(NSDictionary *group) {
+    static NSCache<NSString *, NSImage *> *icons;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ icons = [NSCache new]; icons.countLimit = 64; });
+    for (NSNumber *pid in group[@"pids"]) {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid.intValue];
+        NSString *path = app.bundleURL.path;
+        if (!path) {
+            char executable[PROC_PIDPATHINFO_MAXSIZE];
+            if (proc_pidpath(pid.intValue, executable, sizeof(executable)) > 0)
+                path = [NSString stringWithUTF8String:executable];
+        }
+        NSRange boundary = [path rangeOfString:@".app/"];
+        if (path && boundary.location != NSNotFound) path = [path substringToIndex:boundary.location + 4];
+        if (![path hasSuffix:@".app"]) continue;
+        NSImage *icon = [icons objectForKey:path];
+        if (!icon) {
+            icon = [NSWorkspace.sharedWorkspace iconForFile:path];
+            if (icon) [icons setObject:icon forKey:path];
+        }
+        if (icon) return icon;
     }
-    if (rest > 0) [segments addObject:@{@"w": @(rest), @"color": [NSColor.systemOrangeColor colorWithAlphaComponent:0.25]}];
-    if (draw > apps) [segments addObject:@{@"w": @(draw - apps), @"color": [NSColor.systemGrayColor colorWithAlphaComponent:0.7]}];
-    return segments;
+    return nil;
 }
 
 - (NSString *)burnSinceLabel {
@@ -6572,32 +6547,32 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
 - (NSString *)burnTip:(double)draw {
     NSMutableArray *lines = [NSMutableArray array];
     BOOL hasWh = _energyBaselineAt != nil;
-    double apps = 0, appsWh = 0;
+    double apps = 0;
     for (NSDictionary *row in _burnRows) {
         double w = [row[@"watts"] doubleValue], wh = [row[@"wh"] doubleValue];
-        apps += w; appsWh += wh;
-        [lines addObject:hasWh ? [NSString stringWithFormat:@"%@ %.1f W · %.2f Wh", row[@"name"], w, wh]
-                               : [NSString stringWithFormat:@"%@ %.1f W", row[@"name"], w]];
+        apps += w;
+        [lines addObject:hasWh ? [NSString stringWithFormat:@"%@ %.1f W · %.1f Wh", BurnShortName(row[@"name"]), w, wh]
+                               : [NSString stringWithFormat:@"%@ %.1f W", BurnShortName(row[@"name"]), w]];
     }
     double since = [self burnSinceBaselineWh];
     if (draw > 0) {
         NSString *screen = [NSString stringWithFormat:@"Screen + system %.1f W", MAX(0, draw - apps)];
-        if (hasWh && since >= 0) screen = [screen stringByAppendingFormat:@" · %.2f Wh", MAX(0, since - appsWh)];
         [lines addObject:screen];
     }
     if (hasWh && since >= 0) {
         int minutes = (int)lround(-_energyBaselineAt.timeIntervalSinceNow / 60.0);
         [lines addObject:[NSString stringWithFormat:@"%@: %.1f Wh over %@", [self burnSinceLabel], since, FmtDuration(minutes)]];
     }
-    if (!_burnRows) [lines addObject:@"Measuring which apps are drawing power…"];
-    [lines addObject:@"Apps from the kernel's per-process energy counters; screen + system is the rest of the measured draw."];
     return [lines componentsJoinedByString:@"\n"];
 }
 
-// On battery only: one row, the Mac's draw split by app, with the heaviest app named.
+// One actionable app: at least half an hour gained before the 20% reserve.
 - (CGFloat)addBurnRowTo:(NSView *)root at:(CGFloat)y {
     double draw = [self burnDrawWatts];
-    if (draw < 0) return y;
+    NSDictionary *top = _burnRows.firstObject;
+    double watts = [top[@"watts"] doubleValue];
+    int gain = BurnGainMinutes(MinutesTo20(_bat, [self avgAmp]), draw, watts);
+    if (draw <= 0 || !top || gain < 0) return y;
     ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
     row.target = self;
     row.action = @selector(showBatteryDetails:);
@@ -6606,36 +6581,26 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     NSString *tip = [self burnTip:draw];
     row.toolTip = tip;
     row.accessibilityLabel = tip;
-    [self instrumentSymbol:@"flame" tint:NSColor.systemOrangeColor identifier:@"popover.burn.symbol" in:row].toolTip = tip;
-    [self instrumentName:@"Burn" identifier:@"popover.burn.name" in:row].toolTip = tip;
-    StackedGauge *bar = [[StackedGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
-    bar.scale = MAX(20.0, draw);   // a fixed 20 W tape so the bar's length means something
-    bar.segments = [self burnSegmentsForDraw:draw];
+    NSImage *icon = BurnAppIcon(top);
+    NSImageView *symbol = icon ? [self instrumentLogo:icon identifier:@"popover.burn.symbol" in:row]
+        : [self instrumentSymbol:@"terminal" tint:NSColor.secondaryLabelColor identifier:@"popover.burn.symbol" in:row];
+    symbol.toolTip = tip;
+    NSString *name = BurnShortName(top[@"name"]);
+    NSTextField *nameField = [self instrumentName:name identifier:@"popover.burn.name" in:row];
+    nameField.lineBreakMode = NSLineBreakByTruncatingTail;
+    nameField.toolTip = tip;
+    Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    bar.fraction = MIN(1, watts / draw);
+    bar.color = NSColor.systemOrangeColor;
+    bar.metricLabel = @"App share of battery draw";
     bar.accessibilityIdentifier = @"popover.burn.gauge";
-    bar.accessibilityLabel = @"Battery draw by app";
     bar.toolTip = tip;
     [row addSubview:bar];
-    NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%.0f W", draw]   // whole watts fit the column
-                                         color:NSColor.labelColor identifier:@"popover.burn.value" in:row];
-    value.toolTip = tip;
-    NSString *datum = @"…";
-    NSColor *datumColor = NSColor.tertiaryLabelColor;
-    NSDictionary *top = _burnRows.firstObject;
-    if (top) {
-        NSString *watts = [NSString stringWithFormat:@" %.1f W", [top[@"watts"] doubleValue]];
-        NSString *name = top[@"name"];
-        for (NSString *vendor in @[@"Google ", @"Microsoft ", @"Adobe "])   // "Chrome" is what people call it
-            if ([name hasPrefix:vendor] && name.length > vendor.length) name = [name substringFromIndex:vendor.length];
-        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-        NSDictionary *attrs = @{NSFontAttributeName: font};
-        while (name.length > 1 && [[name stringByAppendingString:watts] sizeWithAttributes:attrs].width > kDatumW - 6)
-            name = [[name substringToIndex:name.length - 2] stringByAppendingString:@"…"];
-        datum = [name stringByAppendingString:watts];
-        datumColor = NSColor.secondaryLabelColor;
-    } else if (_burnRows) {
-        datum = @"screen";   // measured, and no app is drawing: it is all screen and system
-    }
-    [self instrumentDatum:datum color:datumColor identifier:@"popover.burn.datum" in:row].toolTip = tip;
+    NSString *value = [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts];
+    [self instrumentValue:value color:watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
+               identifier:@"popover.burn.value" in:row].toolTip = tip;
+    [self instrumentDatum:[@"quit +" stringByAppendingString:FmtDuration(gain)] color:NSColor.secondaryLabelColor
+               identifier:@"popover.burn.datum" in:row].toolTip = tip;
     [root addSubview:row];
     return y + kRowH;
 }

@@ -828,6 +828,15 @@ int main(void) {
         check(cursorLen.count == 2 && QuotaWindowSeconds(cursorLen[0]) == 1793708671.0 - 1791030271.0,
               @"window length: Cursor spans the billing cycle");
 
+        // --- BurnGainMinutes: T * A / (D - A), shown only from 30 minutes. ---
+        check(BurnGainMinutes(120, 10, 2) == 30, @"burn: exactly thirty minutes qualifies");
+        check(BurnGainMinutes(120, 10, 1.99) == -1, @"burn: below thirty minutes is hidden");
+        check(BurnGainMinutes(120, 10, 5) == 120, @"burn: half the draw doubles the time left");
+        check(BurnGainMinutes(120, 10, 10) == -1 && BurnGainMinutes(120, 10, 11) == -1,
+              @"burn: no finite gain when the app is all of the draw");
+        check(BurnGainMinutes(-1, 10, 5) == -1 && BurnGainMinutes(120, 10, NAN) == -1 &&
+              BurnGainMinutes(120, 10, -1) == -1, @"burn: unknown time or watts is hidden");
+
         // --- BurnRows ---
         {
             NSString *(^group)(pid_t) = ^NSString *(pid_t pid) { return pid == 1 || pid == 2 ? @"Chrome" : pid == 3 ? @"node" : nil; };
@@ -836,6 +845,8 @@ int main(void) {
             NSDictionary *cur  = @{@1: @14e9, @2: @13e9, @3: @51e9, @4: @1e9, @5: @3.6e12};
             NSArray *rows = BurnRows(prev, cur, base, 2.0, group);
             NSDictionary *chrome = rows.firstObject;
+            check([NSSet setWithArray:chrome[@"pids"]].count == 2 && [chrome[@"pids"] containsObject:@1] &&
+                  [chrome[@"pids"] containsObject:@2], @"burn: group retains member pids for icon lookup");
             check([chrome[@"name"] isEqual:@"Chrome"] && fabs([chrome[@"watts"] doubleValue] - 3.0) < 1e-6,
                   @"burn: helpers group into their app and watts come from the sample delta");
             check(fabs([chrome[@"wh"] doubleValue] - (14e9 + 12e9) / 3.6e12) < 1e-9,

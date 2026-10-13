@@ -52,6 +52,9 @@ NSString *FormatWattHours(double wh);
 
 // Minutes until 20%, or -1 if not estimable (charging / settling / already ≤20%).
 int MinutesTo20(BatteryState b, double avgAmp_mA);
+// Minutes gained before 20% by quitting an app drawing appWatts of drawWatts;
+// -1 when unknown or under 30 minutes (the Burn row only shows a gain worth acting on).
+int BurnGainMinutes(int minutesTo20, double drawWatts, double appWatts);
 
 // "h:mm", or "estimating…" for minutes < 0.
 NSString *FmtDuration(int minutes);
@@ -200,7 +203,7 @@ double QuotaWindowSeconds(NSDictionary *window);
 // (proc_pid_rusage ri_energy_nj). Live watts come from prev -> cur over dtSeconds (0 when
 // prev is nil); Wh come from baseline -> cur, where a pid missing from the baseline started
 // after it and counts in full. groupFor names the app a pid belongs to. Rows are
-// @{name, watts, wh}, heaviest live burner first; negligible rows are dropped.
+// @{name, watts, wh, pids}, heaviest live burner first; negligible rows are dropped.
 NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
                                   NSDictionary<NSNumber *, NSNumber *> *cur,
                                   NSDictionary<NSNumber *, NSNumber *> *baseline,

@@ -1,4 +1,5 @@
 #import "pure.h"
+#import <limits.h>
 
 int MinutesTo20(BatteryState b, double avgAmp_mA) {
     if (b.acConnected || b.isCharging || b.percent <= 20) return -1;
@@ -13,6 +14,15 @@ int MinutesTo20(BatteryState b, double avgAmp_mA) {
         return (int)lround(hours * 60.0);
     }
     return -1;
+}
+
+// Quitting an app cuts the draw from D to D - A, stretching time to 20% by T * A / (D - A).
+int BurnGainMinutes(int minutesTo20, double drawWatts, double appWatts) {
+    if (minutesTo20 <= 0 || !isfinite(drawWatts) || !isfinite(appWatts) || appWatts <= 0 ||
+        appWatts >= drawWatts) return -1;
+    double gain = minutesTo20 * appWatts / (drawWatts - appWatts);
+    if (!isfinite(gain) || gain < 30 || gain > INT_MAX) return -1;
+    return (int)lround(gain);
 }
 
 NSString *FmtDuration(int minutes) {
@@ -2060,7 +2070,8 @@ NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
         NSString *name = groupFor ? groupFor(pid.intValue) : nil;
         if (!name.length) name = @"Other";
         NSMutableDictionary *g = groups[name];
-        if (!g) groups[name] = g = [@{@"name": name, @"watts": @0.0, @"wh": @0.0} mutableCopy];
+        if (!g) groups[name] = g = [@{@"name": name, @"watts": @0.0, @"wh": @0.0, @"pids": [NSMutableArray array]} mutableCopy];
+        [g[@"pids"] addObject:pid];
         g[@"watts"] = @([g[@"watts"] doubleValue] + watts);
         g[@"wh"] = @([g[@"wh"] doubleValue] + wh);
     }
