@@ -25,7 +25,8 @@ static BOOL HasText(NSView *view, NSString *text) {
 }
 // Tooltips are terse: a short line of figures, never a paragraph.
 static NSView *WordyTip(NSView *view) {
-    if (view.toolTip.length > 70) return view;
+    for (NSString *line in [view.toolTip componentsSeparatedByString:@"\n"])
+        if (line.length > 70) return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
 }
@@ -245,6 +246,12 @@ static BOOL DetailColumnsMatch(NSArray<NSView *> *docs) {
 }
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        NSMutableDictionary *arguments = [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain] mutableCopy];
+        arguments[@"starlinkCapGB"] = @100;
+        arguments[@"starlinkResetDay"] = @13;
+        arguments[@"telstraCapGB"] = @180;
+        arguments[@"telstraResetDay"] = @7;
+        [NSUserDefaults.standardUserDefaults setVolatileDomain:arguments forName:NSArgumentDomain];
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
         QuotaPairGauge *probe = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(0,0,100,8)];
@@ -729,6 +736,86 @@ int main(int argc, const char **argv) {
             if (!RenderOffscreen(root, [stem stringByAppendingString:@"-cursor.png"], look) ||
                 !RenderOffscreen([c aiDetailsView].documentView, [stem stringByAppendingString:@"-cursor-ai.png"], look)) return Fail(__LINE__);
         }
+        // Starlink adds exactly one aligned instrument, only while detected.
+        if (FindIdentifier(root, @"popover.row.starlink")) return Fail(__LINE__);
+        NSDictionary *starlink = @{@"cycleStart": @(MeteredCycleStart(NSDate.date, MeteredResetDay(@"starlink")).timeIntervalSince1970),
+            @"downloadBytes": @10100000000ULL, @"uploadBytes": @2300000000ULL,
+            @"bytesPerSecond": @1400000, @"onLink": @YES, @"link": @"starlink"};
+        [c setValue:starlink forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        for (NSString *part in @[@"symbol", @"name", @"gauge", @"value", @"datum"])
+            if (CountIdentifier(root, [@"popover.starlink." stringByAppendingString:part]) != 1) return Fail(__LINE__);
+        Gauge *starlinkGauge = (Gauge *)FindIdentifier(root, @"popover.starlink.gauge");
+        NSView *starlinkRow = FindIdentifier(root, @"popover.row.starlink");
+        NSView *systemRow = FindIdentifier(root, @"popover.row.system");
+        if (![starlinkGauge isKindOfClass:Gauge.class] || fabs(starlinkGauge.fraction - 0.876) > 0.001 ||
+            starlinkGauge.markerFraction != -1 ||
+            !SameColumn(starlinkGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            !SameSize(starlinkGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            fabs(NSMinY(starlinkRow.frame) - NSMaxY(systemRow.frame)) > 0.5 ||
+            !HasText(starlinkRow, @"88%") || !HasTip(starlinkRow, @"Mac 12.4 GB of 100 GB") ||
+            !HasTip(starlinkRow, @"↓ 10.1 GB  ↑ 2.3 GB") || !HasTip(starlinkRow, @"now 1.4 MB/s") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(starlinkRow) ||
+            [starlinkRow.toolTip componentsSeparatedByString:@"\n"].count != 3) return Fail(__LINE__);
+        NSView *starlinkDetails = [c overviewDetailsView].documentView;
+        if (!FindIdentifier(starlinkDetails, @"details.overview.starlink.gauge") ||
+            !HasTip(starlinkDetails, @"Mac 12.4 GB of 100 GB") || !FitsChildren(starlinkDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink.png"], look) ||
+                !RenderOffscreen(starlinkDetails, [stem stringByAppendingString:@"-starlink-overview.png"], look)) return Fail(__LINE__);
+        }
+        NSMutableDictionary *fast = [starlink mutableCopy];
+        fast[@"recentBytesPerSecond"] = @(87.6e9 / (5 * 3600 + 20 * 60));
+        [c setValue:fast forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSTextField *lasts = (NSTextField *)FindIdentifier(root, @"popover.starlink.datum");
+        NSView *fastRow = FindIdentifier(root, @"popover.row.starlink");
+        NSView *fastDetails = [c overviewDetailsView].documentView;
+        NSTextField *detailLasts = (NSTextField *)FindIdentifier(fastDetails, @"details.overview.starlink.datum");
+        if (![lasts.stringValue isEqual:@"lasts 5:20"] || ![lasts.textColor isEqual:NSColor.systemYellowColor] ||
+            ![lasts.stringValue isEqual:detailLasts.stringValue] || ![lasts.textColor isEqual:detailLasts.textColor] ||
+            [fastRow.toolTip componentsSeparatedByString:@"\n"].count != 4 || !HasTip(fastRow, @"resets ") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(fastRow) || !FitsChildren(fastDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink-lasts.png"], look) ||
+                !RenderOffscreen(fastDetails, [stem stringByAppendingString:@"-starlink-lasts-overview.png"], look)) return Fail(__LINE__);
+        }
+        NSMutableDictionary *telstra = [starlink mutableCopy];
+        telstra[@"link"] = @"telstra";
+        telstra[@"cycleStart"] = @(MeteredCycleStart(NSDate.date, MeteredResetDay(@"telstra")).timeIntervalSince1970);
+        [c setValue:telstra forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSView *telstraRow = FindIdentifier(root, @"popover.row.telstra");
+        Gauge *telstraGauge = (Gauge *)FindIdentifier(root, @"popover.telstra.gauge");
+        NSView *telstraDetails = [c overviewDetailsView].documentView;
+        if (!telstraRow || FindIdentifier(root, @"popover.row.starlink") || !HasText(telstraRow, @"Telstra") ||
+            !HasText(telstraRow, @"93%") || !HasTip(telstraRow, @"Mac 12.4 GB of 180 GB") ||
+            telstraGauge.markerFraction != -1 || !SameColumn(telstraGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            !FindIdentifier(telstraDetails, @"details.overview.telstra.gauge") ||
+            FindIdentifier(telstraDetails, @"details.overview.starlink.gauge") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || !FitsChildren(telstraDetails) || WordyTip(telstraRow)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-telstra.png"], look) ||
+                !RenderOffscreen(telstraDetails, [stem stringByAppendingString:@"-telstra-overview.png"], look)) return Fail(__LINE__);
+        }
+        [c setValue:@{@"onLink": @NO} forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (FindIdentifier(root, @"popover.row.starlink") || FindIdentifier(root, @"popover.row.telstra") ||
+            FindIdentifier([c overviewDetailsView].documentView, @"details.overview.telstra.gauge") ||
+            FindIdentifier([c overviewDetailsView].documentView, @"details.overview.starlink.gauge")) return Fail(__LINE__);
+
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-metered-none.png"],
+                                 argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+
         // Every battery state renders without cut-off text: charging fast, held at the limit,
         // plugged but draining (the 2026-10-08 "−7.9 W plug…" bug), no power in, and on battery.
         {
@@ -792,7 +879,6 @@ int main(int argc, const char **argv) {
             // Quitting Chrome stretches the Battery row's time to 20% by T * A / (D - A).
             double gain = MinutesTo20(onBattery, onBattery.amperage_mA) * 2.1 / (9.4 - 2.1);
             BOOL expected = gain >= 30;
-            fprintf(stderr, "burn normal: to20=%d gain=%.0f row=%d\n", MinutesTo20(onBattery, onBattery.amperage_mA), gain, expected);
             if ((FindIdentifier(pop, @"popover.row.burn") != nil) != expected) return Fail(__LINE__);
             if (expected && (![burnValue.stringValue isEqual:@"2.1 W"] ||
                 ![burnDatum.stringValue isEqual:[@"quit +" stringByAppendingString:FmtDuration((int)lround(gain))]] ||

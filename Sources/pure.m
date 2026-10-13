@@ -1,6 +1,161 @@
 #import "pure.h"
 #import <limits.h>
 
+static NSCalendar *MeteredCalendar(void) {
+    NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+    cal.timeZone = NSTimeZone.defaultTimeZone;
+    cal.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+    return cal;
+}
+
+static NSDate *MeteredMonthStart(NSCalendar *cal, NSInteger year, NSInteger month, NSInteger day) {
+    NSDateComponents *c = [NSDateComponents new];
+    c.calendar = cal; c.timeZone = cal.timeZone;
+    c.year = year; c.month = month; c.day = 1;
+    NSDate *first = [cal dateFromComponents:c];
+    NSRange days = [cal rangeOfUnit:NSCalendarUnitDay inUnit:NSCalendarUnitMonth forDate:first];
+    c.day = MIN(MAX(day, 1), (NSInteger)days.length);
+    return [cal dateFromComponents:c];
+}
+
+NSDate *MeteredCycleStart(NSDate *now, int resetDay) {
+    if (!now) now = NSDate.date;
+    NSCalendar *cal = MeteredCalendar();
+    NSDateComponents *parts = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth |
+                                          NSCalendarUnitDay fromDate:now];
+    NSDate *candidate = MeteredMonthStart(cal, parts.year, parts.month, resetDay);
+    if ([candidate compare:now] == NSOrderedDescending) {
+        NSDate *previous = [cal dateByAddingUnit:NSCalendarUnitMonth value:-1 toDate:candidate options:0];
+        NSDateComponents *p = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth fromDate:previous];
+        candidate = MeteredMonthStart(cal, p.year, p.month, resetDay);
+    }
+    return candidate;
+}
+
+NSDate *MeteredCycleEnd(NSDate *now, int resetDay) {
+    NSDate *start = MeteredCycleStart(now, resetDay);
+    NSCalendar *cal = MeteredCalendar();
+    NSDateComponents *p = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth fromDate:start];
+    NSInteger year = p.year, month = p.month + 1;
+    if (month > 12) { month = 1; year++; }
+    return MeteredMonthStart(cal, year, month, resetDay);
+}
+
+static uint64_t MeteredUInt64(id value) {
+    return [value isKindOfClass:NSNumber.class] ? [value unsignedLongLongValue] : 0;
+}
+
+static NSArray<NSDictionary *> *MeteredSamples(NSDictionary *state) {
+    NSArray *samples = [state[@"samples"] isKindOfClass:NSArray.class] ? state[@"samples"] : @[];
+    return samples;
+}
+
+double MeteredRecentBytesPerSecond(NSDictionary *state, NSDate *now) {
+    if (!state || ![state[@"onLink"] boolValue] || !now) return 0;
+    double end = now.timeIntervalSince1970;
+    NSMutableArray *samples = [NSMutableArray array];
+    for (NSDictionary *sample in MeteredSamples(state)) {
+        double time = [sample[@"time"] doubleValue];
+        if (isfinite(time) && time >= end - 3600 && time <= end) [samples addObject:sample];
+    }
+    if (!isfinite(end) || samples.count < 2) return 0;
+    NSDictionary *first = samples.firstObject, *last = samples.lastObject;
+    double t0 = [first[@"time"] doubleValue], t1 = [last[@"time"] doubleValue];
+    if (!isfinite(t0) || !isfinite(t1) || t1 <= t0 || end < t1 ||
+        end - t1 > 3600.0 || t1 - t0 < 300.0) return 0;
+    uint64_t b0 = MeteredUInt64(first[@"totalBytes"]), b1 = MeteredUInt64(last[@"totalBytes"]);
+    return b1 >= b0 ? ((double)(b1 - b0) / (t1 - t0)) : 0;
+}
+
+NSDictionary *MeteredAccumulate(NSDictionary *previous, uint64_t inBytes,
+                                 uint64_t outBytes, NSString *interfaceName,
+                                 BOOL onLink, NSDate *now, int resetDay) {
+    if (!now) now = NSDate.date;
+    NSDate *cycle = MeteredCycleStart(now, resetDay);
+    uint64_t cycleEpoch = (uint64_t)llround(cycle.timeIntervalSince1970);
+    double sampledEpoch = now.timeIntervalSince1970;
+    NSString *iface = interfaceName ?: @"";
+    uint64_t download = MeteredUInt64(previous[@"downloadBytes"]);
+    uint64_t upload = MeteredUInt64(previous[@"uploadBytes"]);
+
+    BOOL sameCycle = previous && MeteredUInt64(previous[@"cycleStart"]) == cycleEpoch;
+    BOOL sameInterface = previous && [previous[@"interface"] isKindOfClass:NSString.class] &&
+                         [previous[@"interface"] isEqualToString:iface];
+    BOOL previousOn = previous && [previous[@"onLink"] boolValue];
+    uint64_t oldIn = MeteredUInt64(previous[@"inBytes"]);
+    uint64_t oldOut = MeteredUInt64(previous[@"outBytes"]);
+    double oldAt = [previous[@"sampledAt"] isKindOfClass:NSNumber.class]
+        ? [previous[@"sampledAt"] doubleValue] : 0;
+    BOOL usableDelta = sameCycle && sameInterface && iface.length > 0 && previousOn && onLink &&
+                       isfinite(oldAt) && oldAt > 0 && sampledEpoch >= oldAt &&
+                       inBytes >= oldIn && outBytes >= oldOut;
+    BOOL continuous = usableDelta && sampledEpoch - oldAt <= 3600.0;
+    if (!sameCycle) {
+        download = upload = 0;
+    } else if (usableDelta) {
+        uint64_t din = inBytes - oldIn;
+        uint64_t dout = outBytes - oldOut;
+        download += din;
+        upload += dout;
+    }
+    NSArray *samples = @[];
+    if (continuous) {
+        NSMutableArray *kept = [MeteredSamples(previous) mutableCopy];
+        [kept addObject:@{@"time": @(sampledEpoch), @"totalBytes": @(download + upload)}];
+        while (kept.count && sampledEpoch - [kept.firstObject[@"time"] doubleValue] > 3600.0)
+            [kept removeObjectAtIndex:0];
+        samples = kept;
+    } else if (onLink && iface.length > 0) {
+        samples = @[@{@"time": @(sampledEpoch), @"totalBytes": @(download + upload)}];
+    }
+
+    return @{
+        @"cycleStart": @(cycleEpoch),
+        @"sampledAt": @(sampledEpoch),
+        @"interface": iface,
+        @"inBytes": @(inBytes),
+        @"outBytes": @(outBytes),
+        @"downloadBytes": @(download),
+        @"uploadBytes": @(upload),
+        @"onLink": @(onLink),
+        @"bytesPerSecond": @(usableDelta && sampledEpoch > oldAt ?
+                               ((double)(inBytes - oldIn) + (double)(outBytes - oldOut)) /
+                               (sampledEpoch - oldAt) : 0),
+        @"recentBytesPerSecond": @(MeteredRecentBytesPerSecond(@{ @"onLink": @(onLink), @"samples": samples }, now)),
+        @"samples": samples
+    };
+}
+
+NSDictionary *MeteredAllowanceDatum(uint64_t remainingBytes, double rate,
+                                     NSDate *now, NSDate *cycleEnd) {
+    if (!now) now = NSDate.date;
+    BOOL usable = isfinite(rate) && rate > 0 && cycleEnd &&
+        [cycleEnd timeIntervalSinceDate:now] > 0;
+    double seconds = usable ? (double)remainingBytes / rate : 0;
+    BOOL lasts = usable && seconds < [cycleEnd timeIntervalSinceDate:now];
+    NSString *resetText = @"resets unavailable";
+    if (cycleEnd) {
+        NSDateFormatter *formatter = [NSDateFormatter new];
+        formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.timeZone = NSTimeZone.defaultTimeZone;
+        formatter.dateFormat = @"d MMM";
+        resetText = [NSString stringWithFormat:@"resets %@", [formatter stringFromDate:cycleEnd]];
+    }
+    if (!lasts) {
+        return @{ @"datum": resetText, @"urgency": @0, @"reset": resetText };
+    }
+    int minutes = (int)MAX(0, lround(seconds / 60.0));
+    NSString *duration;
+    if (seconds >= 48.0 * 3600.0) {
+        int hours = (int)floor(seconds / 3600.0);
+        duration = [NSString stringWithFormat:@"lasts %dd %dh", hours / 24, hours % 24];
+    } else {
+        duration = [NSString stringWithFormat:@"lasts %@", FmtDuration(minutes)];
+    }
+    int urgency = seconds < 2.0 * 3600.0 ? 2 : 1;
+    return @{ @"datum": duration, @"urgency": @(urgency), @"reset": resetText };
+}
+
 int MinutesTo20(BatteryState b, double avgAmp_mA) {
     if (b.acConnected || b.isCharging || b.percent <= 20) return -1;
     if (b.minutesToEmpty > 0 && b.percent > 0) {

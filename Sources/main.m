@@ -9,6 +9,9 @@
 #import <IOKit/ps/IOPowerSources.h>
 #import <notify.h>
 #import <Network/Network.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import <net/if.h>
+#import <net/route.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <libproc.h>
 #import <mach/mach.h>
@@ -31,6 +34,251 @@ static NSString *GBHomeDirectory(void) {
     }
     return NSHomeDirectory();
 }
+
+#pragma mark - Metered links (Mac interface bytes only)
+
+static int MeteredResetDay(NSString *link) {
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:[link stringByAppendingString:@"ResetDay"]];
+    return value ? MAX(1, MIN(31, [value intValue])) : ([link isEqual:@"telstra"] ? 7 : 13);
+}
+static double MeteredCapGB(NSString *link) {
+    double cap = [NSUserDefaults.standardUserDefaults doubleForKey:[link stringByAppendingString:@"CapGB"]];
+    return isfinite(cap) && cap > 0 ? cap : ([link isEqual:@"telstra"] ? 180 : 100);
+}
+static NSString *MeteredName(NSString *link) { return [link isEqual:@"telstra"] ? @"Telstra" : @"Starlink"; }
+static NSString *MeteredSymbol(NSString *link) {
+    if (![link isEqual:@"telstra"]) return @"antenna.radiowaves.left.and.right";
+    return [NSImage imageWithSystemSymbolName:@"personalhotspot" accessibilityDescription:nil] ? @"personalhotspot" : @"iphone";
+}
+
+// SystemConfiguration publishes the primary/default-route interface. Prefer IPv4
+// (the dish has an IPv4 address), falling back to IPv6-only service.
+static NSString *MeteredPrimaryInterface(void) {
+    for (NSString *key in @[@"State:/Network/Global/IPv4", @"State:/Network/Global/IPv6"]) {
+        NSDictionary *global = CFBridgingRelease(SCDynamicStoreCopyValue(NULL, (__bridge CFStringRef)key));
+        id name = global[@"PrimaryInterface"];
+        if ([name isKindOfClass:NSString.class] && [name length]) return name;
+    }
+    return nil;
+}
+static NSDictionary *MeteredCounterSample(void) {
+    NSString *name = MeteredPrimaryInterface();
+    unsigned int index = name ? if_nametoindex(name.UTF8String) : 0;
+    if (!index) return nil;
+    int mib[] = {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, (int)index};
+    size_t size = 0;
+    if (sysctl(mib, 6, NULL, &size, NULL, 0) || !size) return nil;
+    NSMutableData *data = [NSMutableData dataWithLength:size];
+    if (sysctl(mib, 6, data.mutableBytes, &size, NULL, 0)) return nil;
+    const uint8_t *bytes = data.bytes;
+    for (size_t offset = 0; offset + sizeof(struct if_msghdr) <= size;) {
+        const struct if_msghdr *header = (const void *)(bytes + offset);
+        if (!header->ifm_msglen || header->ifm_msglen > size - offset) break;
+        if (header->ifm_type == RTM_IFINFO2 && header->ifm_msglen >= sizeof(struct if_msghdr2)) {
+            const struct if_msghdr2 *info = (const void *)header;
+            if (info->ifm_index == index)
+                return @{@"interface": name, @"inBytes": @(info->ifm_data.ifi_ibytes),
+                         @"outBytes": @(info->ifm_data.ifi_obytes)};
+        }
+        offset += header->ifm_msglen;
+    }
+    return nil;
+}
+
+static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
+    if (response.statusCode != 200 || !data.length ||
+        ![[response valueForHTTPHeaderField:@"Content-Type"].lowercaseString hasPrefix:@"application/grpc-web+proto"])
+        return NO;
+    NSString *status = [response valueForHTTPHeaderField:@"grpc-status"];
+    BOOL device = NO;
+    const uint8_t *bytes = data.bytes;
+    for (NSUInteger offset = 0; offset < data.length;) {
+        if (data.length - offset < 5) return NO;
+        uint8_t flags = bytes[offset];
+        uint32_t length = ((uint32_t)bytes[offset+1] << 24) | ((uint32_t)bytes[offset+2] << 16) |
+                          ((uint32_t)bytes[offset+3] << 8) | bytes[offset+4];
+        offset += 5;
+        if (length > data.length - offset) return NO;
+        NSString *part = [[NSString alloc] initWithBytes:bytes + offset length:length encoding:NSISOLatin1StringEncoding];
+        if (flags == 0x80) {
+            for (NSString *line in [part componentsSeparatedByString:@"\r\n"]) {
+                if ([line.lowercaseString hasPrefix:@"grpc-status:"])
+                    status = [[line substringFromIndex:12] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            }
+        } else if (flags == 0) {
+            NSRange found = [part rangeOfString:@"ut[0-9a-fA-F]{8}-[0-9a-fA-F-]+" options:NSRegularExpressionSearch];
+            device |= found.location != NSNotFound;
+        } else return NO;
+        offset += length;
+    }
+    return device && [status isEqualToString:@"0"];
+}
+
+@interface MeteredMonitor : NSObject <NSURLSessionTaskDelegate>
+@property (copy) void (^updated)(NSDictionary *state);
+- (void)tick;
+- (void)sleep;
+- (void)wake;
+- (void)stop;
+@end
+@implementation MeteredMonitor {
+    dispatch_queue_t _queue;
+    NSURLSession *_session;
+    NSMutableDictionary<NSString *, NSDictionary *> *_states;
+    NSString *_directory, *_detectedInterface;
+    NSDate *_lastProbe, *_lastWrite;
+    BOOL _onStarlink, _probing, _sleeping, _stopped;
+    NSUInteger _generation;
+}
+- (instancetype)init {
+    if ((self = [super init])) {
+        _queue = dispatch_queue_create("com.iantodd.glancebar.metered", DISPATCH_QUEUE_SERIAL);
+        _directory = [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Glancebar"];
+        _states = [NSMutableDictionary dictionary];
+        NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+        config.timeoutIntervalForRequest = 2;
+        config.timeoutIntervalForResource = 2;
+        config.URLCache = nil;
+        config.connectionProxyDictionary = @{}; // the dish request stays on the LAN
+        _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+        dispatch_async(_queue, ^{
+            for (NSString *link in @[@"starlink", @"telstra"]) {
+                NSData *data = [NSData dataWithContentsOfFile:[self pathForLink:link]];
+                id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+                // Restore totals only. Never bill an unobserved app/reboot/sleep interval.
+                if ([saved isKindOfClass:NSDictionary.class]) {
+                    NSMutableDictionary *state = [NSMutableDictionary dictionary];
+                    for (NSString *key in @[@"cycleStart", @"downloadBytes", @"uploadBytes"])
+                        if ([saved[key] isKindOfClass:NSNumber.class] && isfinite([saved[key] doubleValue]) && [saved[key] doubleValue] >= 0)
+                            state[key] = saved[key];
+                    self->_states[link] = state;
+                }
+            }
+        });
+    }
+    return self;
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+ willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    (void)session; (void)task; (void)response; (void)request;
+    completionHandler(nil);
+}
+- (NSString *)pathForLink:(NSString *)link {
+    return [_directory stringByAppendingPathComponent:[link stringByAppendingString:@".json"]];
+}
+- (void)publish {
+    NSDictionary *snapshot = @{};
+    for (NSString *link in @[@"starlink", @"telstra"]) {
+        if ([_states[link][@"onLink"] boolValue]) {
+            NSMutableDictionary *active = [_states[link] mutableCopy];
+            active[@"link"] = link;
+            snapshot = [active copy];
+            break;
+        }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{ if (self.updated) self.updated(snapshot); });
+}
+- (void)persist:(BOOL)force {
+    NSDate *now = NSDate.date;
+    if (!force && _lastWrite && [now timeIntervalSinceDate:_lastWrite] < 60) return;
+    BOOL success = [NSFileManager.defaultManager createDirectoryAtPath:_directory
+                            withIntermediateDirectories:YES attributes:nil error:NULL];
+    for (NSString *link in _states) {
+        NSDictionary *state = _states[link];
+        NSDictionary *totals = [state dictionaryWithValuesForKeys:@[@"cycleStart", @"downloadBytes", @"uploadBytes"]];
+        NSData *data = [NSJSONSerialization dataWithJSONObject:totals options:0 error:NULL];
+        success = (data && [data writeToFile:[self pathForLink:link] options:NSDataWritingAtomic error:NULL]) && success;
+    }
+    if (success) _lastWrite = now;
+}
+- (NSDictionary *)counterSample { return MeteredCounterSample(); }
+- (NSString *)primaryInterface { return MeteredPrimaryInterface(); }
+- (NSString *)primaryRouter {
+    NSDictionary *global = CFBridgingRelease(SCDynamicStoreCopyValue(NULL, CFSTR("State:/Network/Global/IPv4")));
+    return [global[@"Router"] isKindOfClass:NSString.class] ? global[@"Router"] : nil;
+}
+- (void)sample {
+    NSDictionary *sample = [self counterSample];
+    NSString *name = sample[@"interface"];
+    BOOL hotspot = sample && [[self primaryRouter] isEqual:@"172.20.10.1"];
+    if (!sample || ![name isEqualToString:_detectedInterface] || hotspot) {
+        _onStarlink = NO;
+        // A route change invalidates any old response and triggers a fresh probe.
+        if (_detectedInterface) { _generation++; _lastProbe = nil; _detectedInterface = nil; }
+    }
+    NSDate *now = NSDate.date;
+    for (NSString *link in @[@"starlink", @"telstra"]) {
+        BOOL active = [link isEqual:@"telstra"] ? hotspot : _onStarlink;
+        _states[link] = MeteredAccumulate(_states[link], [sample[@"inBytes"] unsignedLongLongValue],
+            [sample[@"outBytes"] unsignedLongLongValue], name ?: @"", active, now, MeteredResetDay(link));
+    }
+    [self publish];
+    [self persist:NO];
+}
+- (void)tick {
+    dispatch_async(_queue, ^{
+        if (self->_sleeping || self->_stopped) return;
+        [self sample];
+        if ([[self primaryRouter] isEqual:@"172.20.10.1"]) return;
+        NSDate *now = NSDate.date;
+        if (self->_probing || (self->_lastProbe && [now timeIntervalSinceDate:self->_lastProbe] < 60)) return;
+        self->_lastProbe = now;
+        NSString *name = [self primaryInterface];
+        if (!name) return;
+        self->_probing = YES;
+        NSUInteger generation = self->_generation;
+        const uint8_t body[] = {0, 0, 0, 0, 3, 0x82, 0x3f, 0};
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
+            [NSURL URLWithString:@"http://192.168.100.1:9201/SpaceX.API.Device.Device/Handle"]
+            cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:2];
+        request.HTTPMethod = @"POST";
+        [request setValue:@"application/grpc-web+proto" forHTTPHeaderField:@"content-type"];
+        [request setValue:@"1" forHTTPHeaderField:@"x-grpc-web"];
+        request.HTTPBody = [NSData dataWithBytes:body length:sizeof(body)];
+        [[self->_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            dispatch_async(self->_queue, ^{
+                self->_probing = NO;
+                if (self->_stopped || self->_sleeping || generation != self->_generation) return;
+                BOOL matched = [name isEqualToString:[self primaryInterface]];
+                // The accumulator rejects intervals crossing detection changes.
+                self->_onStarlink = matched && !error && [response isKindOfClass:NSHTTPURLResponse.class] &&
+                    StarlinkProbeSucceeded(data, (NSHTTPURLResponse *)response);
+                self->_detectedInterface = matched ? name : nil;
+                [self sample];
+            });
+        }] resume];
+    });
+}
+- (void)sleep {
+    dispatch_sync(_queue, ^{
+        if (self->_stopped) return;
+        [self sample];
+        self->_sleeping = YES;
+        self->_onStarlink = NO;
+        self->_generation++;
+        for (NSString *link in self->_states.allKeys) {
+            NSMutableDictionary *state = [self->_states[link] mutableCopy];
+            state[@"onLink"] = @NO;
+            state[@"bytesPerSecond"] = @0;
+            state[@"recentBytesPerSecond"] = @0;
+            [state removeObjectForKey:@"samples"];
+            self->_states[link] = state;
+        }
+        [self persist:YES];
+        [self publish];
+    });
+}
+- (void)wake {
+    dispatch_async(_queue, ^{ self->_sleeping = NO; self->_lastProbe = nil; });
+    [self tick];
+}
+- (void)stop {
+    [self sleep];
+    dispatch_sync(_queue, ^{ self->_stopped = YES; });
+    [_session invalidateAndCancel];
+}
+@end
 
 #pragma mark - Disk
 
@@ -3996,6 +4244,8 @@ static NSString *const kYouTubeAutomationNote = @"Allow Glancebar to control Chr
 static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing offline music";
 
 @implementation Controller {
+    MeteredMonitor *_meteredMonitor;
+    NSDictionary *_metered;
     NSStatusItem *_item;
     NSPopover *_popover;
     NSWindow *_detailsWindow;
@@ -4106,6 +4356,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // 8s task watchdog. Stay synchronous — the process is quitting — but don't give them
     // the main thread for longer than the shared budget.
     _terminating = YES;
+    [_meteredMonitor stop];
     dispatch_semaphore_t pmsetDone = dispatch_semaphore_create(0);
     // Not behind the pmset queue: an apply waiting on a password dialog would eat the budget.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -4130,7 +4381,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
-                           @"barShowSystem": @NO,
+                           @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                            @"useCursorAccount": @NO, @"switchToNewOutputs": @YES}];
     _bat = ReadBattery();
@@ -4188,6 +4439,19 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     _popover.contentViewController = [NSViewController new];
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
 
+    _meteredMonitor = [MeteredMonitor new];
+    __weak Controller *weakSelf = self;
+    _meteredMonitor.updated = ^(NSDictionary *state) {
+        Controller *owner = weakSelf;
+        if (!owner || owner->_terminating) return;
+        owner->_metered = state;
+        [owner refreshVisibleSurfaces];
+    };
+    NSNotificationCenter *workspaceNotifications = NSWorkspace.sharedWorkspace.notificationCenter;
+    [workspaceNotifications addObserver:self selector:@selector(meteredWillSleep:)
+                                  name:NSWorkspaceWillSleepNotification object:nil];
+    [workspaceNotifications addObserver:self selector:@selector(meteredDidWake:)
+                                  name:NSWorkspaceDidWakeNotification object:nil];
     [self refresh];
     // The CPU figure needs two tick samples at least 2 s apart; take the second one now
     // rather than leaving "estimating" on the bar until the 15 s timer first fires.
@@ -5035,7 +5299,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
 }
 
+- (void)meteredWillSleep:(NSNotification *)note { (void)note; [_meteredMonitor sleep]; }
+- (void)meteredDidWake:(NSNotification *)note { (void)note; [_meteredMonitor wake]; }
+
 - (void)refresh {
+    [_meteredMonitor tick];
     [self refreshVolumesAsync];
     BOOL wasOnAC = _bat.valid && _bat.acConnected;
     _bat = ReadBattery();
@@ -6759,6 +7027,56 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     return [NSString stringWithFormat:@"%.0fh ago", age / 3600.0];
 }
 
+- (NSDictionary *)meteredFigures {
+    NSDate *now = NSDate.date;
+    NSString *link = _metered[@"link"];
+    int day = MeteredResetDay(link);
+    NSDate *start = MeteredCycleStart(now, day), *end = MeteredCycleEnd(now, day);
+    BOOL current = fabs([_metered[@"cycleStart"] doubleValue] - start.timeIntervalSince1970) < 1;
+    double down = current ? [_metered[@"downloadBytes"] doubleValue] / 1e9 : 0;
+    double up = current ? [_metered[@"uploadBytes"] doubleValue] / 1e9 : 0;
+    double cap = MeteredCapGB(link), fraction = MAX(0, MIN(1, 1 - (down + up) / cap));
+    double recent = current ? [_metered[@"recentBytesPerSecond"] doubleValue] : 0;
+    NSDictionary *choice = MeteredAllowanceDatum(MAX(0, cap - down - up) * 1e9, recent, now, end);
+    NSMutableString *tip = [NSMutableString stringWithFormat:@"Mac %.1f GB of %g GB\n↓ %.1f GB  ↑ %.1f GB\nnow %.1f MB/s · %@ GB/h last hour",
+        down + up, cap, down, up, current ? [_metered[@"bytesPerSecond"] doubleValue] / 1e6 : 0,
+        recent > 0 ? [NSString stringWithFormat:@"%.1f", recent * 3600 / 1e9] : @"—"];
+    if ([choice[@"urgency"] intValue] > 0) [tip appendFormat:@"\n%@", choice[@"reset"]];
+    return @{@"fraction": @(fraction), @"urgency": choice[@"urgency"],
+             @"value": [NSString stringWithFormat:@"%.0f%%", fraction * 100],
+             @"datum": choice[@"datum"], @"tip": tip};
+}
+- (NSColor *)meteredDatumColor:(NSDictionary *)figures {
+    int urgency = [figures[@"urgency"] intValue];
+    return urgency == 2 ? NSColor.systemRedColor : urgency == 1 ? NSColor.systemYellowColor : NSColor.secondaryLabelColor;
+}
+
+- (CGFloat)addMeteredTo:(NSView *)root at:(CGFloat)y {
+    if (![_metered[@"onLink"] boolValue]) return y;
+    NSString *link = _metered[@"link"];
+    NSDictionary *figures = [self meteredFigures];
+    double fraction = [figures[@"fraction"] doubleValue];
+    NSColor *color = AIQuotaColor(fraction);
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+    row.accessibilityIdentifier = [NSString stringWithFormat:@"popover.row.%@", link];
+    row.toolTip = figures[@"tip"];
+    row.accessibilityLabel = [[MeteredName(link) stringByAppendingString:@" — "] stringByAppendingString:figures[@"tip"]];
+    [self instrumentSymbol:MeteredSymbol(link) tint:color identifier:[NSString stringWithFormat:@"popover.%@.symbol", link] in:row];
+    [self instrumentName:MeteredName(link) identifier:[NSString stringWithFormat:@"popover.%@.name", link] in:row];
+    Gauge *gauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH-kGaugeH)/2, kGaugeW, kGaugeH)];
+    gauge.fraction = fraction;
+    gauge.markerFraction = -1;
+    gauge.color = color;
+    gauge.metricLabel = [MeteredName(link) stringByAppendingString:@" Mac data remaining"];
+    gauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.%@.gauge", link];
+    [row addSubview:gauge];
+    [self instrumentValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"popover.%@.value", link] in:row];
+    [self instrumentDatum:figures[@"datum"] color:[self meteredDatumColor:figures] identifier:[NSString stringWithFormat:@"popover.%@.datum", link] in:row];
+    for (NSView *child in row.subviews) child.toolTip = figures[@"tip"];
+    [root addSubview:row];
+    return y + kRowH;
+}
+
 - (void)rebuildContent {
     [self refreshChargeShortcutsIfStale];
     NSView *previousView = _popover.contentViewController.view;
@@ -6897,6 +7215,8 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:row];
         y += kRowH;
     }
+
+    y = [self addMeteredTo:root at:y];
 
     y += 8;
     NSBox *soundRule = [self dividerAt:y];
@@ -8198,6 +8518,27 @@ static NSColor *HealthColor(double fraction) {
         systemName.toolTip = tip;
         [self addSystemInstrumentTo:row gauge:DetailGaugeRect(c) value:DetailValueRect(c)
                               datum:DetailDatumRect(c) stem:@"details.overview.system" tip:tip];
+        y += c.rowH;
+    }
+
+    if ([_metered[@"onLink"] boolValue]) {
+        NSString *link = _metered[@"link"];
+        NSDictionary *figures = [self meteredFigures];
+        NSString *tip = figures[@"tip"];
+        double fraction = [figures[@"fraction"] doubleValue];
+        NSColor *color = AIQuotaColor(fraction);
+        NSView *row = [self detailRowAt:y cols:c identifier:[NSString stringWithFormat:@"details.overview.row.%@", link] tip:tip in:root];
+        [self detailSymbol:MeteredSymbol(link) size:c.symbol tint:color frame:DetailLeadRect(c)
+                identifier:[NSString stringWithFormat:@"details.overview.%@.symbol", link] in:row];
+        [self detailText:MeteredName(link) font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                   color:NSColor.labelColor frame:NSMakeRect(c.nameX, (c.rowH-16)/2, c.nameW, 16)
+                   align:NSTextAlignmentLeft identifier:[NSString stringWithFormat:@"details.overview.%@.name", link] in:row];
+        Gauge *gauge = [self detailGauge:DetailGaugeRect(c) fraction:fraction color:color
+            label:[MeteredName(link) stringByAppendingString:@" Mac data remaining"] identifier:[NSString stringWithFormat:@"details.overview.%@.gauge", link] tip:tip in:row];
+        gauge.markerFraction = -1;
+        [self detailValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"details.overview.%@.value", link] tip:tip in:row cols:c];
+        [self detailDatum:figures[@"datum"] color:[self meteredDatumColor:figures] identifier:[NSString stringWithFormat:@"details.overview.%@.datum", link] tip:tip in:row cols:c];
+        for (NSView *child in row.subviews) child.toolTip = tip;
         y += c.rowH;
     }
 

@@ -10,6 +10,202 @@ static void check(BOOL cond, NSString *msg) {
 
 int main(void) {
     @autoreleasepool {
+        // --- Starlink monthly cycle and counter accumulator ---
+        NSTimeZone *oldTZ = NSTimeZone.defaultTimeZone;
+        [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+        NSCalendar *utc = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+        utc.timeZone = NSTimeZone.defaultTimeZone;
+        NSDateComponents *dc = [NSDateComponents new];
+        dc.year = 2026; dc.month = 2; dc.day = 28; dc.hour = 12;
+        NSDate *feb = [utc dateFromComponents:dc];
+        NSDate *febStart = MeteredCycleStart(feb, 31);
+        NSDateComponents *sc = [utc components:NSCalendarUnitYear | NSCalendarUnitMonth |
+                                          NSCalendarUnitDay | NSCalendarUnitHour fromDate:febStart];
+        check(sc.year == 2026 && sc.month == 2 && sc.day == 28 && sc.hour == 0,
+              @"Starlink reset day 31 clamps to February 28");
+        dc.year = 2028; dc.month = 2; dc.day = 29;
+        NSDate *leap = [utc dateFromComponents:dc];
+        sc = [utc components:NSCalendarUnitDay fromDate:MeteredCycleStart(leap, 31)];
+        check(sc.day == 29, @"Starlink reset day 31 clamps to leap-day 29");
+        dc.year = 2026; dc.month = 1; dc.day = 1; dc.hour = 12;
+        NSDate *jan = [utc dateFromComponents:dc];
+        sc = [utc components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay
+                      fromDate:MeteredCycleStart(jan, 13)];
+        check(sc.year == 2025 && sc.month == 12 && sc.day == 13, @"Starlink before reset uses prior month");
+        dc.year = 2026; dc.month = 1; dc.day = 31; dc.hour = 12;
+        NSDate *jan31 = [utc dateFromComponents:dc];
+        NSDate *janCycleEnd = MeteredCycleEnd(jan31, 31);
+        sc = [utc components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay fromDate:janCycleEnd];
+        check(sc.year == 2026 && sc.month == 2 && sc.day == 28, @"Starlink Jan 31 cycle ends at Feb 28");
+        dc.month = 2; dc.day = 28;
+        NSDate *feb28 = [utc dateFromComponents:dc];
+        NSDate *febCycleEnd = MeteredCycleEnd(feb28, 31);
+        sc = [utc components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay fromDate:febCycleEnd];
+        check(sc.year == 2026 && sc.month == 3 && sc.day == 31, @"Starlink Feb 28 cycle ends at Mar 31");
+        dc.month = 2; dc.day = 28; dc.hour = 0;
+        NSDate *atBoundary = [utc dateFromComponents:dc];
+        check([MeteredCycleStart(atBoundary, 31) isEqual:atBoundary], @"Starlink short-month boundary is inclusive");
+        NSDictionary *shortCycle = MeteredAccumulate(nil, 100, 200, @"en0", YES,
+            [atBoundary dateByAddingTimeInterval:-20], 31);
+        shortCycle = MeteredAccumulate(shortCycle, 150, 280, @"en0", YES,
+            [atBoundary dateByAddingTimeInterval:-10], 31);
+        check([shortCycle[@"downloadBytes"] unsignedLongLongValue] == 50, @"Starlink counts before short-month boundary");
+        shortCycle = MeteredAccumulate(shortCycle, 160, 290, @"en0", YES, atBoundary, 31);
+        check([shortCycle[@"downloadBytes"] unsignedLongLongValue] == 0 &&
+              [shortCycle[@"uploadBytes"] unsignedLongLongValue] == 0,
+              @"Starlink short-month rollover zeroes totals and rebaselines");
+        NSDate *sampleAt = feb;
+        NSDictionary *s1 = MeteredAccumulate(nil, 5000000000ULL, 7000000000ULL, @"en0", YES, sampleAt, 13);
+        check([s1[@"downloadBytes"] unsignedLongLongValue] == 0 &&
+              [s1[@"uploadBytes"] unsignedLongLongValue] == 0, @"Starlink first sample re-baselines");
+        NSDictionary *s2 = MeteredAccumulate(s1, 5000000500ULL, 7000000300ULL, @"en0", YES,
+                                               [sampleAt dateByAddingTimeInterval:10], 13);
+        check([s2[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [s2[@"uploadBytes"] unsignedLongLongValue] == 300 &&
+              fabs([s2[@"bytesPerSecond"] doubleValue] - 80.0) < 0.001,
+              @"Starlink growth counts 64-bit deltas and reports rate");
+        NSDictionary *wide = MeteredAccumulate(s1, 10000000000ULL, 12000000000ULL, @"en0", YES,
+                                                 [sampleAt dateByAddingTimeInterval:10.25], 13);
+        check([wide[@"downloadBytes"] unsignedLongLongValue] == 5000000000ULL &&
+              [wide[@"uploadBytes"] unsignedLongLongValue] == 5000000000ULL &&
+              fabs([wide[@"bytesPerSecond"] doubleValue] - 1e10 / 10.25) < 0.001,
+              @"Starlink counts a delta larger than UINT32_MAX");
+        NSDictionary *restore = MeteredAccumulate(@{ @"cycleStart": s2[@"cycleStart"],
+                                                       @"downloadBytes": s2[@"downloadBytes"],
+                                                       @"uploadBytes": s2[@"uploadBytes"] },
+                                                    5000000600ULL, 7000000400ULL, @"en0", YES,
+                                                    [sampleAt dateByAddingTimeInterval:20], 13);
+        check([restore[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [restore[@"uploadBytes"] unsignedLongLongValue] == 300,
+              @"Starlink restore with totals only preserves usage while rebaselining");
+        NSDictionary *emptyInterface = MeteredAccumulate(s2, 5000000600ULL, 7000000400ULL, @"", YES,
+                                                            [sampleAt dateByAddingTimeInterval:20], 13);
+        check([emptyInterface[@"downloadBytes"] unsignedLongLongValue] == 500,
+              @"Starlink empty interface cannot count");
+        NSDictionary *reset = MeteredAccumulate(s2, 10, 20, @"en0", YES,
+                                                   [sampleAt dateByAddingTimeInterval:20], 13);
+        check([reset[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [reset[@"uploadBytes"] unsignedLongLongValue] == 300, @"Starlink counter reset re-baselines");
+        NSDictionary *oneReset = MeteredAccumulate(s2, 5000000600ULL, 1, @"en0", YES,
+                                                     [sampleAt dateByAddingTimeInterval:20], 13);
+        check([oneReset[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [oneReset[@"uploadBytes"] unsignedLongLongValue] == 300,
+              @"Starlink either counter decrease re-baselines both");
+        NSDictionary *changed = MeteredAccumulate(s2, 5000000600ULL, 7000000400ULL, @"en1", YES,
+                                                    [sampleAt dateByAddingTimeInterval:20], 13);
+        check([changed[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [changed[@"uploadBytes"] unsignedLongLongValue] == 300, @"Starlink interface change re-baselines");
+        NSDictionary *off = MeteredAccumulate(s2, 5000000600ULL, 7000000400ULL, @"en0", NO,
+                                                [sampleAt dateByAddingTimeInterval:20], 13);
+        NSDictionary *reconnect = MeteredAccumulate(off, 5000000700ULL, 7000000500ULL, @"en0", YES,
+                                                       [sampleAt dateByAddingTimeInterval:30], 13);
+        check([off[@"downloadBytes"] unsignedLongLongValue] == 500 &&
+              [reconnect[@"downloadBytes"] unsignedLongLongValue] == 500,
+              @"Starlink off-network and reconnect samples do not leak bytes");
+        dc.year = 2026; dc.month = 3; dc.day = 13; dc.hour = 12;
+        NSDictionary *roll = MeteredAccumulate(s2, 900, 1000, @"en0", YES, [utc dateFromComponents:dc], 13);
+        check([roll[@"downloadBytes"] unsignedLongLongValue] == 0 &&
+              [roll[@"uploadBytes"] unsignedLongLongValue] == 0, @"Starlink cycle rollover clears totals");
+        [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneWithName:@"America/Los_Angeles"]];
+        NSCalendar *local = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+        local.timeZone = NSTimeZone.defaultTimeZone;
+        dc = [NSDateComponents new]; dc.year = 2026; dc.month = 11; dc.day = 1; dc.hour = 12;
+        NSDateComponents *mid = [local components:NSCalendarUnitHour | NSCalendarUnitMinute
+                                           fromDate:MeteredCycleStart([local dateFromComponents:dc], 1)];
+        check(mid.hour == 0 && mid.minute == 0, @"Starlink cycle starts at local midnight across DST");
+        [NSTimeZone setDefaultTimeZone:oldTZ];
+
+        // --- Generic metered links: mature recent rate and allowance datum ---
+        NSDate *meterStart = [NSDate dateWithTimeIntervalSince1970:1000000];
+        NSDictionary *m0 = MeteredAccumulate(nil, 1000, 2000, @"en0", YES, meterStart, 13);
+        NSDictionary *m1 = MeteredAccumulate(m0, 1000 + 600000, 2000, @"en0", YES,
+                                               [meterStart dateByAddingTimeInterval:300], 13);
+        check([m1[@"onLink"] boolValue] && MeteredRecentBytesPerSecond(m1,
+              [meterStart dateByAddingTimeInterval:300]) == 2000.0,
+              @"metered link rate matures after five minutes");
+        NSDictionary *mFast = MeteredAccumulate(m1, 1000 + 600000 + 600000,
+                                                  2000, @"en0", YES,
+                                                  [meterStart dateByAddingTimeInterval:600], 13);
+        check([mFast[@"samples"] count] == 3 &&
+              MeteredRecentBytesPerSecond(mFast, [meterStart dateByAddingTimeInterval:600]) == 2000.0,
+              @"metered samples retain the contiguous last-hour window");
+        NSDictionary *mOff = MeteredAccumulate(mFast, 1000 + 600000 + 600000, 2000,
+                                                 @"en0", NO,
+                                                 [meterStart dateByAddingTimeInterval:900], 13);
+        check([mOff[@"samples"] count] == 0 && MeteredRecentBytesPerSecond(mOff,
+              [meterStart dateByAddingTimeInterval:900]) == 0,
+              @"off-link samples are discarded");
+        NSDictionary *mRestored = MeteredAccumulate(@{ @"cycleStart": mFast[@"cycleStart"],
+                                                         @"downloadBytes": mFast[@"downloadBytes"],
+                                                         @"uploadBytes": mFast[@"uploadBytes"] },
+                                                      9000000, 9000000, @"en0", YES,
+                                                      [meterStart dateByAddingTimeInterval:900], 13);
+        check([mRestored[@"samples"] count] == 1 && MeteredRecentBytesPerSecond(mRestored,
+              [meterStart dateByAddingTimeInterval:900]) == 0,
+              @"restoring totals only rebaselines transient rate samples");
+        NSDate *end = [meterStart dateByAddingTimeInterval:86400];
+        NSDictionary *resetDatum = MeteredAllowanceDatum(1000000, 0, meterStart, end);
+        check([resetDatum[@"urgency"] intValue] == 0 && [resetDatum[@"reset"] hasPrefix:@"resets "],
+              @"metered datum falls back to cycle reset without a rate");
+        end = [meterStart dateByAddingTimeInterval:7 * 86400];
+        NSDictionary *amberDatum = MeteredAllowanceDatum(10800 * 1000, 1000, meterStart, end);
+        check([amberDatum[@"datum"] isEqual:@"lasts 3:00"] && [amberDatum[@"urgency"] intValue] == 1,
+              @"metered datum shows amber lasting duration");
+        NSDictionary *redDatum = MeteredAllowanceDatum(1000, 1, meterStart, end);
+        check([redDatum[@"datum"] isEqual:@"lasts 0:17"] && [redDatum[@"urgency"] intValue] == 2,
+              @"metered datum marks durations under two hours red");
+        NSDictionary *daysDatum = MeteredAllowanceDatum(200000, 1, meterStart, end);
+        check([daysDatum[@"datum"] isEqual:@"lasts 2d 7h"],
+              @"metered datum uses days and hours at forty-eight hours");
+
+        NSDictionary *immature = MeteredAccumulate(m0, 10000, 2000, @"en0", YES,
+            [meterStart dateByAddingTimeInterval:299], 13);
+        check([immature[@"recentBytesPerSecond"] doubleValue] == 0 &&
+              MeteredRecentBytesPerSecond(immature, [meterStart dateByAddingTimeInterval:300]) == 0,
+              @"299 seconds of observations cannot mature merely by waiting");
+        NSDictionary *equalTime = MeteredAccumulate(m0, 1000, 2000, @"en0", YES, meterStart, 13);
+        check(isfinite([equalTime[@"bytesPerSecond"] doubleValue]) && [equalTime[@"bytesPerSecond"] doubleValue] == 0,
+              @"equal timestamps never divide by zero");
+        NSDictionary *pruned = MeteredAccumulate(mFast, 7201000, 2000, @"en0", YES,
+            [meterStart dateByAddingTimeInterval:3601], 13);
+        check([pruned[@"samples"] count] == 3 &&
+              [pruned[@"samples"][0][@"time"] doubleValue] == meterStart.timeIntervalSince1970 + 300,
+              @"samples older than one hour are removed");
+        check(MeteredRecentBytesPerSecond(mFast, [meterStart dateByAddingTimeInterval:4201]) == 0,
+              @"stale observations outside the last hour cannot report a rate");
+        for (NSDictionary *broken in @[
+            MeteredAccumulate(mFast, 1201000, 2000, @"en1", YES, [meterStart dateByAddingTimeInterval:615], 13),
+            MeteredAccumulate(mFast, 1, 2, @"en0", YES, [meterStart dateByAddingTimeInterval:615], 13),
+            MeteredAccumulate(mFast, 1201000, 2000, @"en0", YES, [meterStart dateByAddingTimeInterval:599], 13),
+            MeteredAccumulate(mFast, 1201000, 2000, @"en0", YES, [meterStart dateByAddingTimeInterval:40*86400], 13)]) {
+            check([broken[@"samples"] count] == 1 && [broken[@"recentBytesPerSecond"] doubleValue] == 0,
+                  @"interface, counter, clock and cycle discontinuities reset recent history");
+        }
+        // Separate link states keep independent cycle boundaries and totals.
+        NSDate *seventh = [NSDate dateWithTimeIntervalSince1970:1791331200]; // 7 Oct 2026 UTC
+        [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+        NSDictionary *starBefore = MeteredAccumulate(nil, 100, 100, @"en0", YES, [seventh dateByAddingTimeInterval:-30], 13);
+        NSDictionary *telBefore = MeteredAccumulate(nil, 200, 200, @"en0", YES, [seventh dateByAddingTimeInterval:-30], 7);
+        NSDictionary *starAfter = MeteredAccumulate(starBefore, 110, 120, @"en0", YES, seventh, 13);
+        NSDictionary *telAfter = MeteredAccumulate(telBefore, 250, 260, @"en0", YES, seventh, 7);
+        check([starAfter[@"downloadBytes"] intValue] == 10 && [telAfter[@"downloadBytes"] intValue] == 0 &&
+              ![starAfter[@"cycleStart"] isEqual:telAfter[@"cycleStart"]], @"two metered links reset independently on days thirteen and seven");
+        [NSTimeZone setDefaultTimeZone:oldTZ];
+        for (NSNumber *invalidRate in @[@0, @(-1), @(NAN), @(INFINITY)])
+            check([MeteredAllowanceDatum(1000, invalidRate.doubleValue, meterStart, end)[@"urgency"] intValue] == 0,
+                  @"unusable rates show reset date");
+        check([MeteredAllowanceDatum(7*86400, 1, meterStart, end)[@"urgency"] intValue] == 0 &&
+              [MeteredAllowanceDatum(8*86400, 1, meterStart, end)[@"urgency"] intValue] == 0,
+              @"allowance reaching or outlasting cycle shows reset date");
+        check([MeteredAllowanceDatum(7199, 1, meterStart, end)[@"urgency"] intValue] == 2 &&
+              [MeteredAllowanceDatum(7200, 1, meterStart, end)[@"urgency"] intValue] == 1,
+              @"red urgency ends exactly at two hours");
+        check([MeteredAllowanceDatum(47*3600+59*60, 1, meterStart, end)[@"datum"] isEqual:@"lasts 47:59"] &&
+              [MeteredAllowanceDatum(48*3600, 1, meterStart, end)[@"datum"] isEqual:@"lasts 2d 0h"],
+              @"duration format changes at forty-eight hours");
+        check([MeteredAllowanceDatum(0, 1, meterStart, end)[@"datum"] isEqual:@"lasts 0:00"],
+              @"exhausted allowance lasts zero minutes");
+
         // --- MinutesTo20 ---
         check(MinutesTo20((BatteryState){.acConnected=YES, .percent=90, .minutesToEmpty=300}, -500) == -1, @"AC connected → -1");
         check(MinutesTo20((BatteryState){.isCharging=YES, .percent=50, .minutesToEmpty=200}, -500) == -1, @"charging → -1");

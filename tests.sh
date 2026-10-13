@@ -53,6 +53,14 @@ fi
 
 "$WORK_DIR/glancebar_ai_reader_tests"
 
+# Metered-link transport and persistence coverage. The harness imports the private monitor
+# but stubs both interface counters and NSURLSession-facing tick paths.
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m Tests/test_metered.m \
+    -framework Cocoa -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
+    -framework CoreAudio -framework IOKit -framework ServiceManagement \
+    -o "$WORK_DIR/glancebar_metered_tests"
+"$WORK_DIR/glancebar_metered_tests"
+
 # Production AppKit layout, rendered without creating any visible windows.
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m tools/check-popover.m \
     -framework Cocoa -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \

@@ -584,3 +584,21 @@ NSString *PreciseByteCount(long long bytes);
 // "Macintosh HD — 1.77 TB of 2 TB used · 220.25 GB free (12 GB purgeable)".
 // The parenthetical is omitted when purgeable is <= 0. Nil name → "Volume".
 NSString *StorageVolumeTooltip(NSString *name, long long total, long long available, long long purgeable);
+
+// A metered link's local-calendar monthly usage cycle (reset day clamped to the month).
+// State: cycleStart/sampledAt (epoch seconds), interface, inBytes/outBytes (baseline),
+// downloadBytes/uploadBytes (cycle totals), onLink, bytesPerSecond and in-memory samples.
+// Only intervals with both endpoints on the link count; resets, interface changes and
+// cycle changes rebaseline. Restoring just cycleStart and totals preserves usage without
+// billing downtime (samples are deliberately transient).
+NSDate *MeteredCycleStart(NSDate *now, int resetDay);
+NSDate *MeteredCycleEnd(NSDate *now, int resetDay);
+NSDictionary *MeteredAccumulate(NSDictionary *previous, uint64_t inBytes,
+                                 uint64_t outBytes, NSString *interfaceName,
+                                 BOOL onLink, NSDate *now, int resetDay);
+double MeteredRecentBytesPerSecond(NSDictionary *state, NSDate *now);
+// Returns @{ @"datum": text, @"urgency": @(0 reset, 1 amber, 2 red),
+//            @"reset": reset date text }. A datum is a reset date when there is no mature
+// rate or the allowance would last beyond the cycle end.
+NSDictionary *MeteredAllowanceDatum(uint64_t remainingBytes, double recentBytesPerSecond,
+                                     NSDate *now, NSDate *cycleEnd);
