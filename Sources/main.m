@@ -19,6 +19,8 @@
 #import <sys/mount.h>
 #import <sys/sysctl.h>
 #import <os/log.h>
+#import <Security/Security.h>
+#import <sqlite3.h>
 #import "pure.h"
 #import "nowplaying.h"
 
@@ -44,6 +46,10 @@ static int MeteredResetDay(NSString *link) {
 static double MeteredCapGB(NSString *link) {
     double cap = [NSUserDefaults.standardUserDefaults doubleForKey:[link stringByAppendingString:@"CapGB"]];
     return isfinite(cap) && cap > 0 ? cap : ([link isEqual:@"telstra"] ? 180 : 100);
+}
+// Starlink bills in UTC; the Telstra cycle follows the local calendar.
+static NSTimeZone *MeteredZone(NSString *link) {
+    return [link isEqual:@"telstra"] ? nil : [NSTimeZone timeZoneForSecondsFromGMT:0];
 }
 static NSString *MeteredName(NSString *link) { return [link isEqual:@"telstra"] ? @"Telstra" : @"Starlink"; }
 static NSString *MeteredSymbol(NSString *link) {
@@ -114,6 +120,160 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
     return device && [status isEqualToString:@"0"];
 }
 
+#pragma mark - Starlink account usage (starlink.com, signed in via Chrome)
+
+// The account's own cycle total, which counts every device on the dish. It is read with
+// the user's Chrome session for starlink.com: cookies come from Chrome's cookie store
+// (read-only) and are decrypted with the "Chrome Safe Storage" Keychain key, which macOS
+// asks the user to allow once. Only starlink.com cookies are read, and only sent there.
+@interface StarlinkAccount : NSObject
+- (void)fetch:(void (^)(NSDictionary *usage, NSString *problem))done;
+@end
+@implementation StarlinkAccount {
+    dispatch_queue_t _queue;
+    NSURLSession *_session;
+    NSData *_key;
+    BOOL _keyRefused, _chromeBlocked;
+}
+- (instancetype)init {
+    if ((self = [super init])) {
+        _queue = dispatch_queue_create("com.iantodd.glancebar.starlink-account", DISPATCH_QUEUE_SERIAL);
+        NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+        config.HTTPShouldSetCookies = NO;
+        config.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
+        config.URLCache = nil;
+        config.timeoutIntervalForRequest = 20;
+        config.timeoutIntervalForResource = 30;
+        _session = [NSURLSession sessionWithConfiguration:config];
+    }
+    return self;
+}
+// One Keychain read per launch. A refusal is remembered so the dialog never repeats.
+- (NSData *)key {
+    if (_key || _keyRefused) return _key;
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)@{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"Chrome Safe Storage",
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne}, &result);
+    NSData *secret = CFBridgingRelease(result);
+    if (status != errSecSuccess || !secret.length) {
+        os_log(OS_LOG_DEFAULT, "starlink account: Chrome Safe Storage keychain status %d", (int)status);
+        _keyRefused = YES; return nil;
+    }
+    _key = ChromeCookieKey([[NSString alloc] initWithData:secret encoding:NSUTF8StringEncoding]);
+    _keyRefused = _key == nil;
+    return _key;
+}
+// The Chrome profile most recently signed in to starlink.com.
+- (NSString *)cookieHeader:(NSString **)account {
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Google/Chrome"];
+    NSString *best = nil; long long bestAccess = -1;
+    NSMutableDictionary *bestJar = nil;
+    // macOS App Data protection guards Chrome's folder until Glancebar is granted access.
+    NSError *listError = nil;
+    NSArray *profiles = [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:&listError];
+    _chromeBlocked = [listError.domain isEqual:NSCocoaErrorDomain] && listError.code == NSFileReadNoPermissionError;
+    for (NSString *profile in profiles) {
+        NSString *path = [[root stringByAppendingPathComponent:profile] stringByAppendingPathComponent:@"Cookies"];
+        if (![NSFileManager.defaultManager fileExistsAtPath:path]) continue;
+        NSURLComponents *uri = [NSURLComponents new];
+        uri.scheme = @"file"; uri.path = path; uri.query = @"mode=ro";
+        sqlite3 *db = NULL;
+        if (sqlite3_open_v2(uri.string.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) != SQLITE_OK) {
+            sqlite3_close(db); continue;
+        }
+        sqlite3_busy_timeout(db, 1000);
+        sqlite3_stmt *query = NULL;
+        NSMutableDictionary *jar = [NSMutableDictionary dictionary];
+        long long access = -1;
+        if (sqlite3_prepare_v2(db, "SELECT name, host_key, encrypted_value, value, last_access_utc FROM cookies "
+                                   "WHERE host_key IN ('starlink.com', '.starlink.com')", -1, &query, NULL) == SQLITE_OK) {
+            while (sqlite3_step(query) == SQLITE_ROW) {
+                const char *name = (const char *)sqlite3_column_text(query, 0);
+                const char *host = (const char *)sqlite3_column_text(query, 1);
+                const char *plain = (const char *)sqlite3_column_text(query, 3);
+                if (!name || !host) continue;
+                NSString *cookie = [NSString stringWithUTF8String:name];
+                NSString *value = plain && *plain ? [NSString stringWithUTF8String:plain] : nil;
+                if (!value) {
+                    NSData *sealed = [NSData dataWithBytes:sqlite3_column_blob(query, 2) length:(NSUInteger)sqlite3_column_bytes(query, 2)];
+                    if (!sealed.length) continue;
+                    NSData *key = [self key];
+                    if (!key) break;
+                    value = ChromeCookieDecrypt(sealed, key, [NSString stringWithUTF8String:host]);
+                }
+                if (!value.length) continue;
+                jar[cookie] = value;
+                if ([cookie hasPrefix:@"Starlink.Com.Access"]) access = MAX(access, sqlite3_column_int64(query, 4));
+            }
+        }
+        sqlite3_finalize(query);
+        sqlite3_close(db);
+        if (access > bestAccess && jar[@"Starlink.Com.Access.V1"]) { bestAccess = access; best = path; bestJar = jar; }
+    }
+    if (!best) return nil;
+    if (account) *account = [bestJar[@"starlink.com.account_number"] stringByRemovingPercentEncoding];
+    NSMutableArray *pairs = [NSMutableArray array];
+    for (NSString *name in bestJar) [pairs addObject:[NSString stringWithFormat:@"%@=%@", name, bestJar[name]]];
+    return [pairs componentsJoinedByString:@"; "];
+}
+- (NSData *)get:(NSString *)path cookies:(NSString *)cookies status:(NSInteger *)status {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:[@"https://starlink.com" stringByAppendingString:path]]];
+    [request setValue:cookies forHTTPHeaderField:@"Cookie"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    __block NSData *body = nil; __block NSInteger code = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [[_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && [response isKindOfClass:NSHTTPURLResponse.class]) { code = ((NSHTTPURLResponse *)response).statusCode; body = data; }
+        dispatch_semaphore_signal(done);
+    }] resume];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 35 * NSEC_PER_SEC));
+    if (status) *status = code;
+    return code == 200 ? body : nil;
+}
+- (void)fetch:(void (^)(NSDictionary *, NSString *))done {
+    dispatch_async(_queue, ^{
+        NSString *account = nil, *problem = nil;
+        NSDictionary *usage = nil;
+        NSString *cookies = [self cookieHeader:&account];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *line = [defaults stringForKey:@"starlinkServiceLine"];
+        NSInteger status = 0;
+        if (!cookies) {
+            problem = self->_chromeBlocked ? @"needs Full Disk Access"
+                    : self->_keyRefused ? @"Keychain access refused" : @"sign in at starlink.com in Chrome";
+        } else if (!account.length) {
+            problem = @"no Starlink account number";
+        } else {
+            if (!line.length) {
+                NSData *lines = [self get:@"/api/accounts/v1/accounts/service-line-numbers" cookies:cookies status:&status];
+                id root = lines ? [NSJSONSerialization JSONObjectWithData:lines options:0 error:NULL] : nil;
+                id results = [root isKindOfClass:NSDictionary.class] && [root[@"content"] isKindOfClass:NSDictionary.class]
+                    ? root[@"content"][@"results"] : nil;
+                if ([results isKindOfClass:NSArray.class] && [results count] && [[results firstObject] isKindOfClass:NSString.class]) {
+                    line = [results firstObject];
+                    [defaults setObject:line forKey:@"starlinkServiceLine"];
+                }
+            }
+            if (line.length) {
+                NSString *path = [NSString stringWithFormat:@"/api/telemetryagg/v1/data-usage/account/%@/service-line/%@/annotated",
+                    [account stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet],
+                    [line stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet]];
+                usage = StarlinkUsageParse([self get:path cookies:cookies status:&status], NSDate.date);
+            }
+            if (!usage) problem = status == 401 || status == 403 ? @"sign in at starlink.com in Chrome"
+                                : status ? [NSString stringWithFormat:@"starlink.com HTTP %ld", (long)status]
+                                : @"starlink.com unreachable";
+        }
+        os_log(OS_LOG_DEFAULT, "starlink account: %{public}s", (usage ? [NSString stringWithFormat:@"%@ GB", usage[@"usedGB"]] : problem).UTF8String);
+        done(usage, problem);
+    });
+}
+@end
+
 @interface MeteredMonitor : NSObject <NSURLSessionTaskDelegate>
 @property (copy) void (^updated)(NSDictionary *state);
 - (void)tick;
@@ -127,8 +287,11 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
     NSMutableDictionary<NSString *, NSDictionary *> *_states;
     NSString *_directory, *_detectedInterface;
     NSDate *_lastProbe, *_lastWrite;
-    BOOL _onStarlink, _probing, _sleeping, _stopped;
+    BOOL _onStarlink, _probing, _sleeping, _stopped, _fetchingAccount;
     NSUInteger _generation;
+    StarlinkAccount *_starlinkAccount;
+    NSDictionary *_account; // usedGB, cycleStart/End, fetchedAt, macBytes (Mac cycle total then), problem
+    NSDate *_lastAccountFetch;
 }
 - (instancetype)init {
     if ((self = [super init])) {
@@ -141,7 +304,11 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
         config.URLCache = nil;
         config.connectionProxyDictionary = @{}; // the dish request stays on the LAN
         _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+        _starlinkAccount = [StarlinkAccount new];
         dispatch_async(_queue, ^{
+            NSData *accountData = [NSData dataWithContentsOfFile:[self pathForLink:@"starlink-account"]];
+            id account = accountData ? [NSJSONSerialization JSONObjectWithData:accountData options:0 error:NULL] : nil;
+            if ([account isKindOfClass:NSDictionary.class] && [account[@"usedGB"] isKindOfClass:NSNumber.class]) self->_account = account;
             for (NSString *link in @[@"starlink", @"telstra"]) {
                 NSData *data = [NSData dataWithContentsOfFile:[self pathForLink:link]];
                 id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
@@ -151,6 +318,11 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
                     for (NSString *key in @[@"cycleStart", @"downloadBytes", @"uploadBytes"])
                         if ([saved[key] isKindOfClass:NSNumber.class] && isfinite([saved[key] doubleValue]) && [saved[key] doubleValue] >= 0)
                             state[key] = saved[key];
+                    // Totals saved under the old local-midnight Starlink cycle carry into its UTC cycle.
+                    NSDate *now = NSDate.date;
+                    int day = MeteredResetDay(link);
+                    if (MeteredZone(link) && [state[@"cycleStart"] doubleValue] == MeteredCycleStart(now, day).timeIntervalSince1970)
+                        state[@"cycleStart"] = @(MeteredCycleStartInZone(now, day, MeteredZone(link)).timeIntervalSince1970);
                     self->_states[link] = state;
                 }
             }
@@ -173,6 +345,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
         if ([_states[link][@"onLink"] boolValue]) {
             NSMutableDictionary *active = [_states[link] mutableCopy];
             active[@"link"] = link;
+            if ([link isEqual:@"starlink"] && _account) active[@"account"] = _account;
             snapshot = [active copy];
             break;
         }
@@ -210,8 +383,8 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
     NSDate *now = NSDate.date;
     for (NSString *link in @[@"starlink", @"telstra"]) {
         BOOL active = [link isEqual:@"telstra"] ? hotspot : _onStarlink;
-        _states[link] = MeteredAccumulate(_states[link], [sample[@"inBytes"] unsignedLongLongValue],
-            [sample[@"outBytes"] unsignedLongLongValue], name ?: @"", active, now, MeteredResetDay(link));
+        _states[link] = MeteredAccumulateInZone(_states[link], [sample[@"inBytes"] unsignedLongLongValue],
+            [sample[@"outBytes"] unsignedLongLongValue], name ?: @"", active, now, MeteredResetDay(link), MeteredZone(link));
     }
     [self publish];
     [self persist:NO];
@@ -222,6 +395,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
         [self sample];
         if ([[self primaryRouter] isEqual:@"172.20.10.1"]) return;
         NSDate *now = NSDate.date;
+        if (self->_onStarlink) [self refreshAccount:now];
         if (self->_probing || (self->_lastProbe && [now timeIntervalSinceDate:self->_lastProbe] < 60)) return;
         self->_lastProbe = now;
         NSString *name = [self primaryInterface];
@@ -249,6 +423,33 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
             });
         }] resume];
     });
+}
+// The account figure lags real use by minutes, so ten-minute polling loses nothing.
+- (void)refreshAccount:(NSDate *)now {
+    if (_fetchingAccount || (_lastAccountFetch && [now timeIntervalSinceDate:_lastAccountFetch] < 600)) return;
+    _fetchingAccount = YES;
+    _lastAccountFetch = now;
+    [_starlinkAccount fetch:^(NSDictionary *usage, NSString *problem) {
+        dispatch_async(self->_queue, ^{
+            self->_fetchingAccount = NO;
+            if (self->_stopped) return;
+            NSMutableDictionary *account = [(self->_account ?: @{}) mutableCopy];
+            if (usage) {
+                NSDictionary *mac = self->_states[@"starlink"];
+                [account setDictionary:usage];
+                account[@"fetchedAt"] = @(NSDate.date.timeIntervalSince1970);
+                account[@"macCycleStart"] = mac[@"cycleStart"] ?: @0;
+                account[@"macBytes"] = @([mac[@"downloadBytes"] doubleValue] + [mac[@"uploadBytes"] doubleValue]);
+            } else {
+                account[@"problem"] = problem ?: @"starlink.com unavailable";
+                if (!account[@"usedGB"]) { self->_account = account; [self publish]; return; }
+            }
+            self->_account = account;
+            NSData *data = [NSJSONSerialization dataWithJSONObject:account options:0 error:NULL];
+            [data writeToFile:[self pathForLink:@"starlink-account"] options:NSDataWritingAtomic error:NULL];
+            [self publish];
+        });
+    }];
 }
 - (void)sleep {
     dispatch_sync(_queue, ^{
@@ -7031,18 +7232,41 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSDate *now = NSDate.date;
     NSString *link = _metered[@"link"];
     int day = MeteredResetDay(link);
-    NSDate *start = MeteredCycleStart(now, day), *end = MeteredCycleEnd(now, day);
+    NSTimeZone *zone = MeteredZone(link);
+    NSDate *start = MeteredCycleStartInZone(now, day, zone), *end = MeteredCycleEndInZone(now, day, zone);
     BOOL current = fabs([_metered[@"cycleStart"] doubleValue] - start.timeIntervalSince1970) < 1;
     double down = current ? [_metered[@"downloadBytes"] doubleValue] / 1e9 : 0;
     double up = current ? [_metered[@"uploadBytes"] doubleValue] / 1e9 : 0;
-    double cap = MeteredCapGB(link), fraction = MAX(0, MIN(1, 1 - (down + up) / cap));
+    double cap = MeteredCapGB(link), used = down + up;
     double recent = current ? [_metered[@"recentBytesPerSecond"] doubleValue] : 0;
-    NSDictionary *choice = MeteredAllowanceDatum(MAX(0, cap - down - up) * 1e9, recent, now, end);
-    NSMutableString *tip = [NSMutableString stringWithFormat:@"Mac %.1f GB of %g GB\n↓ %.1f GB  ↑ %.1f GB\nnow %.1f MB/s · %@ GB/h last hour",
-        down + up, cap, down, up, current ? [_metered[@"bytesPerSecond"] doubleValue] / 1e6 : 0,
+    NSString *rate = [NSString stringWithFormat:@"now %.1f MB/s · %@ GB/h last hour",
+        current ? [_metered[@"bytesPerSecond"] doubleValue] / 1e6 : 0,
         recent > 0 ? [NSString stringWithFormat:@"%.1f", recent * 3600 / 1e9] : @"—"];
+    // The account counts every device; the Mac's bytes since the last read keep it live.
+    NSDictionary *account = [_metered[@"account"] isKindOfClass:NSDictionary.class] ? _metered[@"account"] : nil;
+    double accountEnd = [account[@"cycleEnd"] doubleValue];
+    BOOL accountCurrent = [account[@"usedGB"] isKindOfClass:NSNumber.class] &&
+        [account[@"cycleStart"] doubleValue] <= now.timeIntervalSince1970 && now.timeIntervalSince1970 < accountEnd;
+    NSString *headline;
+    if (accountCurrent) {
+        double since = [account[@"macCycleStart"] doubleValue] == [_metered[@"cycleStart"] doubleValue] && current
+            ? MAX(0, used * 1e9 - [account[@"macBytes"] doubleValue]) / 1e9 : 0;
+        int age = (int)MAX(0, lround((now.timeIntervalSince1970 - [account[@"fetchedAt"] doubleValue]) / 60));
+        end = [NSDate dateWithTimeIntervalSince1970:accountEnd];
+        headline = [NSString stringWithFormat:@"%@ %.1f GB of %g GB · read %@ ago%@\nMac ↓ %.1f GB  ↑ %.1f GB",
+            MeteredName(link), [account[@"usedGB"] doubleValue] + since, cap,
+            age < 60 ? [NSString stringWithFormat:@"%d min", age] : [NSString stringWithFormat:@"%d h", age / 60],
+            since >= 0.05 ? [NSString stringWithFormat:@" + Mac %.1f", since] : @"", down, up];
+        used = [account[@"usedGB"] doubleValue] + since;
+    } else {
+        headline = [NSString stringWithFormat:@"Mac %.1f GB of %g GB\n↓ %.1f GB  ↑ %.1f GB", used, cap, down, up];
+    }
+    double fraction = MAX(0, MIN(1, 1 - used / cap));
+    NSDictionary *choice = MeteredAllowanceDatum(MAX(0, cap - used) * 1e9, recent, now, end);
+    NSMutableString *tip = [NSMutableString stringWithFormat:@"%@\n%@", headline, rate];
+    if ([account[@"problem"] isKindOfClass:NSString.class]) [tip appendFormat:@"\naccount: %@", account[@"problem"]];
     if ([choice[@"urgency"] intValue] > 0) [tip appendFormat:@"\n%@", choice[@"reset"]];
-    return @{@"fraction": @(fraction), @"urgency": choice[@"urgency"],
+    return @{@"fraction": @(fraction), @"urgency": choice[@"urgency"], @"account": @(accountCurrent),
              @"value": [NSString stringWithFormat:@"%.0f%%", fraction * 100],
              @"datum": choice[@"datum"], @"tip": tip};
 }
@@ -7067,7 +7291,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     gauge.fraction = fraction;
     gauge.markerFraction = -1;
     gauge.color = color;
-    gauge.metricLabel = [MeteredName(link) stringByAppendingString:@" Mac data remaining"];
+    gauge.metricLabel = [MeteredName(link) stringByAppendingString:[figures[@"account"] boolValue] ? @" data remaining" : @" Mac data remaining"];
     gauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.%@.gauge", link];
     [row addSubview:gauge];
     [self instrumentValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"popover.%@.value", link] in:row];
@@ -8534,7 +8758,7 @@ static NSColor *HealthColor(double fraction) {
                    color:NSColor.labelColor frame:NSMakeRect(c.nameX, (c.rowH-16)/2, c.nameW, 16)
                    align:NSTextAlignmentLeft identifier:[NSString stringWithFormat:@"details.overview.%@.name", link] in:row];
         Gauge *gauge = [self detailGauge:DetailGaugeRect(c) fraction:fraction color:color
-            label:[MeteredName(link) stringByAppendingString:@" Mac data remaining"] identifier:[NSString stringWithFormat:@"details.overview.%@.gauge", link] tip:tip in:row];
+            label:[MeteredName(link) stringByAppendingString:[figures[@"account"] boolValue] ? @" data remaining" : @" Mac data remaining"] identifier:[NSString stringWithFormat:@"details.overview.%@.gauge", link] tip:tip in:row];
         gauge.markerFraction = -1;
         [self detailValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"details.overview.%@.value", link] tip:tip in:row cols:c];
         [self detailDatum:figures[@"datum"] color:[self meteredDatumColor:figures] identifier:[NSString stringWithFormat:@"details.overview.%@.datum", link] tip:tip in:row cols:c];

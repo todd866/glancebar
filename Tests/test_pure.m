@@ -1,6 +1,8 @@
 // Unit tests for Glancebar's pure functions (Sources/pure.m). Run via ./tests.sh.
 #import <Foundation/Foundation.h>
 #import "pure.h"
+#import <CommonCrypto/CommonCryptor.h>
+#import <CommonCrypto/CommonDigest.h>
 
 static int failures = 0;
 static void check(BOOL cond, NSString *msg) {
@@ -45,6 +47,66 @@ int main(void) {
         dc.month = 2; dc.day = 28; dc.hour = 0;
         NSDate *atBoundary = [utc dateFromComponents:dc];
         check([MeteredCycleStart(atBoundary, 31) isEqual:atBoundary], @"Starlink short-month boundary is inclusive");
+        {
+            // Starlink bills in UTC: in Perth (UTC+8) the 13th's cycle starts at 08:00 local.
+            NSTimeZone *perth = [NSTimeZone timeZoneWithName:@"Australia/Perth"];
+            NSTimeZone *gmt = [NSTimeZone timeZoneForSecondsFromGMT:0];
+            NSCalendar *pc = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+            pc.timeZone = perth;
+            NSDateComponents *pd = [NSDateComponents new];
+            pd.year = 2026; pd.month = 10; pd.day = 13; pd.hour = 7;
+            NSDate *early = [pc dateFromComponents:pd];
+            [NSTimeZone setDefaultTimeZone:perth];
+            NSDateComponents *got = [utc components:NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour
+                                           fromDate:MeteredCycleStartInZone(early, 13, gmt)];
+            check(got.month == 9 && got.day == 13 && got.hour == 0, @"07:00 Perth on the 13th is still September's UTC cycle");
+            pd.hour = 9;
+            got = [utc components:NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour
+                         fromDate:MeteredCycleStartInZone([pc dateFromComponents:pd], 13, gmt)];
+            check(got.month == 10 && got.day == 13 && got.hour == 0, @"09:00 Perth on the 13th is October's UTC cycle");
+            check([MeteredCycleStartInZone(early, 13, nil) isEqual:MeteredCycleStart(early, 13)],
+                  @"nil zone keeps the local-calendar cycle");
+            [NSTimeZone setDefaultTimeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+        }
+        {
+            // Chrome cookie round trip: v10 + AES-128-CBC(SHA-256(host) + value).
+            NSData *key = ChromeCookieKey(@"peanuts");
+            NSString *host = @"starlink.com", *value = @"CfDJ8-token";
+            NSMutableData *plain = [NSMutableData dataWithLength:CC_SHA256_DIGEST_LENGTH];
+            NSData *hostData = [host dataUsingEncoding:NSUTF8StringEncoding];
+            CC_SHA256(hostData.bytes, (CC_LONG)hostData.length, plain.mutableBytes);
+            [plain appendData:[value dataUsingEncoding:NSUTF8StringEncoding]];
+            uint8_t iv[kCCBlockSizeAES128]; memset(iv, ' ', sizeof(iv));
+            NSMutableData *sealed = [NSMutableData dataWithLength:plain.length + kCCBlockSizeAES128];
+            size_t moved = 0;
+            CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding, key.bytes, key.length, iv,
+                    plain.bytes, plain.length, sealed.mutableBytes, sealed.length, &moved);
+            sealed.length = moved;
+            NSMutableData *cookie = [[@"v10" dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+            [cookie appendData:sealed];
+            check(key.length == 16, @"Chrome cookie key is AES-128");
+            check([ChromeCookieDecrypt(cookie, key, host) isEqualToString:value], @"Chrome cookie decrypts and drops the host digest");
+            check(ChromeCookieDecrypt(cookie, ChromeCookieKey(@"wrong"), host) == nil ||
+                  ![ChromeCookieDecrypt(cookie, ChromeCookieKey(@"wrong"), host) isEqualToString:value], @"wrong key never yields the value");
+            check(ChromeCookieDecrypt([@"v11xxxxxxxxxxxxxxxxxxx" dataUsingEncoding:NSUTF8StringEncoding], key, host) == nil,
+                  @"unknown cookie seal is rejected");
+        }
+        {
+            NSString *body = @"{\"content\":{\"billingCyclesAnnotated\":["
+                "{\"startDate\":\"2026-09-13T00:00:00+00:00\",\"endDate\":\"2026-10-13T00:00:00+00:00\",\"totalAmountGB\":0},"
+                "{\"startDate\":\"2026-10-13T00:00:00+00:00\",\"endDate\":\"2026-11-13T00:00:00+00:00\",\"totalAmountGB\":70.43}]}}";
+            NSData *json = [body dataUsingEncoding:NSUTF8StringEncoding];
+            NSDate *at = [NSDate dateWithTimeIntervalSince1970:1791950400]; // 2026-10-14 04:00 UTC
+            NSDictionary *usage = StarlinkUsageParse(json, at);
+            check(fabs([usage[@"usedGB"] doubleValue] - 70.43) < 1e-9 &&
+                  [usage[@"cycleStart"] doubleValue] == 1791849600 && [usage[@"cycleEnd"] doubleValue] == 1794528000,
+                  @"Starlink usage picks the cycle containing now");
+            check([StarlinkUsageParse(json, [NSDate dateWithTimeIntervalSince1970:1791849599])[@"usedGB"] doubleValue] == 0,
+                  @"Starlink usage end date is exclusive");
+            check(StarlinkUsageParse(json, [NSDate dateWithTimeIntervalSince1970:1794528000]) == nil, @"no cycle, no figure");
+            check(StarlinkUsageParse([@"{\"content\":null}" dataUsingEncoding:NSUTF8StringEncoding], at) == nil &&
+                  StarlinkUsageParse([@"<html>" dataUsingEncoding:NSUTF8StringEncoding], at) == nil, @"junk usage is nil");
+        }
         NSDictionary *shortCycle = MeteredAccumulate(nil, 100, 200, @"en0", YES,
             [atBoundary dateByAddingTimeInterval:-20], 31);
         shortCycle = MeteredAccumulate(shortCycle, 150, 280, @"en0", YES,

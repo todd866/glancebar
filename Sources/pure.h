@@ -596,7 +596,23 @@ NSDate *MeteredCycleEnd(NSDate *now, int resetDay);
 NSDictionary *MeteredAccumulate(NSDictionary *previous, uint64_t inBytes,
                                  uint64_t outBytes, NSString *interfaceName,
                                  BOOL onLink, NSDate *now, int resetDay);
+// The InZone forms put the reset at midnight in `zone` (nil = the local time zone);
+// Starlink bills in UTC, so its cycle turns over at 08:00 in Perth.
+NSDate *MeteredCycleStartInZone(NSDate *now, int resetDay, NSTimeZone *zone);
+NSDate *MeteredCycleEndInZone(NSDate *now, int resetDay, NSTimeZone *zone);
+NSDictionary *MeteredAccumulateInZone(NSDictionary *previous, uint64_t inBytes,
+                                       uint64_t outBytes, NSString *interfaceName,
+                                       BOOL onLink, NSDate *now, int resetDay, NSTimeZone *zone);
 double MeteredRecentBytesPerSecond(NSDictionary *state, NSDate *now);
+
+// Chrome on macOS seals cookie values as "v10" + AES-128-CBC (IV of 16 spaces) under
+// PBKDF2-SHA1(Keychain "Chrome Safe Storage", "saltysalt", 1003). Since cookie-DB
+// version 24 the plaintext starts with SHA-256(host_key), which is checked and dropped.
+NSData *ChromeCookieKey(NSString *safeStoragePassword);
+NSString *ChromeCookieDecrypt(NSData *encryptedValue, NSData *key, NSString *hostKey);
+// starlink.com's telemetryagg data-usage/.../annotated JSON → the billing cycle containing
+// `now`: @{ @"usedGB", @"cycleStart", @"cycleEnd" (epoch seconds) }, or nil.
+NSDictionary *StarlinkUsageParse(NSData *json, NSDate *now);
 // Returns @{ @"datum": text, @"urgency": @(0 reset, 1 amber, 2 red),
 //            @"reset": reset date text }. A datum is a reset date when there is no mature
 // rate or the allowance would last beyond the cycle end.

@@ -738,7 +738,7 @@ int main(int argc, const char **argv) {
         }
         // Starlink adds exactly one aligned instrument, only while detected.
         if (FindIdentifier(root, @"popover.row.starlink")) return Fail(__LINE__);
-        NSDictionary *starlink = @{@"cycleStart": @(MeteredCycleStart(NSDate.date, MeteredResetDay(@"starlink")).timeIntervalSince1970),
+        NSDictionary *starlink = @{@"cycleStart": @(MeteredCycleStartInZone(NSDate.date, MeteredResetDay(@"starlink"), MeteredZone(@"starlink")).timeIntervalSince1970),
             @"downloadBytes": @10100000000ULL, @"uploadBytes": @2300000000ULL,
             @"bytesPerSecond": @1400000, @"onLink": @YES, @"link": @"starlink"};
         [c setValue:starlink forKey:@"metered"];
@@ -784,6 +784,43 @@ int main(int argc, const char **argv) {
             if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink-lasts.png"], look) ||
                 !RenderOffscreen(fastDetails, [stem stringByAppendingString:@"-starlink-lasts-overview.png"], look)) return Fail(__LINE__);
         }
+        // The account total (every device) leads; Mac bytes since the read keep it live.
+        NSMutableDictionary *withAccount = [starlink mutableCopy];
+        double nowEpoch = NSDate.date.timeIntervalSince1970;
+        withAccount[@"account"] = @{@"usedGB": @70.4, @"cycleStart": @(nowEpoch - 86400), @"cycleEnd": @(nowEpoch + 86400 * 20),
+            @"fetchedAt": @(nowEpoch - 240), @"macCycleStart": starlink[@"cycleStart"], @"macBytes": @12100000000ULL};
+        [c setValue:withAccount forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSView *accountRow = FindIdentifier(root, @"popover.row.starlink");
+        Gauge *accountGauge = (Gauge *)FindIdentifier(root, @"popover.starlink.gauge");
+        NSView *accountDetails = [c overviewDetailsView].documentView;
+        if (fabs(accountGauge.fraction - 0.293) > 0.001 || !HasText(accountRow, @"29%") ||
+            !HasTip(accountRow, @"Starlink 70.7 GB of 100 GB · read 4 min ago + Mac 0.3") ||
+            !HasTip(accountRow, @"Mac ↓ 10.1 GB  ↑ 2.3 GB") || HasTip(accountRow, @"account:") ||
+            [accountRow.toolTip componentsSeparatedByString:@"\n"].count != 3 ||
+            ![accountGauge.metricLabel isEqual:@"Starlink data remaining"] ||
+            !HasTip(accountDetails, @"Starlink 70.7 GB") || !FitsChildren(root) || !InstrumentRowsFit(root) ||
+            WordyTip(accountRow) || !FitsChildren(accountDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink-account.png"], look)) return Fail(__LINE__);
+        }
+        // A failed read keeps the last figure and says why; no figure at all falls back to the Mac.
+        NSMutableDictionary *stale = [withAccount mutableCopy];
+        NSMutableDictionary *staleAccount = [withAccount[@"account"] mutableCopy];
+        staleAccount[@"problem"] = @"sign in at starlink.com in Chrome";
+        stale[@"account"] = staleAccount;
+        [c setValue:stale forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (!HasText(FindIdentifier(root, @"popover.row.starlink"), @"29%") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"account: sign in at starlink.com in Chrome")) return Fail(__LINE__);
+        stale[@"account"] = @{@"problem": @"Keychain access refused"};
+        [c setValue:stale forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (!HasText(FindIdentifier(root, @"popover.row.starlink"), @"88%") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"Mac 12.4 GB of 100 GB") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"account: Keychain access refused")) return Fail(__LINE__);
         NSMutableDictionary *telstra = [starlink mutableCopy];
         telstra[@"link"] = @"telstra";
         telstra[@"cycleStart"] = @(MeteredCycleStart(NSDate.date, MeteredResetDay(@"telstra")).timeIntervalSince1970);

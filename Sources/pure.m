@@ -1,9 +1,12 @@
 #import "pure.h"
 #import <limits.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonKeyDerivation.h>
 
-static NSCalendar *MeteredCalendar(void) {
+static NSCalendar *MeteredCalendar(NSTimeZone *zone) {
     NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
-    cal.timeZone = NSTimeZone.defaultTimeZone;
+    cal.timeZone = zone ?: NSTimeZone.defaultTimeZone;
     cal.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
     return cal;
 }
@@ -18,9 +21,12 @@ static NSDate *MeteredMonthStart(NSCalendar *cal, NSInteger year, NSInteger mont
     return [cal dateFromComponents:c];
 }
 
-NSDate *MeteredCycleStart(NSDate *now, int resetDay) {
+NSDate *MeteredCycleStart(NSDate *now, int resetDay) { return MeteredCycleStartInZone(now, resetDay, nil); }
+NSDate *MeteredCycleEnd(NSDate *now, int resetDay) { return MeteredCycleEndInZone(now, resetDay, nil); }
+
+NSDate *MeteredCycleStartInZone(NSDate *now, int resetDay, NSTimeZone *zone) {
     if (!now) now = NSDate.date;
-    NSCalendar *cal = MeteredCalendar();
+    NSCalendar *cal = MeteredCalendar(zone);
     NSDateComponents *parts = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth |
                                           NSCalendarUnitDay fromDate:now];
     NSDate *candidate = MeteredMonthStart(cal, parts.year, parts.month, resetDay);
@@ -32,9 +38,9 @@ NSDate *MeteredCycleStart(NSDate *now, int resetDay) {
     return candidate;
 }
 
-NSDate *MeteredCycleEnd(NSDate *now, int resetDay) {
-    NSDate *start = MeteredCycleStart(now, resetDay);
-    NSCalendar *cal = MeteredCalendar();
+NSDate *MeteredCycleEndInZone(NSDate *now, int resetDay, NSTimeZone *zone) {
+    NSDate *start = MeteredCycleStartInZone(now, resetDay, zone);
+    NSCalendar *cal = MeteredCalendar(zone);
     NSDateComponents *p = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth fromDate:start];
     NSInteger year = p.year, month = p.month + 1;
     if (month > 12) { month = 1; year++; }
@@ -70,8 +76,14 @@ double MeteredRecentBytesPerSecond(NSDictionary *state, NSDate *now) {
 NSDictionary *MeteredAccumulate(NSDictionary *previous, uint64_t inBytes,
                                  uint64_t outBytes, NSString *interfaceName,
                                  BOOL onLink, NSDate *now, int resetDay) {
+    return MeteredAccumulateInZone(previous, inBytes, outBytes, interfaceName, onLink, now, resetDay, nil);
+}
+
+NSDictionary *MeteredAccumulateInZone(NSDictionary *previous, uint64_t inBytes,
+                                       uint64_t outBytes, NSString *interfaceName,
+                                       BOOL onLink, NSDate *now, int resetDay, NSTimeZone *zone) {
     if (!now) now = NSDate.date;
-    NSDate *cycle = MeteredCycleStart(now, resetDay);
+    NSDate *cycle = MeteredCycleStartInZone(now, resetDay, zone);
     uint64_t cycleEpoch = (uint64_t)llround(cycle.timeIntervalSince1970);
     double sampledEpoch = now.timeIntervalSince1970;
     NSString *iface = interfaceName ?: @"";
@@ -124,6 +136,58 @@ NSDictionary *MeteredAccumulate(NSDictionary *previous, uint64_t inBytes,
         @"recentBytesPerSecond": @(MeteredRecentBytesPerSecond(@{ @"onLink": @(onLink), @"samples": samples }, now)),
         @"samples": samples
     };
+}
+
+NSData *ChromeCookieKey(NSString *password) {
+    NSData *secret = [password dataUsingEncoding:NSUTF8StringEncoding];
+    if (!secret.length) return nil;
+    uint8_t key[kCCKeySizeAES128];
+    if (CCKeyDerivationPBKDF(kCCPBKDF2, secret.bytes, secret.length, (const uint8_t *)"saltysalt", 9,
+                             kCCPRFHmacAlgSHA1, 1003, key, sizeof(key)) != kCCSuccess) return nil;
+    return [NSData dataWithBytes:key length:sizeof(key)];
+}
+
+NSString *ChromeCookieDecrypt(NSData *encrypted, NSData *key, NSString *hostKey) {
+    if (encrypted.length < 3 + kCCBlockSizeAES128 || key.length != kCCKeySizeAES128 ||
+        memcmp(encrypted.bytes, "v10", 3) != 0) return nil;
+    NSMutableData *plain = [NSMutableData dataWithLength:encrypted.length];
+    uint8_t iv[kCCBlockSizeAES128];
+    memset(iv, ' ', sizeof(iv));
+    size_t moved = 0;
+    if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding, key.bytes, key.length, iv,
+                (const uint8_t *)encrypted.bytes + 3, encrypted.length - 3,
+                plain.mutableBytes, plain.length, &moved) != kCCSuccess) return nil;
+    plain.length = moved;
+    NSData *host = [hostKey dataUsingEncoding:NSUTF8StringEncoding];
+    if (host && plain.length >= CC_SHA256_DIGEST_LENGTH) {
+        uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(host.bytes, (CC_LONG)host.length, digest);
+        if (memcmp(plain.bytes, digest, sizeof(digest)) == 0)
+            [plain replaceBytesInRange:NSMakeRange(0, sizeof(digest)) withBytes:NULL length:0];
+    }
+    return [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding];
+}
+
+NSDictionary *StarlinkUsageParse(NSData *json, NSDate *now) {
+    if (!json.length) return nil;
+    if (!now) now = NSDate.date;
+    id root = [NSJSONSerialization JSONObjectWithData:json options:0 error:NULL];
+    id content = [root isKindOfClass:NSDictionary.class] ? root[@"content"] : nil;
+    id cycles = [content isKindOfClass:NSDictionary.class] ? content[@"billingCyclesAnnotated"] : nil;
+    if (![cycles isKindOfClass:NSArray.class]) return nil;
+    NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+    for (id cycle in cycles) {
+        if (![cycle isKindOfClass:NSDictionary.class]) continue;
+        NSDate *start = [cycle[@"startDate"] isKindOfClass:NSString.class] ? [iso dateFromString:cycle[@"startDate"]] : nil;
+        NSDate *end = [cycle[@"endDate"] isKindOfClass:NSString.class] ? [iso dateFromString:cycle[@"endDate"]] : nil;
+        id total = cycle[@"totalAmountGB"];
+        if (!start || !end || ![total isKindOfClass:NSNumber.class] || !isfinite([total doubleValue]) ||
+            [total doubleValue] < 0) continue;
+        if ([start compare:now] != NSOrderedDescending && [now compare:end] == NSOrderedAscending)
+            return @{ @"usedGB": total, @"cycleStart": @(start.timeIntervalSince1970),
+                      @"cycleEnd": @(end.timeIntervalSince1970) };
+    }
+    return nil;
 }
 
 NSDictionary *MeteredAllowanceDatum(uint64_t remainingBytes, double rate,
