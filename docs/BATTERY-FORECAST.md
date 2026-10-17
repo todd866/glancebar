@@ -10,7 +10,7 @@ duration space clear. No extra row or control is added.
 Bar labels show compact remaining time: `45m` below an hour (nearest five minutes),
 `1.5h` at/above an hour (nearest tenth), and whole hours from 10h. Whole-hour decimals
 are omitted (`1h`, `2h`); a rounded 60m promotes to `1h`. Under five minutes reads
-`<5m`, never `0m`. Labels are independent of date/timezone. Hover retains approximate
+`<5m`, never `0m`. Labels are independent of date/timezone. Battery Details retains approximate
 local `HHmm` arrival clocks, rounded to five minutes, with `+1d` across midnight.
 Reached targets omit their labels; unavailable forecasts show an em dash. Estimates are conditional on the present load
 and charging state, not promises. The 0% estimate means the system's usable battery

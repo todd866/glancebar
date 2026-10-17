@@ -25,6 +25,8 @@
 #import "pure.h"
 #import "nowplaying.h"
 #import "activity.h"
+#import "storage_scan.h"
+#import "storage_cleanup.h"
 
 // This preference governs Glancebar's optional requests only, never system networking.
 static BOOL GBLowDataEnabled(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"lowData"]; }
@@ -3809,11 +3811,13 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @interface GBDetailsTabs : NSTabViewController
 @property (copy) dispatch_block_t activitySelected;
 @property (copy) dispatch_block_t otherSelected;
+@property (copy) dispatch_block_t storageSelected;
 @end
 @implementation GBDetailsTabs
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)item {
     [super tabView:tabView didSelectTabViewItem:item];
     if ([item.identifier isEqual:@"activity"]) { if (self.activitySelected) self.activitySelected(); }
+    else if ([item.identifier isEqual:@"storage"]) { if (self.storageSelected) self.storageSelected(); }
     else if (self.otherSelected) self.otherSelected();
 }
 @end
@@ -4023,6 +4027,11 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.action = new.action;
         old.enabled = new.enabled;
         old.state = new.state;
+        if ([old isKindOfClass:NSPopUpButton.class] && [new isKindOfClass:NSPopUpButton.class]) {
+            NSPopUpButton *a=(NSPopUpButton *)old, *b=(NSPopUpButton *)new;
+            if (![a.itemTitles isEqual:b.itemTitles] || ![[a.itemArray valueForKey:@"representedObject"] isEqual:[b.itemArray valueForKey:@"representedObject"]]) a.menu=b.menu;
+            [a selectItemAtIndex:b.indexOfSelectedItem];
+        }
         old.contentTintColor = new.contentTintColor;
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
@@ -4598,6 +4607,12 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     BOOL _activityLoading, _activityPresenting;
     NSUInteger _activityGeneration;
     NSInteger _activitySort;
+    NSString *_storagePath, *_storageNotice;
+    NSDictionary *_storageResult;
+    GBStorageScan *_storageScan;
+    NSProgress *_storageCleanupProgress;
+    NSAlert *_storageReviewAlert;
+    NSUInteger _storageGeneration;
     NSMutableArray<NSNumber *> *_ampHistory;
     NSUInteger _sampleGen;
     CFAbsoluteTime _lastSampleTime;
@@ -4669,6 +4684,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // 8s task watchdog. Stay synchronous — the process is quitting — but don't give them
     // the main thread for longer than the shared budget.
     _terminating = YES;
+    [self cancelStorage];
     [_meteredMonitor stop];
     dispatch_semaphore_t pmsetDone = dispatch_semaphore_create(0);
     // Not behind the pmset queue: an apply waiting on a password dialog would eat the budget.
@@ -5613,7 +5629,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
 }
 
-- (void)meteredWillSleep:(NSNotification *)note { (void)note; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
+- (void)meteredWillSleep:(NSNotification *)note { (void)note; [self cancelStorage]; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
 - (void)meteredDidWake:(NSNotification *)note { (void)note; [_meteredMonitor wake]; }
 
 - (void)refresh {
@@ -8452,8 +8468,9 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [controller addTabViewItem:[self detailTabWithIdentifier:spec[0] title:spec[1]
                                                             view:[self detailViewForIdentifier:spec[0]]]];
     __weak Controller *owner = self;
-    controller.activitySelected = ^{ [owner stopPowerTick]; [owner requestActivitySurveyIfNeeded]; };
-    controller.otherSelected = ^{ [owner startPowerTick]; };
+    controller.activitySelected = ^{ [owner cancelStorage]; [owner stopPowerTick]; [owner requestActivitySurveyIfNeeded]; };
+    controller.storageSelected = ^{ [owner stopPowerTick]; [owner requestStorageScanIfNeeded]; };
+    controller.otherSelected = ^{ [owner cancelStorage]; [owner startPowerTick]; };
     return controller;
 }
 
@@ -9162,6 +9179,8 @@ static NSColor *HealthColor(double fraction) {
     [NSWorkspace.sharedWorkspace selectFile:nil inFileViewerRootedAtPath:path];
 }
 
+#include "storage_ui.inc"
+
 - (NSScrollView *)storageDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 420)];
     root.accessibilityIdentifier = @"details.storage";
@@ -9238,6 +9257,7 @@ static NSColor *HealthColor(double fraction) {
         y += c.rowH;
         index++;
     }
+    y = [self addStorageBrowserTo:root y:y];
     return [self detailScrollForRoot:root height:y];
 }
 
@@ -9700,7 +9720,12 @@ static NSColor *HealthColor(double fraction) {
     if ([self activityTabSelected]) {
         [self stopPowerTick];
         [self requestActivitySurveyIfNeeded];
-    } else if (!_activityPresenting) { [self refreshAIUsageAsync]; [self beginSampling]; }
+    } else if ([self storageTabSelected]) { [self stopPowerTick]; [self requestStorageScanIfNeeded]; }
+    else if (!_activityPresenting) { [self refreshAIUsageAsync]; [self beginSampling]; }
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == _detailsWindow) [self cancelStorage];
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
