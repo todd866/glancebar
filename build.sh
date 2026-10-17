@@ -5,7 +5,7 @@ cd "${0:A:h}"
 
 CC="${CC:-$(xcrun --find clang)}"
 SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
-BUILD_DIR="build"
+BUILD_DIR="${GLANCEBAR_BUILD_DIR:-build}"
 OUTPUT_APP="$BUILD_DIR/Glancebar.app"
 mkdir -p "$BUILD_DIR"
 STAGING_DIR="$(mktemp -d "$BUILD_DIR/.glancebar-build.XXXXXX")"
@@ -127,6 +127,13 @@ elif [[ "${GLANCEBAR_TIMESTAMP:-0}" != "0" ]]; then
     echo "build.sh: ERROR — GLANCEBAR_TIMESTAMP must be 0 or 1." >&2
     exit 1
 fi
+
+# Finder can decorate a newly staged .app while it lives in Documents. Those
+# non-code attributes invalidate codesign; strip only them, never quarantine or
+# other security metadata, and only from our disposable build staging directory.
+for ATTRIBUTE in com.apple.FinderInfo com.apple.ResourceFork; do
+    xattr -dr "$ATTRIBUTE" "$APP" 2>/dev/null || true
+done
 
 echo "Architectures: $ARCH_DESCRIPTION"
 echo "Signing identity: $IDENTITY"

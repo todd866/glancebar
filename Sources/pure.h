@@ -16,6 +16,8 @@ typedef struct {
     long voltage_mV;
     long cycleCount;
     long minutesToEmpty;   // macOS-smoothed; <=0 = invalid
+    long minutesToFull;    // system estimate, including taper; <=0 = invalid
+    double telemetryTimestamp; // IORegistry UpdateTime (Unix seconds); 0 if unavailable
     // Apple's PowerTelemetryData, in milliwatts (LONG_MIN when absent): what the adapter
     // delivers, what the machine consumes, and what goes into (+) or out of (−) the battery.
     long systemPowerIn_mW;
@@ -52,6 +54,25 @@ NSString *FormatWattHours(double wh);
 
 // Minutes until 20%, or -1 if not estimable (charging / settling / already ≤20%).
 int MinutesTo20(BatteryState b, double avgAmp_mA);
+// Public IOPS dictionary times are minutes; -1 means calculating. Direction must agree.
+void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source);
+
+typedef struct {
+    int thresholdPercent, endpointPercent;
+    BOOL thresholdReached, endpointReached;
+    double thresholdTime, endpointTime; // Unix arrival times; 0 = unavailable
+} BatteryForecast;
+
+// Samples at most every 10 seconds. Current-based forecasts require a steady minute;
+// full charge ALWAYS requires a system estimate. A gap, stale telemetry or direction
+// change clears history; small deadline changes are smoothed, large changes replace it.
+@interface BatteryForecastTracker : NSObject
+- (BatteryForecast)update:(BatteryState)b limit80:(BOOL)limit80 at:(double)now;
+@end
+// Clock labels are approximate, rounded to five minutes in the user's local timezone.
+NSString *BatteryForecastClock(double arrival, NSTimeZone *zone);
+NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone);
+
 // Minutes gained before 20% by quitting an app drawing appWatts of drawWatts;
 // -1 when unknown or under 30 minutes (the Burn row only shows a gain worth acting on).
 int BurnGainMinutes(int minutesTo20, double drawWatts, double appWatts);

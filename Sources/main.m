@@ -7,6 +7,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <notify.h>
 #import <Network/Network.h>
 #import <SystemConfiguration/SystemConfiguration.h>
@@ -661,8 +662,25 @@ static BatteryState ReadBattery(void) {
         NSDictionary *adapter = [d[@"AdapterDetails"] isKindOfClass:NSDictionary.class] ? d[@"AdapterDetails"] : nil;
         long adapterWatts = NumFor(adapter, @"Watts");
         b.adapterWatts = (b.acConnected && adapterWatts > 0 && adapterWatts < 1000) ? adapterWatts : 0;
-        long tr = NumFor(d, @"TimeRemaining");
-        b.minutesToEmpty = (tr == LONG_MIN || tr >= 65535) ? -1 : tr;
+        // Never reinterpret the direction-dependent TimeRemaining as time to empty.
+        long empty = NumFor(d, @"AvgTimeToEmpty"), full = NumFor(d, @"AvgTimeToFull");
+        b.minutesToEmpty = !b.acConnected && !b.isCharging && empty > 0 && empty <= 1440 ? empty : -1;
+        b.minutesToFull = b.acConnected && b.isCharging && full > 0 && full <= 1440 ? full : -1;
+        long updated = NumFor(d, @"UpdateTime");
+        b.telemetryTimestamp = updated > 0 ? updated : 0;
+        // Prefer the public, powerd-smoothed estimates. IOPSKeys.h defines both in
+        // minutes, with -1 meaning calculating, and specifies their valid direction.
+        CFTypeRef info = IOPSCopyPowerSourcesInfo();
+        if (info) {
+            NSArray *sources = CFBridgingRelease(IOPSCopyPowerSourcesList(info));
+            for (id source in sources) {
+                NSDictionary *ps = (__bridge NSDictionary *)IOPSGetPowerSourceDescription(info, (__bridge CFTypeRef)source);
+                if (![ps[@kIOPSTypeKey] isEqual:@kIOPSInternalBatteryType]) continue;
+                BatteryApplySystemTimes(&b, ps);
+                break;
+            }
+            CFRelease(info);
+        }
     }
     IOObjectRelease(svc);
     ApplyLivePower(&b);
@@ -3565,6 +3583,48 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
+// Arrival labels occupy the existing battery row. The two clocks need more room
+// than the 20%-to-endpoint gap at 102pt, so short leaders preserve exact anchors.
+@interface BatteryForecastView : NSView
+@property (nonatomic) BatteryForecast forecast;
+@property (nonatomic, copy) NSString *thresholdClock, *endpointClock;
+- (NSRect)clockRect:(BOOL)threshold;
+@end
+@implementation BatteryForecastView
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+- (NSRect)clockRect:(BOOL)threshold {
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium];
+    CGFloat width = ceil([@"0000" sizeWithAttributes:@{NSFontAttributeName:font}].width);
+    CGFloat w = NSWidth(self.bounds), x;
+    if (_forecast.endpointPercent == 0)
+        x = threshold ? MAX(w * 0.20 + 2, width + 3) : 0;
+    else x = threshold ? MIN(w * 0.80 - width - 2, w - 2 * width - 3) : w - width;
+    return NSMakeRect(x, 18, width, 12);
+}
+- (void)drawRect:(NSRect)dirty {
+    (void)dirty;
+    NSDictionary *attrs = @{NSFontAttributeName:[NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium],
+                            NSForegroundColorAttributeName:NSColor.labelColor};
+    for (int i=0; i<2; i++) {
+        BOOL threshold = i == 0;
+        NSString *clock = threshold ? _thresholdClock : _endpointClock;
+        CGFloat anchor = NSWidth(self.bounds) * (threshold ? _forecast.thresholdPercent : _forecast.endpointPercent) / 100.0;
+        anchor = MAX(0.5, MIN(NSWidth(self.bounds)-0.5, anchor));
+        NSRect rect = [self clockRect:threshold];
+        // A thin contrasting tick remains visible through both the fill and trend arrow.
+        NSBezierPath *tick = [NSBezierPath bezierPath];
+        [tick moveToPoint:NSMakePoint(anchor, 9)]; [tick lineToPoint:NSMakePoint(anchor, 17)];
+        if (clock.length) {
+            CGFloat join = _forecast.endpointPercent == 0 ? NSMinX(rect) : NSMaxX(rect);
+            [tick lineToPoint:NSMakePoint(join, 18)];
+        }
+        [[NSColor.windowBackgroundColor colorWithAlphaComponent:0.9] setStroke]; tick.lineWidth = 3; [tick stroke];
+        [NSColor.labelColor setStroke]; tick.lineWidth = 1; [tick stroke];
+        [clock drawInRect:rect withAttributes:attrs];
+    }
+}
+@end
+
 // The airspeed-tape trend vector on the battery bar: a line from the charge level to
 // where it will be in an hour at this rate, with a head. Green in, orange out.
 @interface TrendArrow : NSView
@@ -3948,6 +4008,10 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.metricLabel = new.metricLabel;
         old.accessibilityIdentifier = new.accessibilityIdentifier;
         [old setAccessibilityElement:new.isAccessibilityElement];
+    } else if ([existing isKindOfClass:BatteryForecastView.class]) {
+        BatteryForecastView *old = (BatteryForecastView *)existing, *new = (BatteryForecastView *)fresh;
+        old.forecast = new.forecast; old.thresholdClock = new.thresholdClock; old.endpointClock = new.endpointClock;
+        old.needsDisplay = YES;
     } else if ([existing isKindOfClass:TrendArrow.class]) {
         TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
         old.from = new.from; old.to = new.to;
@@ -4452,6 +4516,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSWindow *_detailsWindow;
     NSArray<Volume *> *_vols;
     BatteryState _bat;
+    BatteryForecastTracker *_batteryForecastTracker;
     SystemState _sys;
     CPUCounters _cpuPrev;
     CFAbsoluteTime _cpuBaselineTime;
@@ -4586,6 +4651,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                            @"useCursorAccount": @NO, @"switchToNewOutputs": @YES}];
     _bat = ReadBattery();
+    [self batteryForecast];
     [self noteEnergyBaseline:NO];
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
@@ -5508,6 +5574,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self refreshVolumesAsync];
     BOOL wasOnAC = _bat.valid && _bat.acConnected;
     _bat = ReadBattery();
+    [self batteryForecast];
     [self noteEnergyBaseline:wasOnAC];
     // refresh fires from three uncoordinated sources (15s timer, IOPS notification
     // bursts, popover open); only advance the CPU tick baseline when the window is
@@ -6209,13 +6276,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     BOOL popover = _popover.isShown, details = _detailsWindow.isVisible;
     if (!popover && !details) { [self stopPowerTick]; return; }
     BatteryState fresh = ReadBattery();
-    if (!fresh.valid) return;
+    if (!fresh.valid) { _bat = fresh; [self batteryForecast]; [self refreshVisibleSurfaces]; return; }
     BOOL stateChanged = fresh.acConnected != _bat.acConnected || fresh.isCharging != _bat.isCharging ||
                         fresh.percent != _bat.percent;
     BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
                         fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
     BOOL wasOnAC = _bat.acConnected;
     _bat = fresh;
+    [self batteryForecast];
     _powerTicks++;
     [self noteEnergyBaseline:wasOnAC];
     if (!_bat.acConnected && _powerTicks % 2 == 0) [self sampleBurnAsync];
@@ -6225,7 +6293,16 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [self updateBar];
         return;
     }
-    if (!powerChanged) return;
+    if (popover) {
+        NSView *root = _popover.contentViewController.view;
+        BatteryForecastView *forecast = (BatteryForecastView *)ViewWithAccessibilityIdentifier(root, @"popover.battery.forecast");
+        if ([forecast isKindOfClass:BatteryForecastView.class]) [self configureBatteryForecast:forecast];
+        NSString *tip = [self batteryPopoverTip];
+        for (NSString *key in @[@"popover.row.battery", @"popover.battery.gauge", @"popover.battery.value", @"popover.battery.trend", @"popover.battery.datum"]) {
+            NSView *view = ViewWithAccessibilityIdentifier(root, key); view.toolTip = tip;
+        }
+    }
+    if (!powerChanged) { if (details && _powerTicks % 2 == 0) [self rebuildDetails]; return; }
     [self updateBar];   // the bar glyph's shade follows the watts
     if (popover) {
         NSView *root = _popover.contentViewController.view;
@@ -6588,11 +6665,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery";
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    NSString *eta = [self chargeETAText];
-    if (!eta.length && !_bat.acConnected && _bat.percent > 20) {
-        int minutes = MinutesTo20(_bat, [self avgAmp]);
-        if (minutes >= 0) eta = [NSString stringWithFormat:@"%@ to 20%%", FmtDuration(minutes)];
-    }
+    NSString *eta = BatteryForecastDetail([self batteryForecast], NSDate.date.timeIntervalSince1970, nil);
     if (eta.length) [parts addObject:eta];
     if (_bat.acConnected && _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW >= 0) {
         NSString *in = _bat.adapterWatts > 0
@@ -6604,7 +6677,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [parts addObject:[NSString stringWithFormat:@"Mac %.0f W", _bat.systemLoad_mW / 1000.0]];
     if (_bat.designCap_mAh > 0)
         [parts addObject:[NSString stringWithFormat:@"health %d%%", (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh)]];
-    return parts.count ? [parts componentsJoinedByString:@" · "] : @"Battery";
+    if (!parts.count) return @"Battery";
+    if (eta.length && parts.count > 1) return [NSString stringWithFormat:@"%@\n%@", parts.firstObject,
+        [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@" · "]];
+    return [parts componentsJoinedByString:@" · "];
 }
 
 - (void)ensureChargeModeLoaded {
@@ -6753,12 +6829,34 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (int)chargeTargetPercent {
     return [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 80 : 100;
 }
-// "0:24 to 80%" / "0:24 to full". Nil when the pack is not taking a charge we can time.
+- (BatteryForecast)batteryForecast {
+    if (!_batteryForecastTracker) _batteryForecastTracker = [BatteryForecastTracker new];
+    return [_batteryForecastTracker update:_bat limit80:[self chargeTargetPercent] == 80 at:NSDate.date.timeIntervalSince1970];
+}
+- (int)chargeForecastMinutes {
+    if (!_bat.acConnected) return -1;
+    BatteryForecast forecast = [self batteryForecast];
+    double arrival = [self chargeTargetPercent] == 80 ? forecast.thresholdTime : forecast.endpointTime;
+    return arrival > 0 ? MAX(1, (int)lround((arrival - NSDate.date.timeIntervalSince1970) / 300.0) * 5) : -1;
+}
 - (NSString *)chargeETAText {
-    int target = [self chargeTargetPercent];
-    int minutes = ChargeMinutesToTarget(_bat, target);
-    if (minutes < 0) return nil;
-    return [NSString stringWithFormat:@"%@ to %@", FmtDuration(minutes), target == 80 ? @"80%" : @"full"];
+    int minutes = [self chargeForecastMinutes];
+    return minutes < 0 ? nil : [NSString stringWithFormat:@"~%@ to %@", FmtDuration(minutes),
+        [self chargeTargetPercent] == 80 ? @"80%" : @"full"];
+}
+- (void)configureBatteryForecast:(BatteryForecastView *)view {
+    BatteryForecast f = [self batteryForecast];
+    view.forecast = f;
+    view.thresholdClock = f.thresholdReached ? @"" : BatteryForecastClock(f.thresholdTime, nil);
+    view.endpointClock = f.endpointReached ? @"" : BatteryForecastClock(f.endpointTime, nil);
+    NSString *status = _bat.acConnected && (!_bat.isCharging || [self chargeTargetPercent] == 80)
+        ? (_bat.fullyCharged ? @"Full" : [self chargeTargetPercent] == 80 ? @"80% charge limit" : @"Charging paused") : @"Estimate unavailable";
+    view.toolTip = [NSString stringWithFormat:@"%@\n%@", BatteryForecastDetail(f, NSDate.date.timeIntervalSince1970, nil),
+        f.thresholdTime > 0 || f.endpointTime > 0 ? @"Approximate local time · nearest 5 min" : status];
+    view.accessibilityLabel = [NSString stringWithFormat:@"%d%% %@ · %d%% %@. %@", f.thresholdPercent,
+        view.thresholdClock, f.endpointPercent, view.endpointClock, view.toolTip];
+    [view setAccessibilityElement:YES]; view.accessibilityRole = NSAccessibilityImageRole;
+    view.needsDisplay = YES;
 }
 - (NSImage *)liveBatteryGlyph {
     NSString *name = BatterySymbolName(_bat.percent, NO);
@@ -6792,7 +6890,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // In line with the bar, unless the head would run off its end (draining from very low):
     // then it lifts just above.
     BOOL roomInLine = NSWidth(gauge.frame) * to >= 6;
-    CGFloat y = roomInLine ? NSMidY(gauge.frame) - 5 : NSMaxY(gauge.frame) + 1;
+    CGFloat y = roomInLine ? NSMidY(gauge.frame) - 5 : NSMinY(gauge.frame) - 9;
     arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, 10);
 }
 - (NSString *)batteryRateText {
@@ -6807,11 +6905,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 }
 - (void)addBatteryTrendTo:(NSView *)row gauge:(NSView *)gauge datum:(NSRect)datum
                      stem:(NSString *)stem tip:(NSString *)tip {
+    NSRect frame = gauge.frame; frame.origin.y = 9; gauge.frame = frame;
+    // The forecast layer owns both target markers so the same treatment reaches every surface.
+    if ([gauge isKindOfClass:Gauge.class]) ((Gauge *)gauge).markerFraction = -1;
     TrendArrow *arrow = [[TrendArrow alloc] initWithFrame:NSZeroRect];
     [self configureTrend:arrow over:gauge];
     arrow.accessibilityIdentifier = [stem stringByAppendingString:@".trend"];
     arrow.toolTip = tip;
     [row addSubview:arrow];
+    BatteryForecastView *forecast = [[BatteryForecastView alloc] initWithFrame:NSMakeRect(NSMinX(frame), 0, NSWidth(frame), 30)];
+    forecast.accessibilityIdentifier = [stem stringByAppendingString:@".forecast"];
+    [self configureBatteryForecast:forecast];
+    [row addSubview:forecast];
     NSTextField *rate = [self text:[self batteryRateText]
                               font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                              color:[self batteryRateColor] at:datum align:NSTextAlignmentLeft];
@@ -9070,7 +9175,7 @@ static NSColor *HealthColor(double fraction) {
             }
             if (!isnan(bw)) {
                 int target = [self chargeTargetPercent];
-                int minutes = ChargeMinutesToTarget(_bat, target);
+                int minutes = [self chargeForecastMinutes];
                 if (minutes >= 0) {
                     NSString *etaName = target == 80 ? @"To 80%" : @"To full";
                     NSString *etaTip = [self chargeETAText] ?: etaName;

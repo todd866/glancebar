@@ -8,6 +8,18 @@
 #undef main
 #pragma clang diagnostic pop
 
+static void PrimeBatteryForecast(Controller *controller, BatteryState battery, BOOL limit80) {
+    BatteryForecastTracker *tracker = [BatteryForecastTracker new];
+    double now = NSDate.date.timeIntervalSince1970;
+    for (int sec=60; sec>=0; sec-=15) [tracker update:battery limit80:limit80 at:now-sec];
+    [controller setValue:tracker forKey:@"batteryForecastTracker"];
+}
+static BOOL ForecastFits(BatteryForecastView *view) {
+    if (![view isKindOfClass:BatteryForecastView.class]) return NO;
+    NSRect a = [view clockRect:YES], b = [view clockRect:NO];
+    return NSContainsRect(view.bounds,a) && NSContainsRect(view.bounds,b) && !NSIntersectsRect(a,b) &&
+        view.forecast.thresholdPercent == (view.forecast.endpointPercent == 0 ? 20 : 80);
+}
 static NSUInteger CountGauges(NSView *view) {
     NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) ? 1 : 0;
     for (NSView *child in view.subviews) count += CountGauges(child);
@@ -78,7 +90,10 @@ static BOOL RenderOffscreen(NSView *view, NSString *path, NSAppearanceName appea
     view.appearance = chrome;
     view.frame = host.bounds;
     [host addSubview:view];
-    NSBitmapImageRep *rep = [host bitmapImageRepForCachingDisplayInRect:host.bounds];
+    NSBitmapImageRep *rep = getenv("GLANCEBAR_RENDER_1X") ? [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)NSWidth(host.bounds) pixelsHigh:(NSInteger)NSHeight(host.bounds)
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0]
+        : [host bitmapImageRepForCachingDisplayInRect:host.bounds];
     if (!rep) return NO;
     [host cacheDisplayInRect:host.bounds toBitmapImageRep:rep];
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
@@ -315,6 +330,7 @@ int main(int argc, const char **argv) {
             .rawCurrent_mAh=2745, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
             .cycleCount=120, .systemPowerIn_mW=18800, .systemLoad_mW=6800, .adapterWatts=20};
         [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
         [c setValue:@YES forKey:@"showWatts"]; [c setValue:@YES forKey:@"showHealth"];
         NSMutableArray *usage = [NSMutableArray array];
         for (NSString *name in @[@"Claude", @"Codex", @"Cursor"]) {
@@ -414,7 +430,7 @@ int main(int argc, const char **argv) {
         // Charging bakes a non-template image. Same colour, no badge, must still differ.
         if (batterySymbol.image.template || !RenderedImagesDiffer(batterySymbol.image, plainTinted))
             return Fail(__LINE__);
-        int etaMin = ChargeMinutesToTarget(b, 80);
+        int etaMin = [c chargeForecastMinutes];
         NSString *etaPhrase = [NSString stringWithFormat:@"%@ to 80%%", FmtDuration(etaMin)];
         NSView *batteryRow = FindIdentifier(root, @"popover.row.battery");
         if (etaMin < 0 || ![batteryRow.toolTip containsString:etaPhrase]) return Fail(__LINE__);
@@ -424,7 +440,7 @@ int main(int argc, const char **argv) {
         NSView *symbolHit = [batterySymbol.superview hitTest:symbolMid];
         if (symbolHit != batterySymbol) return Fail(__LINE__);
         Gauge *batteryMeter = (Gauge *)batteryGauge;
-        if (![batteryMeter isKindOfClass:Gauge.class] || fabs(batteryMeter.markerFraction - 0.80) > 0.001)
+        if (![batteryMeter isKindOfClass:Gauge.class] || !ForecastFits((BatteryForecastView *)FindIdentifier(root, @"popover.battery.forecast")))
             return Fail(__LINE__);
         if (fabs(storageSymbol.frame.origin.x - kPad) > 0.5 ||
             fabs(storageSymbol.frame.size.width - kLeadW) > 0.5 ||
@@ -606,7 +622,8 @@ int main(int argc, const char **argv) {
         Gauge *lowWindow = (Gauge *)FindIdentifier(ai.documentView, @"details.ai.window.codex.0.gauge");
         Gauge *overviewCharge = (Gauge *)FindIdentifier(overview.documentView, @"details.overview.battery.gauge");
         if (![fullWindow isKindOfClass:Gauge.class] || ![lowWindow isKindOfClass:Gauge.class] ||
-            fabs(overviewCharge.markerFraction - 0.80) > 0.001) return Fail(__LINE__);
+            !ForecastFits((BatteryForecastView *)FindIdentifier(overview.documentView, @"details.overview.battery.forecast")) ||
+            overviewCharge.markerFraction != -1) return Fail(__LINE__);
         __block BOOL fullGreen = NO, lowRed = NO;
         [[NSAppearance appearanceNamed:NSAppearanceNameAqua] performAsCurrentDrawingAppearance:^{
             fullGreen = Green([fullWindow.color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace]);
@@ -867,10 +884,19 @@ int main(int argc, const char **argv) {
             for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
                 BatteryState sb = b;
                 sb.acConnected = states[i].ac; sb.isCharging = states[i].charging; sb.percent = states[i].pct;
+                sb.minutesToEmpty = states[i].ac ? -1 : 120;
+                sb.minutesToFull = states[i].charging ? 95 : -1;
                 sb.amperage_mA = states[i].amps; sb.systemPowerIn_mW = states[i].in; sb.systemLoad_mW = states[i].load;
                 [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
+                PrimeBatteryForecast(c, sb, YES);
                 [c rebuildContent];
                 NSView *pop = p.contentViewController.view;
+                BatteryForecastView *fv = (BatteryForecastView *)FindIdentifier(pop, @"popover.battery.forecast");
+                if (!ForecastFits(fv) || fv.forecast.thresholdPercent != (sb.acConnected ? 80 : 20) ||
+                    fv.forecast.endpointPercent != (sb.acConnected ? 100 : 0)) return Fail(__LINE__);
+                if (!sb.acConnected && fv.endpointClock.length != 4) return Fail(__LINE__);
+                if (sb.percent <= 20 && !sb.acConnected && fv.thresholdClock.length) return Fail(__LINE__);
+                if (sb.acConnected && fv.forecast.endpointTime != 0) return Fail(__LINE__); // 80% limit
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
                 TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
                 BOOL moving = fabs(BatteryWatts(sb)) >= 0.3;
@@ -886,12 +912,57 @@ int main(int argc, const char **argv) {
                     return Fail(__LINE__);
             }
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
             [c rebuildContent];
             for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"ai"]) {
                 NSView *doc = ((NSScrollView *)[c detailViewForIdentifier:tab]).documentView;
                 if (!FitsChildren(doc)) { fprintf(stderr, "details tab %s\n", tab.UTF8String); return Fail(__LINE__); }
             }
         }
+        {
+            struct { BOOL ac, charging, full; int pct; long amps, empty, fullMinutes; const char *name; } cases[] = {
+                {NO,NO,NO,63,-1100,120,-1,"discharge"},
+                {YES,YES,NO,42,2400,-1,95,"charge"},
+                {YES,YES,NO,95,200,-1,70,"taper"},
+                {YES,NO,NO,80,0,-1,70,"paused"},
+                {YES,NO,YES,100,0,-1,70,"full"},
+                {NO,NO,NO,63,-1100,-1,-1,"startup"},
+            };
+            [c setValue:@"full" forKey:@"chargeMode"];
+            [c setValue:NSDate.date forKey:@"chargeModeAt"];
+            for (size_t i=0;i<sizeof cases / sizeof cases[0];i++) {
+                BatteryState sb=b; sb.acConnected=cases[i].ac; sb.isCharging=cases[i].charging;
+                sb.fullyCharged=cases[i].full; sb.percent=cases[i].pct; sb.amperage_mA=cases[i].amps;
+                sb.minutesToEmpty=cases[i].empty; sb.minutesToFull=cases[i].fullMinutes;
+                [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
+                if (i==5) [c setValue:[BatteryForecastTracker new] forKey:@"batteryForecastTracker"];
+                else PrimeBatteryForecast(c,sb,NO);
+                [c rebuildContent];
+                NSView *pop=p.contentViewController.view;
+                BatteryForecastView *fv=(BatteryForecastView *)FindIdentifier(pop,@"popover.battery.forecast");
+                if (!ForecastFits(fv) || !FitsChildren(pop)) return Fail(__LINE__);
+                if (i==1 && (fv.thresholdClock.length!=4 || fv.endpointClock.length!=4)) return Fail(__LINE__);
+                if (i==2 && (fv.thresholdClock.length || fv.endpointClock.length!=4)) return Fail(__LINE__);
+                if (i==3 && (fv.forecast.endpointTime || fv.forecast.thresholdTime)) return Fail(__LINE__);
+                if (i==4 && (fv.thresholdClock.length || fv.endpointClock.length)) return Fail(__LINE__);
+                if (i==5 && (![fv.thresholdClock isEqual:@"—"] || ![fv.endpointClock isEqual:@"—"])) return Fail(__LINE__);
+                NSArray *surfaces=@[pop, [c overviewDetailsView].documentView, [c batteryDetailsView].documentView];
+                NSArray *names=@[@"popover", @"overview", @"details"];
+                NSArray *idents=@[@"popover.battery.forecast", @"details.overview.battery.forecast", @"details.battery.charge.forecast"];
+                for (NSUInteger j=0;j<surfaces.count;j++) {
+                    if (!ForecastFits((BatteryForecastView *)FindIdentifier(surfaces[j],idents[j])) || !FitsChildren(surfaces[j])) return Fail(__LINE__);
+                    if (argc>1) {
+                        NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
+                            stringByAppendingFormat:@"-forecast-%s-%@.png",cases[i].name,names[j]];
+                        if (!RenderOffscreen(surfaces[j],path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+                    }
+                }
+            }
+            [c setValue:@"limit80" forKey:@"chargeMode"];
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            PrimeBatteryForecast(c,b,YES);
+        }
+
         // On battery: Burn appears only for actionable quit gains; the Battery
         // tab lists each app's watts and Wh since unplug, the screen + system rest, and the total.
         {
@@ -969,6 +1040,7 @@ int main(int argc, const char **argv) {
             [c setValue:nil forKey:@"energyBaselineAt"];
             [c setValue:savedAmpHistory forKey:@"ampHistory"];
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
             [c rebuildContent];
             if (FindIdentifier(p.contentViewController.view, @"popover.row.burn")) return Fail(__LINE__);   // plugged in: gone
         }
@@ -1061,6 +1133,19 @@ int main(int argc, const char **argv) {
         claude.overageActive = YES;
         [c rebuildContent];
         if (HasText(p.contentViewController.view, @"Fable") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        if (getenv("GLANCEBAR_RENDER_LIVE_BATTERY") && argc > 1) {
+            BatteryState live=ReadBattery();
+            [c setValue:[NSValue valueWithBytes:&live objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[BatteryForecastTracker new] forKey:@"batteryForecastTracker"];
+            [c rebuildContent];
+            NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-live-battery.png"];
+            if (!RenderOffscreen(p.contentViewController.view,path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            BatteryForecast forecast=[c batteryForecast];
+            fprintf(stderr,"Live battery: %d%% AC=%d charging=%d empty=%ld full=%ld telemetryAge=%.0fs; 20/80=%s 0/100=%s\n",
+                live.percent,live.acConnected,live.isCharging,live.minutesToEmpty,live.minutesToFull,
+                NSDate.date.timeIntervalSince1970-live.telemetryTimestamp,
+                BatteryForecastClock(forecast.thresholdTime,nil).UTF8String,BatteryForecastClock(forecast.endpointTime,nil).UTF8String);
+        }
         return 0;
     }
 }

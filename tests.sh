@@ -41,6 +41,10 @@ fi
 
 "$WORK_DIR/glancebar_tests"
 
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Tests/test_battery_forecast.m \
+    -framework Foundation -o "$WORK_DIR/glancebar_battery_tests"
+"$WORK_DIR/glancebar_battery_tests"
+
 # Stateful filesystem/incremental-reader coverage. The harness imports the private app
 # shell so it exercises the production AIReader without publishing a test-only API.
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/nowplaying.m Tests/test_ai_reader.m \

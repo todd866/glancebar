@@ -2249,6 +2249,7 @@ double PowerFlowIntensity(BatteryState b) {
 int ChargeMinutesToTarget(BatteryState b, int targetPercent) {
     if (PowerFlowFor(b) != PowerFlowCharging) return -1;
     if (targetPercent <= b.percent) return -1;
+    if (targetPercent == 100) return b.isCharging && b.minutesToFull > 0 && b.minutesToFull <= 1440 ? (int)b.minutesToFull : -1;
     double watts = BatteryWatts(b);
     if (isnan(watts) || watts < 0.5) return -1;
     double fullWh = BatteryWattHours(b.rawMax_mAh, b.voltage_mV);
@@ -2302,4 +2303,108 @@ NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
         double ha = [a[@"wh"] doubleValue], hb = [b[@"wh"] doubleValue];
         return ha > hb ? NSOrderedAscending : ha < hb ? NSOrderedDescending : [a[@"name"] compare:b[@"name"]];
     }];
+}
+
+#pragma mark - Battery arrival forecasts
+
+static BOOL BatteryMinutesValid(long value) { return value > 0 && value <= 24 * 60; }
+void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
+    // These strings are the public IOPSKeys.h keys (Foundation-only for tests).
+    BOOL charging = [source[@"Is Charging"] boolValue];
+    BOOL onBattery = [source[@"Power Source State"] isEqual:@"Battery Power"];
+    id empty = source[@"Time to Empty"], full = source[@"Time to Full Charge"];
+    b->minutesToEmpty = !b->acConnected && !b->isCharging && onBattery && !charging &&
+        [empty isKindOfClass:NSNumber.class] && BatteryMinutesValid([empty longValue]) ? [empty longValue] : -1;
+    b->minutesToFull = b->acConnected && b->isCharging && charging && !onBattery &&
+        [full isKindOfClass:NSNumber.class] && BatteryMinutesValid([full longValue]) ? [full longValue] : -1;
+}
+
+@implementation BatteryForecastTracker {
+    NSMutableArray<NSDictionary *> *_samples;
+    double _lastUpdate, _lastSample, _thresholdTime, _endpointTime;
+    NSInteger _mode;
+    BOOL _limit80;
+}
+- (BatteryForecast)update:(BatteryState)b limit80:(BOOL)limit80 at:(double)now {
+    BatteryForecast f = {.thresholdPercent=b.acConnected ? 80 : 20, .endpointPercent=b.acConnected ? 100 : 0};
+    f.thresholdReached = b.valid && (b.acConnected ? b.percent >= 80 : b.percent <= 20);
+    f.endpointReached = b.valid && (b.acConnected ? b.fullyCharged || b.percent >= 100 : b.percent <= 0);
+    double watts = BatteryWatts(b);
+    BOOL fresh = b.telemetryTimestamp <= 0 || (now - b.telemetryTimestamp >= -5 && now - b.telemetryTimestamp <= 120);
+    NSInteger mode = !b.valid || !fresh || f.endpointReached ? 0 :
+        b.acConnected ? (b.isCharging && watts >= 0.5 ? 1 : 0) : (!b.isCharging && watts < -0.5 ? -1 : 0);
+    double dt = now - _lastUpdate;
+    if (!_samples || mode != _mode || limit80 != _limit80 || dt < 0 || dt > 90 || mode == 0) {
+        _samples = [NSMutableArray array]; _lastSample = 0;
+        _thresholdTime = 0; _endpointTime = 0;
+    }
+    _mode = mode; _limit80 = limit80; _lastUpdate = now;
+    if (mode == 0) return f;
+
+    // A new load regime must earn its own rate estimate. Repeated UI renders do not
+    // count as independent samples. Units are charge (mAh/mA), avoiding voltage noise.
+    double current = fabs((double)b.amperage_mA);
+    if (!_lastSample || now - _lastSample >= 10) {
+        double prior = [_samples.lastObject[@"amps"] doubleValue];
+        if (prior > 0 && fabs(current - prior) / prior > 0.30) [_samples removeAllObjects];
+        [_samples addObject:@{@"at":@(now), @"amps":@(current)}]; _lastSample = now;
+        while (_samples.count && now - [_samples.firstObject[@"at"] doubleValue] > 90) [_samples removeObjectAtIndex:0];
+    }
+    double mean = 0, variance = 0;
+    for (NSDictionary *s in _samples) mean += [s[@"amps"] doubleValue];
+    mean /= MAX((NSUInteger)1, _samples.count);
+    for (NSDictionary *s in _samples) variance += pow([s[@"amps"] doubleValue] - mean, 2);
+    BOOL steady = _samples.count >= 4 && now - [_samples.firstObject[@"at"] doubleValue] >= 60 &&
+        mean > 1 && sqrt(variance / _samples.count) / mean <= 0.20;
+    double threshold = -1, endpoint = -1;
+    if (mode < 0) {
+        if (BatteryMinutesValid(b.minutesToEmpty)) endpoint = b.minutesToEmpty;
+        else if (steady && b.rawCurrent_mAh > 0 && b.rawMax_mAh > 0 && b.rawCurrent_mAh <= b.rawMax_mAh * 1.05)
+            endpoint = b.rawCurrent_mAh / mean * 60;
+        if (!f.thresholdReached && endpoint > 0) threshold = endpoint * (b.percent - 20.0) / b.percent;
+    } else {
+        if (!limit80 && BatteryMinutesValid(b.minutesToFull)) endpoint = b.minutesToFull;
+        if (!f.thresholdReached && steady && b.rawMax_mAh > 0)
+            threshold = (80.0 - b.percent) / 100.0 * b.rawMax_mAh / mean * 60;
+        // A linear pre-80 estimate must not contradict the system's tapered full estimate.
+        if (endpoint > 0 && threshold > endpoint) threshold = -1;
+    }
+    double (^smooth)(double, double) = ^double(double minutes, double previous) {
+        if (!isfinite(minutes) || minutes <= 0 || minutes > 1440) return 0;
+        double candidate = now + minutes * 60;
+        if (previous <= now || dt <= 0 || fabs(candidate - previous) > MAX(300, minutes * 60 * 0.25)) return candidate;
+        return previous + (candidate - previous) * (1 - exp(-dt / 30.0));
+    };
+    f.thresholdTime = _thresholdTime = smooth(threshold, _thresholdTime);
+    f.endpointTime = _endpointTime = smooth(endpoint, _endpointTime);
+    return f;
+}
+@end
+
+static double BatteryRoundedArrival(double arrival) { return round(arrival / 300.0) * 300.0; }
+NSString *BatteryForecastClock(double arrival, NSTimeZone *zone) {
+    if (!isfinite(arrival) || arrival <= 0) return @"—";
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.timeZone = zone ?: NSTimeZone.localTimeZone; formatter.dateFormat = @"HHmm";
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:BatteryRoundedArrival(arrival)]];
+}
+NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone) {
+    NSMutableArray *parts = [NSMutableArray array];
+    NSCalendar *calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+    calendar.timeZone = zone ?: NSTimeZone.localTimeZone;
+    NSDate *today = [calendar startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:now]];
+    double times[] = {f.thresholdTime, f.endpointTime};
+    int targets[] = {f.thresholdPercent, f.endpointPercent};
+    BOOL reached[] = {f.thresholdReached, f.endpointReached};
+    for (int i=0; i<2; i++) {
+        if (reached[i]) continue;
+        if (!isfinite(times[i]) || times[i] <= now) { [parts addObject:[NSString stringWithFormat:@"%d%% —", targets[i]]]; continue; }
+        NSDate *day = [calendar startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:BatteryRoundedArrival(times[i])]];
+        NSInteger days = [calendar components:NSCalendarUnitDay fromDate:today toDate:day options:0].day;
+        NSString *suffix = days > 0 ? [NSString stringWithFormat:@" +%ldd", (long)days] : @"";
+        int minutes = MAX(1, (int)lround((times[i] - now) / 300.0) * 5);
+        [parts addObject:[NSString stringWithFormat:@"~%@ to %d%%%@", FmtDuration(minutes), targets[i], suffix]];
+    }
+    return [parts componentsJoinedByString:@" · "];
 }
