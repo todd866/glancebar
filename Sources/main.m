@@ -647,9 +647,7 @@ static BatteryState ReadBattery(void) {
         b.isCharging = [d[@"IsCharging"] boolValue];
         b.acConnected = [d[@"ExternalConnected"] boolValue];
         b.fullyCharged = [d[@"FullyCharged"] boolValue];
-        b.rawCurrent_mAh = NumFor(d, @"AppleRawCurrentCapacity");
-        b.rawMax_mAh = NumFor(d, @"AppleRawMaxCapacity");
-        b.designCap_mAh = NumFor(d, @"DesignCapacity");
+        BatteryApplyCapacities(&b, d);
         long amp = NumFor(d, @"Amperage");
         if (amp == LONG_MIN) amp = NumFor(d, @"InstantAmperage");
         if (amp > (1L << 40)) amp -= (1L << 48);
@@ -676,7 +674,12 @@ static BatteryState ReadBattery(void) {
             for (id source in sources) {
                 NSDictionary *ps = (__bridge NSDictionary *)IOPSGetPowerSourceDescription(info, (__bridge CFTypeRef)source);
                 if (![ps[@kIOPSTypeKey] isEqual:@kIOPSInternalBatteryType]) continue;
-                BatteryApplySystemTimes(&b, ps);
+                BatteryState publicTimes = b;
+                BatteryApplySystemTimes(&publicTimes, ps);
+                // powerd may still be calculating while the registry already has a
+                // valid direction-specific estimate. Keep that fallback, not -1.
+                if (publicTimes.minutesToEmpty > 0) b.minutesToEmpty = publicTimes.minutesToEmpty;
+                if (publicTimes.minutesToFull > 0) b.minutesToFull = publicTimes.minutesToFull;
                 break;
             }
             CFRelease(info);
@@ -4519,6 +4522,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSArray<Volume *> *_vols;
     BatteryState _bat;
     BatteryForecastTracker *_batteryForecastTracker;
+    double _batteryDebugStarted, _batteryDebugLast;
     SystemState _sys;
     CPUCounters _cpuPrev;
     CFAbsoluteTime _cpuBaselineTime;
@@ -5578,6 +5582,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _bat = ReadBattery();
     [self batteryForecast];
     [self noteEnergyBaseline:wasOnAC];
+    [self captureBatteryDiagnosticIfRequested];
     // refresh fires from three uncoordinated sources (15s timer, IOPS notification
     // bursts, popover open); only advance the CPU tick baseline when the window is
     // wide enough to be meaningful, and reuse the last good reading otherwise.
@@ -6850,12 +6855,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     BatteryForecast f = [self batteryForecast];
     view.forecast = f;
     double now = NSDate.date.timeIntervalSince1970;
-    view.thresholdText = f.thresholdReached ? @"" : BatteryForecastDuration(f.thresholdTime, now);
-    view.endpointText = f.endpointReached ? @"" : BatteryForecastDuration(f.endpointTime, now);
-    NSString *status = _bat.acConnected && (!_bat.isCharging || [self chargeTargetPercent] == 80)
-        ? (_bat.fullyCharged ? @"Full" : [self chargeTargetPercent] == 80 ? @"80% charge limit" : @"Charging paused") : @"Estimate unavailable";
+    view.thresholdText = f.thresholdReached || f.hideLabels ? @"" : BatteryForecastDuration(f.thresholdTime, now);
+    view.endpointText = f.endpointReached || f.hideLabels ? @"" : BatteryForecastDuration(f.endpointTime, now);
     view.toolTip = [NSString stringWithFormat:@"%@\n%@", BatteryForecastDetail(f, NSDate.date.timeIntervalSince1970, nil),
-        f.thresholdTime > 0 || f.endpointTime > 0 ? @"Approximate arrival · local time" : status];
+        BatteryForecastStatus(f)];
     view.accessibilityLabel = [NSString stringWithFormat:@"%d%% %@ · %d%% %@. %@", f.thresholdPercent,
         view.thresholdText, f.endpointPercent, view.endpointText, view.toolTip];
     [view setAccessibilityElement:YES]; view.accessibilityRole = NSAccessibilityImageRole;
@@ -7409,6 +7412,96 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     return y + kRowH;
 }
 
+// Explicit diagnostic launch only: at most two minutes of the running controller's
+// real battery state and the production row, rendered offscreen without opening UI.
+- (void)captureBatteryDiagnosticIfRequested {
+    const char *directory = getenv("GLANCEBAR_BATTERY_DEBUG_DIR");
+    if (!directory || !*directory) return;
+    NSString *path = [NSString stringWithUTF8String:directory];
+    BOOL isDirectory = NO;
+    if (!path.isAbsolutePath || ![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDirectory] || !isDirectory) return;
+    double now = NSDate.date.timeIntervalSince1970;
+    if (!_batteryDebugStarted) _batteryDebugStarted = now;
+    if (now - _batteryDebugStarted > 120 || (_batteryDebugLast && now - _batteryDebugLast < 14)) return;
+    _batteryDebugLast = now;
+    ClickRow *row = [self batteryInstrumentRow];
+    BatteryForecastView *view = nil;
+    for (NSView *child in row.subviews) if ([child isKindOfClass:BatteryForecastView.class]) view = (BatteryForecastView *)child;
+    if (!view) return;
+    BatteryForecast f = view.forecast;
+    NSDictionary *record = @{@"at":@(now), @"elapsed":@(now - _batteryDebugStarted), @"pid":@(getpid()),
+        @"build":NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"] ?: @"test",
+        @"percent":@(_bat.percent), @"charging":@(_bat.isCharging), @"ac":@(_bat.acConnected),
+        @"current_mAh":@(_bat.rawCurrent_mAh), @"full_mAh":@(_bat.rawMax_mAh), @"current_mA":@(_bat.amperage_mA),
+        @"systemFullMinutes":@(_bat.minutesToFull), @"telemetryAge":@(now - _bat.telemetryTimestamp),
+        @"chargeMode":[self effectiveChargeMode], @"hypotheticalFull":@(f.hypotheticalFull), @"hideLabels":@(f.hideLabels),
+        @"thresholdArrival":@(f.thresholdTime), @"endpointArrival":@(f.endpointTime),
+        @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"tooltip":view.toolTip ?: @""};
+    NSString *stem = [path stringByAppendingPathComponent:[NSString stringWithFormat:@"live-%03d", (int)lround(now - _batteryDebugStarted)]];
+    [[NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
+        writeToFile:[stem stringByAppendingString:@".json"] atomically:YES];
+    for (NSString *name in @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) {
+        PopoverRootView *host = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,kRowH)];
+        host.appearance = [NSAppearance appearanceNamed:name];
+        [host addSubview:row];
+        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+            pixelsWide:(NSInteger)kW pixelsHigh:(NSInteger)kRowH bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES
+            isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        [host cacheDisplayInRect:host.bounds toBitmapImageRep:rep];
+        NSString *suffix = [name isEqual:NSAppearanceNameAqua] ? @"-light.png" : @"-dark.png";
+        [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[stem stringByAppendingString:suffix] atomically:YES];
+    }
+}
+
+- (ClickRow *)batteryInstrumentRow {
+    ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    row.target = self;
+    row.action = @selector(showBatteryDetails:);
+    row.accessibilityRole = NSAccessibilityButtonRole;
+    row.accessibilityIdentifier = @"popover.row.battery";
+    NSString *tip = [self batteryPopoverTip];
+    row.toolTip = tip;
+    row.accessibilityLabel = tip;
+    if (_bat.valid) {
+        NSImage *batteryImage = [self liveBatteryGlyph];
+        NSButton *symbol = [NSButton buttonWithImage:batteryImage target:self action:@selector(toggleChargeLimit:)];
+        symbol.title = @"";
+        symbol.bordered = NO;
+        symbol.imagePosition = NSImageOnly;
+        symbol.imageScaling = NSImageScaleProportionallyDown;
+        symbol.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
+        symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
+        symbol.accessibilityIdentifier = @"popover.battery.symbol";
+        symbol.toolTip = [self chargeLimitTooltip];
+        symbol.accessibilityLabel = symbol.toolTip;
+        [row addSubview:symbol];
+        [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        g.fraction = _bat.percent / 100.0;
+        g.markerFraction = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 0.80 : -1;
+        g.color = BattBarColor(_bat.percent);
+        g.metricLabel = @"Battery charge";
+        g.accessibilityIdentifier = @"popover.battery.gauge";
+        g.toolTip = tip;
+        [row addSubview:g];
+        NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%d%%", _bat.percent]
+                                            color:BattBarColor(_bat.percent)
+                                       identifier:@"popover.battery.value" in:row];
+        value.toolTip = tip;
+        [self addBatteryTrendTo:row gauge:g datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
+                           stem:@"popover.battery" tip:tip];
+    } else {
+        [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
+                   identifier:@"popover.battery.symbol" in:row];
+    [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
+        NSTextField *value = [self instrumentValue:@"—" color:NSColor.tertiaryLabelColor
+                                       identifier:@"popover.battery.value" in:row];
+        value.toolTip = tip;
+        [self instrumentDatum:@"" color:nil identifier:@"popover.battery.datum" in:row];
+    }
+    return row;
+}
+
 - (void)rebuildContent {
     [self refreshChargeShortcutsIfStale];
     NSView *previousView = _popover.contentViewController.view;
@@ -7474,55 +7567,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         y += kRowH;
     }
 
-    {
-        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
-        row.target = self;
-        row.action = @selector(showBatteryDetails:);
-        row.accessibilityRole = NSAccessibilityButtonRole;
-        row.accessibilityIdentifier = @"popover.row.battery";
-        NSString *tip = [self batteryPopoverTip];
-        row.toolTip = tip;
-        row.accessibilityLabel = tip;
-        if (_bat.valid) {
-            NSImage *batteryImage = [self liveBatteryGlyph];
-            NSButton *symbol = [NSButton buttonWithImage:batteryImage target:self action:@selector(toggleChargeLimit:)];
-            symbol.title = @"";
-            symbol.bordered = NO;
-            symbol.imagePosition = NSImageOnly;
-            symbol.imageScaling = NSImageScaleProportionallyDown;
-            symbol.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
-            symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
-            symbol.accessibilityIdentifier = @"popover.battery.symbol";
-            symbol.toolTip = [self chargeLimitTooltip];
-            symbol.accessibilityLabel = symbol.toolTip;
-            [row addSubview:symbol];
-            [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
-            Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
-            g.fraction = _bat.percent / 100.0;
-            g.markerFraction = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 0.80 : -1;
-            g.color = BattBarColor(_bat.percent);
-            g.metricLabel = @"Battery charge";
-            g.accessibilityIdentifier = @"popover.battery.gauge";
-            g.toolTip = tip;
-            [row addSubview:g];
-            NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%d%%", _bat.percent]
-                                                color:BattBarColor(_bat.percent)
-                                           identifier:@"popover.battery.value" in:row];
-            value.toolTip = tip;
-            [self addBatteryTrendTo:row gauge:g datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
-                               stem:@"popover.battery" tip:tip];
-        } else {
-            [self instrumentSymbol:@"battery.0" tint:NSColor.tertiaryLabelColor
-                       identifier:@"popover.battery.symbol" in:row];
-        [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
-            NSTextField *value = [self instrumentValue:@"—" color:NSColor.tertiaryLabelColor
-                                           identifier:@"popover.battery.value" in:row];
-            value.toolTip = tip;
-            [self instrumentDatum:@"" color:nil identifier:@"popover.battery.datum" in:row];
-        }
-        [root addSubview:row];
-        y += kRowH;
-    }
+    ClickRow *batteryRow = [self batteryInstrumentRow];
+    batteryRow.frame = NSMakeRect(0, y, kW, kRowH);
+    [root addSubview:batteryRow];
+    y += kRowH;
 
     y = [self addBurnRowTo:root at:y];
 

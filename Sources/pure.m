@@ -2307,6 +2307,26 @@ NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
 
 #pragma mark - Battery arrival forecasts
 
+static long BatteryCapacityValue(id value, BOOL allowZero) {
+    if (![value isKindOfClass:NSNumber.class]) return LONG_MIN;
+    double n = [value doubleValue];
+    return isfinite(n) && n >= (allowZero ? 0 : 101) && n < 100000 ? (long)n : LONG_MIN;
+}
+void BatteryApplyCapacities(BatteryState *b, NSDictionary *properties) {
+    NSDictionary *data = [properties[@"BatteryData"] isKindOfClass:NSDictionary.class] ? properties[@"BatteryData"] : nil;
+    b->rawMax_mAh = BatteryCapacityValue(properties[@"AppleRawMaxCapacity"], NO);
+    b->rawCurrent_mAh = BatteryCapacityValue(properties[@"AppleRawCurrentCapacity"], YES);
+    // Keep remaining/full from one source; do not mix independently calibrated pairs.
+    if (b->rawMax_mAh == LONG_MIN || b->rawCurrent_mAh == LONG_MIN) {
+        b->rawMax_mAh = BatteryCapacityValue(data[@"FullChargeCapacity"], NO);
+        b->rawCurrent_mAh = BatteryCapacityValue(data[@"RemainingCapacity"], YES);
+    }
+    if (b->rawMax_mAh > 0 && b->rawCurrent_mAh > b->rawMax_mAh * 1.05)
+        b->rawCurrent_mAh = LONG_MIN;
+    b->designCap_mAh = BatteryCapacityValue(properties[@"DesignCapacity"], NO);
+    if (b->designCap_mAh == LONG_MIN) b->designCap_mAh = BatteryCapacityValue(data[@"DesignCapacity"], NO);
+}
+
 static BOOL BatteryMinutesValid(long value) { return value > 0 && value <= 24 * 60; }
 void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     // These strings are the public IOPSKeys.h keys (Foundation-only for tests).
@@ -2329,9 +2349,11 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     BatteryForecast f = {.thresholdPercent=b.acConnected ? 80 : 20, .endpointPercent=b.acConnected ? 100 : 0};
     f.thresholdReached = b.valid && (b.acConnected ? b.percent >= 80 : b.percent <= 20);
     f.endpointReached = b.valid && (b.acConnected ? b.fullyCharged || b.percent >= 100 : b.percent <= 0);
+    f.hideLabels = b.valid && b.acConnected && limit80 && b.percent >= 80;
+    f.hypotheticalFull = b.acConnected && limit80 && !f.hideLabels;
     double watts = BatteryWatts(b);
     BOOL fresh = b.telemetryTimestamp <= 0 || (now - b.telemetryTimestamp >= -5 && now - b.telemetryTimestamp <= 120);
-    NSInteger mode = !b.valid || !fresh || f.endpointReached ? 0 :
+    NSInteger mode = !b.valid || !fresh || f.endpointReached || f.hideLabels ? 0 :
         b.acConnected ? (b.isCharging && watts >= 0.5 ? 1 : 0) : (!b.isCharging && watts < -0.5 ? -1 : 0);
     double dt = now - _lastUpdate;
     if (!_samples || mode != _mode || limit80 != _limit80 || dt < 0 || dt > 90 || mode == 0) {
@@ -2339,6 +2361,10 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
         _thresholdTime = 0; _endpointTime = 0;
     }
     _mode = mode; _limit80 = limit80; _lastUpdate = now;
+    BatteryForecastReason stopped = !b.valid ? BatteryForecastUnknown : !fresh ? BatteryForecastStale :
+        f.hideLabels ? BatteryForecastLimited : BatteryForecastPaused;
+    f.thresholdReason = f.thresholdReached ? BatteryForecastReached : stopped;
+    f.endpointReason = f.endpointReached ? BatteryForecastReached : stopped;
     if (mode == 0) return f;
 
     // A new load regime must earn its own rate estimate. Repeated UI renders do not
@@ -2357,17 +2383,23 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     BOOL steady = _samples.count >= 4 && now - [_samples.firstObject[@"at"] doubleValue] >= 60 &&
         mean > 1 && sqrt(variance / _samples.count) / mean <= 0.20;
     double threshold = -1, endpoint = -1;
+    f.thresholdReason = f.thresholdReached ? BatteryForecastReached :
+        b.rawMax_mAh <= 0 ? BatteryForecastCapacityMissing : BatteryForecastMeasuring;
+    f.endpointReason = mode > 0 ? BatteryForecastSystemMissing :
+        b.rawMax_mAh <= 0 || b.rawCurrent_mAh <= 0 ? BatteryForecastCapacityMissing : BatteryForecastMeasuring;
     if (mode < 0) {
         if (BatteryMinutesValid(b.minutesToEmpty)) endpoint = b.minutesToEmpty;
         else if (steady && b.rawCurrent_mAh > 0 && b.rawMax_mAh > 0 && b.rawCurrent_mAh <= b.rawMax_mAh * 1.05)
             endpoint = b.rawCurrent_mAh / mean * 60;
         if (!f.thresholdReached && endpoint > 0) threshold = endpoint * (b.percent - 20.0) / b.percent;
     } else {
-        if (!limit80 && BatteryMinutesValid(b.minutesToFull)) endpoint = b.minutesToFull;
+        // While below the enabled limit, full is a hypothetical arrival if that
+        // limit is cancelled. Only macOS's taper-aware full estimate can supply it.
+        if (BatteryMinutesValid(b.minutesToFull)) endpoint = b.minutesToFull;
         if (!f.thresholdReached && steady && b.rawMax_mAh > 0)
             threshold = (80.0 - b.percent) / 100.0 * b.rawMax_mAh / mean * 60;
         // A linear pre-80 estimate must not contradict the system's tapered full estimate.
-        if (endpoint > 0 && threshold > endpoint) threshold = -1;
+        if (endpoint > 0 && threshold > endpoint) { threshold = -1; f.thresholdReason = BatteryForecastInconsistent; }
     }
     double (^smooth)(double, double) = ^double(double minutes, double previous) {
         if (!isfinite(minutes) || minutes <= 0 || minutes > 1440) return 0;
@@ -2377,6 +2409,8 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     };
     f.thresholdTime = _thresholdTime = smooth(threshold, _thresholdTime);
     f.endpointTime = _endpointTime = smooth(endpoint, _endpointTime);
+    if (f.thresholdTime > 0) f.thresholdReason = BatteryForecastReady;
+    if (f.endpointTime > 0) f.endpointReason = BatteryForecastReady;
     return f;
 }
 @end
@@ -2404,6 +2438,7 @@ NSString *BatteryForecastClock(double arrival, NSTimeZone *zone) {
     return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:BatteryRoundedArrival(arrival)]];
 }
 NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone) {
+    if (f.hideLabels) return @"80% charge limit reached";
     NSMutableArray *parts = [NSMutableArray array];
     NSCalendar *calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
     calendar.timeZone = zone ?: NSTimeZone.localTimeZone;
@@ -2420,4 +2455,29 @@ NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone)
         [parts addObject:[NSString stringWithFormat:@"%d%% ~%@%@", targets[i], BatteryForecastClock(times[i], zone), suffix]];
     }
     return [parts componentsJoinedByString:@" · "];
+}
+
+NSString *BatteryForecastStatus(BatteryForecast f) {
+    if (f.hideLabels) return @"Forecasts hidden at the enabled 80% limit";
+    NSMutableArray *parts = [NSMutableArray array];
+    BatteryForecastReason reasons[] = {f.thresholdReason, f.endpointReason};
+    int targets[] = {f.thresholdPercent, f.endpointPercent};
+    for (int i=0; i<2; i++) {
+        NSString *reason = nil;
+        switch (reasons[i]) {
+            case BatteryForecastReady: case BatteryForecastReached: break;
+            case BatteryForecastMeasuring: reason = @"measuring a steady rate"; break;
+            case BatteryForecastCapacityMissing: reason = @"battery capacity unavailable"; break;
+            case BatteryForecastStale: reason = @"waiting for fresh battery data"; break;
+            case BatteryForecastPaused: reason = @"charging paused"; break;
+            case BatteryForecastLimited: reason = @"80% charge limit reached"; break;
+            case BatteryForecastSystemMissing: reason = @"macOS full-charge estimate unavailable"; break;
+            case BatteryForecastInconsistent: reason = @"charge estimates settling"; break;
+            default: reason = @"battery estimate unavailable"; break;
+        }
+        if (reason) [parts addObject:[NSString stringWithFormat:@"%d%%: %@", targets[i], reason]];
+    }
+    if (f.hypotheticalFull) [parts addObject:@"100% assumes the 80% limit is cancelled"];
+    if (f.thresholdTime > 0 || f.endpointTime > 0) [parts addObject:@"Approximate arrivals · local time"];
+    return [parts componentsJoinedByString:@"\n"];
 }

@@ -16,6 +16,30 @@ static BatteryForecast Warm(BatteryForecastTracker *t, BatteryState b, BOOL limi
 }
 int main(void) { @autoreleasepool {
     BatteryState b = Battery(NO);
+    // Exact shape exposed by this Mac's live AppleSmartBattery (17 October 2026).
+    NSDictionary *live = @{@"CurrentCapacity":@59, @"MaxCapacity":@100,
+        @"BatteryData":@{@"RemainingCapacity":@2510, @"FullChargeCapacity":@4327,
+                        @"NominalChargeCapacity":@4454, @"DesignCapacity":@4629}};
+    BatteryApplyCapacities(&b, live);
+    check(b.rawCurrent_mAh==2510 && b.rawMax_mAh==4327 && b.designCap_mAh==4629, @"live nested capacity uses mAh, never the 100 percent max");
+    BatteryApplyCapacities(&b, @{@"CurrentCapacity":@59, @"MaxCapacity":@100});
+    check(b.rawMax_mAh==LONG_MIN && b.rawCurrent_mAh==LONG_MIN, @"percentage-only telemetry cannot masquerade as mAh");
+    NSMutableDictionary *legacy=[live mutableCopy];
+    legacy[@"AppleRawCurrentCapacity"]=@2600; legacy[@"AppleRawMaxCapacity"]=@4500; legacy[@"DesignCapacity"]=@4700;
+    BatteryApplyCapacities(&b,legacy);
+    check(b.rawCurrent_mAh==2600 && b.rawMax_mAh==4500 && b.designCap_mAh==4700, @"legacy raw capacity pair is preferred");
+    legacy[@"AppleRawCurrentCapacity"]=@"bad";
+    BatteryApplyCapacities(&b,legacy);
+    check(b.rawCurrent_mAh==2510 && b.rawMax_mAh==4327, @"partial raw pair falls back together");
+    BatteryApplyCapacities(&b,@{@"BatteryData":@"bad"});
+    check(b.rawMax_mAh==LONG_MIN && b.designCap_mAh==LONG_MIN, @"malformed capacity container rejected");
+    BatteryApplyCapacities(&b,@{@"BatteryData":@{@"RemainingCapacity":@0,@"FullChargeCapacity":@4327}});
+    check(b.rawCurrent_mAh==0 && b.rawMax_mAh==4327,@"empty pack has valid zero remaining capacity");
+    for (id bad in @[@0,@100,@(-1),@100000,@"4327",@(NAN),@(INFINITY)]) {
+        BatteryApplyCapacities(&b,@{@"BatteryData":@{@"RemainingCapacity":@2510,@"FullChargeCapacity":bad}});
+        check(b.rawMax_mAh==LONG_MIN,@"invalid full capacity rejected");
+    }
+    b=Battery(NO);
     NSDictionary *ps = @{@"Power Source State":@"Battery Power", @"Is Charging":@NO,
                          @"Time to Empty":@120, @"Time to Full Charge":@99};
     BatteryApplySystemTimes(&b, ps);
@@ -65,12 +89,26 @@ int main(void) { @autoreleasepool {
     check(ChargeMinutesToTarget(b,100)==180, @"legacy full uses system taper");
     b.minutesToFull=-1;
     check(ChargeMinutesToTarget(b,100)==-1, @"legacy full cannot invent linear ETA");
+    b.minutesToFull=180;
     f = [t update:b limit80:YES at:30090];
-    check(f.endpointTime == 0 && f.thresholdTime == 0, @"limit change clears forecasts and suppresses full");
-    f=Warm(t,b,YES,30105); check(f.thresholdTime > 0 && f.endpointTime == 0, @"limited charging shows only 80 ETA");
+    check(f.endpointTime == 40890 && f.thresholdTime == 0 && f.hypotheticalFull, @"limit change clears sampled rate, keeps hypothetical system full");
+    f=Warm(t,b,YES,30105);
+    check(f.thresholdTime > 0 && f.endpointTime > f.thresholdTime && f.hypotheticalFull, @"limited charging below80 shows both arrivals");
+    check([BatteryForecastStatus(f) containsString:@"assumes the 80% limit is cancelled"], @"hypothetical full assumption is explicit");
+    b.minutesToFull=-1;
+    f=[t update:b limit80:YES at:30170];
+    check(f.thresholdTime > 0 && f.endpointTime==0 && f.endpointReason==BatteryForecastSystemMissing, @"missing full estimate is never extrapolated linearly");
     b.isCharging=NO; b.amperage_mA=0; b.percent=80;
     f = [t update:b limit80:YES at:30180];
-    check(f.thresholdReached && !f.endpointReached && f.endpointTime == 0, @"optimized or limited 80 hold has no full forecast");
+    check(f.thresholdReached && !f.endpointReached && f.endpointTime == 0 && f.hideLabels, @"enabled80 hold hides both labels");
+    b.isCharging=YES; b.amperage_mA=1000; b.minutesToFull=60;
+    f=[t update:b limit80:YES at:30181];
+    check(f.hideLabels && f.thresholdTime==0 && f.endpointTime==0, @"at80 hides both even before charging flag catches up");
+    b.percent=81; f=[t update:b limit80:YES at:30182];
+    check(f.hideLabels, @"above enabled limit hides both");
+    f=[t update:b limit80:NO at:30183];
+    check(!f.hideLabels && f.thresholdReached && f.endpointTime>0 && !f.hypotheticalFull, @"cancelled limit resumes ordinary full forecast above80");
+    b.isCharging=NO;
     b.percent=70; b.amperage_mA=-500;
     f = [t update:b limit80:NO at:30200];
     check(f.thresholdTime == 0 && f.endpointTime == 0 && f.endpointPercent==100, @"plugged but draining offers no charge prediction");
@@ -91,6 +129,14 @@ int main(void) { @autoreleasepool {
     b=Battery(YES); b.minutesToFull=20; t=[BatteryForecastTracker new];
     f=Warm(t,b,NO,40000); check(f.thresholdTime==0 && f.endpointTime>0, @"contradictory pre80 prediction withheld");
     b.valid=NO; f=[t update:b limit80:NO at:40075]; check(f.endpointTime==0 && f.thresholdTime==0, @"invalid battery clears all predictions");
+    b=Battery(YES); b.percent=59; b.amperage_mA=4265; b.minutesToFull=58;
+    BatteryApplyCapacities(&b,live);
+    t=[BatteryForecastTracker new]; f=[t update:b limit80:YES at:41000];
+    check(f.thresholdReason==BatteryForecastMeasuring && f.endpointTime>0, @"live startup explains rate warmup while showing system full");
+    f=Warm(t,b,YES,41000);
+    check(f.thresholdTime>41820 && f.thresholdTime<41840 && f.endpointTime>44500, @"real Mac nested fixture produces about13min to80 and58min tofull");
+    b.rawMax_mAh=LONG_MIN; f=Warm([BatteryForecastTracker new],b,YES,42000);
+    check(f.thresholdReason==BatteryForecastCapacityMissing && [BatteryForecastStatus(f) containsString:@"capacity unavailable"], @"unavailable capacity gives an actionable reason");
     NSTimeZone *utc=[NSTimeZone timeZoneForSecondsFromGMT:0];
     double late=1792278900; // 2026-10-17 23:15 UTC
     check([BatteryForecastClock(late,utc) isEqual:@"2315"], @"24-hour HHmm format");

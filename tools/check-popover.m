@@ -899,7 +899,10 @@ int main(int argc, const char **argv) {
                     fv.forecast.endpointPercent != (sb.acConnected ? 100 : 0)) return Fail(__LINE__);
                 if (!sb.acConnected && !([fv.endpointText hasSuffix:@"m"] || [fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
                 if (sb.percent <= 20 && !sb.acConnected && fv.thresholdText.length) return Fail(__LINE__);
-                if (sb.acConnected && fv.forecast.endpointTime != 0) return Fail(__LINE__); // 80% limit
+                if (sb.acConnected && sb.isCharging && sb.percent<80 &&
+                    (fv.forecast.endpointTime<=0 || !fv.forecast.hypotheticalFull ||
+                     ![fv.toolTip containsString:@"assumes the 80% limit is cancelled"])) return Fail(__LINE__);
+                if (sb.acConnected && sb.percent>=80 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
                 TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
                 BOOL moving = fabs(BatteryWatts(sb)) >= 0.3;
@@ -930,16 +933,20 @@ int main(int argc, const char **argv) {
                 {YES,NO,NO,80,0,-1,70,"paused"},
                 {YES,NO,YES,100,0,-1,70,"full"},
                 {NO,NO,NO,63,-1100,-1,-1,"startup"},
+                {YES,YES,NO,65,3200,-1,64,"limit-charge"},
+                {YES,NO,NO,80,0,-1,55,"limit-held"},
             };
             [c setValue:@"full" forKey:@"chargeMode"];
             [c setValue:NSDate.date forKey:@"chargeModeAt"];
             for (size_t i=0;i<sizeof cases / sizeof cases[0];i++) {
+                BOOL limit = i>=6;
+                [c setValue:limit ? @"limit80" : @"full" forKey:@"chargeMode"];
                 BatteryState sb=b; sb.acConnected=cases[i].ac; sb.isCharging=cases[i].charging;
                 sb.fullyCharged=cases[i].full; sb.percent=cases[i].pct; sb.amperage_mA=cases[i].amps;
                 sb.minutesToEmpty=cases[i].empty; sb.minutesToFull=cases[i].fullMinutes;
                 [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
                 if (i==5) [c setValue:[BatteryForecastTracker new] forKey:@"batteryForecastTracker"];
-                else PrimeBatteryForecast(c,sb,NO);
+                else PrimeBatteryForecast(c,sb,limit);
                 [c rebuildContent];
                 NSView *pop=p.contentViewController.view;
                 BatteryForecastView *fv=(BatteryForecastView *)FindIdentifier(pop,@"popover.battery.forecast");
@@ -949,11 +956,15 @@ int main(int argc, const char **argv) {
                 if (i==3 && (fv.forecast.endpointTime || fv.forecast.thresholdTime)) return Fail(__LINE__);
                 if (i==4 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
                 if (i==5 && (![fv.thresholdText isEqual:@"—"] || ![fv.endpointText isEqual:@"—"])) return Fail(__LINE__);
+                if (i==6 && (fv.forecast.thresholdTime<=0 || fv.forecast.endpointTime<=0 || !fv.forecast.hypotheticalFull)) return Fail(__LINE__);
+                if (i==7 && (!fv.forecast.hideLabels || fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
                 NSArray *surfaces=@[pop, [c overviewDetailsView].documentView, [c batteryDetailsView].documentView];
                 NSArray *names=@[@"popover", @"overview", @"details"];
                 NSArray *idents=@[@"popover.battery.forecast", @"details.overview.battery.forecast", @"details.battery.charge.forecast"];
                 for (NSUInteger j=0;j<surfaces.count;j++) {
-                    if (!ForecastFits((BatteryForecastView *)FindIdentifier(surfaces[j],idents[j])) || !FitsChildren(surfaces[j])) return Fail(__LINE__);
+                    BatteryForecastView *other=(BatteryForecastView *)FindIdentifier(surfaces[j],idents[j]);
+                    if (!ForecastFits(other) || !FitsChildren(surfaces[j])) return Fail(__LINE__);
+                    if (i>=6 && (![other.thresholdText isEqual:fv.thresholdText] || ![other.endpointText isEqual:fv.endpointText])) return Fail(__LINE__);
                     if (argc>1) {
                         NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
                             stringByAppendingFormat:@"-forecast-%s-%@.png",cases[i].name,names[j]];

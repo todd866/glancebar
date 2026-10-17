@@ -56,10 +56,22 @@ NSString *FormatWattHours(double wh);
 int MinutesTo20(BatteryState b, double avgAmp_mA);
 // Public IOPS dictionary times are minutes; -1 means calculating. Direction must agree.
 void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source);
+// Apple Silicon can expose mAh only in BatteryData. Top-level Current/MaxCapacity
+// are percentages and must never be mistaken for physical capacity.
+void BatteryApplyCapacities(BatteryState *b, NSDictionary *properties);
+
+typedef NS_ENUM(NSInteger, BatteryForecastReason) {
+    BatteryForecastUnknown, BatteryForecastReady, BatteryForecastMeasuring,
+    BatteryForecastCapacityMissing, BatteryForecastStale, BatteryForecastPaused,
+    BatteryForecastReached, BatteryForecastLimited, BatteryForecastSystemMissing,
+    BatteryForecastInconsistent,
+};
 
 typedef struct {
     int thresholdPercent, endpointPercent;
     BOOL thresholdReached, endpointReached;
+    BOOL hideLabels, hypotheticalFull;
+    BatteryForecastReason thresholdReason, endpointReason;
     double thresholdTime, endpointTime; // Unix arrival times; 0 = unavailable
 } BatteryForecast;
 
@@ -75,6 +87,7 @@ NSString *BatteryForecastDuration(double arrival, double now);
 // Tooltip arrival clocks are approximate, rounded to five minutes in local time.
 NSString *BatteryForecastClock(double arrival, NSTimeZone *zone);
 NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone);
+NSString *BatteryForecastStatus(BatteryForecast f);
 
 // Minutes gained before 20% by quitting an app drawing appWatts of drawWatts;
 // -1 when unknown or under 30 minutes (the Burn row only shows a gain worth acting on).
