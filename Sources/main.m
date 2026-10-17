@@ -7444,6 +7444,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @"current_mAh":@(_bat.rawCurrent_mAh), @"full_mAh":@(_bat.rawMax_mAh), @"current_mA":@(_bat.amperage_mA),
         @"systemFullMinutes":@(_bat.minutesToFull), @"telemetryAge":@(now - _bat.telemetryTimestamp),
         @"chargeMode":[self effectiveChargeMode], @"hypotheticalFull":@(f.hypotheticalFull), @"hideLabels":@(f.hideLabels),
+        @"thresholdFromSystem":@(f.thresholdFromSystem),
         @"thresholdArrival":@(f.thresholdTime), @"endpointArrival":@(f.endpointTime),
         @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"tooltip":view.toolTip ?: @"",
         @"thresholdCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:YES])),

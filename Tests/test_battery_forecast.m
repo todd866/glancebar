@@ -91,7 +91,7 @@ int main(void) { @autoreleasepool {
     check(ChargeMinutesToTarget(b,100)==-1, @"legacy full cannot invent linear ETA");
     b.minutesToFull=180;
     f = [t update:b limit80:YES at:30090];
-    check(f.endpointTime == 40890 && f.thresholdTime == 0 && f.hypotheticalFull, @"limit change clears sampled rate, keeps hypothetical system full");
+    check(f.endpointTime == 40890 && f.thresholdTime > 0 && f.thresholdFromSystem && f.hypotheticalFull, @"limit change uses provisional80 while rate resettles");
     f=Warm(t,b,YES,30105);
     check(f.thresholdTime > 0 && f.endpointTime > f.thresholdTime && f.hypotheticalFull, @"limited charging below80 shows both arrivals");
     check([BatteryForecastStatus(f) containsString:@"assumes the 80% limit is cancelled"], @"hypothetical full assumption is explicit");
@@ -127,16 +127,33 @@ int main(void) { @autoreleasepool {
     f=[t update:b limit80:NO at:30500]; check(f.endpointTime==0, @"stale hardware timestamp invalidates predictions");
     b.telemetryTimestamp=30600; f=[t update:b limit80:NO at:30500]; check(f.endpointTime==0, @"future hardware timestamp invalidates predictions");
     b=Battery(YES); b.minutesToFull=20; t=[BatteryForecastTracker new];
-    f=Warm(t,b,NO,40000); check(f.thresholdTime==0 && f.endpointTime>0, @"contradictory pre80 prediction withheld");
+    f=Warm(t,b,NO,40000); check(f.thresholdTime>0 && f.thresholdTime<f.endpointTime && f.thresholdFromSystem, @"contradictory rate yields to the internally consistent system estimate");
     b.valid=NO; f=[t update:b limit80:NO at:40075]; check(f.endpointTime==0 && f.thresholdTime==0, @"invalid battery clears all predictions");
     b=Battery(YES); b.percent=59; b.amperage_mA=4265; b.minutesToFull=58;
     BatteryApplyCapacities(&b,live);
     t=[BatteryForecastTracker new]; f=[t update:b limit80:YES at:41000];
-    check(f.thresholdReason==BatteryForecastMeasuring && f.endpointTime>0, @"live startup explains rate warmup while showing system full");
+    check(f.thresholdTime>0 && f.thresholdFromSystem && f.endpointTime>0, @"live startup shows provisional80 with system full");
     f=Warm(t,b,YES,41000);
     check(f.thresholdTime>41820 && f.thresholdTime<41840 && f.endpointTime>44500, @"real Mac nested fixture produces about13min to80 and58min tofull");
-    b.rawMax_mAh=LONG_MIN; f=Warm([BatteryForecastTracker new],b,YES,42000);
+    b.rawMax_mAh=LONG_MIN; b.minutesToFull=-1; f=Warm([BatteryForecastTracker new],b,YES,42000);
     check(f.thresholdReason==BatteryForecastCapacityMissing && [BatteryForecastStatus(f) containsString:@"capacity unavailable"], @"unavailable capacity gives an actionable reason");
+    // Actual build7 capture: 77%, 2506mA, full4327mAh, macOS54min, 30sec after restart.
+    b=Battery(YES); b.percent=77; b.amperage_mA=2506; b.rawMax_mAh=4327; b.minutesToFull=54;
+    t=[BatteryForecastTracker new]; f=[t update:b limit80:YES at:43000];
+    check(f.thresholdFromSystem && [BatteryForecastDuration(f.thresholdTime,43000) isEqual:@"5m"] &&
+          [BatteryForecastDuration(f.endpointTime,43000) isEqual:@"55m"], @"real77percent restart shows5m/55m immediately instead of dash");
+    check([BatteryForecastStatus(f) containsString:@"provisional"], @"startup estimate identifies its provisional source");
+    f=Warm(t,b,YES,43000);
+    check(!f.thresholdFromSystem && [BatteryForecastDuration(f.thresholdTime,43060) isEqual:@"<5m"], @"measured rate replaces provisional estimate after a real sample minute");
+    b.amperage_mA=1200; f=[t update:b limit80:YES at:43075];
+    check(f.thresholdTime>0 && f.thresholdFromSystem, @"rate step falls back to system instead of blinking out");
+    b.minutesToFull=-1; f=[t update:b limit80:YES at:43090];
+    check(f.thresholdTime==0 && f.endpointTime==0, @"no system estimate and unsettled rate remain honestly unknown");
+    b.minutesToFull=61; b.percent=79;
+    f=[[BatteryForecastTracker new] update:b limit80:YES at:43100];
+    check([BatteryForecastDuration(f.thresholdTime,43100) isEqual:@"<5m"] && !f.hideLabels, @"79percent remains visible through warmup");
+    b.percent=80; f=[t update:b limit80:YES at:43115];
+    check(f.hideLabels && f.thresholdTime==0 && f.endpointTime==0, @"enabled80 limit still hides both exactly at80");
     NSTimeZone *utc=[NSTimeZone timeZoneForSecondsFromGMT:0];
     double late=1792278900; // 2026-10-17 23:15 UTC
     check([BatteryForecastClock(late,utc) isEqual:@"2315"], @"24-hour HHmm format");

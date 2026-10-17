@@ -2343,7 +2343,7 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     NSMutableArray<NSDictionary *> *_samples;
     double _lastUpdate, _lastSample, _thresholdTime, _endpointTime;
     NSInteger _mode;
-    BOOL _limit80;
+    BOOL _limit80, _thresholdFromSystem;
 }
 - (BatteryForecast)update:(BatteryState)b limit80:(BOOL)limit80 at:(double)now {
     BatteryForecast f = {.thresholdPercent=b.acConnected ? 80 : 20, .endpointPercent=b.acConnected ? 100 : 0};
@@ -2400,7 +2400,20 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
             threshold = (80.0 - b.percent) / 100.0 * b.rawMax_mAh / mean * 60;
         // A linear pre-80 estimate must not contradict the system's tapered full estimate.
         if (endpoint > 0 && threshold > endpoint) { threshold = -1; f.thresholdReason = BatteryForecastInconsistent; }
+        if (!f.thresholdReached && threshold <= 0 && endpoint > 0) {
+            // powerd already has history at launch. Use the remaining charge share
+            // of its full-time estimate provisionally, rather than hiding 80% for
+            // a minute. The full-time tail includes taper, so this can run long;
+            // replace it with the measured pre80 rate once that rate is steady.
+            // This NEVER invents a full-time estimate from a single current sample.
+            threshold = endpoint * (80.0 - b.percent) / (100.0 - b.percent);
+            f.thresholdFromSystem = YES;
+        }
     }
+    // A measured pre80 rate supersedes the conservative startup source. Do not
+    // keep blending the old source into a newly supported near-target estimate.
+    if (f.thresholdFromSystem != _thresholdFromSystem) _thresholdTime = 0;
+    _thresholdFromSystem = f.thresholdFromSystem;
     double (^smooth)(double, double) = ^double(double minutes, double previous) {
         if (!isfinite(minutes) || minutes <= 0 || minutes > 1440) return 0;
         double candidate = now + minutes * 60;
@@ -2478,6 +2491,7 @@ NSString *BatteryForecastStatus(BatteryForecast f) {
         if (reason) [parts addObject:[NSString stringWithFormat:@"%d%%: %@", targets[i], reason]];
     }
     if (f.hypotheticalFull) [parts addObject:@"100% assumes the 80% limit is cancelled"];
+    if (f.thresholdFromSystem) [parts addObject:@"80%: provisional from macOS full time; may run long"];
     if (f.thresholdTime > 0 || f.endpointTime > 0) [parts addObject:@"Approximate arrivals · local time"];
     return [parts componentsJoinedByString:@"\n"];
 }

@@ -70,12 +70,13 @@ typedef NS_ENUM(NSInteger, BatteryForecastReason) {
 typedef struct {
     int thresholdPercent, endpointPercent;
     BOOL thresholdReached, endpointReached;
-    BOOL hideLabels, hypotheticalFull;
+    BOOL hideLabels, hypotheticalFull, thresholdFromSystem;
     BatteryForecastReason thresholdReason, endpointReason;
     double thresholdTime, endpointTime; // Unix arrival times; 0 = unavailable
 } BatteryForecast;
 
 // Samples at most every 10 seconds. Current-based forecasts require a steady minute;
+// until then, a valid full-charge time supplies a provisional pre80 share of that time.
 // full charge ALWAYS requires a system estimate. A gap, stale telemetry or direction
 // change clears history; small deadline changes are smoothed, large changes replace it.
 @interface BatteryForecastTracker : NSObject

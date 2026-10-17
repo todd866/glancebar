@@ -20,8 +20,11 @@ present charging current linearly to 100%.
 
 A current-based estimate needs a steady minute of real samples. It resets after a
 large load change, a direction change, stale telemetry, or a long sampling gap.
-Unavailable values use a dash with the reason in the tooltip. In particular, the
-80% estimate can be absent for the first minute after launch.
+When a full-charge estimate is available, its remaining charge share supplies a
+provisional 80% estimate during rate warm-up or a rate reset. Because the full-time
+tail includes taper, this provisional value can run long; the tooltip says so.
+The measured pre80 rate replaces it once steady. Without either usable source,
+values use a dash with the reason in the tooltip.
 
 On this Mac, `AppleRawCurrentCapacity`, `AppleRawMaxCapacity`, and `DesignCapacity`
 are absent at the root of AppleSmartBattery. Read the mAh values from nested
