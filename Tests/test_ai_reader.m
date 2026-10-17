@@ -767,6 +767,71 @@ int main(void) {
         check([elapsedClaude.statusReason hasPrefix:@"Limit windows reset since last Claude refresh"],
               @"elapsed Claude status names the last refresh");
 
+        // The newest local observation can itself be old. A future reset, newer
+        // model bucket, fresh credits, or completed history index cannot renew it.
+        {
+            double fixedNow=1800000000;
+            check(CodexObservationFresh([NSDate dateWithTimeIntervalSince1970:fixedNow-900],fixedNow),@"Codex: observation expires at the 15-minute boundary");
+            check(!CodexObservationFresh([NSDate dateWithTimeIntervalSince1970:fixedNow-901],fixedNow),@"Codex: older observation is stale without a newer snapshot");
+            check(!CodexObservationFresh(nil,fixedNow)&&!CodexObservationFresh([NSDate dateWithTimeIntervalSince1970:fixedNow+6],fixedNow),@"Codex: missing and future observation times are not current");
+            NSString *home=[root stringByAppendingPathComponent:@"freshness-home"];
+            AIReader *reader=[[AIReader alloc] initWithHomeDirectory:home applicationSupportDirectory:[root stringByAppendingPathComponent:@"freshness-support"]];
+            [reader setValue:[@{@"fixture":@{}} mutableCopy] forKey:@"codexFiles"];
+            double now=NSDate.date.timeIntervalSince1970;
+            NSString *oldAt=ISODateString([NSDate dateWithTimeIntervalSinceNow:-19*3600]);
+            NSString *freshAt=ISODateString(NSDate.date);
+            NSDictionary *old=@{@"limit_id":@"codex",@"plan_type":@"pro",@"primary":@{@"used_percent":@94,@"window_minutes":@10080,@"resets_at":@(now+86400)},@"secondary":NSNull.null,@"credits":@{@"has_credits":@YES,@"unlimited":@NO,@"balance":@"5946"}};
+            void (^load)(NSDictionary *,NSString *,NSDictionary *)=^(NSDictionary *buckets,NSString *timestamp,NSDictionary *newest){
+                [reader setValue:buckets forKey:@"buckets"];[reader setValue:timestamp forKey:@"limitsTs"];[reader setValue:newest forKey:@"limitsNewest"];
+            };
+            NSDictionary *oldBuckets=FoldCodexSnapshotIntoBuckets(nil,old,oldAt);load(oldBuckets,oldAt,old);
+            Controller *controller=[Controller new];
+            for(NSUInteger stopped=0;stopped<3;stopped++){
+                AIUsage *stale=[reader codexUsage];
+                check(stale.limitStale&&CodexQuotaUnavailable(stale),@"Codex: all snapshots stopped is stale on every refresh");
+                check([[controller aiPercentText:stale] isEqual:@"—"]&&[[controller aiProblemText:stale] hasPrefix:@"stale 19h"],@"Codex: old 6% renders unavailable with its age");
+                check([stale.extraUsage containsString:@"unavailable"]&&!stale.billingNote,@"Codex: stopped logs cannot claim an available old credit balance or current billing");
+                FlippedView *row=[[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,kRowH)];
+                [controller addAICard:stale toView:row width:kW pad:0 at:0];
+                check(!ViewWithAccessibilityIdentifier(row,@"popover.ai.codex.gauge"),@"Codex: stale quota has no misleading gauge fill");
+                NSTextField *value=(id)ViewWithAccessibilityIdentifier(row,@"popover.ai.codex.value");
+                check([value.stringValue isEqual:@"—"],@"Codex: production popover suppresses old capacity");
+                stale.limitStale=NO;
+                check([[controller aiPercentText:stale] isEqual:@"—"],@"Codex: cached UI models also expire without a reader refresh");
+            }
+            NSMutableDictionary *fresh=[old mutableCopy];fresh[@"primary"]=@{@"used_percent":@3,@"window_minutes":@10080,@"resets_at":@(now+7*86400)};
+            fresh[@"credits"]=@{@"has_credits":@NO,@"unlimited":@NO,@"balance":@"0"};
+            load(FoldCodexSnapshotIntoBuckets(oldBuckets,fresh,freshAt),freshAt,fresh);
+            AIUsage *current=[reader codexUsage];
+            check(!current.limitStale&&[[controller aiPercentText:current] isEqual:@"97%"]&&[current.extraUsage isEqual:@"No credits (balance 0)"],@"Codex: reset recovers to 97% remaining independently of zero paid credits");
+            check(current.limitWindows.count==1,@"Codex: missing five-hour window is not invented");
+            NSMutableDictionary *side=[fresh mutableCopy];side[@"limit_id"]=@"codex_other";
+            load(FoldCodexSnapshotIntoBuckets(oldBuckets,side,freshAt),freshAt,side);
+            AIUsage *partial=[reader codexUsage];
+            check(CodexQuotaUnavailable(partial)&&[[controller aiPercentText:partial] isEqual:@"—"]&&[partial.extraUsage isEqual:@"No credits (balance 0)"],@"Codex: newer side bucket and credits do not renew the old plan window");
+            NSMutableDictionary *mixed=[fresh mutableCopy];
+            mixed[@"secondary"]=@{@"used_percent":@94,@"window_minutes":@300,@"resets_at":@(now+3600),@"_glancebarObservedAt":oldAt};
+            mixed[@"credits"]=oldBuckets[@"codex"][@"limits"][@"credits"];
+            load(FoldCodexSnapshotIntoBuckets(nil,mixed,freshAt),freshAt,mixed);
+            partial=[reader codexUsage];
+            check([[controller aiPercentText:partial] isEqual:@"97%"]&&[partial.extraUsage containsString:@"unavailable"],@"Codex: a fresh plan window stays usable while old sibling and credits stay stale");
+            check(!partial.billingNote && ![partial.statusReason containsString:@"credits"],@"Codex: stale credits cannot leave a current billing claim in the reason");
+            FlippedView *detail=[[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kDetailW,300)];
+            [controller addDetailWindows:partial to:detail y:0 cols:DetailLayout(kDetailW)];
+            NSTextField *oldWindow=(id)ViewWithAccessibilityIdentifier(detail,@"details.ai.window.codex.1.value");
+            NSTextField *oldAge=(id)ViewWithAccessibilityIdentifier(detail,@"details.ai.window.codex.1.datum");
+            check([oldWindow.stringValue isEqual:@"—"]&&[oldAge.stringValue hasPrefix:@"stale 19h"],@"Codex: partial detailed source never paints an old sibling as current");
+            NSMutableDictionary *expired=[fresh mutableCopy];expired[@"primary"]=@{@"used_percent":@3,@"window_minutes":@10080,@"resets_at":@(now-1)};
+            load(FoldCodexSnapshotIntoBuckets(nil,expired,freshAt),freshAt,expired);
+            AIUsage *reset=[reader codexUsage];
+            check(!reset.limitStatusAvailable&&[[controller aiPercentText:reset] isEqual:@"—"]&&[reset.statusReason containsString:@"reset"],@"Codex: elapsed reset never invents renewed capacity");
+            load(FoldCodexSnapshotIntoBuckets(nil,fresh,@"unknown"),@"unknown",fresh);
+            check([[controller aiProblemText:[reader codexUsage]] isEqual:@"unavailable"],@"Codex: unknown observation time stays unavailable");
+            NSString *future=ISODateString([NSDate dateWithTimeIntervalSinceNow:3600]);
+            load(FoldCodexSnapshotIntoBuckets(nil,fresh,future),future,fresh);
+            check([[controller aiProblemText:[reader codexUsage]] isEqual:@"unavailable"],@"Codex: future timestamp cannot imply freshness");
+        }
+
         // Codex meters several limit_id buckets in one session (shapes from 2026-09-07:
         // the plan bucket's weekly window at 99% in the PRIMARY slot, a side bucket at
         // 0%/0% seconds later, then "premium" with both windows null and no credits).
@@ -780,12 +845,12 @@ int main(void) {
             NSString *usage = @"\"info\":{\"last_token_usage\":{\"total_tokens\":10,\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":0}}";
             NSString *credits = @"\"credits\":{\"has_credits\":false,\"unlimited\":false,\"balance\":\"0\"}";
             NSString *lines = [NSString stringWithFormat:
-                @"{\"timestamp\":\"2026-09-07T05:45:58.309Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":99.0,\"window_minutes\":10080,\"resets_at\":%lld},\"secondary\":null,%@}}}\n"
-                 "{\"timestamp\":\"2026-09-07T05:53:27.384Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex_bengalfox\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":0.0,\"window_minutes\":300,\"resets_at\":%lld},\"secondary\":{\"used_percent\":0.0,\"window_minutes\":10080,\"resets_at\":%lld},%@}}}\n"
-                 "{\"timestamp\":\"2026-09-07T05:54:01.194Z\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"premium\",\"plan_type\":\"pro\",\"primary\":null,\"secondary\":null,%@}}}\n",
-                usage, nowEpoch + 5 * 86400, credits,
-                usage, nowEpoch + 3600, nowEpoch + 7 * 86400, credits,
-                usage, credits];
+                @"{\"timestamp\":\"%@\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":99.0,\"window_minutes\":10080,\"resets_at\":%lld},\"secondary\":null,%@}}}\n"
+                 "{\"timestamp\":\"%@\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"codex_bengalfox\",\"plan_type\":\"pro\",\"primary\":{\"used_percent\":0.0,\"window_minutes\":300,\"resets_at\":%lld},\"secondary\":{\"used_percent\":0.0,\"window_minutes\":10080,\"resets_at\":%lld},%@}}}\n"
+                 "{\"timestamp\":\"%@\",\"payload\":{\"type\":\"token_count\",%@,\"rate_limits\":{\"limit_id\":\"premium\",\"plan_type\":\"pro\",\"primary\":null,\"secondary\":null,%@}}}\n",
+                ISODateString([NSDate dateWithTimeIntervalSinceNow:-40]), usage, nowEpoch + 5 * 86400, credits,
+                ISODateString([NSDate dateWithTimeIntervalSinceNow:-30]), usage, nowEpoch + 3600, nowEpoch + 7 * 86400, credits,
+                ISODateString([NSDate dateWithTimeIntervalSinceNow:-20]), usage, credits];
             NSString *rolloutPath = [bSessions stringByAppendingPathComponent:@"rollout-buckets.jsonl"];
             [lines writeToFile:rolloutPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
             AIReader *bucketReader = [[AIReader alloc] initWithHomeDirectory:bHome applicationSupportDirectory:bSupport];

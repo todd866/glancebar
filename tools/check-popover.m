@@ -394,8 +394,17 @@ int main(int argc, const char **argv) {
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
-        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 6 ||
+        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 5 ||
             HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
+        if (FindIdentifier(root,@"popover.ai.codex.gauge") ||
+            ![((NSTextField *)FindIdentifier(root,@"popover.ai.codex.value")).stringValue isEqual:@"—"]) return Fail(__LINE__);
+        if (argc>1) {
+            NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-codex-stale.png"];
+            if (!RenderOffscreen(root,path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        // The remaining geometry checks exercise current, fully populated rows.
+        AIUsage *currentCodex=usage[1];currentCodex.limitStale=NO;currentCodex.limitUpdatedAt=NSDate.date;
+        [c rebuildContent];root=p.contentViewController.view;
         // Token indexing is internal machinery: it never reaches an instrument (2026-10-06).
         [c setValue:@YES forKey:@"_aiTotalsIncomplete"];
         [c setValue:@"Indexing 96% · totals incomplete" forKey:@"_aiCatchUpStatus"];

@@ -1153,6 +1153,19 @@ static const double kAccountPollInterval = 900;   // 15 minutes
 static const double kHiddenAIRefreshInterval = 300;   // background pass while no AI surface shows
 static const double kAuthFailureRetryInterval = 300;  // after a 401/403: a re-login is quick
 
+// A future reset does not make an old observation current. Codex logs can stop
+// carrying limits entirely (for example when work moves to another surface).
+static BOOL CodexObservationFresh(NSDate *observed, double now) {
+    if (!observed || !isfinite(now)) return NO;
+    double age=now-observed.timeIntervalSince1970;
+    return isfinite(age) && age>=-5 && age<=kAccountPollInterval;
+}
+static BOOL CodexQuotaUnavailable(AIUsage *u) {
+    if (![u.name isEqualToString:@"Codex"]) return NO;
+    if (u.resetAt && u.resetAt.timeIntervalSinceNow<=0) return YES;
+    return u.limitUpdatedAt ? !CodexObservationFresh(u.limitUpdatedAt,NSDate.date.timeIntervalSince1970) : u.limitStale;
+}
+
 // Unified logging for the AI pipeline: transitions only, metadata only (booleans,
 // HTTP codes, our own status strings — never tokens, counts, or credentials).
 // View: log show --predicate 'subsystem == "com.iantodd.glancebar"' --last 12h
@@ -3312,9 +3325,23 @@ typedef struct {
 
     // Read drift from the newest snapshot as it arrived, not from the merged view.
     NSString *drift = CodexSchemaDriftReason(_limitsNewest);
-    u.limitWindows = CodexBucketWindows(_buckets, now);
+    NSMutableArray *datedWindows=[NSMutableArray array];
+    for (NSDictionary *window in CodexBucketWindows(_buckets,now)) {
+        NSMutableDictionary *dated=[window mutableCopy];
+        NSString *stamp=_buckets[window[@"bucket"]][@"ts"];
+        if (!dated[@"observedAt"] && [stamp isKindOfClass:NSString.class]) dated[@"observedAt"]=stamp;
+        [datedWindows addObject:dated];
+    }
+    u.limitWindows=datedWindows;
     NSDictionary *planBuckets = _buckets[@"codex"] ? @{@"codex": _buckets[@"codex"]} : @{};
     NSDictionary *pick = PickCodexBucketWindow(planBuckets, now);
+    NSDictionary *freshPick=nil;
+    for (NSDictionary *window in u.limitWindows) {
+        if (![window[@"bucket"] isEqual:@"codex"] ||
+            !CodexObservationFresh(DateFromStatusString(window[@"observedAt"]),now)) continue;
+        if (!freshPick || [window[@"remainingFraction"] doubleValue]<[freshPick[@"remainingFraction"] doubleValue]) freshPick=window;
+    }
+    if (freshPick) pick=freshPick;
     u.billingNote = CodexBillingNote(_buckets, now);
     NSMutableSet *bucketsShown = [NSMutableSet set];
     for (NSDictionary *w in u.limitWindows) if (w[@"bucket"]) [bucketsShown addObject:w[@"bucket"]];
@@ -3333,30 +3360,51 @@ typedef struct {
             ? [NSString stringWithFormat:@"%@ window · %@ bucket", pick[@"window"], pick[@"bucketLabel"]]
             : [NSString stringWithFormat:@"%@ window", pick[@"window"]];
         u.statusReason = plan.length ? [NSString stringWithFormat:@"%@ · %@ plan", window, plan] : window;
-        if (u.billingNote.length) u.statusReason = [u.statusReason stringByAppendingFormat:@" · %@", u.billingNote];
         u.statusSource = @"~/.codex session logs";
         // A window carried forward from an earlier snapshot is as old as its own
         // observation, not as old as the latest snapshot — and that makes it stale,
         // which is exactly what the row's "cached" marker exists to say.
         NSString *observed = [pick[@"observedAt"] isKindOfClass:NSString.class] ? pick[@"observedAt"] : nil;
-        u.limitUpdatedAt = DateFromStatusString(observed ?: _limitsTs);
-        if (observed.length && _limitsTs.length && [observed compare:_limitsTs] == NSOrderedAscending)
+        NSString *planStamp=planBuckets[@"codex"][@"ts"];
+        u.limitUpdatedAt = DateFromStatusString(observed ?: ([planStamp isKindOfClass:NSString.class] ? planStamp : nil));
+        if (!CodexObservationFresh(u.limitUpdatedAt,now) ||
+            (observed.length && _limitsTs.length && [observed compare:_limitsTs] == NSOrderedAscending))
             u.limitStale = YES;
     }
     // With no gauge left, "the payload changed shape" beats "the windows have reset":
     // both are true, but only one tells the user why no new number is coming.
-    else u.statusReason = drift ?: CodexBucketsStatusReason(planBuckets, now);
+    else {
+        u.statusReason = drift ?: CodexBucketsStatusReason(planBuckets, now);
+        // Keep the plan's observation age even after its reset removes the gauge;
+        // a newer model-specific bucket cannot refresh the general allowance.
+        NSDictionary *plan=planBuckets[@"codex"];
+        u.limitUpdatedAt=DateFromStatusString([plan[@"ts"] isKindOfClass:NSString.class] ? plan[@"ts"] : nil);
+        u.limitStale=plan!=nil;
+    }
+    if (CodexQuotaUnavailable(u)) {
+        u.statusReason=@"Current Codex allowance unavailable; local session limit snapshot is stale";
+        u.limitRefreshError=@"No fresh Codex limit observation in local session logs";
+    }
+    if (!CodexObservationFresh(DateFromStatusString(_limitsTs),now)) u.billingNote=nil;
 
     // Context, never the gauge: a zero credit balance is normal while the plan window
     // still has room. See CodexCreditsStatus. Credits are account-level; read them from
     // whichever bucket reported them last.
     NSDictionary *credits = CodexCreditsStatus(CodexNewestBucketLimits(_buckets));
+    NSString *creditsObserved=_limitsTs;
     for (NSString *bucketID in _buckets) {
         if (credits) break;
         NSDictionary *entry = _buckets[bucketID];
         credits = CodexCreditsStatus([entry[@"limits"] isKindOfClass:NSDictionary.class] ? entry[@"limits"] : nil);
+        if (credits) creditsObserved=[entry[@"ts"] isKindOfClass:NSString.class] ? entry[@"ts"] : nil;
     }
-    if (credits[@"description"]) u.extraUsage = credits[@"description"];
+    if (credits[@"description"]) {
+        NSDate *observed=DateFromStatusString(credits[@"observedAt"] ?: creditsObserved);
+        u.extraUsage=CodexObservationFresh(observed,now) ? credits[@"description"] : @"Credit balance unavailable · stale local snapshot";
+        if (!CodexObservationFresh(observed,now)) u.billingNote=nil;
+    }
+    if (u.billingNote.length)
+        u.statusReason = [u.statusReason stringByAppendingFormat:@" · %@", u.billingNote];
     // Say it even while a carried-forward window still reads, or the cause hides behind
     // up to a week of apparently-healthy rows. limitRefreshError is exactly "why the
     // figure above is the last-known one", and Codex never sets it otherwise.
@@ -5774,7 +5822,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 - (AIUsage *)lowestAIStatus {
     AIUsage *lowest = nil;
     for (AIUsage *u in _aiUsage) {
-        if (!u.limitStatusAvailable || u.remainingFraction < 0) continue;
+        if (!u.limitStatusAvailable || u.remainingFraction < 0 || CodexQuotaUnavailable(u)) continue;
         // A still-current figure from any tool outranks an elapsed cached one, however
         // low the elapsed one reads; among peers the least room wins.
         BOOL elapsed = AIWindowElapsed(u), lowestElapsed = lowest ? AIWindowElapsed(lowest) : YES;
@@ -5786,7 +5834,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 }
 
 - (NSString *)aiPercentText:(AIUsage *)u {
-    if (!u.limitStatusAvailable || u.remainingFraction < 0) return @"—";
+    if (!u.limitStatusAvailable || u.remainingFraction < 0 || CodexQuotaUnavailable(u)) return @"—";
     return [NSString stringWithFormat:@"%d%%", (int)lround(u.remainingFraction * 100)];
 }
 
@@ -5797,6 +5845,7 @@ static BOOL AIWindowElapsed(AIUsage *u) {
 // A cached figure older than two poll intervals is not one a refresh would reproduce:
 // the number turns amber so the reader does not act on it as current.
 - (BOOL)aiSnapshotStaleWarns:(AIUsage *)u {
+    if (CodexQuotaUnavailable(u)) return YES;
     if (!u.limitStale || !u.limitUpdatedAt) return NO;
     return StaleSnapshotWarns(-u.limitUpdatedAt.timeIntervalSinceNow, kAccountPollInterval);
 }
@@ -6725,6 +6774,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // A problem replaces the reset clock in the datum column. The full sentence stays
 // on the tooltip (aiStatusSubtext / limitRefreshError). Nil means "show the reset".
 - (NSString *)aiProblemText:(AIUsage *)u {
+    if (CodexQuotaUnavailable(u) && (!u.limitUpdatedAt || u.limitUpdatedAt.timeIntervalSinceNow>5)) return @"unavailable";
     NSString *err = u.limitRefreshError ?: @"";
     if ([err hasPrefix:@"Signed out"]) return @"signed out";
     NSString *blob = [[NSString stringWithFormat:@"%@ %@", err, u.statusReason ?: @""] lowercaseString];
@@ -7272,7 +7322,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         ? ClaudeModelQuotas(u.limitWindows) : nil;
     double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
     BOOL claudeMeter = quotas != nil;
-    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0 && !CodexQuotaUnavailable(u));
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
@@ -8766,7 +8816,7 @@ static NSColor *HealthColor(double fraction) {
     double week = quotas ? [quotas[@"opus"] doubleValue] : -1;
     BOOL claudeMeter = quotas != nil;
     NSDictionary *cursorPools = CursorPoolQuotas(u);
-    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0);
+    BOOL hasGauge = claudeMeter || cursorPools || (u.limitStatusAvailable && u.remainingFraction >= 0 && !CodexQuotaUnavailable(u));
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
@@ -8894,12 +8944,23 @@ static NSColor *HealthColor(double fraction) {
         NSString *bucket = DetailBucketLabel(w);
         NSString *full = bucket.length ? [NSString stringWithFormat:@"%@ · %@", windowName, bucket] : windowName;
         BOOL hasFrac = [w[@"remainingFraction"] isKindOfClass:NSNumber.class];
+        NSDate *observed=DateFromStatusString([w[@"observedAt"] isKindOfClass:NSString.class] ? w[@"observedAt"] : nil);
+        BOOL staleCodex=[u.name isEqualToString:@"Codex"] &&
+            (w[@"observedAt"] || u.limitStale) &&
+            !CodexObservationFresh(observed ?: u.limitUpdatedAt,NSDate.date.timeIntervalSince1970);
+        if (staleCodex) hasFrac=NO;
         double frac = hasFrac ? [w[@"remainingFraction"] doubleValue] : -1;
         NSString *pct = hasFrac ? [NSString stringWithFormat:@"%d%%", (int)lround(frac * 100.0)] : @"—";
         NSDate *resetDate = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? [NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]] : nil;
         NSString *clock = CompactResetClock(resetDate, NSDate.date);
         NSString *reset = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
+        if (staleCodex) {
+            NSDate *stamp=observed ?: u.limitUpdatedAt;
+            NSString *age=stamp && stamp.timeIntervalSinceNow<=5 ? [self shortAgeForDate:stamp] : nil;
+            age=[age stringByReplacingOccurrencesOfString:@" ago" withString:@""];
+            reset=age.length && ![age isEqual:@"pending"] ? [@"stale " stringByAppendingString:age] : @"unavailable";
+        }
         // Each window is coloured by its own remaining fraction. A full window stays
         // green even when the provider row is amber or red.
         NSColor *color = hasFrac ? AIQuotaColor(MIN(1.0, MAX(0.0, frac))) : NSColor.tertiaryLabelColor;
@@ -9927,12 +9988,13 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     BOOL anyAIAvailable = NO;
     for (AIUsage *item in usage) {
         anyAIAvailable |= item.available || item.limitStatusAvailable;
+        BOOL quotaAvailable=item.limitStatusAvailable && item.remainingFraction>=0 && !CodexQuotaUnavailable(item);
         [providers addObject:@{
             @"name": item.name ?: @"AI",
             @"available": JSONBool(item.available),
-            @"limitStatusAvailable": JSONBool(item.limitStatusAvailable && item.remainingFraction >= 0),
-            @"limitStale": JSONBool(item.limitStale),
-            @"remainingPercent": item.limitStatusAvailable && item.remainingFraction >= 0
+            @"limitStatusAvailable": JSONBool(quotaAvailable),
+            @"limitStale": JSONBool(item.limitStale || CodexQuotaUnavailable(item)),
+            @"remainingPercent": quotaAvailable
                 ? @(item.remainingFraction * 100.0) : NSNull.null,
             @"limitUpdatedAt": JSONValue(ISODateString(item.limitUpdatedAt)),
             @"limitRefreshError": JSONValue(item.limitRefreshError),
