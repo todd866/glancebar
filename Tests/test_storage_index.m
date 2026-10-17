@@ -64,6 +64,45 @@ int main(void){@autoreleasepool{
     NSString *last=File(small,@"largest-created-last",900000);
     GBStorageIndex *smallIndex=[[GBStorageIndex alloc] initWithRoots:@[small] home:home];NSDictionary *smallSnap=Finish(smallIndex);
     Check([smallSnap[@"rows"][0][@"path"] isEqual:last],@"top ranking includes late sub-megabyte files");
+    // More than 100 protected groups and ordinary folders exercise both rolling
+    // rankings, including leaders discovered after earlier snapshots.
+    NSString *many=Dir(home,@"many"); NSMutableArray *expectedFolders=[NSMutableArray array],*expectedGroups=[NSMutableArray array];
+    NSMutableDictionary *largestEntry=nil;
+    for(NSUInteger n=0;n<120;n++)for(NSNumber *package in @[@NO,@YES]){
+        NSString *directory=Dir(many,[NSString stringWithFormat:@"item-%03lu%@",(unsigned long)n,package.boolValue?@".app":@""]);
+        NSString *path=File(directory,@"data",(n+1)*4096);
+        NSDictionary *row=@{@"path":directory,@"allocatedBytes":@(Allocated(path))};
+        [expectedFolders addObject:row];if(package.boolValue)[expectedGroups addObject:row];
+        if(n==119&&!package.boolValue)largestEntry=[@{@"path":path,@"allocatedBytes":row[@"allocatedBytes"],@"logicalBytes":@((n+1)*4096)} mutableCopy];
+    }
+    GBStorageIndex *manyIndex=[[GBStorageIndex alloc] initWithRoots:@[many] home:home];
+    NSDictionary *manySnap=Finish(manyIndex);
+    // The root total occupies one folder position; independently rank the rest.
+    NSArray *want=GBStorageLargestRows(expectedFolders,99);
+    Check([[manySnap[@"folders"] subarrayWithRange:NSMakeRange(1,99)] valueForKey:@"path"] &&
+        [[[manySnap[@"folders"] subarrayWithRange:NSMakeRange(1,99)] valueForKey:@"path"] isEqual:[want valueForKey:@"path"]],@"incremental folder leaders equal independent complete ranking");
+    NSMutableArray *actualGroups=[NSMutableArray array];for(NSDictionary *row in manySnap[@"rows"])if([row[@"isDirectory"] boolValue])[actualGroups addObject:row];
+    for(NSDictionary *row in actualGroups)Check([row[@"allocatedBytes"] isEqual:Row(expectedGroups,row[@"path"])[@"allocatedBytes"]],@"incremental protected totals remain exact");
+    [manyIndex removeFile:largestEntry];
+    for(NSMutableDictionary *row in [expectedFolders mutableCopy])if([row[@"path"] isEqual:[largestEntry[@"path"] stringByDeletingLastPathComponent]]){
+        NSUInteger position=[expectedFolders indexOfObject:row];expectedFolders[position]=@{@"path":row[@"path"],@"allocatedBytes":@0};break;
+    }
+    NSArray *afterRemove=[manyIndex snapshot][@"folders"];
+    Check([[[afterRemove subarrayWithRange:NSMakeRange(1,99)] valueForKey:@"path"] isEqual:[GBStorageLargestRows(expectedFolders,99) valueForKey:@"path"]],@"decreasing a leader admits the unchanged runner-up");
+    NSString *depthRoot=Dir(home,@"depth-limit"),*nested=depthRoot;
+    for(NSUInteger n=0;n<70;n++)nested=Dir(nested,@"d");
+    File(nested,@"beyond-limit",4096);NSString *reachable=File(depthRoot,@"reachable",8192);
+    NSDictionary *depthSnap=Finish([[GBStorageIndex alloc] initWithRoots:@[depthRoot] home:home]);
+    Check([depthSnap[@"complete"] boolValue]&&![depthSnap[@"limited"] boolValue]&&[depthSnap[@"skipped"] unsignedIntegerValue]>0&&Row(depthSnap[@"rows"],reachable),@"one deep branch cannot terminate the global scan");
+    NSDictionary *old=@{@"capturedAt":@1,@"rows":@[@{@"path":@"/old",@"allocatedBytes":@100},@{@"path":@"/group",@"isDirectory":@YES,@"allocatedBytes":@300}],@"folders":@[]};
+    NSDictionary *fresh=@{@"capturedAt":@2,@"entries":@9,@"rows":@[@{@"path":@"/new",@"allocatedBytes":@200},@{@"path":@"/group",@"isDirectory":@YES,@"allocatedBytes":@30}],@"folders":@[]};
+    NSDictionary *merged=GBStorageMergeSnapshot(fresh,old);
+    Check([merged[@"entries"] isEqual:@9]&&[merged[@"capturedAt"] isEqual:@2]&&[merged[@"cachedAt"] isEqual:@1],@"new progress advances while previous measurements remain available");
+    Check([Row(merged[@"rows"],@"/old")[@"cached"] boolValue]&&[Row(merged[@"rows"],@"/group")[@"allocatedBytes"] isEqual:@300]&&!Row(merged[@"rows"],@"/new")[@"cached"],@"old and fresh leaders are distinguished without understating unfinished groups");
+    NSMutableDictionary *ended=[fresh mutableCopy];ended[@"complete"]=@YES;
+    Check([GBStorageMergeSnapshot(ended,merged) isEqual:ended],@"completed refresh drops deleted or smaller cached entries");
+    ended[@"complete"]=@NO;ended[@"limited"]=@YES;
+    Check([GBStorageMergeSnapshot(ended,merged) isEqual:ended],@"bounded incomplete result also retires stale cached measurements");
     NSString *cache=[home stringByAppendingPathComponent:@"cache"];GBStorageSaveCache(snapshot,cache,home);
     Check(GBStorageLoadCache(cache,home)!=nil,@"private cache round trip");struct stat st;lstat(cache.fileSystemRepresentation,&st);Check((st.st_mode&0777)==0700,@"cache directory private");
     NSString *cacheFile=[cache stringByAppendingPathComponent:@"index.json"];lstat(cacheFile.fileSystemRepresentation,&st);Check((st.st_mode&0777)==0600,@"cache file private");

@@ -70,22 +70,21 @@
         return;
     }
     GBStorageIndex *index=_storageIndex;
-    BOOL onAC=_bat.valid && _bat.acConnected, retainSnapshot=_storageRetainSnapshot;
+    BOOL onAC=_bat.valid && _bat.acConnected;
+    NSDictionary *previous=_storageRetainSnapshot ? _storageResult : nil;
     dispatch_async(_storageQueue,^{
         NSDictionary *snapshot=[index advanceForSeconds:onAC ? .35 : .15 entries:onAC ? 3000 : 1200];
         BOOL finished=index.finished;
+        NSDictionary *visible=GBStorageMergeSnapshot(snapshot,previous);
         double tick=NSDate.date.timeIntervalSince1970;
-        if(finished || (!retainSnapshot && tick-self->_storageLastCache>30)){GBStorageSaveCache(snapshot,[self storageCacheDirectory],[self storageHomeDirectory]);self->_storageLastCache=tick;}
+        if(finished || tick-self->_storageLastCache>30){GBStorageSaveCache(visible,[self storageCacheDirectory],[self storageHomeDirectory]);self->_storageLastCache=tick;}
         dispatch_async(dispatch_get_main_queue(),^{
             self->_storageSliceRunning=NO;
             if(self->_terminating || generation!=self->_storageGeneration)return;
             self->_storageFinished=finished;self->_storageProgress=snapshot;
             if(finished)self->_storageLastStart=NSDate.date.timeIntervalSince1970;
-            // A refresh keeps the previous ranking until the replacement pass ends.
-            // Otherwise early small files would displace known large cached items.
-            if((!self->_storageRetainSnapshot || finished) && ([snapshot[@"rows"] count] || finished || !self->_storageResult))
-                self->_storageResult=[self storageVisibleSnapshot:snapshot];
-            if(finished)self->_storageRetainSnapshot=NO;
+            self->_storageResult=[self storageVisibleSnapshot:visible];
+            self->_storageRetainSnapshot=visible[@"cachedAt"]!=nil;
             [self refreshStorageSurface];
             if(!finished)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(onAC ? 1 : 2)*NSEC_PER_SEC),dispatch_get_main_queue(),^{[self requestStorageScanIfNeeded];});
         });
@@ -193,15 +192,16 @@
     NSString *buttonTitle=_storageFinished ? @"Refresh" : _storagePaused ? @"Resume" : @"Pause";
     NSButton *scan=[NSButton buttonWithTitle:buttonTitle target:self action:@selector(scanStorage:)];
     scan.frame=NSMakeRect(width-pad-84,y,84,26);scan.enabled=!busy;scan.accessibilityIdentifier=@"details.storage.scan";[root addSubview:scan];y+=32;
-    NSString *state=_storagePaused ? @"Paused" : ![self storagePowerPermitsWork] ? @"Paused for battery" : _storageFinished ? ([_storageResult[@"limited"] boolValue] ? @"Partial scan" : @"Updated") : @"Updating";
+    NSString *state=_storagePaused ? @"Paused" : ![self storagePowerPermitsWork] ? @"Paused for battery" : _storageFinished ? ([_storageResult[@"limited"] boolValue] ? @"Scan limit reached" : @"Updated") : @"Updating";
     NSDateFormatter *clock=[NSDateFormatter new];clock.dateFormat=@"HH:mm";
     NSString *stamp=_storageResult[@"capturedAt"] ? [clock stringFromDate:[NSDate dateWithTimeIntervalSince1970:[_storageResult[@"capturedAt"] doubleValue]]] : @"";
     if(_storageFinished && [_storageResult[@"partial"] boolValue] && ![_storageResult[@"limited"] boolValue])state=@"Updated · partial";
     NSDictionary *progress=_storageProgress ?: _storageResult;
-    NSString *status=_storageNotice ?: [NSString stringWithFormat:@"%@%@ %@ · %@ entries · %@ unavailable",state,_storageRetainSnapshot ? @" · cached" : @"",stamp,progress[@"entries"] ?: @0,progress[@"errors"] ?: @0];
+    NSString *status=_storageNotice ?: [NSString stringWithFormat:@"%@ %@ · %@ entries · %@ unavailable",state,stamp,progress[@"entries"] ?: @0,progress[@"errors"] ?: @0];
     [self detailText:status font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor frame:NSMakeRect(pad,y,width-2*pad-(_storageUndo ? 70 : 0),18) align:NSTextAlignmentLeft identifier:@"details.storage.status" in:root];
     if(_storageUndo){NSButton *undo=[NSButton buttonWithTitle:@"Undo" target:self action:@selector(undoStorage:)];undo.frame=NSMakeRect(width-pad-64,y-4,64,26);undo.enabled=!busy;undo.accessibilityIdentifier=@"details.storage.undo";[root addSubview:undo];}y+=22;
     NSString *legend=_storageFolders ? @"Folder totals overlap · parent folders include their contents" : @"Home, apps, Library & local volumes · APFS shared blocks may overlap";
+    if(_storageRetainSnapshot)legend=[legend stringByAppendingString:@" · ~ cached"];
     [self detailText:legend font:[NSFont systemFontOfSize:11.5] color:NSColor.secondaryLabelColor frame:NSMakeRect(pad,y,width-2*pad,18) align:NSTextAlignmentLeft identifier:@"details.storage.legend" in:root];y+=24;
     CGFloat nameW=width-326,allocatedX=width-292,logicalX=width-208,actionX=width-122;
     NSArray *titles=@[@"Item",@"Allocated",@"Logical"];CGFloat xs[]={pad,allocatedX,logicalX},ws[]={nameW,78,78};
@@ -213,7 +213,7 @@
         NSString *path=[entry[@"path"] stringByAbbreviatingWithTildeInPath];
         NSTextField *location=[self detailText:path font:[NSFont systemFontOfSize:11] color:NSColor.secondaryLabelColor frame:NSMakeRect(pad,y+18,nameW,16) align:NSTextAlignmentLeft identifier:[prefix stringByAppendingString:@".path"] in:root];location.lineBreakMode=NSLineBreakByTruncatingMiddle;location.accessibilityLabel=entry[@"path"];
         for(NSUInteger col=1;col<3;col++){
-            NSString *value=[NSString stringWithFormat:@"%@%@",[entry[@"partial"] boolValue] ? @"≥" : @"",CompactByteCount([entry[col==1 ? @"allocatedBytes" : @"logicalBytes"] unsignedLongLongValue])];
+            NSString *value=[NSString stringWithFormat:@"%@%@",[entry[@"cached"] boolValue] ? @"~" : [entry[@"partial"] boolValue] ? @"≥" : @"",CompactByteCount([entry[col==1 ? @"allocatedBytes" : @"logicalBytes"] unsignedLongLongValue])];
             [self detailText:value font:[NSFont monospacedDigitSystemFontOfSize:12.5 weight:NSFontWeightRegular] color:NSColor.labelColor frame:NSMakeRect(xs[col],y+7,ws[col],18) align:NSTextAlignmentRight identifier:[prefix stringByAppendingFormat:@".%lu",(unsigned long)col] in:root];
         }
         BOOL trash=!_storageFolders && [entry[@"action"] isEqual:@"trash"];

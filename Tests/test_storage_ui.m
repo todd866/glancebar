@@ -21,7 +21,7 @@ static void Await(BOOL (^done)(void)) {
 @end
 @interface TestStorageController : Controller
 @property NSString *testHome;
-@property NSUInteger operations, paints;
+@property NSUInteger operations, paints, rootsCalls;
 @property BOOL permitPower;
 @property dispatch_semaphore_t rootsGate;
 @end
@@ -32,7 +32,7 @@ static void Await(BOOL (^done)(void)) {
 - (BOOL)storagePowerPermitsWork { return self.permitPower; }
 - (NSString *)storageHomeDirectory { return self.testHome; }
 - (NSString *)storageCacheDirectory { return [self.testHome stringByAppendingPathComponent:@"cache"]; }
-- (NSArray *)storageRoots { if(self.rootsGate)dispatch_semaphore_wait(self.rootsGate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));return @[self.testHome]; }
+- (NSArray *)storageRoots { self.rootsCalls++;if(self.rootsGate)dispatch_semaphore_wait(self.rootsGate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));return @[self.testHome]; }
 - (NSDictionary *)performStorageCleanup:(NSDictionary *)entry compress:(BOOL)compress progress:(NSProgress *)progress {
     (void)entry;(void)compress;(void)progress;self.operations++;return @{@"message":@"Fixture transport only"};
 }
@@ -95,6 +95,25 @@ int main(int argc,const char **argv) { @autoreleasepool {
     Await(^BOOL{return [[cached valueForKey:@"storageFinished"] boolValue];});
     Check(![[cached valueForKey:@"storageRetainSnapshot"] boolValue],@"replacement pass retires the cached marker");
     [cached cancelStorage];
+    NSString *progressHome=[home stringByAppendingPathComponent:@"progress-fixture"];
+    [NSFileManager.defaultManager createDirectoryAtPath:progressHome withIntermediateDirectories:YES attributes:nil error:NULL];
+    for(NSUInteger n=0;n<2400;n++)Check([NSData.data writeToFile:[progressHome stringByAppendingPathComponent:[NSString stringWithFormat:@"item-%04lu",(unsigned long)n]] atomically:NO],@"multi-slice fixture");
+    TestStorageController *refresh=[TestStorageController new];refresh.testHome=progressHome;refresh.permitPower=YES;
+    NSMutableDictionary *prior=[result mutableCopy];prior[@"entries"]=@999999;prior[@"capturedAt"]=@(NSDate.date.timeIntervalSince1970-600);
+    GBStorageSaveCache(prior,[refresh storageCacheDirectory],progressHome);
+    [refresh requestStorageScanIfNeeded];
+    Await(^BOOL{return [refresh valueForKey:@"storageProgress"]!=nil;});
+    Check(![[refresh valueForKey:@"storageFinished"] boolValue],@"large refresh publishes before completion");
+    NSDictionary *progressCache=GBStorageLoadCache([refresh storageCacheDirectory],progressHome);
+    Check([progressCache[@"entries"] unsignedIntegerValue]>0&&[progressCache[@"entries"] unsignedIntegerValue]<999999&&[progressCache[@"cachedAt"] doubleValue]>0,@"retained results no longer suppress progress cache writes");
+    id runningIndex=[refresh valueForKey:@"storageIndex"];
+    for(NSUInteger open=0;open<20;open++){[refresh storageDetailsView];[refresh requestStorageScanIfNeeded];}
+    Check([refresh valueForKey:@"storageIndex"]==runningIndex&&refresh.rootsCalls==1,@"repeated opening reuses the in-flight scan");
+    Await(^BOOL{return [[refresh valueForKey:@"storageFinished"] boolValue];});
+    Check([[[refresh valueForKey:@"storageResult"] objectForKey:@"complete"] boolValue]&&![[refresh valueForKey:@"storageRetainSnapshot"] boolValue],@"multi-slice refresh completes and retires old measurements");
+    for(NSUInteger open=0;open<20;open++)[refresh requestStorageScanIfNeeded];
+    Check(refresh.rootsCalls==1,@"repeated opening after completion does not restart the scan");
+    [refresh cancelStorage];
     TestStorageWindow *window=[[TestStorageWindow alloc] initWithContentRect:NSMakeRect(0,0,600,420) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:YES];
     [c setValue:window forKey:@"detailsWindow"];
     NSButton *button=[NSButton new];button.identifier=file;
@@ -118,6 +137,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     if (argc>2) {
         NSDictionary *live=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[2]]] options:0 error:NULL];
         [ui setValue:live forKey:@"storageResult"];
+        [ui setValue:@(live[@"cachedAt"]!=nil) forKey:@"storageRetainSnapshot"];
         [ui setValue:@([live[@"complete"] boolValue] || [live[@"limited"] boolValue]) forKey:@"storageFinished"];
         [ui setValue:ScanVolumes() forKey:@"vols"];
     }
@@ -136,8 +156,14 @@ int main(int argc,const char **argv) { @autoreleasepool {
     Check([((NSTextField *)Find(folders,@"details.storage.legend")).stringValue containsString:@"overlap"],@"folder overlap semantics are visible");
     if(argc>1)Check(Render(folders,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:@"storage-folders.png"],NSAppearanceNameAqua),@"folder mode rendered");
     [ui setValue:@NO forKey:@"storageFolders"];
-    for(NSString *state in @[@"empty",@"paused",@"loading",@"undo"]){
-        [ui setValue:[state isEqual:@"undo"] ? Fixture() : @{@"rows":@[],@"capturedAt":@(NSDate.date.timeIntervalSince1970)} forKey:@"storageResult"];
+    for(NSString *state in @[@"empty",@"paused",@"loading",@"undo",@"cached"]){
+        NSMutableDictionary *sample=[Fixture() mutableCopy];
+        if([state isEqual:@"cached"]){
+            NSMutableArray *rows=[NSMutableArray array];
+            for(NSDictionary *entry in sample[@"rows"]){NSMutableDictionary *row=[entry mutableCopy];row[@"cached"]=@YES;[rows addObject:row];}sample[@"rows"]=rows;
+        }
+        [ui setValue:@([state isEqual:@"cached"]) forKey:@"storageRetainSnapshot"];
+        [ui setValue:([state isEqual:@"undo"] || [state isEqual:@"cached"]) ? sample : @{@"rows":@[],@"capturedAt":@(NSDate.date.timeIntervalSince1970)} forKey:@"storageResult"];
         [ui setValue:@([state isEqual:@"paused"]) forKey:@"storagePaused"];
         [ui setValue:@([state isEqual:@"empty"]) forKey:@"storageFinished"];
         [ui setValue:[state isEqual:@"undo"] ? @{@"trashedPath":@"/fixture/Trash"} : nil forKey:@"storageUndo"];

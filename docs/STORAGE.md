@@ -6,9 +6,10 @@ folders are seeded first, then the wider scan continues automatically. No folder
 selection or manual drill-down is needed. Results arrive progressively and remain
 cached while Details is closed. Refresh starts a new pass; Pause/Resume preserves
 its traversal position. Passes refresh after 30 minutes, with a private local cache
-retained for up to 24 hours across app restarts. Refreshes keep the previous
-ranking, explicitly labeled cached, until the replacement pass finishes; the
-first pass shows progressive results immediately.
+retained for up to 24 hours across app restarts. Refreshes publish new leaders and progress throughout the pass. Previously
+measured leaders remain available with a `~` cached-size marker until rechecked;
+completion retires stale entries. Progress is cached every 30 seconds even when
+previous measurements are retained.
 
 The default list ranks individual ordinary files and protected aggregates such as
 repositories, application bundles and photo libraries by allocated bytes. It does
@@ -51,8 +52,10 @@ The row's ellipsis offers Compress Copy for supported text/log/data exports up t
 without overwriting another file. The original remains; compression itself frees
 no space. Cache files are local only, with directory mode 0700/file mode 0600.
 Rendering does no filesystem access; all traversal, cache and cleanup work runs
-on a single background queue. Progressive folder updates select the largest 100
-rows before copying them, avoiding whole-index copying and sorting on large homes.
+on a single background queue. Progressive updates rank only changed folders and protected groups against the
+previous top 100. They do not repeatedly copy or sort the entire growing index.
+A branch deeper than 64 path components is skipped without stopping other roots.
+Resource ceilings finish with an explicit “Scan limit reached” state.
 Completion never opens a window.
 
 Tests use disposable filesystem fixtures for global ranking, protected aggregate

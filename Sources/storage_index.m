@@ -28,6 +28,29 @@ NSArray<NSDictionary *> *GBStorageLargestRows(NSArray<NSDictionary *> *rows, NSU
     }
     return top;
 }
+NSDictionary *GBStorageMergeSnapshot(NSDictionary *fresh, NSDictionary *previous) {
+    if (!previous || [fresh[@"complete"] boolValue] || [fresh[@"limited"] boolValue]) return fresh;
+    NSMutableDictionary *result=[fresh mutableCopy]; BOOL retained=NO;
+    for (NSString *key in @[@"rows",@"folders"]) {
+        NSMutableDictionary *byPath=[NSMutableDictionary dictionary];
+        for (NSDictionary *row in previous[key]) {
+            NSMutableDictionary *copy=[row mutableCopy]; copy[@"cached"]=@YES;
+            byPath[row[@"path"]]=copy;
+        }
+        for (NSDictionary *row in fresh[key]) {
+            NSDictionary *old=byPath[row[@"path"]];
+            // A partial directory total is only a lower bound; retain a larger
+            // prior measurement until the new pass catches up or finishes.
+            if (![row[@"isDirectory"] boolValue] || !old ||
+                [row[@"allocatedBytes"] unsignedLongLongValue]>=[old[@"allocatedBytes"] unsignedLongLongValue])
+                byPath[row[@"path"]]=row;
+        }
+        result[key]=GBStorageLargestRows(byPath.allValues,100);
+        for (NSDictionary *row in result[key]) if ([row[@"cached"] boolValue]) retained=YES;
+    }
+    if (retained) result[@"cachedAt"]=previous[@"cachedAt"] ?: previous[@"capturedAt"];
+    return result;
+}
 static BOOL Skip(NSString *name) { return [@[@".Trash",@".Trashes",@".Spotlight-V100",@".fseventsd",@".TemporaryItems",@"CloudStorage",@"Mobile Documents"] containsObject:name]; }
 // Opening every path component with O_NOFOLLOW prevents ancestor link races.
 static int OpenDirectory(NSString *path) {
@@ -73,6 +96,8 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
     NSMutableArray<GBStorageWalk *> *_pending,*_active;
     NSMutableSet *_directories,*_hardlinks;
     NSMutableDictionary<NSString *,NSMutableDictionary *> *_folders,*_groups;
+    NSMutableSet<NSString *> *_changedFolders,*_changedGroups;
+    NSArray<NSDictionary *> *_folderLeaders,*_groupLeaders;
     NSMutableArray<NSDictionary *> *_files;
     NSMutableDictionary *_eligibility;
     NSUInteger _entries,_errors,_skipped,_cursor;
@@ -84,6 +109,8 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
         _roots=[roots copy]; _home=[home copy]; _pending=[NSMutableArray array]; _active=[NSMutableArray array];
         _directories=[NSMutableSet set]; _hardlinks=[NSMutableSet set]; _folders=[NSMutableDictionary dictionary];
         _groups=[NSMutableDictionary dictionary]; _eligibility=[NSMutableDictionary dictionary]; _files=[NSMutableArray array]; _started=NSDate.date.timeIntervalSince1970;
+        _changedFolders=[NSMutableSet set]; _changedGroups=[NSMutableSet set];
+        _folderLeaders=@[]; _groupLeaders=@[];
         for (NSString *path in roots) {
             GBStorageWalk *walk=[GBStorageWalk new]; walk.path=path; walk.root=YES; [_pending insertObject:walk atIndex:0];
         }
@@ -98,6 +125,7 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
     }
 }
 - (NSMutableDictionary *)folder:(NSString *)path group:(BOOL)group {
+    [(group ? _changedGroups : _changedFolders) addObject:path];
     NSMutableDictionary *row=(group ? _groups : _folders)[path];
     if (!row) {
         row=[@{@"path":path,@"name":path.lastPathComponent,@"isDirectory":@YES,@"allocatedBytes":@0,@"logicalBytes":@0} mutableCopy];
@@ -164,7 +192,8 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
             if (fstatat(dirfd(walk.directory),entry->d_name,&s,AT_SYMLINK_NOFOLLOW)) { _errors++; [self markPartial:walk.path]; continue; }
             if (S_ISLNK(s.st_mode) || s.st_dev!=walk.device || (s.st_flags&SF_DATALESS)) { _skipped++; [self markPartial:walk.path]; continue; }
             if (S_ISDIR(s.st_mode)) {
-                if (_pending.count+_directories.count>=500000 || path.pathComponents.count>64) { _limited=YES; break; }
+                if (path.pathComponents.count>64) { _skipped++; [self markPartial:walk.path]; continue; }
+                if (_pending.count+_directories.count>=500000) { _limited=YES; break; }
                 GBStorageWalk *child=[GBStorageWalk new]; child.path=path; child.group=walk.group;
                 child.identity=@{@"device":@(s.st_dev),@"inode":@(s.st_ino)}; [_pending addObject:child];
             } else if (S_ISREG(s.st_mode)) {
@@ -192,8 +221,18 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
     return [self snapshot];
 }
 - (NSDictionary *)snapshot {
+    // Totals only increase during traversal. Only changed rows can enter the top
+    // 100; re-ranking every visited folder/group per slice becomes quadratic.
+    NSMutableDictionary *candidates=[NSMutableDictionary dictionary];
+    for (NSDictionary *row in _folderLeaders) candidates[row[@"path"]]=row;
+    for (NSString *path in _changedFolders) candidates[path]=_folders[path];
+    _folderLeaders=GBStorageLargestRows(candidates.allValues,100); [_changedFolders removeAllObjects];
+    [candidates removeAllObjects];
+    for (NSDictionary *row in _groupLeaders) candidates[row[@"path"]]=row;
+    for (NSString *path in _changedGroups) candidates[path]=_groups[path];
+    _groupLeaders=GBStorageLargestRows(candidates.allValues,100); [_changedGroups removeAllObjects];
     NSMutableArray *items=[_files mutableCopy];
-    for (NSDictionary *row in _groups.allValues) { NSMutableDictionary *copy=[row mutableCopy]; if (!self.finished || _limited) copy[@"partial"]=@YES; [items addObject:copy]; }
+    for (NSDictionary *row in _groupLeaders) { NSMutableDictionary *copy=[row mutableCopy]; if (!self.finished || _limited) copy[@"partial"]=@YES; [items addObject:copy]; }
     [items sortUsingComparator:^NSComparisonResult(id a,id b){return Biggest(a,b);}];
     if (items.count>100) [items removeObjectsInRange:NSMakeRange(100,items.count-100)];
     NSMutableArray *files=[NSMutableArray array];
@@ -215,7 +254,7 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
     NSMutableArray *folders=[NSMutableArray array];
     // Copy only the visible leaders. Large homes can have hundreds of thousands
     // of folders; copying and sorting all of them on every slice swamps the walk.
-    for (NSDictionary *row in GBStorageLargestRows(_folders.allValues,100)) {
+    for (NSDictionary *row in _folderLeaders) {
         NSMutableDictionary *copy=[row mutableCopy]; copy[@"action"]=@"reveal";
         if (!self.finished || _limited) copy[@"partial"]=@YES; [folders addObject:copy];
     }
@@ -227,6 +266,8 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
     if(!matches.count)return;
     [_files removeObjectsAtIndexes:matches];
     [self addLogical:-[entry[@"logicalBytes"] longLongValue] allocated:-[entry[@"allocatedBytes"] longLongValue] path:path group:nil];
+    // A decrease can admit an unchanged runner-up, unlike monotone traversal.
+    [_changedFolders addObjectsFromArray:_folders.allKeys];
 }
 @end
 
@@ -251,7 +292,7 @@ NSDictionary *GBStorageLoadCache(NSString *directory, NSString *home) {
             for(NSString *field in @[@"path",@"name",@"action"])if(![row[field] isKindOfClass:NSString.class])return nil;
             if(![row[@"path"] isAbsolutePath])return nil;
             for(NSString *field in @[@"allocatedBytes",@"logicalBytes"])if(![row[field] isKindOfClass:NSNumber.class])return nil;
-            for(NSString *field in @[@"isDirectory",@"partial"])if(row[field]&&![row[field] isKindOfClass:NSNumber.class])return nil;
+            for(NSString *field in @[@"isDirectory",@"partial",@"cached"])if(row[field]&&![row[field] isKindOfClass:NSNumber.class])return nil;
             for(NSString *field in @[@"cleanupReason",@"protectedReason"])if(row[field]&&![row[field] isKindOfClass:NSString.class])return nil;
             if(row[@"identity"]&&![row[@"identity"] isKindOfClass:NSDictionary.class])return nil;
         }
