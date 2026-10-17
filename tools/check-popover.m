@@ -62,15 +62,14 @@ static BOOL HasText(NSView *view, NSString *text) {
     for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
     return NO;
 }
-// Tooltips are terse: a short line of figures, never a paragraph.
+// No app-authored hover popups: information remains in accessibility help.
 static NSView *WordyTip(NSView *view) {
-    for (NSString *line in [view.toolTip componentsSeparatedByString:@"\n"])
-        if (line.length > 70) return view;
+    if (view.toolTip.length) return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
 }
 static BOOL HasTip(NSView *view, NSString *text) {
-    if ([view.toolTip containsString:text]) return YES;
+    if ([view.accessibilityHelp containsString:text]) return YES;
     if ([view.accessibilityLabel containsString:text]) return YES;
     for (NSView *child in view.subviews) if (HasTip(child, text)) return YES;
     return NO;
@@ -96,6 +95,7 @@ static BOOL SameSize(NSView *a, NSView *b) {
 static BOOL ActionableMenuImages(NSMenu *menu) {
     if (!menu) return NO;
     for (NSMenuItem *item in menu.itemArray) {
+        if (item.toolTip.length) return NO;
         if (item.isSeparatorItem) continue;
         BOOL actionable = item.action != NULL || item.submenu != nil;
         if (actionable && !item.image) {
@@ -160,8 +160,18 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
+    if (view.toolTip.length) return NO;
     for (NSView *child in view.subviews) {
-        if (!NSContainsRect(view.bounds, child.frame) || !FitsChildren(child)) return NO;
+        // AppKit's segmented control has an empty private hosting view before
+        // window layout. It paints no content and NSContainsRect rejects empty rects.
+        if (NSIsEmptyRect(child.frame)) continue;
+        if (!NSContainsRect(view.bounds, child.frame)) {
+            fprintf(stderr, "outside %s (%s) in %s: %s / %s\n", child.accessibilityIdentifier.UTF8String,
+                NSStringFromClass(child.class).UTF8String, NSStringFromClass(view.class).UTF8String,
+                NSStringFromRect(child.frame).UTF8String, NSStringFromRect(view.bounds).UTF8String);
+            return NO;
+        }
+        if (!FitsChildren(child)) return NO;
         // No cut-off text anywhere: every label's whole string fits its frame.
         if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
             NSTextField *field = (NSTextField *)child;
@@ -243,7 +253,6 @@ static BOOL DetailColumnsMatch(NSArray<NSView *> *docs) {
         @"details.storage.row.0.value",
         @"details.battery.charge.value",
         @"details.battery.health.value",
-        @"details.battery.eta.value",
         @"details.system.cpu.value",
         @"details.system.memory.value",
         @"details.system.swap.value",
@@ -460,7 +469,7 @@ int main(int argc, const char **argv) {
         int etaMin = [c chargeForecastMinutes];
         NSString *etaPhrase = [NSString stringWithFormat:@"80%% ~%@", BatteryForecastClock([c batteryForecast].thresholdTime, nil)];
         NSView *batteryRow = FindIdentifier(root, @"popover.row.battery");
-        if (etaMin < 0 || ![batteryRow.toolTip containsString:etaPhrase]) return Fail(__LINE__);
+        if (etaMin < 0 || ![batteryRow.accessibilityHelp containsString:etaPhrase]) return Fail(__LINE__);
         NSPoint symbolMid = [batterySymbol convertPoint:NSMakePoint(NSMidX(batterySymbol.bounds),
                                                                      NSMidY(batterySymbol.bounds))
                                                   toView:batterySymbol.superview.superview];
@@ -495,7 +504,7 @@ int main(int argc, const char **argv) {
         NSView *output = FindIdentifier(root, @"popover.sound");
         if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) ||
             ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
-            ![output.toolTip isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
+            ![output.accessibilityHelp isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
@@ -525,7 +534,7 @@ int main(int argc, const char **argv) {
             HasText(root,@"Fable") || HasText(root, @"5-hour") || HasText(root, @" left")) return Fail(__LINE__);
         if (!HasTip(root, @"week resets tomorrow")) return Fail(__LINE__);
         NSView *wordy = WordyTip(root);
-        if (wordy) { fprintf(stderr, "wordy tooltip on %s: %s\n", wordy.accessibilityIdentifier.UTF8String, wordy.toolTip.UTF8String); return Fail(__LINE__); }
+        if (wordy) { fprintf(stderr, "unexpected hover tooltip on %s: %s\n", wordy.accessibilityIdentifier.UTF8String, wordy.toolTip.UTF8String); return Fail(__LINE__); }
         // The longest caption the row can produce must still fit: near-equal quotas (arrows),
         // a weekly reset named by weekday and date, and a cache-age note.
         AIUsage *longest = usage[0];
@@ -585,7 +594,7 @@ int main(int argc, const char **argv) {
         NSView *stored = FindIdentifier(storage.documentView, @"details.storage.row.0");
         NSButton *reveal = nil;
         for (NSView *sub in stored.subviews) if ([sub isKindOfClass:NSButton.class]) reveal = (NSButton *)sub;
-        if (!reveal || reveal.title.length || !reveal.image || ![reveal.toolTip isEqualToString:@"Reveal in Finder"])
+        if (!reveal || reveal.title.length || !reveal.image || ![reveal.accessibilityHelp isEqualToString:@"Reveal in Finder"])
             return Fail(__LINE__);
         NSView *provider = FindIdentifier(ai.documentView, @"details.ai.row.claude");
         NSView *windowRow = FindIdentifier(ai.documentView, @"details.ai.window.claude.0");
@@ -601,16 +610,19 @@ int main(int argc, const char **argv) {
         }
         if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
         NSTextField *etaName = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.name");
-        NSTextField *etaValue = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.value");
+        NSTextField *etaValue = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.arrivals");
         // The charge wattage is said once, on the Charge row: no "at +12 W" echo here, and
         // the Mac's draw and charge share one flow bar instead of three text rows.
-        if (![etaName.stringValue isEqual:@"To 80%"] || ![etaValue.stringValue isEqual:FmtDuration(etaMin)] ||
+        BatteryForecast detailsForecast = [c batteryForecast];
+        NSString *expectedArrivals = BatteryForecastDetail(detailsForecast, NSDate.date.timeIntervalSince1970, nil);
+        if (detailsForecast.hypotheticalFull) expectedArrivals = [expectedArrivals stringByAppendingString:@" · 100% if limit off"];
+        if (![etaName.stringValue isEqual:@"Forecast"] || ![etaValue.stringValue isEqual:expectedArrivals] ||
             FindIdentifier(battery.documentView, @"details.battery.eta.datum") ||
             FindIdentifier(battery.documentView, @"details.battery.row.power") ||
             FindIdentifier(battery.documentView, @"details.battery.row.load"))
             return Fail(__LINE__);
         PowerFlowGauge *flowBar = (PowerFlowGauge *)FindIdentifier(battery.documentView, @"details.battery.input.gauge");
-        if (flowBar && (![flowBar isKindOfClass:PowerFlowGauge.class] || !flowBar.toolTip.length)) return Fail(__LINE__);
+        if (flowBar && (![flowBar isKindOfClass:PowerFlowGauge.class] || !flowBar.accessibilityHelp.length)) return Fail(__LINE__);
         // System: CPU is the bar; memory in use is the thin line inside it (Cursor's language).
         // No words or unexplained glyphs beside it.
         for (NSView *doc in @[root, overview.documentView]) {
@@ -685,7 +697,7 @@ int main(int argc, const char **argv) {
             root = p.contentViewController.view;
             NSView *playingOut = FindIdentifier(root, @"popover.sound");
             if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
-                ![playingOut.toolTip containsString:@"click for"] ||
+                ![playingOut.accessibilityHelp containsString:@"click for"] ||
                 ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"])
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "idle") == 0) {
@@ -709,11 +721,11 @@ int main(int argc, const char **argv) {
         [c rebuildDetails];
         NSTabViewController *tabs = (NSTabViewController *)details.contentViewController;
         if (![tabs isKindOfClass:NSTabViewController.class] ||
-            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 5)
+            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 6)
             return Fail(__LINE__);
         [c rebuildDetails];   // in-place refresh must keep the symbols and the documents
-        if (tabs.tabViewItems.count != 5) return Fail(__LINE__);
-        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"ai"]];
+        if (tabs.tabViewItems.count != 6) return Fail(__LINE__);
+        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]];
         for (NSTabViewItem *item in tabs.tabViewItems) {
             if (!item.image || ![item.identifier isKindOfClass:NSString.class] ||
                 ![idents containsObject:item.identifier]) return Fail(__LINE__);
@@ -736,9 +748,9 @@ int main(int argc, const char **argv) {
         if (getenv("GLANCEBAR_DUMP_TIPS")) {
             for (NSString *rid in @[@"popover.row.storage", @"popover.row.battery", @"popover.row.system",
                                     @"popover.row.ai.claude", @"popover.row.ai.codex", @"popover.row.ai.cursor"])
-                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).toolTip.UTF8String);
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).accessibilityHelp.UTF8String);
             for (NSString *rid in @[@"popover.battery.symbol", @"popover.ai.claude.gauge"])
-                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).toolTip.UTF8String);
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).accessibilityHelp.UTF8String);
         }
         // Cursor is an ordinary one-bar row showing Grok + Composer (Cursor's own models);
         // the API pool is on the tooltip and gets its own window row on the AI tab.
@@ -800,7 +812,7 @@ int main(int argc, const char **argv) {
             !HasText(starlinkRow, @"88%") || !HasTip(starlinkRow, @"Mac 12.4 GB of 100 GB") ||
             !HasTip(starlinkRow, @"↓ 10.1 GB  ↑ 2.3 GB") || !HasTip(starlinkRow, @"now 1.4 MB/s") ||
             !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(starlinkRow) ||
-            [starlinkRow.toolTip componentsSeparatedByString:@"\n"].count != 3) return Fail(__LINE__);
+            [starlinkRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 3) return Fail(__LINE__);
         NSView *starlinkDetails = [c overviewDetailsView].documentView;
         if (!FindIdentifier(starlinkDetails, @"details.overview.starlink.gauge") ||
             !HasTip(starlinkDetails, @"Mac 12.4 GB of 100 GB") || !FitsChildren(starlinkDetails)) return Fail(__LINE__);
@@ -820,7 +832,7 @@ int main(int argc, const char **argv) {
         NSTextField *detailLasts = (NSTextField *)FindIdentifier(fastDetails, @"details.overview.starlink.datum");
         if (![lasts.stringValue isEqual:@"lasts 5:20"] || ![lasts.textColor isEqual:NSColor.systemYellowColor] ||
             ![lasts.stringValue isEqual:detailLasts.stringValue] || ![lasts.textColor isEqual:detailLasts.textColor] ||
-            [fastRow.toolTip componentsSeparatedByString:@"\n"].count != 4 || !HasTip(fastRow, @"resets ") ||
+            [fastRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 4 || !HasTip(fastRow, @"resets ") ||
             !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(fastRow) || !FitsChildren(fastDetails)) return Fail(__LINE__);
         if (argc > 1) {
             NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
@@ -841,7 +853,7 @@ int main(int argc, const char **argv) {
         if (fabs(accountGauge.fraction - 0.293) > 0.001 || !HasText(accountRow, @"29%") ||
             !HasTip(accountRow, @"Starlink 70.7 GB of 100 GB · read 4 min ago + Mac 0.3") ||
             !HasTip(accountRow, @"Mac ↓ 10.1 GB  ↑ 2.3 GB") || HasTip(accountRow, @"account:") ||
-            [accountRow.toolTip componentsSeparatedByString:@"\n"].count != 3 ||
+            [accountRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 3 ||
             ![accountGauge.metricLabel isEqual:@"Starlink data remaining"] ||
             !HasTip(accountDetails, @"Starlink 70.7 GB") || !FitsChildren(root) || !InstrumentRowsFit(root) ||
             WordyTip(accountRow) || !FitsChildren(accountDetails)) return Fail(__LINE__);
@@ -925,7 +937,7 @@ int main(int argc, const char **argv) {
                 if (sb.percent <= 20 && !sb.acConnected && fv.thresholdText.length) return Fail(__LINE__);
                 if (sb.acConnected && sb.isCharging && sb.percent<80 &&
                     (fv.forecast.endpointTime<=0 || !fv.forecast.hypotheticalFull ||
-                     ![fv.toolTip containsString:@"assumes the 80% limit is cancelled"])) return Fail(__LINE__);
+                     ![fv.accessibilityHelp containsString:@"assumes the 80% limit is cancelled"])) return Fail(__LINE__);
                 if (sb.acConnected && sb.percent>=80 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
                 TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
@@ -944,7 +956,7 @@ int main(int argc, const char **argv) {
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
         PrimeBatteryForecast(c, b, YES);
             [c rebuildContent];
-            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"ai"]) {
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]) {
                 NSView *doc = ((NSScrollView *)[c detailViewForIdentifier:tab]).documentView;
                 if (!FitsChildren(doc)) { fprintf(stderr, "details tab %s\n", tab.UTF8String); return Fail(__LINE__); }
             }
@@ -1143,7 +1155,7 @@ int main(int argc, const char **argv) {
         const char *detailsPrefix = getenv("GLANCEBAR_RENDER_DETAILS");
         if (detailsPrefix && detailsPrefix[0]) {
             NSAppearanceName appearance = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
-            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"ai"]) {
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]) {
                 NSScrollView *scroll = [c detailViewForIdentifier:tab];
                 NSView *doc = [scroll isKindOfClass:NSScrollView.class] ? scroll.documentView : scroll;
                 NSString *path = [NSString stringWithFormat:@"%s-%@.png", detailsPrefix, tab];

@@ -24,6 +24,11 @@
 #import <sqlite3.h>
 #import "pure.h"
 #import "nowplaying.h"
+#import "activity.h"
+
+// This preference governs Glancebar's optional requests only, never system networking.
+static BOOL GBLowDataEnabled(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"lowData"]; }
+static NSString *const GBLowDataTip = @"Glancebar only: defer account refreshes and dish discovery.\nLocal readings and cached figures remain. Other apps are unaffected.";
 
 static NSString * const GBVersion = @"1.1.0";
 
@@ -221,6 +226,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
     return [pairs componentsJoinedByString:@"; "];
 }
 - (NSData *)get:(NSString *)path cookies:(NSString *)cookies status:(NSInteger *)status {
+    if (GBLowDataEnabled()) { if (status) *status = 0; return nil; }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
         [NSURL URLWithString:[@"https://starlink.com" stringByAppendingString:path]]];
     [request setValue:cookies forHTTPHeaderField:@"Cookie"];
@@ -237,6 +243,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
 }
 - (void)fetch:(void (^)(NSDictionary *, NSString *))done {
     dispatch_async(_queue, ^{
+        if (GBLowDataEnabled()) { done(nil, @"Low Data · Glancebar"); return; }
         NSString *account = nil, *problem = nil;
         NSDictionary *usage = nil;
         NSString *cookies = [self cookieHeader:&account];
@@ -394,6 +401,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
     dispatch_async(_queue, ^{
         if (self->_sleeping || self->_stopped) return;
         [self sample];
+        if (GBLowDataEnabled()) return;
         if ([[self primaryRouter] isEqual:@"172.20.10.1"]) return;
         NSDate *now = NSDate.date;
         if (self->_onStarlink) [self refreshAccount:now];
@@ -427,6 +435,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
 }
 // The account figure lags real use by minutes, so ten-minute polling loses nothing.
 - (void)refreshAccount:(NSDate *)now {
+    if (GBLowDataEnabled()) return;
     if (_fetchingAccount || (_lastAccountFetch && [now timeIntervalSinceDate:_lastAccountFetch] < 600)) return;
     _fetchingAccount = YES;
     _lastAccountFetch = now;
@@ -434,6 +443,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
         dispatch_async(self->_queue, ^{
             self->_fetchingAccount = NO;
             if (self->_stopped) return;
+            if (!usage && GBLowDataEnabled()) { self->_lastAccountFetch = nil; return; }
             NSMutableDictionary *account = [(self->_account ?: @{}) mutableCopy];
             if (usage) {
                 NSDictionary *mac = self->_states[@"starlink"];
@@ -1647,6 +1657,7 @@ static NSDictionary *FetchResult(NSData *data, NSHTTPURLResponse *http, NSError 
 // Synchronous by design: callers run on the AI queue, never the main thread.
 static NSDictionary *HTTPJSON(NSString *token, NSString *method, NSString *urlString, NSString *host,
                               NSDictionary *headers, NSData *body, NSString *timeoutMessage) {
+    if (GBLowDataEnabled()) return nil;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     req.HTTPMethod = method;
     req.timeoutInterval = 10;
@@ -2842,13 +2853,16 @@ static NSString *ISOStringFromEpoch(double epoch) {
                       token:(NSString *(^)(void))tokenForNow
                     fetcher:(NSDictionary *(^)(NSString *))fetcher
                     onError:(void (^)(NSDictionary *))onError {
+    if (GBLowDataEnabled()) return; // also guards work queued before the toggle changed
     if (ShouldFetchClaudeAccount(use, allow, *usageJSON != nil, (*accountStatus).length > 0, now, *nextFetch)) {
         *skipReason = nil;
         NSString *token = tokenForNow();
+        if (GBLowDataEnabled()) return;
         // No token, no request: leave the schedule to the credential reader's own backoff
         // instead of spending the 15-minute slot on nothing.
         if (token) *nextFetch = now + kAccountPollInterval;   // the endpoints rate-limit readily
         NSDictionary *fetch = token ? fetcher(token) : nil;
+        if (!fetch && GBLowDataEnabled()) { *nextFetch = now; return; }
         if ([fetch[@"_glancebarFetchError"] boolValue]) {
             onError(fetch);
             GBLog("%{public}s fetch: failed http=%ld rateLimited=%d", label,
@@ -3792,6 +3806,18 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @end
 @implementation FlippedView - (BOOL)isFlipped { return YES; } @end
 
+@interface GBDetailsTabs : NSTabViewController
+@property (copy) dispatch_block_t activitySelected;
+@property (copy) dispatch_block_t otherSelected;
+@end
+@implementation GBDetailsTabs
+- (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)item {
+    [super tabView:tabView didSelectTabViewItem:item];
+    if ([item.identifier isEqual:@"activity"]) { if (self.activitySelected) self.activitySelected(); }
+    else if (self.otherSelected) self.otherSelected();
+}
+@end
+
 // Opaque, appearance-adaptive backing for the popover. The default NSPopover material is
 // translucent (behind-window vibrancy), so a dark or saturated window behind the menu bar
 // bleeds through and washes out the fixed semantic text colors toward the bottom of the
@@ -3965,7 +3991,6 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     existing.autoresizingMask = fresh.autoresizingMask;
     existing.hidden = fresh.hidden;
     existing.alphaValue = fresh.alphaValue;
-    existing.toolTip = fresh.toolTip;
     existing.identifier = fresh.identifier;
     existing.accessibilityIdentifier = fresh.accessibilityIdentifier;
     existing.accessibilityLabel = fresh.accessibilityLabel;
@@ -4002,6 +4027,10 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
+    } else if ([existing isKindOfClass:NSSegmentedControl.class]) {
+        NSSegmentedControl *old = (NSSegmentedControl *)existing, *new = (NSSegmentedControl *)fresh;
+        old.selectedSegment = new.selectedSegment;
+        old.target = new.target; old.action = new.action; old.enabled = new.enabled;
     } else if ([existing isKindOfClass:NSImageView.class]) {
         NSImageView *old = (NSImageView *)existing, *new = (NSImageView *)fresh;
         old.image = new.image;
@@ -4565,6 +4594,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSArray<NSDictionary *> *_burnRows;
     NSMutableDictionary<NSNumber *, NSString *> *_burnGroupCache;
     NSArray<NSDictionary *> *_topCPU, *_topMem;
+    NSDictionary *_activitySurvey;
+    BOOL _activityLoading, _activityPresenting;
+    NSUInteger _activityGeneration;
+    NSInteger _activitySort;
     NSMutableArray<NSNumber *> *_ampHistory;
     NSUInteger _sampleGen;
     CFAbsoluteTime _lastSampleTime;
@@ -4663,7 +4696,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
-                           @"useCursorAccount": @NO, @"switchToNewOutputs": @YES}];
+                           @"useCursorAccount": @NO, @"switchToNewOutputs": @YES, @"lowData": @NO}];
     _bat = ReadBattery();
     [self batteryForecast];
     [self noteEnergyBaseline:NO];
@@ -5460,7 +5493,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSString *nextName = nil;
     for (NSDictionary *row in menu)
         if ([row[@"uid"] isEqual:nextUID]) { nextName = row[@"name"]; break; }
-    button.toolTip = nextName.length ? [NSString stringWithFormat:@"%@ — click for %@", name, nextName] : name;
+    button.accessibilityHelp = nextName.length ? [NSString stringWithFormat:@"%@ — click for %@", name, nextName] : name;
     return button;
 }
 - (IBAction)cycleOutput:(id)sender {
@@ -5494,7 +5527,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                              color:NSColor.secondaryLabelColor
                                 at:NSMakeRect(kPad, y, kW - 2 * kPad, 14) align:NSTextAlignmentLeft];
     hint.maximumNumberOfLines = 1;
-    hint.toolTip = _musicNote;
+    hint.accessibilityHelp = _musicNote;
     hint.accessibilityIdentifier = @"popover.music.hint";
     [root addSubview:hint];
     return y + 16;
@@ -5580,7 +5613,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
 }
 
-- (void)meteredWillSleep:(NSNotification *)note { (void)note; [_meteredMonitor sleep]; }
+- (void)meteredWillSleep:(NSNotification *)note { (void)note; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
 - (void)meteredDidWake:(NSNotification *)note { (void)note; [_meteredMonitor wake]; }
 
 - (void)refresh {
@@ -5612,7 +5645,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self refreshVisibleSurfaces];
     // The details window stays open indefinitely; refresh its one-shot process samples
     // on a slow cadence so they don't masquerade as live data next to live numbers.
-    if (_detailsWindow.isVisible && !_hogsLoading && !_procStatsLoading &&
+    if (_detailsWindow.isVisible && ![self activityTabSelected] && !_hogsLoading && !_procStatsLoading &&
         CFAbsoluteTimeGetCurrent() - _lastSampleTime >= 30)
         [self beginSampling];
 }
@@ -5629,7 +5662,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 
 - (void)refreshAIUsageAsync {
-    BOOL showAI = _popover.isShown || _detailsWindow.isVisible;
+    BOOL showAI = !_activityPresenting && (_popover.isShown || (_detailsWindow.isVisible && ![self activityTabSelected]));
     // While every AI surface is hidden, one bounded pass every few minutes keeps the figures
     // warm. Skipping hidden passes entirely meant every open began from whatever the last
     // open left behind, a "Cached limit" from hours ago that read as stuck (2026-10-06).
@@ -5641,8 +5674,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     BOOL useCursorAccount = [ud boolForKey:@"useCursorAccount"];
     // Hidden passes are local-only: the account endpoints rate-limit readily, and an open
     // fetches at once when the cache is past its 15 minutes, so a hidden request buys little.
-    BOOL allowAccountFetch = showAI && useAccount;
-    BOOL allowCursorAccountFetch = showAI && useCursorAccount;
+    BOOL allowAccountFetch = showAI && useAccount && !GBLowDataEnabled();
+    BOOL allowCursorAccountFetch = showAI && useCursorAccount && !GBLowDataEnabled();
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
         useCursorAccount != _lastUseCursorAccount || allowTranscripts != _lastAllowTranscripts) {
@@ -6133,7 +6166,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         self->_item.button.image = next;
     }];
     NSString *summary = [self barAccessibilityText];
-    _item.button.toolTip = [@"Glancebar — " stringByAppendingString:summary];
+    _item.button.accessibilityHelp = [@"Glancebar — " stringByAppendingString:summary];
     [_item.button setAccessibilityLabel:@"Glancebar"];
     [_item.button setAccessibilityValue:summary];
     [_item.button setAccessibilityHelp:@"Open Glancebar status and details"];
@@ -6301,7 +6334,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self batteryForecast];
     _powerTicks++;
     [self noteEnergyBaseline:wasOnAC];
-    if (!_bat.acConnected && _powerTicks % 2 == 0) [self sampleBurnAsync];
+    if (!_bat.acConnected && _powerTicks % 2 == 0 && ![self activityTabSelected]) [self sampleBurnAsync];
     if (stateChanged) {
         if (popover) [self rebuildContent];
         if (details) [self rebuildDetails];
@@ -6314,7 +6347,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         if ([forecast isKindOfClass:BatteryForecastView.class]) [self configureBatteryForecast:forecast];
         NSString *tip = [self batteryPopoverTip];
         for (NSString *key in @[@"popover.row.battery", @"popover.battery.gauge", @"popover.battery.value", @"popover.battery.trend", @"popover.battery.datum"]) {
-            NSView *view = ViewWithAccessibilityIdentifier(root, key); view.toolTip = tip;
+            NSView *view = ViewWithAccessibilityIdentifier(root, key); view.accessibilityHelp = tip;
         }
     }
     if (!powerChanged) { if (details && _powerTicks % 2 == 0) [self rebuildDetails]; return; }
@@ -6335,9 +6368,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                 glyph.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
             }
             NSString *tip = [self batteryPopoverTip];
-            datum.toolTip = tip;
+            datum.accessibilityHelp = tip;
             NSView *row = ViewWithAccessibilityIdentifier(root, @"popover.row.battery");
-            row.toolTip = tip; row.accessibilityLabel = tip;
+            row.accessibilityHelp = tip; row.accessibilityLabel = tip;
         }
     }
     // Details rows are rebuilt wholesale; every other second is live enough there.
@@ -6537,9 +6570,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     _keepAwakeButton.accessibilityLabel = [NSString stringWithFormat:@"Keep Awake — %@", awakeState];
     _lowPowerButton.accessibilityLabel = [NSString stringWithFormat:@"Low Power — %@", lowState];
     // The pill already shows its name and state; the tooltip says only what it does.
-    _keepAwakeButton.toolTip = PmsetRuleInstalled() ? @"No sleep, even with the lid closed"
+    _keepAwakeButton.accessibilityHelp = PmsetRuleInstalled() ? @"No sleep, even with the lid closed"
                                                     : @"No sleep, even with the lid closed · asks for your password";
-    _lowPowerButton.toolTip = @"macOS Low Power Mode";
+    _lowPowerButton.accessibilityHelp = @"macOS Low Power Mode";
     _keepAwakeButton.frame = NSMakeRect(kPad, 0, kKeepW, kToggleH);
     _lowPowerButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap, 0, kLowW, kToggleH);
     if (_chargeButton) {
@@ -6548,7 +6581,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         BOOL limited = ![[self effectiveChargeMode] isEqualToString:@"full"];
         [self styleToggle:_chargeButton on:limited tint:NSColor.systemGreenColor ink:NSColor.whiteColor];
         _chargeButton.accessibilityLabel = [NSString stringWithFormat:@"Limit charge to 80%% — %@", limited ? @"on" : @"off"];
-        _chargeButton.toolTip = [self chargeLimitTooltip];
+        _chargeButton.accessibilityHelp = [self chargeLimitTooltip];
         _chargeButton.frame = NSMakeRect(kPad + kKeepW + kToggleGap + kLowW + kToggleGap, 0, kChargeW, kToggleH);
     }
 }
@@ -6676,7 +6709,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return nil;
 }
 
-// Tooltips are terse: only figures the row doesn't already show, never repeated, no machinery.
+// Extra figures remain available to assistive technology; hover popups are disabled.
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery";
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
@@ -6865,10 +6898,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     double now = NSDate.date.timeIntervalSince1970;
     view.thresholdText = f.thresholdReached || f.hideLabels ? @"" : BatteryForecastDuration(f.thresholdTime, now);
     view.endpointText = f.endpointReached || f.hideLabels ? @"" : BatteryForecastDuration(f.endpointTime, now);
-    view.toolTip = [NSString stringWithFormat:@"%@\n%@", BatteryForecastDetail(f, NSDate.date.timeIntervalSince1970, nil),
+    view.accessibilityHelp = [NSString stringWithFormat:@"%@\n%@", BatteryForecastDetail(f, NSDate.date.timeIntervalSince1970, nil),
         BatteryForecastStatus(f)];
     view.accessibilityLabel = [NSString stringWithFormat:@"%d%% %@ · %d%% %@. %@", f.thresholdPercent,
-        view.thresholdText, f.endpointPercent, view.endpointText, view.toolTip];
+        view.thresholdText, f.endpointPercent, view.endpointText, view.accessibilityHelp];
     [view setAccessibilityElement:YES]; view.accessibilityRole = NSAccessibilityImageRole;
     view.needsDisplay = YES;
 }
@@ -6925,7 +6958,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     TrendArrow *arrow = [[TrendArrow alloc] initWithFrame:NSZeroRect];
     [self configureTrend:arrow over:gauge];
     arrow.accessibilityIdentifier = [stem stringByAppendingString:@".trend"];
-    arrow.toolTip = tip;
+    arrow.accessibilityHelp = tip;
     [row addSubview:arrow];
     BatteryForecastView *forecast = [[BatteryForecastView alloc] initWithFrame:
         NSMakeRect(NSMinX(frame) - kBatteryForecastSideRoom, 0, NSWidth(frame) + 2 * kBatteryForecastSideRoom, 30)];
@@ -6936,7 +6969,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
                               font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                              color:[self batteryRateColor] at:datum align:NSTextAlignmentLeft];
     rate.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
-    rate.toolTip = tip;
+    rate.accessibilityHelp = tip;
     [row addSubview:rate];
 }
 
@@ -6976,14 +7009,14 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     g.color = cpuColor;
     g.metricLabel = @"CPU";
     g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
-    g.toolTip = tip;
+    g.accessibilityHelp = tip;
     [row addSubview:g];
     NSTextField *value = [self text:(_sys.cpuValid ? [NSString stringWithFormat:@"%d%%", (int)lround(cpu * 100)] : @"—")
                                font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
                               color:cpuColor at:valueFrame align:NSTextAlignmentRight];
     value.accessibilityIdentifier = [stem stringByAppendingString:@".value"];
     value.accessibilityLabel = cpuTip;
-    value.toolTip = tip;
+    value.accessibilityHelp = tip;
     [row addSubview:value];
 
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
@@ -7168,28 +7201,28 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.accessibilityRole = NSAccessibilityButtonRole;
     row.accessibilityIdentifier = @"popover.row.burn";
     NSString *tip = [self burnTip:draw];
-    row.toolTip = tip;
+    row.accessibilityHelp = tip;
     row.accessibilityLabel = tip;
     NSImage *icon = BurnAppIcon(top);
     NSImageView *symbol = icon ? [self instrumentLogo:icon identifier:@"popover.burn.symbol" in:row]
         : [self instrumentSymbol:@"terminal" tint:NSColor.secondaryLabelColor identifier:@"popover.burn.symbol" in:row];
-    symbol.toolTip = tip;
+    symbol.accessibilityHelp = tip;
     NSString *name = BurnShortName(top[@"name"]);
     NSTextField *nameField = [self instrumentName:name identifier:@"popover.burn.name" in:row];
     nameField.lineBreakMode = NSLineBreakByTruncatingTail;
-    nameField.toolTip = tip;
+    nameField.accessibilityHelp = tip;
     Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
     bar.fraction = MIN(1, watts / draw);
     bar.color = NSColor.systemOrangeColor;
     bar.metricLabel = @"App share of battery draw";
     bar.accessibilityIdentifier = @"popover.burn.gauge";
-    bar.toolTip = tip;
+    bar.accessibilityHelp = tip;
     [row addSubview:bar];
     NSString *value = [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts];
     [self instrumentValue:value color:watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
-               identifier:@"popover.burn.value" in:row].toolTip = tip;
+               identifier:@"popover.burn.value" in:row].accessibilityHelp = tip;
     [self instrumentDatum:[@"quit +" stringByAppendingString:FmtDuration(gain)] color:NSColor.secondaryLabelColor
-               identifier:@"popover.burn.datum" in:row].toolTip = tip;
+               identifier:@"popover.burn.datum" in:row].accessibilityHelp = tip;
     [root addSubview:row];
     return y + kRowH;
 }
@@ -7272,16 +7305,16 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;   // spoken
     NSString *shortTip = tip.length ? tip : name;   // shown: the row already names itself
     if (!logo) mark.contentTintColor = valueColor;
-    mark.toolTip = shortTip;
+    mark.accessibilityHelp = shortTip;
     mark.accessibilityLabel = named;
-    nameField.toolTip = shortTip;
+    nameField.accessibilityHelp = shortTip;
     nameField.accessibilityLabel = name;
-    if (meter) meter.toolTip = shortTip;
-    if (plainGauge) plainGauge.toolTip = shortTip;
+    if (meter) meter.accessibilityHelp = shortTip;
+    if (plainGauge) plainGauge.accessibilityHelp = shortTip;
     NSString *valueID = [name isEqualToString:@"Claude"] ? @"popover.claude.value"
         : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
     NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
-    value.toolTip = shortTip;
+    value.accessibilityHelp = shortTip;
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
     NSColor *datumColor = NSColor.secondaryLabelColor;
@@ -7298,9 +7331,9 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     }
     NSTextField *datumField = [self instrumentDatum:datum color:datumColor
                                         identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];
-    datumField.toolTip = shortTip;
+    datumField.accessibilityHelp = shortTip;
     datumField.accessibilityLabel = named.length ? named : datum;
-    row.toolTip = shortTip;
+    row.accessibilityHelp = shortTip;
     row.accessibilityLabel = named;
     [root addSubview:row];
     y += rowH;
@@ -7324,8 +7357,8 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [apiRow addSubview:apiBar];
         [self instrumentValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
                    identifier:@"popover.ai.cursor.api.value" in:apiRow];
-        apiRow.toolTip = apiTip;
-        for (NSView *sub in apiRow.subviews) sub.toolTip = apiTip;
+        apiRow.accessibilityHelp = apiTip;
+        for (NSView *sub in apiRow.subviews) sub.accessibilityHelp = apiTip;
         [root addSubview:apiRow];
         y += kRowH;
     }
@@ -7403,7 +7436,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSColor *color = AIQuotaColor(fraction);
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
     row.accessibilityIdentifier = [NSString stringWithFormat:@"popover.row.%@", link];
-    row.toolTip = figures[@"tip"];
+    row.accessibilityHelp = figures[@"tip"];
     row.accessibilityLabel = [[MeteredName(link) stringByAppendingString:@" — "] stringByAppendingString:figures[@"tip"]];
     [self instrumentSymbol:MeteredSymbol(link) tint:color identifier:[NSString stringWithFormat:@"popover.%@.symbol", link] in:row];
     [self instrumentName:MeteredName(link) identifier:[NSString stringWithFormat:@"popover.%@.name", link] in:row];
@@ -7416,7 +7449,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [row addSubview:gauge];
     [self instrumentValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"popover.%@.value", link] in:row];
     [self instrumentDatum:figures[@"datum"] color:[self meteredDatumColor:figures] identifier:[NSString stringWithFormat:@"popover.%@.datum", link] in:row];
-    for (NSView *child in row.subviews) child.toolTip = figures[@"tip"];
+    for (NSView *child in row.subviews) child.accessibilityHelp = figures[@"tip"];
     [root addSubview:row];
     return y + kRowH;
 }
@@ -7446,7 +7479,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @"chargeMode":[self effectiveChargeMode], @"hypotheticalFull":@(f.hypotheticalFull), @"hideLabels":@(f.hideLabels),
         @"thresholdFromSystem":@(f.thresholdFromSystem),
         @"thresholdArrival":@(f.thresholdTime), @"endpointArrival":@(f.endpointTime),
-        @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"tooltip":view.toolTip ?: @"",
+        @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"accessibilityHelp":view.accessibilityHelp ?: @"",
         @"thresholdCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:YES])),
         @"endpointCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:NO])),
         @"gaugeStartX":@(kGaugeX), @"gaugeWidth":@(kGaugeW)};
@@ -7473,7 +7506,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.accessibilityRole = NSAccessibilityButtonRole;
     row.accessibilityIdentifier = @"popover.row.battery";
     NSString *tip = [self batteryPopoverTip];
-    row.toolTip = tip;
+    row.accessibilityHelp = tip;
     row.accessibilityLabel = tip;
     if (_bat.valid) {
         NSImage *batteryImage = [self liveBatteryGlyph];
@@ -7485,8 +7518,8 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         symbol.contentTintColor = batteryImage.template ? PowerFlowColor(_bat, NSColor.labelColor) : nil;
         symbol.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
         symbol.accessibilityIdentifier = @"popover.battery.symbol";
-        symbol.toolTip = [self chargeLimitTooltip];
-        symbol.accessibilityLabel = symbol.toolTip;
+        symbol.accessibilityHelp = [self chargeLimitTooltip];
+        symbol.accessibilityLabel = symbol.accessibilityHelp;
         [row addSubview:symbol];
         [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
         Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
@@ -7495,12 +7528,12 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         g.color = BattBarColor(_bat.percent);
         g.metricLabel = @"Battery charge";
         g.accessibilityIdentifier = @"popover.battery.gauge";
-        g.toolTip = tip;
+        g.accessibilityHelp = tip;
         [row addSubview:g];
         NSTextField *value = [self instrumentValue:[NSString stringWithFormat:@"%d%%", _bat.percent]
                                             color:BattBarColor(_bat.percent)
                                        identifier:@"popover.battery.value" in:row];
-        value.toolTip = tip;
+        value.accessibilityHelp = tip;
         [self addBatteryTrendTo:row gauge:g datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
                            stem:@"popover.battery" tip:tip];
     } else {
@@ -7509,7 +7542,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
         NSTextField *value = [self instrumentValue:@"—" color:NSColor.tertiaryLabelColor
                                        identifier:@"popover.battery.value" in:row];
-        value.toolTip = tip;
+        value.accessibilityHelp = tip;
         [self instrumentDatum:@"" color:nil identifier:@"popover.battery.datum" in:row];
     }
     return row;
@@ -7552,7 +7585,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         if (v.purgeable > 0) [tip appendFormat:@" · %@ purgeable", CompactByteCount(v.purgeable)];
         if ([secondaryNotice[@"text"] isKindOfClass:NSString.class])
             [tip appendFormat:@"\n%@", secondaryNotice[@"text"]];
-        row.toolTip = tip;
+        row.accessibilityHelp = tip;
         row.accessibilityLabel = tip;
         // A second mount over 85% full is the alarm: it tints the symbol and is named above.
         NSColor *symbolTint = secondaryNotice ? DiskColor([secondaryNotice[@"fraction"] doubleValue])
@@ -7565,17 +7598,17 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         g.color = DiskColor(v.fraction);
         g.metricLabel = [NSString stringWithFormat:@"%@ storage used", v.name];
         g.accessibilityIdentifier = @"popover.storage.gauge";
-        g.toolTip = tip;
+        g.accessibilityHelp = tip;
         [row addSubview:g];
         NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(v.fraction * 100)];
         NSTextField *value = [self instrumentValue:pct color:DiskColor(v.fraction)
                                         identifier:@"popover.storage.value" in:row];
-        value.toolTip = tip;
+        value.accessibilityHelp = tip;
         value.accessibilityLabel = [NSString stringWithFormat:@"%@ percent used", pct];
         NSTextField *datum = [self instrumentDatum:[NSString stringWithFormat:@"%@ free", CompactByteCount(v.available)]
                                             color:NSColor.secondaryLabelColor
                                        identifier:@"popover.storage.datum" in:row];
-        datum.toolTip = tip;
+        datum.accessibilityHelp = tip;
         [root addSubview:row];
         y += kRowH;
     }
@@ -7595,7 +7628,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         row.action = @selector(showSystemDetails:);
         row.accessibilityRole = NSAccessibilityButtonRole;
         row.accessibilityIdentifier = @"popover.row.system";
-        row.toolTip = summary;
+        row.accessibilityHelp = summary;
         row.accessibilityLabel = summary;
         [self instrumentSymbol:@"cpu" tint:SystemPressureColor(sysLevel)
                    identifier:@"popover.system.symbol" in:row];
@@ -7676,7 +7709,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     more.imageScaling = NSImageScaleProportionallyDown;
     more.contentTintColor = NSColor.secondaryLabelColor;
     more.frame = NSMakeRect(kW - kPad - kToggleH, 0, kToggleH, kToggleH);
-    more.toolTip = [@"Details, settings and Quit. " stringByAppendingString:freshness];
+    more.accessibilityHelp = [@"Details, settings and Quit. " stringByAppendingString:freshness];
     more.accessibilityIdentifier = @"popover.more";
     [foot addSubview:more];
     [footer addSubview:foot];
@@ -7754,6 +7787,9 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSMenuItem *details = [m addItemWithTitle:@"Details…" action:@selector(showDetails:) keyEquivalent:@""];
     details.target = self;
     details.image = [self menuSymbol:@"rectangle.grid.1x2"];
+    NSMenuItem *activity = [m addItemWithTitle:@"Activity…" action:@selector(showActivityDetails:) keyEquivalent:@""];
+    activity.target = self;
+    activity.image = [self menuSymbol:@"waveform.path.ecg"];
     NSMenuItem *settings = [m addItemWithTitle:@"Settings" action:nil keyEquivalent:@""];
     settings.image = [self menuSymbol:@"gearshape"];
     settings.submenu = [self settingsMenu];
@@ -7800,9 +7836,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self settingsItem:m title:@"Health" symbol:@"heart" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
     [self settingsItem:m title:@"Keep Awake & Low Power without a password" symbol:@"lock.open"
                     action:@selector(togglePmsetRule:)
-                    on:PmsetRuleInstalled()].toolTip = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
+                    on:PmsetRuleInstalled()].accessibilityHelp = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
 
     [self addSection:m title:@"AI status"];
+    [self settingsItem:m title:@"Low Data · Glancebar" symbol:@"arrow.down.circle"
+                    action:@selector(toggleLowData:) on:GBLowDataEnabled()].accessibilityHelp = GBLowDataTip;
     [self settingsItem:m title:@"Claude transcript token totals" symbol:@"doc.text"
                     action:@selector(toggleClaudeTranscripts:)
                     on:[ud boolForKey:@"useClaudeTranscripts"]];
@@ -7932,10 +7970,14 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 // it so the toggle snaps back.
 - (void)toggleLowPowerMode:(id)s {
     BOOL enabling = !LowPowerModeEnabled();
+    BOOL wasVisible = _popover.isShown || _detailsWindow.isVisible;
     [self syncPowerButtons];   // undo the click's own flip until the system confirms
     [self applyPmset:@"lowpowermode" on:enabling
             reason:enabling ? @"turn on Low Power Mode" : @"turn off Low Power Mode"
-              then:^{ [self syncPowerButtons]; }];
+              then:^{
+        [self syncPowerButtons];
+        [self lowPowerFinishedEnabling:enabling active:LowPowerModeEnabled() reveal:wasVisible];
+    }];
 }
 // Applies one pmset flag, then runs `then` on the main queue whatever happened (callers
 // re-read live state, so a cancel needs no rollback). With the rule installed: `sudo -n`,
@@ -8152,7 +8194,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         mark.contentTintColor = providerLogo ? nil : (tint ?: NSColor.secondaryLabelColor);
         mark.frame = NSMakeRect(kDetailPad, *y, 16, 16);
         mark.accessibilityElement = NO;   // the heading text is the accessible name
-        if (tip.length) mark.toolTip = tip;
+        if (tip.length) mark.accessibilityHelp = tip;
         [root addSubview:mark];
         textX = kDetailPad + 20;
         textY = *y + 1;
@@ -8163,7 +8205,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
                                     at:NSMakeRect(textX, textY, width - kDetailPad - textX, 14)
                                  align:NSTextAlignmentLeft];
     ApplyHeadingAccessibility(heading, title);
-    if (tip.length) heading.toolTip = tip;
+    if (tip.length) heading.accessibilityHelp = tip;
     NSString *key = sectionKey.length ? sectionKey.lowercaseString : title.lowercaseString;
     NSString *scope = root.accessibilityIdentifier ?: @"details";
     heading.accessibilityIdentifier = DisambiguatedDetailKey(detailRoot, @"id",
@@ -8239,11 +8281,141 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     return scroll;
 }
 
+// A survey is a bounded snapshot, not a background monitor. Completion only updates
+// an already visible window; closing Details never causes it to reopen.
+- (BOOL)activityTabSelected {
+    NSTabViewController *tabs = [_detailsWindow.contentViewController isKindOfClass:NSTabViewController.class]
+        ? (NSTabViewController *)_detailsWindow.contentViewController : nil;
+    return [tabs.tabView.selectedTabViewItem.identifier isEqual:@"activity"];
+}
+- (NSDictionary *)performActivitySurvey { return GBActivitySurvey(); }
+- (void)requestActivitySurvey {
+    if (_activityLoading || _terminating) return;
+    _activityLoading = YES;
+    NSUInteger generation = _activityGeneration;
+    [self refreshVisibleSurfaces];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *result = [self performActivitySurvey];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_activityLoading = NO;
+            if (self->_terminating) return;
+            if (generation == self->_activityGeneration) self->_activitySurvey = result;
+            [self refreshVisibleSurfaces];
+        });
+    });
+}
+- (void)requestActivitySurveyIfNeeded {
+    double age = NSDate.date.timeIntervalSince1970 - [_activitySurvey[@"capturedAt"] doubleValue];
+    if (!_activitySurvey || age < 0 || age > 60) [self requestActivitySurvey];
+}
+- (void)surveyActivity:(id)sender { (void)sender; [self requestActivitySurvey]; }
+- (void)sortActivity:(NSSegmentedControl *)sender {
+    _activitySort = MAX(0, MIN(2, sender.selectedSegment));
+    [self rebuildDetails];
+}
+- (void)toggleLowData:(id)sender {
+    (void)sender;
+    [NSUserDefaults.standardUserDefaults setBool:!GBLowDataEnabled() forKey:@"lowData"];
+    [self refreshVisibleSurfaces];
+    // Local reads stay available. Existing authorized requests resume only when off.
+    [self refreshAIUsageAsync];
+    [_meteredMonitor tick];
+}
+- (void)showActivityDetails:(id)sender {
+    _activityPresenting = YES;
+    [self showDetailsTab:@"activity" sender:sender];
+    _activityPresenting = NO;
+    [self stopPowerTick];
+    [self requestActivitySurveyIfNeeded];
+}
+- (void)lowPowerFinishedEnabling:(BOOL)enabling active:(BOOL)active reveal:(BOOL)reveal {
+    if (!enabling || !active || _terminating) return;
+    // If the user already dismissed the requesting surface, collect quietly.
+    if (reveal && (_popover.isShown || _detailsWindow.isVisible)) [self showActivityDetails:nil];
+    [self requestActivitySurvey];
+}
+- (NSScrollView *)activityDetailsView {
+    CGFloat width = kDetailW, pad = 16;
+    FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, width, 360)];
+    root.accessibilityIdentifier = @"details.activity";
+    NSSegmentedControl *sort = [NSSegmentedControl segmentedControlWithLabels:@[@"CPU", @"Download", @"Upload"]
+                    trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(sortActivity:)];
+    sort.frame = NSMakeRect(pad, 12, 230, 28);
+    sort.selectedSegment = _activitySort;
+    sort.accessibilityIdentifier = @"details.activity.sort";
+    sort.accessibilityLabel = @"Sort activity by";
+    sort.accessibilityHelp = @"Sort this snapshot; selecting a metric does not take another sample.";
+    [root addSubview:sort];
+    NSButton *lowData = [self powerToggle:@"Low Data · Glancebar" symbol:@"arrow.down.circle" action:@selector(toggleLowData:)];
+    lowData.frame = NSMakeRect(width - 274, 12, 184, 28);
+    [self styleToggle:lowData on:GBLowDataEnabled() tint:NSColor.systemYellowColor ink:[NSColor colorWithWhite:0.1 alpha:1]];
+    lowData.accessibilityIdentifier = @"details.activity.low-data";
+    lowData.accessibilityLabel = @"Low Data for Glancebar only";
+    lowData.accessibilityHelp = GBLowDataTip;
+    [root addSubview:lowData];
+    NSButton *survey = [NSButton buttonWithTitle:_activityLoading ? @"Sampling…" : @"Survey" target:self action:@selector(surveyActivity:)];
+    survey.frame = NSMakeRect(width - 84, 12, 76, 28);
+    survey.enabled = !_activityLoading;
+    survey.accessibilityIdentifier = @"details.activity.survey";
+    survey.accessibilityHelp = @"Take a short read-only sample. Apps and transfers keep running.";
+    [root addSubview:survey];
+    CGFloat nameW = width - 404, cpuX = width - 376, downX = width - 290, upX = width - 142;
+    NSArray *titles = @[@"App / process", @"CPU", @"Down", @"Up"];
+    CGFloat xs[] = {pad, cpuX, downX, upX}, ws[] = {nameW, 64, 126, 126};
+    for (NSUInteger col = 0; col < 4; col++)
+        [self detailText:titles[col] font:[NSFont systemFontOfSize:12.5] color:NSColor.secondaryLabelColor
+                   frame:NSMakeRect(xs[col], 82, ws[col], 18) align:col ? NSTextAlignmentRight : NSTextAlignmentLeft
+              identifier:[@"details.activity.heading." stringByAppendingString:titles[col]] in:root];
+    NSString *metric = @[@"cpu", @"download", @"upload"][_activitySort];
+    NSArray *rows = GBActivitySortedRows(_activitySurvey[@"rows"] ?: @[], metric);
+    CGFloat y = 108;
+    NSUInteger index = 0;
+    for (NSDictionary *entry in rows) {
+        NSString *name = entry[@"name"] ?: @"Process";
+        NSString *identity = entry[@"group"] ?: [NSString stringWithFormat:@"%lu", (unsigned long)index];
+        NSString *prefix = [@"details.activity.row." stringByAppendingString:identity];
+        NSString *tip = [NSString stringWithFormat:@"%@\nCPU: 100%% = one core. ≥ = accessible subset. Network includes local and tunnel traffic.\nPIDs: %@", name, [entry[@"pids"] componentsJoinedByString:@", "] ?: @""];
+        NSArray *values = @[name, GBActivityCPU(entry[@"cpu"], [entry[@"cpuPartial"] boolValue]),
+            GBActivityRate(entry[@"download"], [entry[@"networkPartial"] boolValue]),
+            GBActivityRate(entry[@"upload"], [entry[@"networkPartial"] boolValue])];
+        for (NSUInteger col = 0; col < 4; col++) {
+            NSFont *font = col ? [NSFont monospacedDigitSystemFontOfSize:13 weight:col == 1 ? NSFontWeightSemibold : NSFontWeightRegular]
+                              : [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+            NSTextField *field = [self detailText:values[col] font:font color:col < 2 ? NSColor.labelColor : NSColor.secondaryLabelColor
+                          frame:NSMakeRect(xs[col], y, ws[col], 18) align:col ? NSTextAlignmentRight : NSTextAlignmentLeft
+                     identifier:[prefix stringByAppendingFormat:@".%lu", (unsigned long)col] in:root];
+            field.accessibilityHelp = tip;
+            field.accessibilityLabel = [NSString stringWithFormat:@"%@ %@", name, titles[col]];
+        }
+        y += 32; index++;
+    }
+    if (!rows.count) {
+        NSString *empty = _activityLoading ? @"Sampling…" : _activitySurvey ? @"Activity unavailable" : @"Take a survey";
+        [self detailText:empty font:[NSFont systemFontOfSize:13] color:NSColor.secondaryLabelColor
+                  frame:NSMakeRect(pad, y, width - 2 * pad, 18) align:NSTextAlignmentLeft
+             identifier:@"details.activity.empty" in:root];
+        y += 32;
+    }
+    NSString *stamp = @"";
+    if (_activitySurvey) {
+        NSDateFormatter *clock = [NSDateFormatter new]; clock.dateFormat = @"d MMM HH:mm:ss";
+        stamp = [NSString stringWithFormat:@"Sample %@ · %.1fs · accessible processes%@",
+            [clock stringFromDate:[NSDate dateWithTimeIntervalSince1970:[_activitySurvey[@"capturedAt"] doubleValue]]],
+            [_activitySurvey[@"intervalSeconds"] doubleValue], [_activitySurvey[@"networkAvailable"] boolValue] ? @"" : @" · network unavailable"];
+    }
+    NSTextField *status = [self detailText:stamp font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
+                 frame:NSMakeRect(pad, 52, width - 2 * pad, 18) align:NSTextAlignmentLeft
+            identifier:@"details.activity.stamp" in:root];
+    status.accessibilityHelp = _activitySurvey[@"problem"] ?: @"Snapshot only; not a live monitor. Missing or reset counters show —. VPN and local traffic are not Internet billing totals.";
+    return [self detailScrollForRoot:root height:y + 8];
+}
+
 - (NSString *)detailTabSymbol:(NSString *)identifier {
     if ([identifier isEqualToString:@"overview"]) return @"square.grid.2x2";
     if ([identifier isEqualToString:@"storage"]) return @"internaldrive";
     if ([identifier isEqualToString:@"battery"]) return @"battery.100";
     if ([identifier isEqualToString:@"system"]) return @"cpu";
+    if ([identifier isEqualToString:@"activity"]) return @"waveform.path.ecg";
     if ([identifier isEqualToString:@"ai"]) return @"sparkle";   // the section, not one provider
     return @"circle.dashed";
 }
@@ -8264,7 +8436,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 }
 
 - (NSTabViewController *)newDetailsTabController {
-    NSTabViewController *controller = [[NSTabViewController alloc] init];
+    GBDetailsTabs *controller = [[GBDetailsTabs alloc] init];
     controller.tabStyle = NSTabViewControllerTabStyleToolbar;
     controller.transitionOptions = NSViewControllerTransitionNone;
     controller.tabView.accessibilityIdentifier = @"details.tabs";
@@ -8273,11 +8445,15 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @[@"storage", @"Storage"],
         @[@"battery", @"Battery"],
         @[@"system", @"System"],
+        @[@"activity", @"Activity"],
         @[@"ai", @"AI"],
     ];
     for (NSArray<NSString *> *spec in specs)
         [controller addTabViewItem:[self detailTabWithIdentifier:spec[0] title:spec[1]
                                                             view:[self detailViewForIdentifier:spec[0]]]];
+    __weak Controller *owner = self;
+    controller.activitySelected = ^{ [owner stopPowerTick]; [owner requestActivitySurveyIfNeeded]; };
+    controller.otherSelected = ^{ [owner startPowerTick]; };
     return controller;
 }
 
@@ -8438,7 +8614,7 @@ static NSColor *HealthColor(double fraction) {
     gauge.color = color ?: NSColor.controlAccentColor;
     gauge.metricLabel = label.length ? label : @"Progress";
     gauge.accessibilityIdentifier = identifier;   // metricLabel overwrites this; set it after
-    gauge.toolTip = tip;
+    gauge.accessibilityHelp = tip;
     [row addSubview:gauge];
     return gauge;
 }
@@ -8448,7 +8624,7 @@ static NSColor *HealthColor(double fraction) {
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, c.width, c.rowH)];
     row.accessibilityIdentifier = identifier;
     if (tip.length) {
-        row.toolTip = tip;
+        row.accessibilityHelp = tip;
         row.accessibilityLabel = tip;
     }
     [root addSubview:row];
@@ -8460,7 +8636,7 @@ static NSColor *HealthColor(double fraction) {
     NSTextField *field = [self detailText:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
                                      color:color frame:DetailValueRect(c) align:NSTextAlignmentRight
                                 identifier:identifier in:row];
-    if (tip.length) field.toolTip = tip;
+    if (tip.length) field.accessibilityHelp = tip;
     return field;
 }
 
@@ -8470,7 +8646,7 @@ static NSColor *HealthColor(double fraction) {
                                      color:color ?: NSColor.secondaryLabelColor
                                      frame:DetailDatumRect(c) align:NSTextAlignmentLeft
                                 identifier:identifier in:row];
-    if (tip.length) field.toolTip = tip;
+    if (tip.length) field.accessibilityHelp = tip;
     return field;
 }
 
@@ -8483,7 +8659,7 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:@"exclamationmark.triangle" size:c.symbol
                                           tint:NSColor.systemOrangeColor frame:DetailLeadRect(c)
                                     identifier:[identifier stringByAppendingString:@".symbol"] in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         mark.accessibilityLabel = tip;
         [self detailDatum:@"unavailable" color:NSColor.systemOrangeColor
                identifier:[identifier stringByAppendingString:@".datum"] tip:tip in:row cols:c];
@@ -8512,7 +8688,7 @@ static NSColor *HealthColor(double fraction) {
                                     frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16)
                                     align:NSTextAlignmentLeft
                                identifier:[identifier stringByAppendingString:@".name"] in:row];
-    name.toolTip = tip;
+    name.accessibilityHelp = tip;
     NSRect bar = NSMakeRect(c.barX, (c.rowH - c.barH) / 2.0, c.barW, c.barH);
     [self detailGauge:bar fraction:fraction color:color label:tip
            identifier:[identifier stringByAppendingString:@".bar"] tip:tip in:row];
@@ -8523,7 +8699,7 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:symbol size:15 tint:NSColor.tertiaryLabelColor
                                          frame:NSMakeRect(NSMinX(datum), (c.rowH - 18) / 2.0, 20, 18)
                                     identifier:[identifier stringByAppendingString:@".context"] in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         mark.accessibilityLabel = context;
     }
     return y + c.rowH;
@@ -8605,21 +8781,21 @@ static NSColor *HealthColor(double fraction) {
         : [self detailSymbol:[self aiSymbolName:name] size:c.symbol tint:valueColor frame:DetailLeadRect(c)
                   identifier:[stem stringByAppendingString:@".symbol"] in:row];
     if (logo) { mark.image = logo; mark.contentTintColor = nil; }
-    mark.toolTip = named;
+    mark.accessibilityHelp = named;
     mark.accessibilityLabel = named;
     NSTextField *providerName = [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                                            color:NSColor.labelColor
                                            frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                            align:NSTextAlignmentLeft
                                       identifier:[stem stringByAppendingString:@".name"] in:row];
-    providerName.toolTip = named;
+    providerName.accessibilityHelp = named;
     providerName.accessibilityLabel = name;
     if (claudeMeter) {
         QuotaPairGauge *meter = [[QuotaPairGauge alloc] initWithFrame:DetailGaugeRect(c)];
         meter.secondFraction = week;   // weekly all-models figure; Fable stays off this gauge
         meter.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
-        meter.toolTip = named;
+        meter.accessibilityHelp = named;
         [row addSubview:meter];
     } else if (cursorPools) {
         [self detailGauge:DetailGaugeRect(c) fraction:MAX(CursorPrimaryFraction(cursorPools), 0) color:valueColor
@@ -8654,7 +8830,7 @@ static NSColor *HealthColor(double fraction) {
         NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
         [self detailText:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium] color:NSColor.secondaryLabelColor
                    frame:NSMakeRect(c.labelX, (c.rowH - 16) / 2.0, c.labelW, 16) align:NSTextAlignmentLeft
-              identifier:[stem stringByAppendingString:@".api.name"] in:apiRow].toolTip = apiTip;
+              identifier:[stem stringByAppendingString:@".api.name"] in:apiRow].accessibilityHelp = apiTip;
         [self detailGauge:DetailGaugeRect(c) fraction:api color:ink label:@"Cursor API remaining"
                identifier:[stem stringByAppendingString:@".api.gauge"] tip:apiTip in:apiRow];
         [self detailValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
@@ -8698,7 +8874,7 @@ static NSColor *HealthColor(double fraction) {
                                        frame:NSMakeRect(c.labelX, (c.rowH - 16) / 2.0, c.labelW, 16)
                                        align:NSTextAlignmentLeft
                                   identifier:[rowID stringByAppendingString:@".label"] in:row];
-        lab.toolTip = tip;
+        lab.accessibilityHelp = tip;
         if (hasFrac && frac >= 0)
             [self detailGauge:DetailGaugeRect(c) fraction:frac color:color label:tip
                    identifier:[rowID stringByAppendingString:@".gauge"] tip:tip in:row];
@@ -8756,14 +8932,14 @@ static NSColor *HealthColor(double fraction) {
                                        tint:(logo ? nil : NSColor.tertiaryLabelColor)
                                       frame:symbol identifier:[rowID stringByAppendingString:@".symbol"] in:row];
     if (logo) { glyph.image = logo; glyph.contentTintColor = nil; }
-    glyph.toolTip = tip;
+    glyph.accessibilityHelp = tip;
     glyph.accessibilityLabel = tip;
     NSString *metric = hasTokens ? @"Tokens" : hasSessions ? @"Sessions" : u.todayMessages > 0 ? @"Messages" : @"Tools";
     long long todayCount = hasTokens ? u.todayTokens : hasSessions ? u.todaySessions : u.todayMessages > 0 ? u.todayMessages : u.todayToolCalls;
     long long weekCount = hasTokens ? u.weekTokens : hasSessions ? u.weekSessions : 0;
     [self detailText:metric font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
               color:NSColor.secondaryLabelColor frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
-              align:NSTextAlignmentLeft identifier:[rowID stringByAppendingString:@".metric"] in:row].toolTip = tip;
+              align:NSTextAlignmentLeft identifier:[rowID stringByAppendingString:@".metric"] in:row].accessibilityHelp = tip;
     NSString *todayText = FmtCompact(todayCount);
     NSString *weekText = (hasTokens || hasSessions) ? FmtCompact(weekCount) : @"—";
     CGFloat tagW = 46;
@@ -8776,18 +8952,18 @@ static NSColor *HealthColor(double fraction) {
                                      frame:NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, todayValueW, c.valueH)
                                      align:NSTextAlignmentRight
                                 identifier:[rowID stringByAppendingString:@".today"] in:row];
-    today.toolTip = tip;
+    today.accessibilityHelp = tip;
     NSTextField *todayTag = [self detailText:@"today" font:tag color:NSColor.tertiaryLabelColor
                                         frame:NSMakeRect(todayTagX, (c.rowH - c.datumH) / 2.0, tagW, c.datumH)
                                         align:NSTextAlignmentLeft
                                    identifier:[rowID stringByAppendingString:@".todayLabel"] in:row];
-    todayTag.toolTip = tip;
+    todayTag.accessibilityHelp = tip;
     [self detailValue:weekText color:((hasTokens || hasSessions) ? NSColor.labelColor : NSColor.tertiaryLabelColor)
            identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
     NSTextField *weekTag = [self detailText:@"7d" font:tag color:NSColor.tertiaryLabelColor
                                        frame:DetailDatumRect(c) align:NSTextAlignmentLeft
                                   identifier:[rowID stringByAppendingString:@".weekLabel"] in:row];
-    weekTag.toolTip = tip;
+    weekTag.accessibilityHelp = tip;
     return y + c.rowH;
 }
 
@@ -8798,7 +8974,7 @@ static NSColor *HealthColor(double fraction) {
                                       tint:(on ? NSColor.systemGreenColor : NSColor.tertiaryLabelColor)
                                      frame:DetailLeadRect(c)
                                 identifier:[identifier stringByAppendingString:@".symbol"] in:row];
-    mark.toolTip = tip;
+    mark.accessibilityHelp = tip;
     mark.accessibilityLabel = tip;
     CGFloat nameW = c.valueX + c.valueW - c.gaugeX - c.gap;
     NSTextField *title = [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
@@ -8806,7 +8982,7 @@ static NSColor *HealthColor(double fraction) {
                                      frame:NSMakeRect(c.gaugeX, (c.rowH - 16) / 2.0, nameW, 16)
                                      align:NSTextAlignmentLeft
                                 identifier:[identifier stringByAppendingString:@".name"] in:row];
-    title.toolTip = tip;
+    title.accessibilityHelp = tip;
     [self detailDatum:datum color:(on ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor)
            identifier:[identifier stringByAppendingString:@".datum"] tip:tip in:row cols:c];
     return y + c.rowH;
@@ -8841,14 +9017,14 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:(v.isInternal ? @"internaldrive" : @"externaldrive")
                                           size:c.symbol tint:tint frame:DetailLeadRect(c)
                                     identifier:@"details.overview.storage.symbol" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         NSTextField *volumeName = [self detailText:(v.name.length ? v.name : @"Disk")
                                                font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                                               color:NSColor.labelColor
                                               frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                               align:NSTextAlignmentLeft
                                          identifier:@"details.overview.storage.name" in:row];
-        volumeName.toolTip = tip;
+        volumeName.accessibilityHelp = tip;
         [self detailGauge:DetailGaugeRect(c) fraction:v.fraction color:DiskColor(v.fraction)
                     label:[NSString stringWithFormat:@"%@ storage used", v.name]
                identifier:@"details.overview.storage.gauge" tip:tip in:row];
@@ -8867,14 +9043,14 @@ static NSColor *HealthColor(double fraction) {
                                               tint:PowerFlowColor(_bat, NSColor.secondaryLabelColor) frame:DetailLeadRect(c)
                                         identifier:@"details.overview.battery.symbol" in:row];
             [self badgeBatterySymbolView:mark];
-            mark.toolTip = tip;
+            mark.accessibilityHelp = tip;
             NSTextField *batteryName = [self detailText:@"Battery"
                                                     font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                                                    color:NSColor.labelColor
                                                    frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                                    align:NSTextAlignmentLeft
                                               identifier:@"details.overview.battery.name" in:row];
-            batteryName.toolTip = tip;
+            batteryName.accessibilityHelp = tip;
             Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
                         label:@"Battery charge" identifier:@"details.overview.battery.gauge" tip:tip in:row];
             if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
@@ -8901,14 +9077,14 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.system" tip:tip in:root];
         NSImageView *mark = [self detailSymbol:@"cpu" size:c.symbol tint:SystemPressureColor(level)
                                          frame:DetailLeadRect(c) identifier:@"details.overview.system.symbol" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         NSTextField *systemName = [self detailText:@"System"
                                                font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                                               color:NSColor.labelColor
                                               frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                               align:NSTextAlignmentLeft
                                          identifier:@"details.overview.system.name" in:row];
-        systemName.toolTip = tip;
+        systemName.accessibilityHelp = tip;
         [self addSystemInstrumentTo:row gauge:DetailGaugeRect(c) value:DetailValueRect(c)
                               datum:DetailDatumRect(c) stem:@"details.overview.system" tip:tip];
         y += c.rowH;
@@ -8931,7 +9107,7 @@ static NSColor *HealthColor(double fraction) {
         gauge.markerFraction = -1;
         [self detailValue:figures[@"value"] color:color identifier:[NSString stringWithFormat:@"details.overview.%@.value", link] tip:tip in:row cols:c];
         [self detailDatum:figures[@"datum"] color:[self meteredDatumColor:figures] identifier:[NSString stringWithFormat:@"details.overview.%@.datum", link] tip:tip in:row cols:c];
-        for (NSView *child in row.subviews) child.toolTip = tip;
+        for (NSView *child in row.subviews) child.accessibilityHelp = tip;
         y += c.rowH;
     }
 
@@ -9016,14 +9192,14 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
                                           size:c.symbol tint:fill frame:DetailLeadRect(c)
                                     identifier:[rowID stringByAppendingString:@".symbol"] in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         NSTextField *name = [self detailText:volume.name ?: @"Volume"
                                          font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium]
                                         color:NSColor.labelColor
                                         frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                         align:NSTextAlignmentLeft
                                    identifier:[rowID stringByAppendingString:@".name"] in:row];
-        name.toolTip = tip;
+        name.accessibilityHelp = tip;
         NSRect gauge = NSMakeRect(c.storageGaugeX, (c.rowH - c.gaugeH) / 2.0, c.storageGaugeW, c.gaugeH);
         [self detailGauge:gauge fraction:volume.fraction color:fill
                     label:[NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"]
@@ -9036,14 +9212,14 @@ static NSColor *HealthColor(double fraction) {
                                         frame:NSMakeRect(c.datumX, (c.rowH - c.datumH) / 2.0, c.freeW, c.datumH)
                                         align:NSTextAlignmentLeft
                                    identifier:[rowID stringByAppendingString:@".free"] in:row];
-        free.toolTip = tip;
+        free.accessibilityHelp = tip;
         NSTextField *cap = [self detailText:CompactByteCount(volume.total)
                                         font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                                        color:NSColor.tertiaryLabelColor
                                        frame:NSMakeRect(c.capX, (c.rowH - c.datumH) / 2.0, c.capW, c.datumH)
                                        align:NSTextAlignmentRight
                                   identifier:[rowID stringByAppendingString:@".capacity"] in:row];
-        cap.toolTip = tip;
+        cap.accessibilityHelp = tip;
         NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular];
         NSImage *image = [[NSImage imageWithSystemSymbolName:@"arrow.up.forward.square" accessibilityDescription:@"Reveal in Finder"]
                           imageWithSymbolConfiguration:cfg];
@@ -9054,7 +9230,7 @@ static NSColor *HealthColor(double fraction) {
         reveal.imageScaling = NSImageScaleProportionallyDown;
         reveal.contentTintColor = NSColor.secondaryLabelColor;
         reveal.identifier = volume.path;
-        reveal.toolTip = @"Reveal in Finder";
+        reveal.accessibilityHelp = @"Reveal in Finder";
         reveal.accessibilityLabel = [NSString stringWithFormat:@"Reveal %@ in Finder", volume.name ?: @"volume"];
         reveal.accessibilityIdentifier = [@"details.reveal." stringByAppendingString:volume.path ?: @""];
         reveal.frame = NSMakeRect(c.revealX, (c.rowH - c.revealW) / 2.0, c.revealW, c.revealW);
@@ -9090,7 +9266,7 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:identifier tip:tip in:root];
         [self detailText:name font:[NSFont systemFontOfSize:13 weight:NSFontWeightMedium] color:NSColor.labelColor
                    frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16) align:NSTextAlignmentLeft
-              identifier:[identifier stringByAppendingString:@".name"] in:row].toolTip = tip;
+              identifier:[identifier stringByAppendingString:@".name"] in:row].accessibilityHelp = tip;
         [self detailGauge:NSMakeRect(c.barX, (c.rowH - c.barH) / 2.0, c.barW, c.barH) fraction:MIN(watts / scale, 1.0)
                     color:color label:tip identifier:[identifier stringByAppendingString:@".bar"] tip:tip in:row];
         [self detailValue:[NSString stringWithFormat:@"%.1f W", watts] color:NSColor.labelColor
@@ -9119,7 +9295,7 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.battery.burn.since" tip:tip in:root];
         [self detailText:label font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
                    frame:NSMakeRect(c.barNameX, (c.rowH - 16) / 2.0, c.barNameW, 16) align:NSTextAlignmentLeft
-              identifier:@"details.battery.burn.since.name" in:row].toolTip = tip;
+              identifier:@"details.battery.burn.since.name" in:row].accessibilityHelp = tip;
         [self detailValue:[NSString stringWithFormat:@"%.1f Wh", since] color:NSColor.labelColor
                identifier:@"details.battery.burn.since.value" tip:tip in:row cols:c];
         [self detailDatum:[@"over " stringByAppendingString:FmtDuration(minutes)] color:NSColor.secondaryLabelColor
@@ -9153,7 +9329,7 @@ static NSColor *HealthColor(double fraction) {
                                     identifier:@"details.battery.charge.symbol" in:row];
         [self badgeBatterySymbolView:mark];
             [self detailRowName:@"Charge" cols:c identifier:@"details.battery.charge.name" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         Gauge *charge = [self detailGauge:DetailGaugeRect(c) fraction:_bat.percent / 100.0 color:BattBarColor(_bat.percent)
                     label:@"Battery charge" identifier:@"details.battery.charge.gauge" tip:tip in:row];
         if ([[self effectiveChargeMode] isEqualToString:@"limit80"]) charge.markerFraction = 0.80;
@@ -9161,6 +9337,22 @@ static NSColor *HealthColor(double fraction) {
                identifier:@"details.battery.charge.value" tip:tip in:row cols:c];
         [self addBatteryTrendTo:row gauge:charge datum:DetailDatumRect(c) stem:@"details.battery.charge" tip:tip];
         y += c.rowH;
+
+        BatteryForecast forecast = [self batteryForecast];
+        NSString *arrivals = BatteryForecastDetail(forecast, NSDate.date.timeIntervalSince1970, nil);
+        if (arrivals.length) {
+            if (forecast.hypotheticalFull) arrivals = [arrivals stringByAppendingString:@" · 100% if limit off"];
+            NSString *help = BatteryForecastStatus(forecast);
+            NSView *etaRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.eta" tip:help in:root];
+            [self detailSymbol:@"clock" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
+                    identifier:@"details.battery.eta.symbol" in:etaRow];
+            [self detailRowName:@"Forecast" cols:c identifier:@"details.battery.eta.name" in:etaRow];
+            NSTextField *times = [self detailText:arrivals font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
+                color:NSColor.secondaryLabelColor frame:NSMakeRect(c.gaugeX, (c.rowH-18)/2, c.width-kDetailPad-c.gaugeX, 18)
+                align:NSTextAlignmentRight identifier:@"details.battery.eta.arrivals" in:etaRow];
+            times.accessibilityHelp = help;
+            y += c.rowH;
+        }
 
         if (health) {
             int pct = (int)lround(healthFrac * 100.0);
@@ -9171,7 +9363,7 @@ static NSColor *HealthColor(double fraction) {
             NSImageView *heart = [self detailSymbol:@"heart" size:c.symbol tint:color frame:DetailLeadRect(c)
                                          identifier:@"details.battery.health.symbol" in:healthRow];
             [self detailRowName:@"Health" cols:c identifier:@"details.battery.health.name" in:healthRow];
-            heart.toolTip = healthTip;
+            heart.accessibilityHelp = healthTip;
             [self detailGauge:DetailGaugeRect(c) fraction:MIN(healthFrac, 1.0) color:color
                         label:@"Battery health" identifier:@"details.battery.health.gauge" tip:healthTip in:healthRow];
             [self detailValue:[NSString stringWithFormat:@"%d%%", pct] color:color
@@ -9188,7 +9380,7 @@ static NSColor *HealthColor(double fraction) {
             NSString *energyTip = [self batteryEnergyText] ?: @"";
             NSView *energyRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.energy" tip:energyTip in:root];
             [self detailSymbol:@"battery.100" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
-                    identifier:@"details.battery.energy.symbol" in:energyRow].toolTip = energyTip;
+                    identifier:@"details.battery.energy.symbol" in:energyRow].accessibilityHelp = energyTip;
             [self detailRowName:@"Energy" cols:c identifier:@"details.battery.energy.name" in:energyRow];
             if (!isnan(whFull) && whFull > 0)
                 [self detailGauge:DetailGaugeRect(c) fraction:MIN(whNow / whFull, 1.0) color:BattBarColor(_bat.percent)
@@ -9210,7 +9402,7 @@ static NSColor *HealthColor(double fraction) {
                 double inW = _bat.systemPowerIn_mW / 1000.0;
                 NSView *inRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.input" tip:flowTip in:root];
                 [self detailSymbol:@"powerplug" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
-                        identifier:@"details.battery.input.symbol" in:inRow].toolTip = flowTip;
+                        identifier:@"details.battery.input.symbol" in:inRow].accessibilityHelp = flowTip;
                 [self detailRowName:@"Power" cols:c identifier:@"details.battery.input.name" in:inRow];
                 PowerFlowGauge *flow = [[PowerFlowGauge alloc] initWithFrame:DetailGaugeRect(c)];
                 flow.scaleWatts = _bat.adapterWatts > 0 ? _bat.adapterWatts : inW;
@@ -9219,7 +9411,7 @@ static NSColor *HealthColor(double fraction) {
                 flow.batteryWatts = isnan(bw) ? 0 : bw;
                 flow.accessibilityIdentifier = @"details.battery.input.gauge";
                 flow.accessibilityValue = flowTip;
-                flow.toolTip = flowTip;
+                flow.accessibilityHelp = flowTip;
                 [inRow addSubview:flow];
                 [self detailValue:[NSString stringWithFormat:@"%.1f W", inW] color:NSColor.labelColor
                        identifier:@"details.battery.input.value" tip:flowTip in:inRow cols:c];
@@ -9231,27 +9423,13 @@ static NSColor *HealthColor(double fraction) {
                 // On battery the Charge row already carries the signed watts; this is the Mac's draw.
                 NSView *loadRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.load" tip:flowTip in:root];
                 [self detailSymbol:@"laptopcomputer" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
-                        identifier:@"details.battery.load.symbol" in:loadRow].toolTip = flowTip;
+                        identifier:@"details.battery.load.symbol" in:loadRow].accessibilityHelp = flowTip;
                 [self detailRowName:@"System" cols:c identifier:@"details.battery.load.name" in:loadRow];
                 [self detailValue:[NSString stringWithFormat:@"%.1f W", loadW] color:NSColor.labelColor
                        identifier:@"details.battery.load.value" tip:flowTip in:loadRow cols:c];
                 y += c.rowH;
             }
-            if (!isnan(bw)) {
-                int target = [self chargeTargetPercent];
-                int minutes = [self chargeForecastMinutes];
-                if (minutes >= 0) {
-                    NSString *etaName = target == 80 ? @"To 80%" : @"To full";
-                    NSString *etaTip = [self chargeETAText] ?: etaName;
-                    NSView *etaRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.eta" tip:etaTip in:root];
-                    [self detailSymbol:@"clock" size:c.symbol tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
-                            identifier:@"details.battery.eta.symbol" in:etaRow].toolTip = etaTip;
-                    [self detailRowName:etaName cols:c identifier:@"details.battery.eta.name" in:etaRow];
-                    [self detailValue:FmtDuration(minutes) color:NSColor.labelColor
-                           identifier:@"details.battery.eta.value" tip:etaTip in:etaRow cols:c];
-                    y += c.rowH;
-                }
-            }
+
         }
     }
 
@@ -9341,7 +9519,7 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.cpu" tip:tip in:root];
         NSImageView *mark = [self detailSymbol:@"cpu" size:c.symbol tint:color frame:DetailLeadRect(c)
                                     identifier:@"details.system.cpu.symbol" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         if (known)
             [self detailGauge:DetailGaugeRect(c) fraction:MIN(cpu, 1.0) color:color label:tip
                    identifier:@"details.system.cpu.gauge" tip:tip in:row];
@@ -9357,7 +9535,7 @@ static NSColor *HealthColor(double fraction) {
         NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.memory" tip:tip in:root];
         NSImageView *mark = [self detailSymbol:@"memorychip" size:c.symbol tint:color frame:DetailLeadRect(c)
                                     identifier:@"details.system.memory.symbol" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         if (known) {
             double frac = (double)_sys.memUsed / (double)_sys.memTotal;
             [self detailGauge:DetailGaugeRect(c) fraction:MIN(frac, 1.0) color:color label:tip
@@ -9377,7 +9555,7 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:@"arrow.left.arrow.right" size:c.symbol
                                           tint:NSColor.secondaryLabelColor frame:DetailLeadRect(c)
                                     identifier:@"details.system.swap.symbol" in:row];
-        mark.toolTip = tip;
+        mark.accessibilityHelp = tip;
         [self detailValue:value color:(_sys.swapValid ? NSColor.labelColor : NSColor.tertiaryLabelColor)
                identifier:@"details.system.swap.value" tip:tip in:row cols:c];
         y += c.rowH;
@@ -9405,7 +9583,7 @@ static NSColor *HealthColor(double fraction) {
                         identifier:ident to:root y:y cols:c];
             if (index == 0 && kernelTip.length && _topCPU.count < 2) {
                 NSView *bar = root.subviews.lastObject;
-                bar.toolTip = [NSString stringWithFormat:@"%@\n%@", bar.toolTip ?: @"", kernelTip];
+                bar.accessibilityHelp = [NSString stringWithFormat:@"%@\n%@", bar.accessibilityHelp ?: @"", kernelTip];
             }
             index++;
         }
@@ -9437,6 +9615,7 @@ static NSColor *HealthColor(double fraction) {
 }
 
 - (NSScrollView *)detailViewForIdentifier:(NSString *)identifier {
+    if ([identifier isEqualToString:@"activity"]) return [self activityDetailsView];
     if ([identifier isEqualToString:@"overview"]) return [self overviewDetailsView];
     if ([identifier isEqualToString:@"storage"]) return [self storageDetailsView];
     if ([identifier isEqualToString:@"battery"]) return [self batteryDetailsView];
@@ -9497,8 +9676,8 @@ static NSColor *HealthColor(double fraction) {
 }
 
 - (void)showDetails:(id)sender {
-    [self refresh];
-    [self startPowerTick];   // stops itself once neither the popover nor Details is visible
+    if (!_activityPresenting) [self refresh];
+    if (!_activityPresenting) [self startPowerTick];   // stops itself once neither the popover nor Details is visible
     BOOL didCreateWindow = (_detailsWindow == nil);
     if (!_detailsWindow) {
         _detailsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 520)
@@ -9518,8 +9697,10 @@ static NSColor *HealthColor(double fraction) {
     [_detailsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     [_popover close];
-    [self refreshAIUsageAsync];
-    [self beginSampling];
+    if ([self activityTabSelected]) {
+        [self stopPowerTick];
+        [self requestActivitySurveyIfNeeded];
+    } else if (!_activityPresenting) { [self refreshAIUsageAsync]; [self beginSampling]; }
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
@@ -9905,12 +10086,7 @@ static void PrintHumanDump(NSDictionary *snapshot) {
     else printf("status complete\n");
 }
 
-static BOOL PrintJSONDump(NSDictionary *snapshot) {
-    NSString *schemaError = DumpBooleanTypeError(snapshot);
-    if (schemaError) {
-        fprintf(stderr, "Glancebar: JSON schema validation failed: %s\n", UTF8(schemaError));
-        return NO;
-    }
+static BOOL PrintJSON(NSDictionary *snapshot) {
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot
                                                    options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
@@ -9924,12 +10100,22 @@ static BOOL PrintJSONDump(NSDictionary *snapshot) {
     return YES;
 }
 
+static BOOL PrintJSONDump(NSDictionary *snapshot) {
+    NSString *schemaError = DumpBooleanTypeError(snapshot);
+    if (schemaError) {
+        fprintf(stderr, "Glancebar: JSON schema validation failed: %s\n", UTF8(schemaError));
+        return NO;
+    }
+    return PrintJSON(snapshot);
+}
+
 static void PrintUsage(FILE *stream) {
     fprintf(stream,
         "Glancebar %s\n"
         "Usage: Glancebar [--dump [--json] [--strict] [--online]]\n"
         "       Glancebar --version\n"
         "       Glancebar --help\n\n"
+        "  --activity-json  Take one read-only app CPU/network snapshot.\n"
         "  --dump     Print a local machine and AI status snapshot.\n"
         "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
         "  --strict   Exit 2 when any sampled source is partial/unavailable.\n"
@@ -9983,11 +10169,12 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO;
+        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO;
         const char *onlineEnvironment = getenv("GLANCEBAR_ALLOW_ACCOUNT");
         BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "--dump") == 0) dump = YES;
+            if (strcmp(argv[i], "--activity-json") == 0) activityJSON = YES;
+            else if (strcmp(argv[i], "--dump") == 0) dump = YES;
             else if (strcmp(argv[i], "--json") == 0) json = YES;
             else if (strcmp(argv[i], "--strict") == 0) strict = YES;
             else if (strcmp(argv[i], "--online") == 0) { allowOnline = YES; onlineArgument = YES; }
@@ -9997,6 +10184,7 @@ int main(int argc, const char **argv) {
             else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { PrintUsage(stdout); return 0; }
             else { fprintf(stderr, "Glancebar: unknown option '%s'\n", argv[i]); PrintUsage(stderr); return 64; }
         }
+        if (activityJSON) return PrintJSON(GBActivitySurvey()) ? 0 : 70;
         if ((json || strict || onlineArgument) && !dump) {
             fprintf(stderr, "Glancebar: --json, --strict, and --online require --dump\n");
             return 64;
