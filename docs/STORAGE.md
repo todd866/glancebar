@@ -51,7 +51,9 @@ The row's ellipsis offers Compress Copy for supported text/log/data exports up t
 without overwriting another file. The original remains; compression itself frees
 no space. Cache files are local only, with directory mode 0700/file mode 0600.
 Rendering does no filesystem access; all traversal, cache and cleanup work runs
-on a single background queue. Completion never opens a window.
+on a single background queue. Progressive folder updates select the largest 100
+rows before copying them, avoiding whole-index copying and sorting on large homes.
+Completion never opens a window.
 
 Tests use disposable filesystem fixtures for global ranking, protected aggregate
 boundaries, overlapping roots, sparse files, hardlinks, pause/resume, unavailable

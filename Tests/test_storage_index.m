@@ -12,6 +12,16 @@ static NSDictionary *Row(NSArray *rows,NSString *path){for(NSDictionary *r in ro
 static unsigned long long Allocated(NSString *p){struct stat s;Check(!lstat(p.fileSystemRepresentation,&s),@"independent stat");return s.st_blocks*512ULL;}
 static NSDictionary *Finish(GBStorageIndex *index){NSDictionary *s=nil;for(int n=0;n<10000&&!index.finished;n++)s=[index advanceForSeconds:.05 entries:13];Check(index.finished,@"bounded fixture completes");return s ?: [index snapshot];}
 int main(void){@autoreleasepool{
+    NSMutableArray *ranking=[NSMutableArray array];
+    for(NSUInteger n=0;n<20000;n++)[ranking addObject:@{@"path":[NSString stringWithFormat:@"/folder-%lu",(unsigned long)n],@"allocatedBytes":@((n*7919)%101)}];
+    NSArray *sorted=[ranking sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a,NSDictionary *b){
+        NSComparisonResult bytes=[b[@"allocatedBytes"] compare:a[@"allocatedBytes"]];
+        return bytes==NSOrderedSame ? [a[@"path"] localizedStandardCompare:b[@"path"]] : bytes;
+    }];
+    for(NSNumber *limit in @[@0,@1,@37,@100,@25000]) {
+        NSUInteger count=MIN(limit.unsignedIntegerValue,ranking.count);
+        Check([GBStorageLargestRows(ranking,limit.unsignedIntegerValue) isEqual:[sorted subarrayWithRange:NSMakeRange(0,count)]],@"bounded top rows equal complete sort, including size ties");
+    }
     char resolved[PATH_MAX];Check(realpath(NSTemporaryDirectory().fileSystemRepresentation,resolved)!=NULL,@"canonical fixture parent");
     NSString *home=Dir([NSString stringWithUTF8String:resolved],[@"storage-index-" stringByAppendingString:NSUUID.UUID.UUIDString]);
     NSString *downloads=Dir(home,@"Downloads"), *deep=Dir(downloads,@"nested/deep"), *repo=Dir(home,@"repo");Dir(repo,@".git");

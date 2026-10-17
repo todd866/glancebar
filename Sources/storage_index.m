@@ -15,6 +15,19 @@ static NSComparisonResult Biggest(NSDictionary *a,NSDictionary *b) {
     NSComparisonResult n=[b[@"allocatedBytes"] compare:a[@"allocatedBytes"]];
     return n==NSOrderedSame ? [a[@"path"] localizedStandardCompare:b[@"path"]] : n;
 }
+NSArray<NSDictionary *> *GBStorageLargestRows(NSArray<NSDictionary *> *rows, NSUInteger limit) {
+    if (!limit) return @[];
+    NSMutableArray *top=[NSMutableArray arrayWithCapacity:MIN(limit,rows.count)];
+    NSComparator compare=^NSComparisonResult(id a,id b){return Biggest(a,b);};
+    for (NSDictionary *row in rows) {
+        if (top.count==limit && Biggest(row,top.lastObject)!=NSOrderedAscending) continue;
+        NSUInteger position=[top indexOfObject:row inSortedRange:NSMakeRange(0,top.count)
+                                       options:NSBinarySearchingInsertionIndex usingComparator:compare];
+        [top insertObject:row atIndex:position];
+        if (top.count>limit) [top removeLastObject];
+    }
+    return top;
+}
 static BOOL Skip(NSString *name) { return [@[@".Trash",@".Trashes",@".Spotlight-V100",@".fseventsd",@".TemporaryItems",@"CloudStorage",@"Mobile Documents"] containsObject:name]; }
 // Opening every path component with O_NOFOLLOW prevents ancestor link races.
 static int OpenDirectory(NSString *path) {
@@ -200,12 +213,12 @@ NSArray<NSString *> *GBStorageDefaultRoots(NSString *home) {
         [files addObject:row];
     }
     NSMutableArray *folders=[NSMutableArray array];
-    for (NSDictionary *row in _folders.allValues) {
+    // Copy only the visible leaders. Large homes can have hundreds of thousands
+    // of folders; copying and sorting all of them on every slice swamps the walk.
+    for (NSDictionary *row in GBStorageLargestRows(_folders.allValues,100)) {
         NSMutableDictionary *copy=[row mutableCopy]; copy[@"action"]=@"reveal";
         if (!self.finished || _limited) copy[@"partial"]=@YES; [folders addObject:copy];
     }
-    [folders sortUsingComparator:^NSComparisonResult(id a,id b){return Biggest(a,b);}];
-    if(folders.count>100)[folders removeObjectsInRange:NSMakeRange(100,folders.count-100)];
     return @{@"rows":files,@"folders":folders,@"roots":_roots,@"entries":@(_entries),@"errors":@(_errors),@"skipped":@(_skipped),@"complete":@(self.finished&&!_limited),@"limited":@(_limited),@"partial":@(!self.finished||_limited||_errors||_skipped),@"capturedAt":@(NSDate.date.timeIntervalSince1970),@"startedAt":@(_started),@"activeSeconds":@(_activeSeconds),@"directories":@(_directories.count),@"pendingDirectories":@(_pending.count),@"schema":@2};
 }
 - (void)removeFile:(NSDictionary *)entry {
