@@ -21,28 +21,20 @@ static void Await(BOOL (^done)(void)) {
 @end
 @interface TestStorageController : Controller
 @property NSString *testHome;
-@property NSUInteger scans, operations, reviews;
-@property NSModalResponse choice;
-@property dispatch_semaphore_t gate;
-@property NSAlert *lastReview;
+@property NSUInteger operations, paints;
+@property BOOL permitPower;
+@property dispatch_semaphore_t rootsGate;
 @end
 @implementation TestStorageController
 - (void)refreshVisibleSurfaces {}
+- (void)refreshStorageSurface { self.paints++; }
 - (BOOL)storageTabSelected { return YES; }
+- (BOOL)storagePowerPermitsWork { return self.permitPower; }
 - (NSString *)storageHomeDirectory { return self.testHome; }
-- (NSString *)storageOpenFileReason:(NSString *)path { (void)path; return nil; }
-- (NSDictionary *)performStorageScan:(GBStorageScan *)scan path:(NSString *)path {
-    self.scans++;
-    if (self.gate) dispatch_semaphore_wait(self.gate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));
-    // Real filesystem fixtures get scheduling room under shared disk load.
-    // Production uses six seconds; budget/cancellation behavior is covered separately.
-    return [scan scanPath:path entryLimit:100 seconds:15];
-}
-- (void)presentStorageReview:(NSAlert *)alert completion:(void (^)(NSModalResponse))completion {
-    self.lastReview=alert; self.reviews++; completion(self.choice);
-}
+- (NSString *)storageCacheDirectory { return [self.testHome stringByAppendingPathComponent:@"cache"]; }
+- (NSArray *)storageRoots { if(self.rootsGate)dispatch_semaphore_wait(self.rootsGate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));return @[self.testHome]; }
 - (NSDictionary *)performStorageCleanup:(NSDictionary *)entry compress:(BOOL)compress progress:(NSProgress *)progress {
-    (void)entry; (void)compress; (void)progress; self.operations++; return @{@"message":@"Fixture transport only"};
+    (void)entry;(void)compress;(void)progress;self.operations++;return @{@"message":@"Fixture transport only"};
 }
 @end
 static NSView *Find(NSView *root, NSString *identifier) {
@@ -70,13 +62,14 @@ static BOOL Render(NSView *view,NSString *path,NSAppearanceName appearance) {
     return [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
 }
 static NSDictionary *Fixture(void) {
-    return @{@"capturedAt":@(NSDate.date.timeIntervalSince1970),@"entries":@12450,@"skipped":@12,@"errors":@2,@"partial":@YES,@"rows":@[
-        @{@"name":@"Movies",@"path":@"/fixture/Movies",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES},
-        @{@"name":@"Downloads",@"path":@"/fixture/Downloads",@"isDirectory":@YES,@"allocatedBytes":@13200000000ULL,@"logicalBytes":@13200000000ULL},
-        @{@"name":@"Long named export of flight records and instruments.csv",@"path":@"/fixture/records.csv",@"allocatedBytes":@8900000000ULL,@"logicalBytes":@8900000000ULL},
-        @{@"name":@"Projects",@"path":@"/fixture/Projects",@"isDirectory":@YES,@"protectedReason":@"Repository or worktree"},
-        @{@"name":@"Photos Library.photoslibrary",@"path":@"/fixture/Photos Library.photoslibrary",@"isDirectory":@YES,@"protectedReason":@"Application or library package"},
-        @{@"name":@"Cloud archive",@"path":@"/fixture/cloud",@"problem":@"Cloud placeholder"}
+    return @{@"capturedAt":@(NSDate.date.timeIntervalSince1970),@"entries":@12450,@"skipped":@12,@"errors":@2,@"partial":@YES,@"folders":@[
+        @{@"name":@"Movies",@"path":@"/Users/ian/Movies",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal"}
+    ],@"rows":@[
+        @{@"name":@"Photos Library.photoslibrary",@"path":@"/Users/ian/Pictures/Photos Library.photoslibrary",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal",@"protectedReason":@"Library package"},
+        @{@"name":@"Trip footage.mov",@"path":@"/Users/ian/Movies/Trip footage.mov",@"allocatedBytes":@13200000000ULL,@"logicalBytes":@13200000000ULL,@"action":@"trash"},
+        @{@"name":@"Long named export of flight records and instruments.csv",@"path":@"/Users/ian/Documents/Flights/records.csv",@"allocatedBytes":@8900000000ULL,@"logicalBytes":@8900000000ULL,@"action":@"trash"},
+        @{@"name":@"Machine learning research",@"path":@"/Users/ian/Projects/Machine learning research",@"isDirectory":@YES,@"allocatedBytes":@4100000000ULL,@"logicalBytes":@8200000000ULL,@"protectedReason":@"Repository or worktree",@"action":@"reveal"},
+        @{@"name":@"Xcode.app",@"path":@"/Applications/Xcode.app",@"isDirectory":@YES,@"allocatedBytes":@3800000000ULL,@"logicalBytes":@3800000000ULL,@"protectedReason":@"Application",@"action":@"reveal"}
     ]};
 }
 int main(int argc,const char **argv) { @autoreleasepool {
@@ -87,52 +80,70 @@ int main(int argc,const char **argv) { @autoreleasepool {
     [NSFileManager.defaultManager createDirectoryAtPath:downloads withIntermediateDirectories:YES attributes:nil error:NULL];
     NSString *file=[downloads stringByAppendingPathComponent:@"sample.txt"];
     [@"Disposable fixture" writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    TestStorageController *c=[TestStorageController new]; c.testHome=home;
-    [c setValue:downloads forKey:@"storagePath"]; c.gate=dispatch_semaphore_create(0);
-    [c requestStorageScan]; [c requestStorageScan]; Await(^BOOL { return c.scans==1; });
-    [c cancelStorage]; dispatch_semaphore_signal(c.gate); Await(^BOOL { return ![c storageBusy]; });
-    Check(![c valueForKey:@"storageResult"] && ![c valueForKey:@"detailsWindow"],@"cancelled scan cannot publish or reopen window");
-    c.gate=nil; [c requestStorageScan]; Await(^BOOL { return ![c storageBusy]; });
-    [c requestStorageScanIfNeeded]; Check(c.scans==2,@"cached navigation does not rescan");
+    TestStorageController *c=[TestStorageController new];c.testHome=home;c.permitPower=YES;
+    [c requestStorageScanIfNeeded];[c requestStorageScanIfNeeded];
+    Await(^BOOL{return [[c valueForKey:@"storageFinished"] boolValue];});
     NSDictionary *result=[c valueForKey:@"storageResult"];
+    Check([result[@"rows"] count]==1,@"automatic global results appear without choosing folders");
+    id index=[c valueForKey:@"storageIndex"];[c requestStorageScanIfNeeded];
+    Check(index==[c valueForKey:@"storageIndex"],@"cached reopening does not restart complete index");
+    TestStorageController *cached=[TestStorageController new];cached.testHome=home;cached.permitPower=YES;cached.rootsGate=dispatch_semaphore_create(0);
+    [cached requestStorageScanIfNeeded];[cached requestStorageScanIfNeeded];
+    Await(^BOOL{return [[cached valueForKey:@"storageRetainSnapshot"] boolValue];});
+    Check([[[cached valueForKey:@"storageResult"] objectForKey:@"rows"] count]==1,@"cached ranking remains available while replacement begins");
+    dispatch_semaphore_signal(cached.rootsGate);
+    Await(^BOOL{return [[cached valueForKey:@"storageFinished"] boolValue];});
+    Check(![[cached valueForKey:@"storageRetainSnapshot"] boolValue],@"replacement pass retires the cached marker");
+    [cached cancelStorage];
     TestStorageWindow *window=[[TestStorageWindow alloc] initWithContentRect:NSMakeRect(0,0,600,420) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:YES];
     [c setValue:window forKey:@"detailsWindow"];
-    NSButton *button=[NSButton new]; button.identifier=file;
-    c.choice=NSAlertFirstButtonReturn; [c reviewStorage:button]; Await(^BOOL { return c.reviews==1; });
-    Check(c.operations==0 && [c.lastReview.buttons.firstObject.title isEqual:@"Cancel"] && [c.lastReview.buttons.firstObject.keyEquivalent isEqual:@"\r"],@"Cancel and Return never authorize cleanup");
-    Check(c.lastReview.buttons.count==3 && [c.lastReview.informativeText containsString:file],@"review includes full path and both eligible choices");
-    if (argc>1) {
-        [c.lastReview layout];
-        Check(Render(c.lastReview.window.contentView,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:@"storage-review.png"],NSAppearanceNameAqua),@"review sheet rendered without presentation");
-    }
-    c.choice=NSAlertSecondButtonReturn; [c reviewStorage:button]; Await(^BOOL { return c.operations==1 && ![c storageBusy]; });
+    NSButton *button=[NSButton new];button.identifier=file;
+    [c trashStorage:button];[c trashStorage:button];
+    Await(^BOOL{return c.operations==1 && ![c storageBusy];});
+    Check([NSFileManager.defaultManager fileExistsAtPath:file],@"one direct action; fixture transport never deletes user files");
+    Check(![[c valueForKey:@"storageResult"][@"rows"] count],@"trashed item leaves cached ranking immediately");
     [c setValue:result forKey:@"storageResult"];
-    c.choice=NSAlertThirdButtonReturn; [c reviewStorage:button]; Await(^BOOL { return c.operations==2 && ![c storageBusy]; });
-    Check([NSFileManager.defaultManager fileExistsAtPath:file],@"UI tests never touch real Trash or delete fixtures");
+    [c setValue:@NO forKey:@"storageFinished"];[c scanStorage:nil];
+    Check([[c valueForKey:@"storagePaused"] boolValue],@"Pause is explicit and does not discard result");
+    [c windowWillClose:[NSNotification notificationWithName:NSWindowWillCloseNotification object:window]];
+    Check([c valueForKey:@"storageResult"]!=nil,@"closing Details preserves the global result");
     [c setValue:nil forKey:@"detailsWindow"];
-    Controller *ui=[Controller new]; [ui setValue:Fixture() forKey:@"storageResult"];
-    [ui setValue:NSHomeDirectory().stringByResolvingSymlinksInPath forKey:@"storagePath"];
+    [c cancelStorage];
+    Controller *ui=[Controller new];
+    BatteryState battery={.valid=YES,.acConnected=YES,.percent=80};
+    [ui setValue:[NSValue valueWithBytes:&battery objCType:@encode(BatteryState)] forKey:@"bat"];
+    [ui setValue:Fixture() forKey:@"storageResult"];
     Volume *volume=[Volume new]; volume.name=@"Macintosh HD"; volume.path=@"/"; volume.total=2000000000000LL; volume.available=234000000000LL; volume.isInternal=YES;
     [ui setValue:@[volume] forKey:@"vols"];
     if (argc>2) {
         NSDictionary *live=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[2]]] options:0 error:NULL];
-        [ui setValue:live forKey:@"storageResult"]; [ui setValue:live[@"path"] forKey:@"storagePath"];
+        [ui setValue:live forKey:@"storageResult"];
+        [ui setValue:@([live[@"complete"] boolValue] || [live[@"limited"] boolValue]) forKey:@"storageFinished"];
+        [ui setValue:ScanVolumes() forKey:@"vols"];
     }
     for (NSNumber *width in @[@600,@840]) for (NSNumber *dark in @[@NO,@YES]) {
         kDetailW=width.doubleValue; NSScrollView *scroll=[ui storageDetailsView]; Geometry(scroll.documentView);
-        Check(NSMaxX(Find(scroll,@"details.storage.up").frame) < NSMinX(Find(scroll,@"details.storage.scan").frame),@"toolbar controls fit");
+        Check(NSMaxX(Find(scroll,@"details.storage.mode").frame) < NSMinX(Find(scroll,@"details.storage.scan").frame),@"toolbar controls fit");
         if (argc>1) Check(Render(scroll,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:[NSString stringWithFormat:@"storage-%@-%@.png",width,dark.boolValue?@"dark":@"light"]],dark.boolValue?NSAppearanceNameDarkAqua:NSAppearanceNameAqua),@"native screenshot saved");
     }
     kDetailW=600;
-    NSPopUpButton *old=(id)Find([ui storageDetailsView],@"details.storage.scope");
-    [ui setValue:@"/Applications" forKey:@"storagePath"];
-    NSPopUpButton *fresh=(id)Find([ui storageDetailsView],@"details.storage.scope"); ApplyFreshViewState(old,fresh);
-    Check([old.selectedItem.representedObject isEqual:@"/Applications"],@"folder picker survives reconciliation");
-    for (NSString *state in @[@"empty",@"error",@"loading"]) {
-        [ui setValue:[state isEqual:@"error"] ? @{@"error":@"Folder unavailable with current access."} : @{@"rows":@[],@"capturedAt":@(NSDate.date.timeIntervalSince1970)} forKey:@"storageResult"];
-        [ui setValue:[state isEqual:@"loading"] ? [GBStorageScan new] : nil forKey:@"storageScan"];
-        NSScrollView *scroll=[ui storageDetailsView]; Geometry(scroll.documentView);
-        if (argc>1) Check(Render(scroll,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:[NSString stringWithFormat:@"storage-%@.png",state]],NSAppearanceNameAqua),@"state screenshot saved");
+    NSScrollView *items=[ui storageDetailsView];
+    NSButton *trash=(id)Find(items,@"details.storage.item./Users/ian/Movies/Trip footage.mov.action");
+    if(argc<=2)Check([trash.title isEqual:@"Trash"] && trash.action==@selector(trashStorage:),@"Trash is the explicit one-click action, not review navigation");
+    if(argc<=2)Check([((NSButton *)Find(items,@"details.storage.item./Applications/Xcode.app.action")).title isEqual:@"Reveal"],@"protected packages have a usable safe action");
+    [ui setValue:@YES forKey:@"storageFolders"];
+    NSScrollView *folders=[ui storageDetailsView];Geometry(folders.documentView);
+    Check([((NSTextField *)Find(folders,@"details.storage.legend")).stringValue containsString:@"overlap"],@"folder overlap semantics are visible");
+    if(argc>1)Check(Render(folders,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:@"storage-folders.png"],NSAppearanceNameAqua),@"folder mode rendered");
+    [ui setValue:@NO forKey:@"storageFolders"];
+    for(NSString *state in @[@"empty",@"paused",@"loading",@"undo"]){
+        [ui setValue:[state isEqual:@"undo"] ? Fixture() : @{@"rows":@[],@"capturedAt":@(NSDate.date.timeIntervalSince1970)} forKey:@"storageResult"];
+        [ui setValue:@([state isEqual:@"paused"]) forKey:@"storagePaused"];
+        [ui setValue:@([state isEqual:@"empty"]) forKey:@"storageFinished"];
+        [ui setValue:[state isEqual:@"undo"] ? @{@"trashedPath":@"/fixture/Trash"} : nil forKey:@"storageUndo"];
+        [ui setValue:[state isEqual:@"undo"] ? @"Moved to Trash. Space is released when Trash is emptied." : nil forKey:@"storageNotice"];
+        NSScrollView *scroll=[ui storageDetailsView];Geometry(scroll.documentView);
+        if(argc>1)Check(Render(scroll,[[NSString stringWithUTF8String:argv[1]] stringByAppendingPathComponent:[NSString stringWithFormat:@"storage-%@.png",state]],NSAppearanceNameAqua),@"state screenshot saved");
     }
     [NSFileManager.defaultManager removeItemAtPath:home error:NULL];
     fprintf(stderr,"Storage UI: %d checks passed\n",checks);

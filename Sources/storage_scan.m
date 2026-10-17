@@ -22,16 +22,28 @@ BOOL GBStorageIdentityMatches(NSDictionary *a, NSDictionary *b) {
         if (!a[key] || !b[key] || ![a[key] isEqual:b[key]]) return NO;
     return YES;
 }
-static NSString *BoundaryAtPath(NSString *part) {
+NSString *GBStorageBoundaryAtPath(NSString *part) {
     static NSSet *reserved, *packages; static dispatch_once_t once;
     dispatch_once(&once, ^{
         reserved = [NSSet setWithArray:@[@".git",@".hg",@".svn",@"node_modules",@"build",@".build",@"dist",@".Trash",@"CloudStorage",@"Mobile Documents",@".codex",@".cursor",@".claude"]];
-        packages = [NSSet setWithArray:@[@"app",@"bundle",@"framework",@"photoslibrary",@"photolibrary",@"musiclibrary",@"pvm",@"vmwarevm"]];
+        packages = [NSSet setWithArray:@[@"app",@"bundle",@"framework",@"photoslibrary",@"photolibrary",@"musiclibrary",@"pvm",@"vmwarevm",@"sparsebundle",@"backupbundle",@"fcpbundle",@"imovielibrary",@"logicx",@"band",@"garageband",@"xcarchive",@"xcodeproj",@"xcworkspace",@"playground",@"pages",@"numbers",@"key",@"scriv"]];
     });
     NSString *name=part.lastPathComponent;
     if ([reserved containsObject:name] || [part hasSuffix:@"/Documents/Codex"])
         return @"Protected developer, cloud or system folder";
     if ([packages containsObject:name.pathExtension.lowercaseString]) return @"Application or library package";
+    struct stat directory;
+    if(!lstat(part.fileSystemRepresentation,&directory) && S_ISDIR(directory.st_mode)) {
+        if([name hasPrefix:@"."])return @"Hidden application or configuration folder";
+        // Third-party document packages may have registered extensions we do not know.
+        if(name.pathExtension.length){NSNumber *package=nil;
+            [[NSURL fileURLWithPath:part] getResourceValue:&package forKey:NSURLIsPackageKey error:NULL];
+            if(package.boolValue)return @"Application or document package";
+        }
+        struct stat head,objects;
+        if(!lstat([part stringByAppendingPathComponent:@"HEAD"].fileSystemRepresentation,&head) && S_ISREG(head.st_mode) &&
+           !lstat([part stringByAppendingPathComponent:@"objects"].fileSystemRepresentation,&objects) && S_ISDIR(objects.st_mode))return @"Repository data";
+    }
     for (NSString *marker in @[@".git",@".hg",@".svn"]) {
         struct stat s;
         if (!lstat([part stringByAppendingPathComponent:marker].fileSystemRepresentation,&s)) return @"Repository or worktree";
@@ -43,7 +55,7 @@ NSString *GBStorageBoundaryReason(NSString *path) {
     for (NSString *name in path.pathComponents) {
         if ([name isEqual:@"/"]) continue;
         part = [part stringByAppendingPathComponent:name];
-        NSString *reason=BoundaryAtPath(part); if (reason) return reason;
+        NSString *reason=GBStorageBoundaryAtPath(part); if (reason) return reason;
     }
     return nil;
 }
@@ -77,7 +89,7 @@ NSString *GBStorageBoundaryReason(NSString *path) {
         NSString *name = [NSFileManager.defaultManager stringWithFileSystemRepresentation:entry->d_name length:strlen(entry->d_name)];
         NSString *child = [path stringByAppendingPathComponent:name]; struct stat s;
         if (fstatat(dirfd(directory),entry->d_name,&s,AT_SYMLINK_NOFOLLOW)) { _errors++; complete=NO; continue; }
-        if (s.st_dev != _device || S_ISLNK(s.st_mode) || (s.st_flags & SF_DATALESS) || BoundaryAtPath(child)) {
+        if (s.st_dev != _device || S_ISLNK(s.st_mode) || (s.st_flags & SF_DATALESS) || GBStorageBoundaryAtPath(child)) {
             _skipped++; complete=NO; continue;
         }
         if (S_ISDIR(s.st_mode)) {
@@ -136,7 +148,7 @@ NSString *GBStorageBoundaryReason(NSString *path) {
             NSString *child=[path stringByAppendingPathComponent:name]; struct stat s;
             if (fstatat(dirfd(directory),entry->d_name,&s,AT_SYMLINK_NOFOLLOW)) { _errors++; continue; }
             NSMutableDictionary *row=[@{@"name":name,@"path":child,@"isDirectory":@(S_ISDIR(s.st_mode)),@"isLink":@(S_ISLNK(s.st_mode)),@"identity":Identity(child,s)} mutableCopy];
-            NSString *boundary=BoundaryAtPath(child);
+            NSString *boundary=GBStorageBoundaryAtPath(child);
             if (boundary) row[@"protectedReason"]=boundary;
             BOOL complete=YES, measured=YES; uint64_t logical=0,allocated=0;
             if (boundary || S_ISLNK(s.st_mode) || s.st_dev != _device || (s.st_flags & SF_DATALESS)) {

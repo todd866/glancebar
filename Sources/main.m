@@ -27,6 +27,7 @@
 #import "activity.h"
 #import "storage_scan.h"
 #import "storage_cleanup.h"
+#import "storage_index.h"
 
 // This preference governs Glancebar's optional requests only, never system networking.
 static BOOL GBLowDataEnabled(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"lowData"]; }
@@ -4607,12 +4608,17 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     BOOL _activityLoading, _activityPresenting;
     NSUInteger _activityGeneration;
     NSInteger _activitySort;
-    NSString *_storagePath, *_storageNotice;
-    NSDictionary *_storageResult;
-    GBStorageScan *_storageScan;
+    BOOL _popoverPrepared, _popoverPreparePending;
+    NSString *_storageNotice;
+    NSDictionary *_storageResult, *_storageUndo, *_storageProgress;
+    NSMutableDictionary *_storageBlocked;
+    GBStorageIndex *_storageIndex;
+    dispatch_queue_t _storageQueue;
     NSProgress *_storageCleanupProgress;
-    NSAlert *_storageReviewAlert;
+    BOOL _storageSliceRunning, _storagePaused, _storageSleeping, _storageFolders, _storageCacheLoaded, _storageCacheLoading;
+    BOOL _storageFinished, _storageRetainSnapshot;
     NSUInteger _storageGeneration;
+    double _storageLastStart, _storageLastCache;
     NSMutableArray<NSNumber *> *_ampHistory;
     NSUInteger _sampleGen;
     CFAbsoluteTime _lastSampleTime;
@@ -4764,7 +4770,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
 
     _popover = [NSPopover new];
     _popover.behavior = NSPopoverBehaviorTransient;
-    _popover.animates = YES;
+    _popover.animates = NO;
     _popover.delegate = self;   // popoverWillClose: timestamps the dismiss for the toggle guard
     _popover.contentViewController = [NSViewController new];
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
@@ -4783,6 +4789,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     [workspaceNotifications addObserver:self selector:@selector(meteredDidWake:)
                                   name:NSWorkspaceDidWakeNotification object:nil];
     [self refresh];
+    [self rebuildContent]; // Prepare the first click while launch work is already in progress.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [self requestStorageScanIfNeeded]; });
     // The CPU figure needs two tick samples at least 2 s apart; take the second one now
     // rather than leaving "estimating" on the bar until the 15 s timer first fires.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
@@ -5629,8 +5637,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
 }
 
-- (void)meteredWillSleep:(NSNotification *)note { (void)note; [self cancelStorage]; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
-- (void)meteredDidWake:(NSNotification *)note { (void)note; [_meteredMonitor wake]; }
+- (void)meteredWillSleep:(NSNotification *)note { (void)note; _storageSleeping=YES; _storageIndex.paused=YES; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
+- (void)meteredDidWake:(NSNotification *)note { (void)note; _storageSleeping=NO; [_meteredMonitor wake]; [self requestStorageScanIfNeeded]; }
 
 - (void)refresh {
     [_meteredMonitor tick];
@@ -5661,7 +5669,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self refreshVisibleSurfaces];
     // The details window stays open indefinitely; refresh its one-shot process samples
     // on a slow cadence so they don't masquerade as live data next to live numbers.
-    if (_detailsWindow.isVisible && ![self activityTabSelected] && !_hogsLoading && !_procStatsLoading &&
+    if (_storageCacheLoaded) [self requestStorageScanIfNeeded];
+    if (_detailsWindow.isVisible && ![self activityTabSelected] && ![self storageTabSelected] && !_hogsLoading && !_procStatsLoading &&
         CFAbsoluteTimeGetCurrent() - _lastSampleTime >= 30)
         [self beginSampling];
 }
@@ -6223,6 +6232,13 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 // Redraw whatever on-screen surfaces are currently visible.
 - (void)refreshVisibleSurfaces {
     if (_popover.isShown) [self rebuildContent];
+    else if (_popover && !_popoverPreparePending) {
+        _popoverPreparePending=YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+            self->_popoverPreparePending=NO;
+            if(!self->_terminating && !self->_popover.isShown)[self rebuildContent];
+        });
+    }
     if (_detailsWindow.isVisible) [self rebuildDetails];
 }
 
@@ -6297,15 +6313,20 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // never closes the panel the way a menu would. Suppress the reopen for a frame or two
     // after any close so the icon toggles cleanly. (sender is nil for programmatic opens.)
     if (sender && CFAbsoluteTimeGetCurrent() - _popoverClosedAt < 0.20) return;
-    // Reset the content view so the rebuild starts at the top on a fresh open.
-    _popoverScroll = nil;
-    _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
-    [self refresh];
-    // Opening the panel is one of the two moments local mode can get out of the way.
-    if (_musicProbesEnabled) [self yieldLocalMusicIfIdle];
-    [self rebuildContent];
+    // The prepared tree is refreshed while hidden. Nothing reads telemetry or
+    // walks the filesystem between this click and the presentation request.
+    if (!_popoverPrepared) [self rebuildContent];
+    if (_popoverScroll) {
+        [_popoverScroll.contentView scrollToPoint:NSZeroPoint];
+        [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
+    }
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
-    if (_musicProbesEnabled) [self runYouTubeStatusAfter:0 generation:_musicGen];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+        if(!self->_popover.isShown || self->_terminating)return;
+        [self refresh];
+        if(self->_musicProbesEnabled){[self yieldLocalMusicIfIdle];[self runYouTubeStatusAfter:0 generation:self->_musicGen];}
+        [self beginSampling];[self startPowerTick];
+    });
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
     // stays invisible until something scrolls it — so the sections below the fold (AI
     // Status is the last one) look like they do not exist. Flash it on open only: the
@@ -6316,9 +6337,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     // dismissed when the user clicks another app. Activate on open so a click elsewhere
     // (and the key-window resign it triggers) closes the panel like a normal menu.
     [NSApp activateIgnoringOtherApps:YES];
-    [self refreshAIUsageAsync];
-    [self beginSampling];
-    [self startPowerTick];
 }
 
 // Power changes (charger plugged, load spikes, AlDente letting go) post no IOPS event, so
@@ -6847,8 +6865,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [ud setObject:mode forKey:@"glancebarChargeMode"];
     [ud setObject:at forKey:@"glancebarChargeModeAt"];
     [self syncPowerButtons];
-    if (_popover.isShown) [self rebuildContent];
-    if (_detailsWindow.isVisible) [self rebuildDetails];
+    [self refreshVisibleSurfaces];
 }
 - (void)toggleChargeLimit:(id)sender {
     (void)sender;
@@ -7565,6 +7582,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 }
 
 - (void)rebuildContent {
+    _popoverPrepared=YES;
     [self refreshChargeShortcutsIfStale];
     NSView *previousView = _popover.contentViewController.view;
     NSWindow *popoverWindow = previousView.window;
@@ -8464,13 +8482,17 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @[@"activity", @"Activity"],
         @[@"ai", @"AI"],
     ];
-    for (NSArray<NSString *> *spec in specs)
-        [controller addTabViewItem:[self detailTabWithIdentifier:spec[0] title:spec[1]
-                                                            view:[self detailViewForIdentifier:spec[0]]]];
+    for (NSArray<NSString *> *spec in specs) {
+        // Unselected tabs acquire their document when selected; creating the
+        // toolbar never constructs six independent dashboards on the click path.
+        NSScrollView *view=[spec[0] isEqual:@"overview"] ? [self overviewDetailsView]
+            : [[NSScrollView alloc] initWithFrame:NSMakeRect(0,0,kDetailW,420)];
+        [controller addTabViewItem:[self detailTabWithIdentifier:spec[0] title:spec[1] view:view]];
+    }
     __weak Controller *owner = self;
-    controller.activitySelected = ^{ [owner cancelStorage]; [owner stopPowerTick]; [owner requestActivitySurveyIfNeeded]; };
-    controller.storageSelected = ^{ [owner stopPowerTick]; [owner requestStorageScanIfNeeded]; };
-    controller.otherSelected = ^{ [owner cancelStorage]; [owner startPowerTick]; };
+    controller.activitySelected = ^{ [owner rebuildDetails]; [owner stopPowerTick]; [owner requestActivitySurveyIfNeeded]; };
+    controller.storageSelected = ^{ [owner rebuildDetails]; [owner stopPowerTick]; [owner requestStorageScanIfNeeded]; };
+    controller.otherSelected = ^{ [owner rebuildDetails]; [owner startPowerTick]; };
     return controller;
 }
 
@@ -9665,9 +9687,10 @@ static NSColor *HealthColor(double fraction) {
         return;
     }
 
-    // Periodic refresh: swap each tab's document in place — the tab view, selection,
-    // first responder, and per-tab scroll position all survive.
+    // Refresh the visible document only. Each tab keeps its prepared view and
+    // scroll position; switching tabs refreshes that document from cached data.
     for (NSTabViewItem *item in tabs.tabViewItems) {
+        if(item!=tabs.selectedTabViewItem)continue;
         NSScrollView *fresh = [self detailViewForIdentifier:item.identifier];
         if (!fresh) continue;
         NSRect existingFrame = item.view.frame;
@@ -9696,7 +9719,6 @@ static NSColor *HealthColor(double fraction) {
 }
 
 - (void)showDetails:(id)sender {
-    if (!_activityPresenting) [self refresh];
     if (!_activityPresenting) [self startPowerTick];   // stops itself once neither the popover nor Details is visible
     BOOL didCreateWindow = (_detailsWindow == nil);
     if (!_detailsWindow) {
@@ -9712,7 +9734,7 @@ static NSColor *HealthColor(double fraction) {
         _detailsWindow.delegate = self;
         _detailsWindow.minSize = NSMakeSize(648, 420);
     }
-    [self rebuildDetails];
+    if(didCreateWindow)[self rebuildDetails];
     if (didCreateWindow) [_detailsWindow center];
     [_detailsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -9721,11 +9743,15 @@ static NSColor *HealthColor(double fraction) {
         [self stopPowerTick];
         [self requestActivitySurveyIfNeeded];
     } else if ([self storageTabSelected]) { [self stopPowerTick]; [self requestStorageScanIfNeeded]; }
-    else if (!_activityPresenting) { [self refreshAIUsageAsync]; [self beginSampling]; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
+        if(!self->_detailsWindow.isVisible || self->_terminating)return;
+        [self refresh];
+        if(![self activityTabSelected] && ![self storageTabSelected])[self beginSampling];
+    });
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
-    if (notification.object == _detailsWindow) [self cancelStorage];
+    (void)notification; // Global storage indexing survives closing Details.
 }
 
 - (void)windowDidResize:(NSNotification *)notification {

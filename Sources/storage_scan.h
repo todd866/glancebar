@@ -6,3 +6,6 @@ NSString *GBStorageBoundaryReason(NSString *path);
 @property(atomic, getter=isCancelled) BOOL cancelled;
 - (NSDictionary *)scanPath:(NSString *)path entryLimit:(NSUInteger)limit seconds:(double)seconds;
 @end
+
+// Boundary at this directory only; callers must already carry ancestor protection.
+NSString *GBStorageBoundaryAtPath(NSString *path);

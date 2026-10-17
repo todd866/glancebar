@@ -26,8 +26,10 @@ int main(void) { @autoreleasepool {
     char real[PATH_MAX]; Check(realpath(NSTemporaryDirectory().fileSystemRepresentation,real)!=NULL,@"physical temp directory");
     NSString *home=[[NSString stringWithUTF8String:real] stringByAppendingPathComponent:[@"gb-storage-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     NSString *downloads=[home stringByAppendingPathComponent:@"Downloads"];
+    NSString *trash=[home stringByAppendingPathComponent:@".Trash"];
     NSFileManager *fm=NSFileManager.defaultManager;
     Check([fm createDirectoryAtPath:downloads withIntermediateDirectories:YES attributes:nil error:NULL],@"private fixture home");
+    Check([fm createDirectoryAtPath:trash withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions:@0700} error:NULL],@"private fixture Trash");
     NSString *sparse=[downloads stringByAppendingPathComponent:@"sparse.bin"];
     int fd=open(sparse.fileSystemRepresentation,O_CREAT|O_RDWR,0600);
     Check(fd>=0 && !ftruncate(fd,1048576),@"sparse fixture"); close(fd);
@@ -55,9 +57,9 @@ int main(void) { @autoreleasepool {
     NSString *eligible=Write(downloads,@"eligible.txt",@"trash fixture");
     __block NSUInteger opens=0, transports=0;
     GBStorageOpenCheck openCheck=^NSString *(NSString *path) { (void)path; opens++; return nil; };
-    GBStorageTrashTransport transport=^BOOL(NSURL *url,NSError **error) { (void)url; (void)error; transports++; return YES; };
+    GBStorageTrashTransport transport=^BOOL(NSURL *url,NSURL **resultingURL,NSError **error) { (void)url; (void)resultingURL; (void)error; transports++; return YES; };
     NSDictionary *result=GBStorageTrash(Entry(eligible),home,openCheck,transport);
-    Check(!result[@"error"] && opens && transports==1,@"eligible reviewed file reaches injected transport");
+    Check(result[@"error"] && opens && transports==1,@"no-op transport cannot falsely report a move");
     Check([fm fileExistsAtPath:eligible],@"injected Trash transport never deletes");
     NSString *changed=Write(downloads,@"changed.txt",@"before"); NSDictionary *old=Entry(changed);
     Write(downloads,@"changed.txt",@"after"); transports=0;
@@ -65,6 +67,61 @@ int main(void) { @autoreleasepool {
     Check(!GBStorageIdentityMatches(@{},@{}) && !GBStorageIdentityMatches(@{},GBStorageIdentity(changed)),@"malformed identities never match");
     Check(GBStorageTrash(Entry(eligible),home,^NSString *(NSString *path) { (void)path; return @"In use"; },transport)[@"error"] && transports==0,@"in-use file denied");
     Check(GBStorageTrash(Entry(eligible),home,nil,transport)[@"error"] && transports==0,@"missing in-use check fails closed");
+    // All successful moves go only between this private fixture's Downloads
+    // and .Trash. Neither the real user's Trash nor a permanent delete is used.
+    GBStorageTrashTransport fixtureMove=^BOOL(NSURL *url,NSURL **resultingURL,NSError **error) {
+        transports++;
+        NSURL *target=[NSURL fileURLWithPath:[trash stringByAppendingPathComponent:url.filePathURL.lastPathComponent]];
+        BOOL ok=[fm moveItemAtURL:url toURL:target error:error]; if (ok && resultingURL) *resultingURL=target; return ok;
+    };
+    NSString *undoSource=Write(downloads,@"undo.txt",@"recoverable fixture");
+    NSDictionary *undoRecord=GBStorageTrash(Entry(undoSource),home,openCheck,fixtureMove);
+    Check(!undoRecord[@"error"] && undoRecord[@"undoToken"] && [undoRecord[@"originalPath"] isEqual:undoSource] &&
+          [undoRecord[@"trashedPath"] isEqual:[trash stringByAppendingPathComponent:@"undo.txt"]],@"direct Trash returns verified original and Trash paths");
+    Check(![fm fileExistsAtPath:undoSource] && [fm fileExistsAtPath:undoRecord[@"trashedPath"]],@"direct Trash moves the fixture once");
+    NSMutableDictionary *tampered=[undoRecord mutableCopy]; tampered[@"originalPath"]=[home stringByAppendingPathComponent:@"outside.txt"];
+    Check(GBStorageRestore(tampered,home)[@"error"]!=nil,@"outside destination alteration rejected");
+    tampered=[undoRecord mutableCopy]; tampered[@"trashedPath"]=eligible;
+    Check(GBStorageRestore(tampered,home)[@"error"]!=nil,@"outside Trash alteration rejected");
+    tampered=[undoRecord mutableCopy]; tampered[@"undoToken"]=NSUUID.UUID.UUIDString;
+    Check(GBStorageRestore(tampered,home)[@"error"]!=nil,@"unissued Undo capability rejected");
+    Check(GBStorageRestore(undoRecord,downloads)[@"error"]!=nil,@"changed home scope rejected");
+    Write(downloads,@"undo.txt",@"replacement must survive");
+    Check(GBStorageRestore(undoRecord,home)[@"error"]!=nil,@"Undo refuses a destination collision");
+    Check([[NSString stringWithContentsOfFile:undoSource encoding:NSUTF8StringEncoding error:NULL] isEqual:@"replacement must survive"],@"collision contents untouched");
+    Check([fm removeItemAtPath:undoSource error:NULL],@"remove only fixture collision");
+    Check(!GBStorageRestore(undoRecord,home)[@"error"] && [fm fileExistsAtPath:undoSource],@"Undo restores original when destination is free");
+    Check([[NSString stringWithContentsOfFile:undoSource encoding:NSUTF8StringEncoding error:NULL] isEqual:@"recoverable fixture"],@"Undo restores exact contents");
+    Check(GBStorageRestore(undoRecord,home)[@"error"]!=nil,@"Undo capability consumed after successful restore");
+    NSString *changedTrashSource=Write(downloads,@"trash-changed.txt",@"before Trash");
+    NSDictionary *changedTrash=GBStorageTrash(Entry(changedTrashSource),home,openCheck,fixtureMove);
+    Write(trash,@"trash-changed.txt",@"replacement in Trash");
+    Check(GBStorageRestore(changedTrash,home)[@"error"] && ![fm fileExistsAtPath:changedTrashSource],@"replaced trashed identity cannot be restored");
+    NSString *linkedSource=Write(downloads,@"trash-linked.txt",@"linked fixture");
+    NSDictionary *linkedTrash=GBStorageTrash(Entry(linkedSource),home,openCheck,fixtureMove);
+    Check(!link([linkedTrash[@"trashedPath"] fileSystemRepresentation],[[trash stringByAppendingPathComponent:@"extra-link.txt"] fileSystemRepresentation]),@"private Trash hardlink fixture");
+    Check(GBStorageRestore(linkedTrash,home)[@"error"]!=nil,@"file hardlinked after Trash cannot be restored");
+    NSString *nested=[downloads stringByAppendingPathComponent:@"nested"];
+    Check([fm createDirectoryAtPath:nested withIntermediateDirectories:NO attributes:nil error:NULL],@"nested fixture directory");
+    NSString *nestedSource=Write(nested,@"nested.txt",@"nested fixture");
+    NSDictionary *nestedTrash=GBStorageTrash(Entry(nestedSource),home,openCheck,fixtureMove);
+    NSString *oldNested=[downloads stringByAppendingPathComponent:@"nested-old"];
+    Check([fm moveItemAtPath:nested toPath:oldNested error:NULL] && [fm createDirectoryAtPath:nested withIntermediateDirectories:NO attributes:nil error:NULL],@"replace original parent fixture");
+    Check(GBStorageRestore(nestedTrash,home)[@"error"] && ![fm fileExistsAtPath:nestedSource],@"replacement parent cannot receive Undo");
+    Check([fm removeItemAtPath:nested error:NULL] && !symlink(oldNested.fileSystemRepresentation,nested.fileSystemRepresentation),@"original parent symlink fixture");
+    Check(GBStorageRestore(nestedTrash,home)[@"error"] && ![fm fileExistsAtPath:[oldNested stringByAppendingPathComponent:@"nested.txt"]],@"symlink parent cannot redirect Undo");
+    NSString *symlinkSource=Write(downloads,@"undo-symlink.txt",@"target fixture");
+    NSDictionary *symlinkTrash=GBStorageTrash(Entry(symlinkSource),home,openCheck,fixtureMove);
+    Check(!symlink("missing-target",symlinkSource.fileSystemRepresentation),@"dangling destination symlink fixture");
+    Check(GBStorageRestore(symlinkTrash,home)[@"error"]!=nil,@"dangling destination symlink counts as a collision");
+    NSDictionary *oldest=nil, *latest=nil;
+    for (NSUInteger i=0;i<17;i++) {
+        NSString *name=[NSString stringWithFormat:@"bounded-%lu.txt",(unsigned long)i];
+        NSDictionary *moved=GBStorageTrash(Entry(Write(downloads,name,@"bounded fixture")),home,openCheck,fixtureMove);
+        if (!i) oldest=moved; latest=moved;
+    }
+    Check(GBStorageRestore(oldest,home)[@"error"]!=nil,@"old Undo capabilities expire at the bounded capacity");
+    Check(!GBStorageRestore(latest,home)[@"error"],@"latest Undo remains available at bounded capacity");
     Check(GBStorageCleanupReason(Entry(hard),home,NO)!=nil,@"hardlinks reveal-only");
     Check(GBStorageCleanupReason(Entry(linkPath),home,NO)!=nil,@"symlinks reveal-only");
     Check(GBStorageCleanupReason(Entry(head),home,NO)!=nil,@"repository contents reveal-only");

@@ -745,6 +745,20 @@ int main(int argc, const char **argv) {
                 item.view = [c detailViewForIdentifier:@"overview"];
             }
         }
+        NSTabViewItem *aiTab=nil,*batteryTab=nil;
+        for(NSTabViewItem *item in tabs.tabViewItems){
+            if([item.identifier isEqual:@"ai"])aiTab=item;
+            if([item.identifier isEqual:@"battery"])batteryTab=item;
+        }
+        NSView *unselectedAI=aiTab.view;
+        if(((NSScrollView *)unselectedAI).documentView) return Fail(__LINE__);
+        [tabs.tabView selectTabViewItemWithIdentifier:@"battery"];
+        if(![((NSScrollView *)batteryTab.view).documentView.accessibilityIdentifier isEqual:@"details.battery"] || aiTab.view!=unselectedAI)
+            return Fail(__LINE__);
+        [c rebuildDetails];
+        if(aiTab.view!=unselectedAI) return Fail(__LINE__);
+        [tabs.tabView selectTabViewItemWithIdentifier:@"overview"];
+        [c stopPowerTick];
         if (getenv("GLANCEBAR_DUMP_TIPS")) {
             for (NSString *rid in @[@"popover.row.storage", @"popover.row.battery", @"popover.row.system",
                                     @"popover.row.ai.claude", @"popover.row.ai.codex", @"popover.row.ai.cursor"])
