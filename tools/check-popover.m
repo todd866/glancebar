@@ -17,11 +17,35 @@ static void PrimeBatteryForecast(Controller *controller, BatteryState battery, B
 static BOOL ForecastFits(BatteryForecastView *view) {
     if (![view isKindOfClass:BatteryForecastView.class]) return NO;
     NSRect a = [view labelRect:YES], b = [view labelRect:NO];
-    NSDictionary *attrs = @{NSFontAttributeName:[NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium]};
-    return [view.thresholdText sizeWithAttributes:attrs].width <= NSWidth(a) &&
-        [view.endpointText sizeWithAttributes:attrs].width <= NSWidth(b) &&
-        NSContainsRect(view.bounds,a) && NSContainsRect(view.bounds,b) && !NSIntersectsRect(a,b) &&
-        view.forecast.thresholdPercent == (view.forecast.endpointPercent == 0 ? 20 : 80);
+    NSDictionary *attrs = [view labelAttributes];
+    CGFloat gaugeWidth = NSWidth(view.bounds) - 2 * kBatteryForecastSideRoom;
+    CGFloat expectedA = kBatteryForecastSideRoom + gaugeWidth * view.forecast.thresholdPercent / 100.0;
+    CGFloat expectedB = kBatteryForecastSideRoom + gaugeWidth * view.forecast.endpointPercent / 100.0;
+    CGFloat gap = view.forecast.endpointPercent == 0 ? NSMinX(a)-NSMaxX(b) : NSMinX(b)-NSMaxX(a);
+    if ([view.thresholdText sizeWithAttributes:attrs].width > NSWidth(a) + 0.01 ||
+        [view.endpointText sizeWithAttributes:attrs].width > NSWidth(b) + 0.01 ||
+        !NSContainsRect(view.bounds,a) || !NSContainsRect(view.bounds,b) || gap < 1 ||
+        fabs(NSMidX(a)-expectedA)>0.01 || fabs(NSMidX(b)-expectedB)>0.01 ||
+        view.forecast.thresholdPercent != (view.forecast.endpointPercent == 0 ? 20 : 80)) return NO;
+    // Compare with the production gauge, independently of overlay padding and width.
+    for (NSView *sibling in view.superview.subviews) {
+        if ([sibling isKindOfClass:Gauge.class]) {
+            CGFloat origin=NSMinX(sibling.frame), width=NSWidth(sibling.frame);
+            if (fabs(NSMinX(view.frame)+NSMidX(a)-(origin+width*view.forecast.thresholdPercent/100.0))>0.01 ||
+                fabs(NSMinX(view.frame)+NSMidX(b)-(origin+width*view.forecast.endpointPercent/100.0))>0.01) return NO;
+        }
+        if ([sibling isKindOfClass:NSTextField.class]) {
+            NSTextField *field=(NSTextField *)sibling;
+            if (![field.accessibilityIdentifier hasSuffix:@".value"] && ![field.accessibilityIdentifier hasSuffix:@".name"]) continue;
+            CGFloat width=[field.stringValue sizeWithAttributes:@{NSFontAttributeName:field.font}].width+4;
+            NSRect ink=field.frame;
+            if (field.alignment==NSTextAlignmentRight) ink.origin.x=NSMaxX(ink)-width;
+            ink.size.width=width;
+            if ((view.thresholdText.length && NSIntersectsRect([view convertRect:a toView:view.superview],ink)) ||
+                (view.endpointText.length && NSIntersectsRect([view convertRect:b toView:view.superview],ink))) return NO;
+        }
+    }
+    return YES;
 }
 static NSUInteger CountGauges(NSView *view) {
     NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) ? 1 : 0;
@@ -963,7 +987,12 @@ int main(int argc, const char **argv) {
                 NSArray *idents=@[@"popover.battery.forecast", @"details.overview.battery.forecast", @"details.battery.charge.forecast"];
                 for (NSUInteger j=0;j<surfaces.count;j++) {
                     BatteryForecastView *other=(BatteryForecastView *)FindIdentifier(surfaces[j],idents[j]);
-                    if (!ForecastFits(other) || !FitsChildren(surfaces[j])) return Fail(__LINE__);
+                    if (!ForecastFits(other) || !FitsChildren(surfaces[j])) {
+                        fprintf(stderr,"forecast case=%zu surface=%s bounds=%s a=%s b=%s attrs=%s\n",i,[names[j] UTF8String],
+                            NSStringFromRect(other.bounds).UTF8String,NSStringFromRect([other labelRect:YES]).UTF8String,
+                            NSStringFromRect([other labelRect:NO]).UTF8String,[[other labelAttributes] description].UTF8String);
+                        return Fail(__LINE__);
+                    }
                     if (i>=6 && (![other.thresholdText isEqual:fv.thresholdText] || ![other.endpointText isEqual:fv.endpointText])) return Fail(__LINE__);
                     if (argc>1) {
                         NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
@@ -978,14 +1007,19 @@ int main(int argc, const char **argv) {
         }
 
         {
-            BatteryForecastView *probe=[[BatteryForecastView alloc] initWithFrame:NSMakeRect(0,0,kGaugeW,30)];
-            for (int endpoint=0;endpoint<=100;endpoint+=100) {
-                probe.forecast=(BatteryForecast){.thresholdPercent=endpoint ? 80 : 20,.endpointPercent=endpoint};
-                for (NSString *text in @[@"<5m",@"5m",@"45m",@"55m",@"1h",@"1.5h",@"9.9h",@"10h",@"24h",@"—"]) {
-                    probe.thresholdText=text; probe.endpointText=text;
-                    if (!ForecastFits(probe)) return Fail(__LINE__);
+            BatteryForecastView *probe=[[BatteryForecastView alloc] initWithFrame:NSZeroRect];
+            NSArray *labels=@[@"<5m",@"5m",@"45m",@"55m",@"1h",@"1.5h",@"9.9h",@"10h",@"24h",@"—"];
+            for (NSNumber *gaugeWidth in @[@94,@102,@222]) {
+                probe.frame=NSMakeRect(0,0,gaugeWidth.doubleValue+2*kBatteryForecastSideRoom,30);
+                for (int endpoint=0;endpoint<=100;endpoint+=100) {
+                    probe.forecast=(BatteryForecast){.thresholdPercent=endpoint ? 80 : 20,.endpointPercent=endpoint};
+                    for (NSString *text in labels) for (NSString *other in labels) {
+                        probe.thresholdText=text; probe.endpointText=other;
+                        if (!ForecastFits(probe)) return Fail(__LINE__);
+                    }
                 }
             }
+            fprintf(stderr,"Forecast geometry: 600 text/width/direction combinations passed\n");
         }
 
         // On battery: Burn appears only for actionable quit gains; the Battery

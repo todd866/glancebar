@@ -3586,43 +3586,51 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
-// Duration labels occupy the existing battery row. Nearby targets need more room
-// than the 20%-to-endpoint gap at 102pt, so short leaders preserve exact anchors.
+// Duration labels are centred on the actual target coordinates, including 0/100%.
+// Side room belongs to the overlay, not the gauge: endpoints can overhang the bar.
+static const CGFloat kBatteryForecastSideRoom = 14;
 @interface BatteryForecastView : NSView
 @property (nonatomic) BatteryForecast forecast;
 @property (nonatomic, copy) NSString *thresholdText, *endpointText;
 - (NSRect)labelRect:(BOOL)threshold;
+- (NSDictionary *)labelAttributes;
 @end
 @implementation BatteryForecastView
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (NSRect)labelRect:(BOOL)threshold {
+- (CGFloat)targetX:(BOOL)threshold {
+    CGFloat gaugeWidth = NSWidth(self.bounds) - 2 * kBatteryForecastSideRoom;
+    return kBatteryForecastSideRoom + gaugeWidth *
+        (threshold ? _forecast.thresholdPercent : _forecast.endpointPercent) / 100.0;
+}
+- (NSDictionary *)labelAttributes {
     NSFont *font = [NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium];
-    CGFloat width = 0;
-    for (NSString *sample in @[@"55m", @"9.9h", @"<5m", @"24h"])
-        width = MAX(width, ceil([sample sizeWithAttributes:@{NSFontAttributeName:font}].width));
-    CGFloat w = NSWidth(self.bounds), x;
-    if (_forecast.endpointPercent == 0)
-        x = threshold ? MAX(w * 0.20 + 2, width + 3) : 0;
-    else x = threshold ? MIN(w * 0.80 - width - 2, w - 2 * width - 3) : w - width;
-    return NSMakeRect(x, 18, width, 12);
+    NSMutableDictionary *attrs = [@{NSFontAttributeName:font, NSForegroundColorAttributeName:NSColor.labelColor} mutableCopy];
+    CGFloat pairWidth = ([_thresholdText sizeWithAttributes:attrs].width + [_endpointText sizeWithAttributes:attrs].width) / 2;
+    CGFloat gap = fabs([self targetX:YES] - [self targetX:NO]) - pairWidth;
+    // Only two long neighbouring readings need slightly tighter tracking. Keep
+    // the font size and exact centres; never displace a label to make it fit.
+    if (_thresholdText.length && _endpointText.length && gap < 1.5) {
+        CGFloat characters = (_thresholdText.length + _endpointText.length) / 2.0;
+        attrs[NSKernAttributeName] = @(-MIN(0.9, (1.5 - gap) / characters));
+    }
+    return attrs;
+}
+- (NSRect)labelRect:(BOOL)threshold {
+    NSString *text = threshold ? _thresholdText : _endpointText;
+    CGFloat width = MAX(1, [text sizeWithAttributes:[self labelAttributes]].width);
+    return NSMakeRect([self targetX:threshold] - width / 2, 18, width, 12);
 }
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
-    NSDictionary *attrs = @{NSFontAttributeName:[NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium],
-                            NSForegroundColorAttributeName:NSColor.labelColor};
+    NSDictionary *attrs = [self labelAttributes];
     for (int i=0; i<2; i++) {
         BOOL threshold = i == 0;
         NSString *text = threshold ? _thresholdText : _endpointText;
-        CGFloat anchor = NSWidth(self.bounds) * (threshold ? _forecast.thresholdPercent : _forecast.endpointPercent) / 100.0;
-        anchor = MAX(0.5, MIN(NSWidth(self.bounds)-0.5, anchor));
+        CGFloat anchor = [self targetX:threshold];
         NSRect rect = [self labelRect:threshold];
-        // A thin contrasting tick remains visible through both the fill and trend arrow.
+        // A straight tick shares the label's centre, with no sideways leader.
         NSBezierPath *tick = [NSBezierPath bezierPath];
         [tick moveToPoint:NSMakePoint(anchor, 9)]; [tick lineToPoint:NSMakePoint(anchor, 17)];
-        if (text.length) {
-            CGFloat join = _forecast.endpointPercent == 0 ? NSMinX(rect) : NSMaxX(rect);
-            [tick lineToPoint:NSMakePoint(join, 18)];
-        }
         [[NSColor.windowBackgroundColor colorWithAlphaComponent:0.9] setStroke]; tick.lineWidth = 3; [tick stroke];
         [NSColor.labelColor setStroke]; tick.lineWidth = 1; [tick stroke];
         [text drawInRect:rect withAttributes:attrs];
@@ -6919,7 +6927,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     arrow.accessibilityIdentifier = [stem stringByAppendingString:@".trend"];
     arrow.toolTip = tip;
     [row addSubview:arrow];
-    BatteryForecastView *forecast = [[BatteryForecastView alloc] initWithFrame:NSMakeRect(NSMinX(frame), 0, NSWidth(frame), 30)];
+    BatteryForecastView *forecast = [[BatteryForecastView alloc] initWithFrame:
+        NSMakeRect(NSMinX(frame) - kBatteryForecastSideRoom, 0, NSWidth(frame) + 2 * kBatteryForecastSideRoom, 30)];
     forecast.accessibilityIdentifier = [stem stringByAppendingString:@".forecast"];
     [self configureBatteryForecast:forecast];
     [row addSubview:forecast];
@@ -7436,7 +7445,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @"systemFullMinutes":@(_bat.minutesToFull), @"telemetryAge":@(now - _bat.telemetryTimestamp),
         @"chargeMode":[self effectiveChargeMode], @"hypotheticalFull":@(f.hypotheticalFull), @"hideLabels":@(f.hideLabels),
         @"thresholdArrival":@(f.thresholdTime), @"endpointArrival":@(f.endpointTime),
-        @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"tooltip":view.toolTip ?: @""};
+        @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"tooltip":view.toolTip ?: @"",
+        @"thresholdCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:YES])),
+        @"endpointCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:NO])),
+        @"gaugeStartX":@(kGaugeX), @"gaugeWidth":@(kGaugeW)};
     NSString *stem = [path stringByAppendingPathComponent:[NSString stringWithFormat:@"live-%03d", (int)lround(now - _batteryDebugStarted)]];
     [[NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
         writeToFile:[stem stringByAppendingString:@".json"] atomically:YES];

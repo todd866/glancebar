@@ -3,6 +3,9 @@
 The existing battery row shows compact remaining durations above the 20% and 0%
 markers while discharging, or 80% and 100% while charging. Values round to five
 minutes below an hour, then tenths of an hour. Arrival clocks remain in the tooltip.
+The measured text is centred exactly on each target tick. Endpoint labels may extend
+past the gauge into the overlay's side room, without moving the gauge or columns.
+Long adjacent labels use slightly tighter tracking at the same 9pt font size.
 
 With the 80% limit enabled, the 100% duration assumes the owner cancels that limit.
 The tooltip states this assumption. At or above 80%, both duration labels disappear.
