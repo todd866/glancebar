@@ -111,6 +111,23 @@ int main(void) { @autoreleasepool {
     check(f.endpointTime==0 && f.thresholdTime==0, @"lagging positive current without charging confirmation cannot invent an ETA");
     b=Battery(NO); t=[BatteryForecastTracker new]; f=Warm(t,b,NO,53000);
     f=[t update:b limit80:NO at:52900]; check(f.endpointTime==0, @"backward clock adjustment clears sampled history");
+    struct { double minutes; const char *text; } durationCases[] = {
+        {0.01,"<5m"},{2.5,"<5m"},{4.99,"<5m"},{5,"5m"},{7.49,"5m"},{7.5,"10m"},
+        {44,"45m"},{45,"45m"},{54,"55m"},{57.49,"55m"},{57.5,"1h"},{59.99,"1h"},{60,"1h"},
+        {62.99,"1h"},{63,"1.1h"},{90,"1.5h"},{120,"2h"},{594,"9.9h"},{596.99,"9.9h"},
+        {597,"10h"},{600,"10h"},{629.99,"10h"},{630,"11h"},{1440,"24h"},
+        {0,"—"},{-1,"—"},{1441,"—"},{NAN,"—"},{INFINITY,"—"}
+    };
+    for (NSUInteger i=0;i<sizeof durationCases/sizeof durationCases[0];i++) {
+        NSString *expected=[NSString stringWithUTF8String:durationCases[i].text];
+        NSString *actual=BatteryForecastDuration(late+durationCases[i].minutes*60,late);
+        check([actual isEqual:expected],[NSString stringWithFormat:@"duration %.2f minutes => %@",durationCases[i].minutes,expected]);
+    }
+    check([BatteryForecastDuration(0,late) isEqual:@"—"],@"unknown duration stays unavailable");
+    check([BatteryForecastDuration(late,NAN) isEqual:@"—"],@"invalid now stays unavailable");
+    check([BatteryForecastDuration(late+90*60,late) isEqual:@"1.5h"],@"duration is unchanged across midnight");
+    f=(BatteryForecast){.thresholdPercent=20,.endpointPercent=0,.thresholdTime=late+3600,.endpointTime=late+7200};
+    check([BatteryForecastDetail(f,late,utc) isEqual:@"20% ~0015 +1d · 0% ~0115 +1d"],@"tooltip retains arrival clocks behind compact durations");
     fprintf(stderr,"Battery forecast: %d checks, %d failures\n",checks,failures);
     return failures ? 1 : 0;
 } }

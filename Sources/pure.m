@@ -2381,6 +2381,20 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
 }
 @end
 
+NSString *BatteryForecastDuration(double arrival, double now) {
+    double minutes = (arrival - now) / 60.0;
+    if (!isfinite(arrival) || !isfinite(now) || arrival <= 0 || !isfinite(minutes) || minutes <= 0 || minutes > 1440)
+        return @"—";
+    if (minutes < 5) return @"<5m";
+    int roundedMinutes = (int)lround(minutes / 5.0) * 5;
+    // Promote a rounded 60m to 1h, so the minute/hour boundary never shows 60m.
+    if (roundedMinutes < 60) return [NSString stringWithFormat:@"%dm", roundedMinutes];
+    int tenths = (int)lround(minutes / 6.0);
+    if (tenths >= 100) return [NSString stringWithFormat:@"%dh", (int)lround(minutes / 60.0)];
+    if (tenths % 10 == 0) return [NSString stringWithFormat:@"%dh", tenths / 10];
+    return [NSString stringWithFormat:@"%d.%dh", tenths / 10, tenths % 10];
+}
+
 static double BatteryRoundedArrival(double arrival) { return round(arrival / 300.0) * 300.0; }
 NSString *BatteryForecastClock(double arrival, NSTimeZone *zone) {
     if (!isfinite(arrival) || arrival <= 0) return @"—";
@@ -2403,8 +2417,7 @@ NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone)
         NSDate *day = [calendar startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:BatteryRoundedArrival(times[i])]];
         NSInteger days = [calendar components:NSCalendarUnitDay fromDate:today toDate:day options:0].day;
         NSString *suffix = days > 0 ? [NSString stringWithFormat:@" +%ldd", (long)days] : @"";
-        int minutes = MAX(1, (int)lround((times[i] - now) / 300.0) * 5);
-        [parts addObject:[NSString stringWithFormat:@"~%@ to %d%%%@", FmtDuration(minutes), targets[i], suffix]];
+        [parts addObject:[NSString stringWithFormat:@"%d%% ~%@%@", targets[i], BatteryForecastClock(times[i], zone), suffix]];
     }
     return [parts componentsJoinedByString:@" · "];
 }

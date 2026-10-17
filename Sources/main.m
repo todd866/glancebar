@@ -3583,18 +3583,20 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 }
 @end
 
-// Arrival labels occupy the existing battery row. The two clocks need more room
+// Duration labels occupy the existing battery row. Nearby targets need more room
 // than the 20%-to-endpoint gap at 102pt, so short leaders preserve exact anchors.
 @interface BatteryForecastView : NSView
 @property (nonatomic) BatteryForecast forecast;
-@property (nonatomic, copy) NSString *thresholdClock, *endpointClock;
-- (NSRect)clockRect:(BOOL)threshold;
+@property (nonatomic, copy) NSString *thresholdText, *endpointText;
+- (NSRect)labelRect:(BOOL)threshold;
 @end
 @implementation BatteryForecastView
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (NSRect)clockRect:(BOOL)threshold {
+- (NSRect)labelRect:(BOOL)threshold {
     NSFont *font = [NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium];
-    CGFloat width = ceil([@"0000" sizeWithAttributes:@{NSFontAttributeName:font}].width);
+    CGFloat width = 0;
+    for (NSString *sample in @[@"55m", @"9.9h", @"<5m", @"24h"])
+        width = MAX(width, ceil([sample sizeWithAttributes:@{NSFontAttributeName:font}].width));
     CGFloat w = NSWidth(self.bounds), x;
     if (_forecast.endpointPercent == 0)
         x = threshold ? MAX(w * 0.20 + 2, width + 3) : 0;
@@ -3607,20 +3609,20 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
                             NSForegroundColorAttributeName:NSColor.labelColor};
     for (int i=0; i<2; i++) {
         BOOL threshold = i == 0;
-        NSString *clock = threshold ? _thresholdClock : _endpointClock;
+        NSString *text = threshold ? _thresholdText : _endpointText;
         CGFloat anchor = NSWidth(self.bounds) * (threshold ? _forecast.thresholdPercent : _forecast.endpointPercent) / 100.0;
         anchor = MAX(0.5, MIN(NSWidth(self.bounds)-0.5, anchor));
-        NSRect rect = [self clockRect:threshold];
+        NSRect rect = [self labelRect:threshold];
         // A thin contrasting tick remains visible through both the fill and trend arrow.
         NSBezierPath *tick = [NSBezierPath bezierPath];
         [tick moveToPoint:NSMakePoint(anchor, 9)]; [tick lineToPoint:NSMakePoint(anchor, 17)];
-        if (clock.length) {
+        if (text.length) {
             CGFloat join = _forecast.endpointPercent == 0 ? NSMinX(rect) : NSMaxX(rect);
             [tick lineToPoint:NSMakePoint(join, 18)];
         }
         [[NSColor.windowBackgroundColor colorWithAlphaComponent:0.9] setStroke]; tick.lineWidth = 3; [tick stroke];
         [NSColor.labelColor setStroke]; tick.lineWidth = 1; [tick stroke];
-        [clock drawInRect:rect withAttributes:attrs];
+        [text drawInRect:rect withAttributes:attrs];
     }
 }
 @end
@@ -4010,7 +4012,7 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         [old setAccessibilityElement:new.isAccessibilityElement];
     } else if ([existing isKindOfClass:BatteryForecastView.class]) {
         BatteryForecastView *old = (BatteryForecastView *)existing, *new = (BatteryForecastView *)fresh;
-        old.forecast = new.forecast; old.thresholdClock = new.thresholdClock; old.endpointClock = new.endpointClock;
+        old.forecast = new.forecast; old.thresholdText = new.thresholdText; old.endpointText = new.endpointText;
         old.needsDisplay = YES;
     } else if ([existing isKindOfClass:TrendArrow.class]) {
         TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
@@ -6847,14 +6849,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 - (void)configureBatteryForecast:(BatteryForecastView *)view {
     BatteryForecast f = [self batteryForecast];
     view.forecast = f;
-    view.thresholdClock = f.thresholdReached ? @"" : BatteryForecastClock(f.thresholdTime, nil);
-    view.endpointClock = f.endpointReached ? @"" : BatteryForecastClock(f.endpointTime, nil);
+    double now = NSDate.date.timeIntervalSince1970;
+    view.thresholdText = f.thresholdReached ? @"" : BatteryForecastDuration(f.thresholdTime, now);
+    view.endpointText = f.endpointReached ? @"" : BatteryForecastDuration(f.endpointTime, now);
     NSString *status = _bat.acConnected && (!_bat.isCharging || [self chargeTargetPercent] == 80)
         ? (_bat.fullyCharged ? @"Full" : [self chargeTargetPercent] == 80 ? @"80% charge limit" : @"Charging paused") : @"Estimate unavailable";
     view.toolTip = [NSString stringWithFormat:@"%@\n%@", BatteryForecastDetail(f, NSDate.date.timeIntervalSince1970, nil),
-        f.thresholdTime > 0 || f.endpointTime > 0 ? @"Approximate local time · nearest 5 min" : status];
+        f.thresholdTime > 0 || f.endpointTime > 0 ? @"Approximate arrival · local time" : status];
     view.accessibilityLabel = [NSString stringWithFormat:@"%d%% %@ · %d%% %@. %@", f.thresholdPercent,
-        view.thresholdClock, f.endpointPercent, view.endpointClock, view.toolTip];
+        view.thresholdText, f.endpointPercent, view.endpointText, view.toolTip];
     [view setAccessibilityElement:YES]; view.accessibilityRole = NSAccessibilityImageRole;
     view.needsDisplay = YES;
 }

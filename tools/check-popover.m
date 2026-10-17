@@ -16,8 +16,11 @@ static void PrimeBatteryForecast(Controller *controller, BatteryState battery, B
 }
 static BOOL ForecastFits(BatteryForecastView *view) {
     if (![view isKindOfClass:BatteryForecastView.class]) return NO;
-    NSRect a = [view clockRect:YES], b = [view clockRect:NO];
-    return NSContainsRect(view.bounds,a) && NSContainsRect(view.bounds,b) && !NSIntersectsRect(a,b) &&
+    NSRect a = [view labelRect:YES], b = [view labelRect:NO];
+    NSDictionary *attrs = @{NSFontAttributeName:[NSFont monospacedDigitSystemFontOfSize:9 weight:NSFontWeightMedium]};
+    return [view.thresholdText sizeWithAttributes:attrs].width <= NSWidth(a) &&
+        [view.endpointText sizeWithAttributes:attrs].width <= NSWidth(b) &&
+        NSContainsRect(view.bounds,a) && NSContainsRect(view.bounds,b) && !NSIntersectsRect(a,b) &&
         view.forecast.thresholdPercent == (view.forecast.endpointPercent == 0 ? 20 : 80);
 }
 static NSUInteger CountGauges(NSView *view) {
@@ -431,7 +434,7 @@ int main(int argc, const char **argv) {
         if (batterySymbol.image.template || !RenderedImagesDiffer(batterySymbol.image, plainTinted))
             return Fail(__LINE__);
         int etaMin = [c chargeForecastMinutes];
-        NSString *etaPhrase = [NSString stringWithFormat:@"%@ to 80%%", FmtDuration(etaMin)];
+        NSString *etaPhrase = [NSString stringWithFormat:@"80%% ~%@", BatteryForecastClock([c batteryForecast].thresholdTime, nil)];
         NSView *batteryRow = FindIdentifier(root, @"popover.row.battery");
         if (etaMin < 0 || ![batteryRow.toolTip containsString:etaPhrase]) return Fail(__LINE__);
         NSPoint symbolMid = [batterySymbol convertPoint:NSMakePoint(NSMidX(batterySymbol.bounds),
@@ -894,8 +897,8 @@ int main(int argc, const char **argv) {
                 BatteryForecastView *fv = (BatteryForecastView *)FindIdentifier(pop, @"popover.battery.forecast");
                 if (!ForecastFits(fv) || fv.forecast.thresholdPercent != (sb.acConnected ? 80 : 20) ||
                     fv.forecast.endpointPercent != (sb.acConnected ? 100 : 0)) return Fail(__LINE__);
-                if (!sb.acConnected && fv.endpointClock.length != 4) return Fail(__LINE__);
-                if (sb.percent <= 20 && !sb.acConnected && fv.thresholdClock.length) return Fail(__LINE__);
+                if (!sb.acConnected && !([fv.endpointText hasSuffix:@"m"] || [fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
+                if (sb.percent <= 20 && !sb.acConnected && fv.thresholdText.length) return Fail(__LINE__);
                 if (sb.acConnected && fv.forecast.endpointTime != 0) return Fail(__LINE__); // 80% limit
                 NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
                 TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
@@ -922,7 +925,7 @@ int main(int argc, const char **argv) {
         {
             struct { BOOL ac, charging, full; int pct; long amps, empty, fullMinutes; const char *name; } cases[] = {
                 {NO,NO,NO,63,-1100,120,-1,"discharge"},
-                {YES,YES,NO,42,2400,-1,95,"charge"},
+                {YES,YES,NO,42,2400,-1,90,"charge"},
                 {YES,YES,NO,95,200,-1,70,"taper"},
                 {YES,NO,NO,80,0,-1,70,"paused"},
                 {YES,NO,YES,100,0,-1,70,"full"},
@@ -941,11 +944,11 @@ int main(int argc, const char **argv) {
                 NSView *pop=p.contentViewController.view;
                 BatteryForecastView *fv=(BatteryForecastView *)FindIdentifier(pop,@"popover.battery.forecast");
                 if (!ForecastFits(fv) || !FitsChildren(pop)) return Fail(__LINE__);
-                if (i==1 && (fv.thresholdClock.length!=4 || fv.endpointClock.length!=4)) return Fail(__LINE__);
-                if (i==2 && (fv.thresholdClock.length || fv.endpointClock.length!=4)) return Fail(__LINE__);
+                if (i==1 && (![fv.thresholdText isEqual:@"45m"] || ![fv.endpointText isEqual:@"1.5h"])) return Fail(__LINE__);
+                if (i==2 && (fv.thresholdText.length || ![fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
                 if (i==3 && (fv.forecast.endpointTime || fv.forecast.thresholdTime)) return Fail(__LINE__);
-                if (i==4 && (fv.thresholdClock.length || fv.endpointClock.length)) return Fail(__LINE__);
-                if (i==5 && (![fv.thresholdClock isEqual:@"—"] || ![fv.endpointClock isEqual:@"—"])) return Fail(__LINE__);
+                if (i==4 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
+                if (i==5 && (![fv.thresholdText isEqual:@"—"] || ![fv.endpointText isEqual:@"—"])) return Fail(__LINE__);
                 NSArray *surfaces=@[pop, [c overviewDetailsView].documentView, [c batteryDetailsView].documentView];
                 NSArray *names=@[@"popover", @"overview", @"details"];
                 NSArray *idents=@[@"popover.battery.forecast", @"details.overview.battery.forecast", @"details.battery.charge.forecast"];
@@ -961,6 +964,17 @@ int main(int argc, const char **argv) {
             [c setValue:@"limit80" forKey:@"chargeMode"];
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
             PrimeBatteryForecast(c,b,YES);
+        }
+
+        {
+            BatteryForecastView *probe=[[BatteryForecastView alloc] initWithFrame:NSMakeRect(0,0,kGaugeW,30)];
+            for (int endpoint=0;endpoint<=100;endpoint+=100) {
+                probe.forecast=(BatteryForecast){.thresholdPercent=endpoint ? 80 : 20,.endpointPercent=endpoint};
+                for (NSString *text in @[@"<5m",@"5m",@"45m",@"55m",@"1h",@"1.5h",@"9.9h",@"10h",@"24h",@"—"]) {
+                    probe.thresholdText=text; probe.endpointText=text;
+                    if (!ForecastFits(probe)) return Fail(__LINE__);
+                }
+            }
         }
 
         // On battery: Burn appears only for actionable quit gains; the Battery

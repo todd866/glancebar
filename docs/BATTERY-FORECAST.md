@@ -1,15 +1,18 @@
 # Battery-bar forecasts
 
 One 30-point instrument row, unchanged columns and 102-point popover gauge. The charge
-bar sits at y=9; 9-point medium monospaced-digit clocks occupy y=18–30. Endpoint clocks
+bar sits at y=9; 9-point medium monospaced-digit durations occupy y=18–30. Endpoint labels
 stay inside the gauge column; short leaders connect displaced text to exact target
 ticks (20%/0% on battery, 80%/100% on AC). The same view is used by the popover,
 Overview, and Battery tab. The low-charge trend arrow moves below the bar to leave
-clock space clear. No extra row or control is added.
+duration space clear. No extra row or control is added.
 
-Clock labels use local `HHmm`, rounded to five minutes. Hover durations carry `~` and
-`+1d` (or another day count) across local midnight. Reached targets omit their clocks;
-unavailable forecasts show an em dash. Estimates are conditional on the present load
+Bar labels show compact remaining time: `45m` below an hour (nearest five minutes),
+`1.5h` at/above an hour (nearest tenth), and whole hours from 10h. Whole-hour decimals
+are omitted (`1h`, `2h`); a rounded 60m promotes to `1h`. Under five minutes reads
+`<5m`, never `0m`. Labels are independent of date/timezone. Hover retains approximate
+local `HHmm` arrival clocks, rounded to five minutes, with `+1d` across midnight.
+Reached targets omit their labels; unavailable forecasts show an em dash. Estimates are conditional on the present load
 and charging state, not promises. The 0% estimate means the system's usable battery
 endpoint; macOS may sleep before literal electrochemical exhaustion.
 
@@ -39,7 +42,7 @@ endpoint; macOS may sleep before literal electrochemical exhaustion.
 `./tests.sh` includes deterministic battery cases in `Tests/test_battery_forecast.m`
 and the production offscreen AppKit layout harness. The latter renders discharge,
 charge, taper, pause, full, startup, and low battery; checks both target anchors,
-nonintersecting clock bounds, unchanged row height, all three surfaces, and the
+nonintersecting duration bounds, unchanged row height, all three surfaces, and the
 existing popover/detail constraints. Pass a PNG path to the compiled harness to save
 images; add a second argument for dark mode. `GLANCEBAR_RENDER_1X=1` renders at
 one pixel per point. `GLANCEBAR_RENDER_LIVE_BATTERY=1` adds a real battery snapshot

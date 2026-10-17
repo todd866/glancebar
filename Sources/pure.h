@@ -69,7 +69,10 @@ typedef struct {
 @interface BatteryForecastTracker : NSObject
 - (BatteryForecast)update:(BatteryState)b limit80:(BOOL)limit80 at:(double)now;
 @end
-// Clock labels are approximate, rounded to five minutes in the user's local timezone.
+// Compact remaining time: <5m, nearest 5m below an hour, tenths of an hour below
+// 10h, whole hours thereafter. Invalid/expired predictions are an em dash.
+NSString *BatteryForecastDuration(double arrival, double now);
+// Tooltip arrival clocks are approximate, rounded to five minutes in local time.
 NSString *BatteryForecastClock(double arrival, NSTimeZone *zone);
 NSString *BatteryForecastDetail(BatteryForecast f, double now, NSTimeZone *zone);
 
