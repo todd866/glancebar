@@ -32,6 +32,30 @@ static AIUsage *UsageNamed(NSArray<AIUsage *> *usage, NSString *name) {
     return nil;
 }
 
+// Exercise the actual controller scheduling and account fetch paths without log
+// traversal, real credentials, networking, or visible windows.
+@interface AccountScheduleReader : AIReader
+@property NSUInteger reads;
+@end
+@implementation AccountScheduleReader
+- (NSArray<AIUsage *> *)read {
+    self.reads++;
+    return @[[self claudeUsage], [self cursorUsage]];
+}
+@end
+@interface AccountScheduleController : Controller @end
+@implementation AccountScheduleController
+- (void)updateBar {}
+- (void)refreshVisibleSurfaces {}
+@end
+
+static void FinishAIRead(Controller *controller) {
+    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:3];
+    while ([[controller valueForKey:@"aiLoading"] boolValue] && deadline.timeIntervalSinceNow>0)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+    check(![[controller valueForKey:@"aiLoading"] boolValue],@"account scheduler: bounded read completes");
+}
+
 // The bounded reader is private to main.m; the harness already imports that shell.
 @interface AIReader (BoundedReaderTestAccess)
 - (NSData *)newLineDataAtPath:(NSString *)path record:(NSMutableDictionary *)record
@@ -1025,6 +1049,53 @@ int main(void) {
             AIUsage *again = UsageNamed([reindexed readUntilCaughtUpWithTimeLimit:5.0], @"Claude");
             check(again.models.count == 2 && again.todaySessions == 2 && again.todayTokens == 204,
                   @"upgrade: a pre-schema transcript record is re-indexed once, without double counting");
+        }
+
+        // Hidden refreshes must actually collect fresh account responses, with the
+        // same cadence/consent/Low Data gates as visible refreshes.
+        {
+            NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
+            NSDictionary *oldArguments=[defaults volatileDomainForName:NSArgumentDomain];
+            NSMutableDictionary *arguments=[oldArguments mutableCopy] ?: [NSMutableDictionary dictionary];
+            arguments[@"useClaudeAccount"]=@YES;arguments[@"useCursorAccount"]=@YES;arguments[@"lowData"]=@NO;
+            [defaults setVolatileDomain:arguments forName:NSArgumentDomain];
+            AccountScheduleReader *reader=[[AccountScheduleReader alloc] initWithHomeDirectory:[root stringByAppendingPathComponent:@"schedule-home"] applicationSupportDirectory:[root stringByAppendingPathComponent:@"schedule-support"]];
+            double now=NSDate.date.timeIntervalSince1970;
+            __block NSUInteger claudeFetches=0,cursorFetches=0;
+            reader.claudeCredentialReader=^NSDictionary *{return @{@"token":@"fixture-only",@"expiresAt":@(now+3600)};};
+            reader.cursorTokenReader=^NSString *(NSString *__unused home){return @"fixture-only";};
+            reader.claudeUsageFetcher=^NSDictionary *(NSString *__unused token){claudeFetches++;return @{@"seven_day":@{@"utilization":@25,@"resets_at":@(now+86400)}};};
+            reader.cursorUsageFetcher=^NSDictionary *(NSString *__unused token){cursorFetches++;return @{@"enabled":@YES,@"planUsage":@{@"autoPercentUsed":@25,@"apiPercentUsed":@50},@"billingCycleEnd":@((now+86400)*1000)};};
+            AccountScheduleController *controller=[AccountScheduleController new];
+            [controller setValue:reader forKey:@"aiReader"];
+            [controller setValue:dispatch_queue_create("glancebar.test.account-schedule",DISPATCH_QUEUE_SERIAL) forKey:@"aiQueue"];
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(reader.reads==1 && claudeFetches==1 && cursorFetches==1,@"hidden account scheduler: first due pass refreshes both opted-in accounts");
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(reader.reads==1,@"hidden account scheduler: repeated ticks respect five-minute local cadence");
+            [controller setValue:[NSDate dateWithTimeIntervalSinceNow:-301] forKey:@"lastAIRefresh"];
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(reader.reads==2 && claudeFetches==1 && cursorFetches==1,@"hidden account scheduler: local pass does not defeat 15-minute endpoint throttle");
+            [reader setValue:@(now-1) forKey:@"claudeNextFetch"];[reader setValue:@(now-1) forKey:@"cursorNextFetch"];
+            [controller setValue:[NSDate dateWithTimeIntervalSinceNow:-301] forKey:@"lastAIRefresh"];
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(claudeFetches==2 && cursorFetches==2,@"hidden account scheduler: later due pass refreshes without opening a panel");
+            [reader setValue:@(now-3600) forKey:@"claudeLastSuccessAt"];
+            AIUsage *old=[reader claudeUsage];
+            check(old.limitStale,@"account freshness: a response ages even after a successful fetch in this process");
+            old.limitRefreshError=@"Claude Code token expired · open Claude Code to refresh it";
+            check([[controller aiProblemText:old] isEqual:@"login expired"],@"account status: expired login explains the stale reading");
+            arguments[@"lowData"]=@YES;[defaults setVolatileDomain:arguments forName:NSArgumentDomain];
+            [reader setValue:@0 forKey:@"claudeNextFetch"];[reader setValue:@0 forKey:@"cursorNextFetch"];
+            [controller setValue:[NSDate dateWithTimeIntervalSinceNow:-301] forKey:@"lastAIRefresh"];
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(claudeFetches==2 && cursorFetches==2,@"hidden account scheduler: Low Data forbids due network requests");
+            arguments[@"lowData"]=@NO;arguments[@"useClaudeAccount"]=@NO;arguments[@"useCursorAccount"]=@NO;
+            [defaults setVolatileDomain:arguments forName:NSArgumentDomain];
+            [controller setValue:[NSDate dateWithTimeIntervalSinceNow:-301] forKey:@"lastAIRefresh"];
+            [controller refreshAIUsageAsync];FinishAIRead(controller);
+            check(claudeFetches==2 && cursorFetches==2 && !reader.useClaudeAccount && !reader.useCursorAccount,@"hidden account scheduler: disabling consent forbids account requests");
+            [defaults setVolatileDomain:oldArguments ?: @{} forName:NSArgumentDomain];
         }
 
         // The whole account path — credential read, throttle, fetch, error handling —

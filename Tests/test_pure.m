@@ -178,7 +178,9 @@ int main(void) {
         [NSTimeZone setDefaultTimeZone:oldTZ];
 
         // --- Generic metered links: mature recent rate and allowance datum ---
-        NSDate *meterStart = [NSDate dateWithTimeIntervalSince1970:1000000];
+        // Keep the one-hour pruning fixture away from reset day 13 in every
+        // timezone; the old January 12 epoch crossed that boundary in UTC+10.
+        NSDate *meterStart = [NSDate dateWithTimeIntervalSince1970:1800000000];
         NSDictionary *m0 = MeteredAccumulate(nil, 1000, 2000, @"en0", YES, meterStart, 13);
         NSDictionary *m1 = MeteredAccumulate(m0, 1000 + 600000, 2000, @"en0", YES,
                                                [meterStart dateByAddingTimeInterval:300], 13);

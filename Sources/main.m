@@ -2959,7 +2959,8 @@ typedef struct {
         [parts addObject:accountName];
         NSString *window = [parts componentsJoinedByString:@" · "];
         BOOL diskRestoredOnly = !fetchedThisRun && usage != nil;
-        if (usingStaleWindows || diskRestoredOnly || accountStatus.length) u.limitStale = YES;
+        BOOL observationOld = lastSuccessAt <= 0 || now-lastSuccessAt > kAccountPollInterval || lastSuccessAt > now+5;
+        if (usingStaleWindows || diskRestoredOnly || accountStatus.length || observationOld) u.limitStale = YES;
         NSString *asOf = AsOfTextFromEpoch(lastSuccessAt);
         if (accountStatus.length) {
             u.statusReason = asOf
@@ -5745,10 +5746,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL useAccount = [ud boolForKey:@"useClaudeAccount"];
     BOOL useCursorAccount = [ud boolForKey:@"useCursorAccount"];
-    // Hidden passes are local-only: the account endpoints rate-limit readily, and an open
-    // fetches at once when the cache is past its 15 minutes, so a hidden request buys little.
-    BOOL allowAccountFetch = showAI && useAccount && !GBLowDataEnabled();
-    BOOL allowCursorAccountFetch = showAI && useCursorAccount && !GBLowDataEnabled();
+    // Keep already opted-in accounts current between opens. The reader enforces the
+    // shared 15-minute fetch interval and provider retry delays; hiding the panel must
+    // not prevent an otherwise due refresh. Low Data and account consent still gate it.
+    BOOL allowAccountFetch = useAccount && !GBLowDataEnabled();
+    BOOL allowCursorAccountFetch = useCursorAccount && !GBLowDataEnabled();
     BOOL allowTranscripts = [ud boolForKey:@"useClaudeTranscripts"];
     if (!_aiGatesLogged || showAI != _lastShowAI || useAccount != _lastUseAccount ||
         useCursorAccount != _lastUseCursorAccount || allowTranscripts != _lastAllowTranscripts) {
@@ -6777,6 +6779,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     if (CodexQuotaUnavailable(u) && (!u.limitUpdatedAt || u.limitUpdatedAt.timeIntervalSinceNow>5)) return @"unavailable";
     NSString *err = u.limitRefreshError ?: @"";
     if ([err hasPrefix:@"Signed out"]) return @"signed out";
+    if ([err hasPrefix:@"Claude Code token expired"]) return @"login expired";
     NSString *blob = [[NSString stringWithFormat:@"%@ %@", err, u.statusReason ?: @""] lowercaseString];
     if ([blob containsString:@"rate-limited"] || [blob containsString:@"rate limited"] ||
         [blob containsString:@"429"])
