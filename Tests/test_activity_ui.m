@@ -133,11 +133,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
     Check(![[c valueForKey:@"activityLoading"] boolValue], @"disabled or unsuccessful Low Power changes do not sample");
     [c setValue:[ShownPopover new] forKey:@"popover"];
     [c lowPowerFinishedEnabling:YES active:YES reveal:YES]; Await(^BOOL { return c.calls == 3; });
-    Check(c.reveals == 1, @"successful Low Power from an open surface reveals Activity once");
+    Check(c.reveals == 0, @"successful Low Power samples quietly and opens no window");
     dispatch_semaphore_signal(c.gate); Await(^BOOL { return ![[c valueForKey:@"activityLoading"] boolValue]; });
     [c setValue:nil forKey:@"popover"]; [c lowPowerFinishedEnabling:YES active:YES reveal:YES]; Await(^BOOL { return c.calls == 4; });
     dispatch_semaphore_signal(c.gate); Await(^BOOL { return ![[c valueForKey:@"activityLoading"] boolValue]; });
-    Check(c.reveals == 1, @"dismissal while Low Power is applying prevents a later reveal");
+    Check(c.reveals == 0, @"Low Power never opens Activity");
 
     NSDictionary *data = Fixture();
     if (argc > 2) {

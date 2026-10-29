@@ -8696,9 +8696,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self requestActivitySurveyIfNeeded];
 }
 - (void)lowPowerFinishedEnabling:(BOOL)enabling active:(BOOL)active reveal:(BOOL)reveal {
+    (void)reveal;
     if (!enabling || !active || _terminating) return;
-    // If the user already dismissed the requesting surface, collect quietly.
-    if (reveal && (_popover.isShown || _detailsWindow.isVisible)) [self showActivityDetails:nil];
+    // A toggle only toggles: never open a window. Collect the survey quietly so the
+    // Activity tab is ready if the owner goes looking; the Burn row names the drain.
     [self requestActivitySurvey];
 }
 - (NSScrollView *)activityDetailsView {
