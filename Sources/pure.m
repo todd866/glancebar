@@ -2365,7 +2365,10 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     double watts = BatteryWatts(b);
     BOOL fresh = b.telemetryTimestamp <= 0 || (now - b.telemetryTimestamp >= -5 && now - b.telemetryTimestamp <= 120);
     NSInteger mode = !b.valid || !fresh || f.endpointReached || f.hideLabels ? 0 :
-        filling ? (b.isCharging && watts >= 0.5 ? 1 : 0) : (!b.isCharging && watts < -0.5 ? -1 : 0);
+        // macOS keeps IsCharging set behind a short charger while the pack loses charge;
+        // there the measured net watts decide.
+        filling ? (b.isCharging && watts >= 0.5 ? 1 : 0) :
+        ((!b.isCharging || b.acConnected) && watts < -0.5 ? -1 : 0);
     double dt = now - _lastUpdate;
     if (!_samples || mode != _mode || limit80 != _limit80 || dt < 0 || dt > 90 || mode == 0) {
         _samples = [NSMutableArray array]; _lastSample = 0;

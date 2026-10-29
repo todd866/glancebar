@@ -1194,6 +1194,11 @@ int main(void) {
                 for (int sec = 0; sec <= 90; sec += 15) f = [t update:s limit80:NO at:1000 + sec];
                 check(f.thresholdPercent == 20 && f.endpointPercent == 0 && f.thresholdTime > 1090 && f.endpointTime > f.thresholdTime,
                       @"power: a short charger forecasts 20% and empty");
+                s.isCharging = YES;   // what macOS reports on the plane's port, despite the net drain
+                BatteryForecastTracker *t2 = [BatteryForecastTracker new];
+                for (int sec = 0; sec <= 90; sec += 15) f = [t2 update:s limit80:NO at:2000 + sec];
+                check(f.thresholdTime > 2090 && f.endpointTime > f.thresholdTime,
+                      @"power: a short charger forecasts even while macOS still says charging");
                 s.systemPowerIn_mW = LONG_MIN;
                 check(!ChargerFallsShort(s), @"power: unknown input is not called short");
             }
