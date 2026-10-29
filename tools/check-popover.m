@@ -62,9 +62,15 @@ static BOOL HasText(NSView *view, NSString *text) {
     for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
     return NO;
 }
-// No app-authored hover popups: information remains in accessibility help.
+// Recovery of clipped text is required; unsolicited explanatory popups stay off.
+static BOOL RecoveryTip(NSView *view) {
+    if (![view isKindOfClass:NSTextField.class]) return NO;
+    NSTextField *field = (NSTextField *)view;
+    return [view.toolTip isEqual:field.stringValue] &&
+        field.attributedStringValue.size.width + 4 > NSWidth(field.bounds);
+}
 static NSView *WordyTip(NSView *view) {
-    if (view.toolTip.length) return view;
+    if (view.toolTip.length && !RecoveryTip(view)) return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
 }
@@ -160,7 +166,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
-    if (view.toolTip.length) return NO;
+    if (view.toolTip.length && !RecoveryTip(view)) return NO;
     for (NSView *child in view.subviews) {
         // AppKit's segmented control has an empty private hosting view before
         // window layout. It paints no content and NSContainsRect rejects empty rects.
@@ -564,8 +570,27 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         if (!HasTip(root, @"Macintosh HD")) return Fail(__LINE__);
         AIUsage *history = usage[0];
-        history.todayTokens = 12500;
-        history.weekTokens = 84000;
+        history.todayTokens = 268000;
+        history.weekTokens = 11200000;
+        AIUsage *codexHistory = usage[1];
+        codexHistory.todayTokens = 20800000;
+        codexHistory.weekTokens = 52800000;
+        // Real multi-million readings and the largest stored total must fit in
+        // one row, with no ellipsis and no overlap between label/value columns.
+        for (NSNumber *count in @[@0, @999, @999499, @20800000, @999499999, @999499999999LL, @(LLONG_MAX)]) {
+            AIUsage *sample = [AIUsage new]; sample.name = @"Codex";
+            sample.todayTokens = count.longLongValue; sample.weekTokens = MAX(1, count.longLongValue);
+            NSView *doc = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kDetailW,32)];
+            [c addDetailHistory:sample to:doc y:0 cols:DetailLayout(kDetailW)];
+            if (!FitsChildren(doc)) return Fail(__LINE__);
+            NSArray *columns = @[@"metric", @"today", @"todayLabel", @"value", @"weekLabel"];
+            CGFloat previousRight = 0;
+            for (NSString *column in columns) {
+                NSView *field = FindIdentifier(doc, [@"details.ai.history.codex." stringByAppendingString:column]);
+                if (!field || NSMinX(field.frame) < previousRight || field.toolTip.length) return Fail(__LINE__);
+                previousRight = NSMaxX(field.frame);
+            }
+        }
         history.todaySessions = 2;
         history.weekSessions = 9;
         NSArray *sampleApps = @[

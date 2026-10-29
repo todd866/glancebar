@@ -8,6 +8,7 @@
 - (NSString *)storageCacheDirectory { return [[self storageHomeDirectory] stringByAppendingPathComponent:@"Library/Caches/com.iantodd.glancebar/storage"]; }
 - (NSArray *)storageRoots { return GBStorageDefaultRoots([self storageHomeDirectory]); }
 - (BOOL)storagePowerPermitsWork { return _bat.valid && (_bat.acConnected || _bat.percent>40); }
+- (NSUInteger)storageSliceEntryBudgetOnAC:(BOOL)onAC { return onAC ? 3000 : 1200; }
 - (BOOL)storageBusy { return _storageCleanupProgress!=nil; }
 - (void)cancelStorage {
     _storageGeneration++; _storageIndex.paused=YES; [_storageCleanupProgress cancel];
@@ -71,9 +72,10 @@
     }
     GBStorageIndex *index=_storageIndex;
     BOOL onAC=_bat.valid && _bat.acConnected;
+    NSUInteger entryBudget=[self storageSliceEntryBudgetOnAC:onAC];
     NSDictionary *previous=_storageRetainSnapshot ? _storageResult : nil;
     dispatch_async(_storageQueue,^{
-        NSDictionary *snapshot=[index advanceForSeconds:onAC ? .35 : .15 entries:onAC ? 3000 : 1200];
+        NSDictionary *snapshot=[index advanceForSeconds:onAC ? .35 : .15 entries:entryBudget];
         BOOL finished=index.finished;
         NSDictionary *visible=GBStorageMergeSnapshot(snapshot,previous);
         double tick=NSDate.date.timeIntervalSince1970;

@@ -69,9 +69,9 @@ static NSView *Find(NSView *root, NSString *identifier) {
     return nil;
 }
 static void CheckGeometry(NSView *root) {
-    Check(!root.toolTip.length, @"Activity has no hover popups");
+    Check(!root.toolTip.length || ([root isKindOfClass:NSTextField.class] && [root.toolTip isEqual:((NSTextField *)root).stringValue]), @"Activity hover only recovers full text");
     for (NSView *view in root.subviews) {
-        Check(!view.toolTip.length, @"Activity controls and readings have no hover popups");
+        Check(!view.toolTip.length || ([view isKindOfClass:NSTextField.class] && [view.toolTip isEqual:((NSTextField *)view).stringValue]), @"Activity hover only recovers full text");
         Check(NSContainsRect(root.bounds, view.frame), @"all Activity elements fit the document");
         if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier hasPrefix:@"details.activity.row."] &&
             ![view.accessibilityIdentifier hasSuffix:@".0"]) {

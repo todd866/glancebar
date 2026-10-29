@@ -190,6 +190,66 @@ static void AppendClaudeEvent(NSMutableData *data, NSString *messageID, long lon
 
 int main(void) {
     @autoreleasepool {
+        {
+            Controller *controller = [Controller new];
+            NSString *full = @"2026-10-23 · full diagnostic value that must remain recoverable";
+            NSTextField *label = [controller text:full font:[NSFont systemFontOfSize:12] color:nil
+                at:NSMakeRect(0, 0, 40, 18) align:NSTextAlignmentLeft];
+            check([label.toolTip isEqual:full] && [label.stringValue isEqual:full],
+                  @"truncation: a narrow field retains and reveals the complete value");
+            NSEvent *event = [NSEvent mouseEventWithType:NSEventTypeRightMouseDown location:NSZeroPoint
+                modifierFlags:0 timestamp:0 windowNumber:0 context:nil eventNumber:0 clickCount:1 pressure:0];
+            NSMenuItem *copy = [label menuForEvent:event].itemArray.firstObject;
+            check([copy.title isEqual:@"Copy full text"] && copy.target == label,
+                  @"truncation: clipped labels offer full-text copy");
+            label.frame = NSMakeRect(0, 0, 800, 18);
+            check(!label.toolTip.length, @"truncation: fitting text has no popup");
+            NSTextField *fresh = [controller text:@"a different long value after refresh" font:label.font color:nil
+                at:NSMakeRect(0, 0, 45, 18) align:NSTextAlignmentLeft];
+            ApplyFreshViewState(label, fresh);
+            check([label.toolTip isEqual:fresh.stringValue], @"truncation: refresh updates recovery text");
+            label.stringValue = @"OK";
+            check(!label.toolTip.length, @"truncation: short replacement clears old recovery text");
+        }
+
+        // The desktop can be busy without writing any local quota events.
+        // Live account reads must work with no rollout at all and remain bounded/offline-safe.
+        {
+            NSString *fixture = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+            NSString *support = [fixture stringByAppendingPathComponent:@"support"];
+            double now = NSDate.date.timeIntervalSince1970;
+            NSDictionary *reply = @{@"rateLimitsByLimitId": @{
+                @"codex": @{@"planType": @"pro", @"primary": NSNull.null,
+                    @"secondary": @{@"usedPercent": @72, @"windowDurationMins": @10080, @"resetsAt": @(now+86400)}},
+                @"codex_other": @{@"secondary": @{@"usedPercent": @0, @"windowDurationMins": @10080, @"resetsAt": @(now+86400)}}}};
+            AIReader *reader = [[AIReader alloc] initWithHomeDirectory:fixture applicationSupportDirectory:support];
+            __block NSUInteger calls = 0;
+            reader.codexUsageFetcher = ^NSDictionary *{ calls++; return reply; };
+            check(!UsageNamed([reader read], @"Codex").limitStatusAvailable && calls == 0,
+                  @"Codex: offline reads never start an account request");
+            reader.allowCodexAccountFetch = YES;
+            AIUsage *live = UsageNamed([reader read], @"Codex");
+            check(calls == 1 && live.limitStatusAvailable && !live.limitStale && fabs(live.remainingFraction-.28)<.001,
+                  @"Codex: account allowance works without local logs; side bucket cannot hide plan usage");
+            check([live.statusSource containsString:@"app-server"], @"Codex: live source is identified");
+            [reader read];
+            check(calls == 1, @"Codex: background and catch-up reads respect account throttle");
+            AIReader *restored = [[AIReader alloc] initWithHomeDirectory:fixture applicationSupportDirectory:support];
+            AIUsage *cached = UsageNamed([restored read], @"Codex");
+            check(cached.limitStatusAvailable && fabs(cached.remainingFraction-.28)<.001,
+                  @"Codex: account snapshot survives restart and offline read");
+            reader = [[AIReader alloc] initWithHomeDirectory:fixture applicationSupportDirectory:[fixture stringByAppendingPathComponent:@"failed-support"]];
+            reader.allowCodexAccountFetch = YES;
+            [reader setValue:CodexAccountBuckets(reply, ISOStringFromEpoch(now-3600)) forKey:@"codexAccountBuckets"];
+            reader.codexUsageFetcher = ^NSDictionary *{ calls++; return nil; };
+            live = UsageNamed([reader read], @"Codex");
+            check(calls == 2 && live.limitRefreshError.length > 0 && CodexQuotaUnavailable(live),
+                  @"Codex: failed refresh is exposed, not stamped as fresh");
+            check(!CodexAccountBuckets(@{@"rateLimits": @{@"primary": NSNull.null}}, ISOStringFromEpoch(now)).count,
+                  @"Codex: malformed/empty account response cannot refresh allowance");
+            [NSFileManager.defaultManager removeItemAtPath:fixture error:nil];
+        }
+
         check(IsJSONBoolean(JSONBool(YES)) && IsJSONBoolean(JSONBool(NO)),
               @"JSONBool emits real JSON booleans");
         check(!IsJSONBoolean(@1) && !IsJSONBoolean(@0),

@@ -9,11 +9,10 @@
 #pragma clang diagnostic pop
 static int checks;
 static void Check(BOOL ok, NSString *message) { checks++; if (!ok) { fprintf(stderr,"FAIL %s\n",message.UTF8String); exit(1); } }
-static void Await(BOOL (^done)(void)) {
-    static NSUInteger sequence; sequence++;
+static void Await(NSString *operation, BOOL (^done)(void)) {
     NSDate *until=[NSDate dateWithTimeIntervalSinceNow:30];
     while (!done() && until.timeIntervalSinceNow > 0) [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-    Check(done(),[NSString stringWithFormat:@"asynchronous completion %lu",(unsigned long)sequence]);
+    Check(done(),[NSString stringWithFormat:@"timed out waiting for %@",operation]);
 }
 @interface TestStorageWindow : NSWindow @end
 @implementation TestStorageWindow
@@ -21,7 +20,7 @@ static void Await(BOOL (^done)(void)) {
 @end
 @interface TestStorageController : Controller
 @property NSString *testHome;
-@property NSUInteger operations, paints, rootsCalls;
+@property NSUInteger operations, paints, rootsCalls, sliceEntries;
 @property BOOL permitPower;
 @property dispatch_semaphore_t rootsGate;
 @end
@@ -30,6 +29,7 @@ static void Await(BOOL (^done)(void)) {
 - (void)refreshStorageSurface { self.paints++; }
 - (BOOL)storageTabSelected { return YES; }
 - (BOOL)storagePowerPermitsWork { return self.permitPower; }
+- (NSUInteger)storageSliceEntryBudgetOnAC:(BOOL)onAC { return self.sliceEntries ?: [super storageSliceEntryBudgetOnAC:onAC]; }
 - (NSString *)storageHomeDirectory { return self.testHome; }
 - (NSString *)storageCacheDirectory { return [self.testHome stringByAppendingPathComponent:@"cache"]; }
 - (NSArray *)storageRoots { self.rootsCalls++;if(self.rootsGate)dispatch_semaphore_wait(self.rootsGate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));return @[self.testHome]; }
@@ -42,7 +42,7 @@ static NSView *Find(NSView *root, NSString *identifier) {
     for (NSView *child in root.subviews) { NSView *found=Find(child,identifier); if (found) return found; } return nil;
 }
 static void Geometry(NSView *view) {
-    Check(!view.toolTip.length,@"no hover popups");
+    Check(!view.toolTip.length || ([view isKindOfClass:NSTextField.class] && [view.toolTip isEqual:((NSTextField *)view).stringValue]),@"hover only recovers full text");
     for (NSView *child in view.subviews) {
         Check(NSContainsRect(view.bounds,child.frame),@"native content fits document");
         if ([child.accessibilityIdentifier hasPrefix:@"details.storage.item."] &&
@@ -82,34 +82,38 @@ int main(int argc,const char **argv) { @autoreleasepool {
     [@"Disposable fixture" writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     TestStorageController *c=[TestStorageController new];c.testHome=home;c.permitPower=YES;
     [c requestStorageScanIfNeeded];[c requestStorageScanIfNeeded];
-    Await(^BOOL{return [[c valueForKey:@"storageFinished"] boolValue];});
+    Await(@"initial scan completion", ^BOOL{return [[c valueForKey:@"storageFinished"] boolValue];});
     NSDictionary *result=[c valueForKey:@"storageResult"];
     Check([result[@"rows"] count]==1,@"automatic global results appear without choosing folders");
     id index=[c valueForKey:@"storageIndex"];[c requestStorageScanIfNeeded];
     Check(index==[c valueForKey:@"storageIndex"],@"cached reopening does not restart complete index");
     TestStorageController *cached=[TestStorageController new];cached.testHome=home;cached.permitPower=YES;cached.rootsGate=dispatch_semaphore_create(0);
     [cached requestStorageScanIfNeeded];[cached requestStorageScanIfNeeded];
-    Await(^BOOL{return [[cached valueForKey:@"storageRetainSnapshot"] boolValue];});
+    Await(@"cached ranking publication", ^BOOL{return [[cached valueForKey:@"storageRetainSnapshot"] boolValue];});
     Check([[[cached valueForKey:@"storageResult"] objectForKey:@"rows"] count]==1,@"cached ranking remains available while replacement begins");
     dispatch_semaphore_signal(cached.rootsGate);
-    Await(^BOOL{return [[cached valueForKey:@"storageFinished"] boolValue];});
+    Await(@"cached replacement completion", ^BOOL{return [[cached valueForKey:@"storageFinished"] boolValue];});
     Check(![[cached valueForKey:@"storageRetainSnapshot"] boolValue],@"replacement pass retires the cached marker");
     [cached cancelStorage];
     NSString *progressHome=[home stringByAppendingPathComponent:@"progress-fixture"];
     [NSFileManager.defaultManager createDirectoryAtPath:progressHome withIntermediateDirectories:YES attributes:nil error:NULL];
-    for(NSUInteger n=0;n<2400;n++)Check([NSData.data writeToFile:[progressHome stringByAppendingPathComponent:[NSString stringWithFormat:@"item-%04lu",(unsigned long)n]] atomically:NO],@"multi-slice fixture");
-    TestStorageController *refresh=[TestStorageController new];refresh.testHome=progressHome;refresh.permitPower=YES;
+    // Force several real scan slices by entry budget, independently of disk speed.
+    // A large fixture with a wall-clock deadline flakes under background I/O throttling.
+    for(NSUInteger n=0;n<24;n++)Check([NSData.data writeToFile:[progressHome stringByAppendingPathComponent:[NSString stringWithFormat:@"item-%04lu",(unsigned long)n]] atomically:NO],@"multi-slice fixture");
+    TestStorageController *refresh=[TestStorageController new];refresh.testHome=progressHome;refresh.permitPower=YES;refresh.sliceEntries=8;
     NSMutableDictionary *prior=[result mutableCopy];prior[@"entries"]=@999999;prior[@"capturedAt"]=@(NSDate.date.timeIntervalSince1970-600);
     GBStorageSaveCache(prior,[refresh storageCacheDirectory],progressHome);
     [refresh requestStorageScanIfNeeded];
-    Await(^BOOL{return [refresh valueForKey:@"storageProgress"]!=nil;});
-    Check(![[refresh valueForKey:@"storageFinished"] boolValue],@"large refresh publishes before completion");
+    Await(@"first incremental scan snapshot", ^BOOL{return [refresh valueForKey:@"storageProgress"]!=nil;});
+    Check(![[refresh valueForKey:@"storageFinished"] boolValue],@"incremental refresh publishes before completion");
+    Check([[[refresh valueForKey:@"storageProgress"] objectForKey:@"entries"] unsignedIntegerValue]<=8,@"fixture entry budget forces an incomplete first slice");
     NSDictionary *progressCache=GBStorageLoadCache([refresh storageCacheDirectory],progressHome);
     Check([progressCache[@"entries"] unsignedIntegerValue]>0&&[progressCache[@"entries"] unsignedIntegerValue]<999999&&[progressCache[@"cachedAt"] doubleValue]>0,@"retained results no longer suppress progress cache writes");
     id runningIndex=[refresh valueForKey:@"storageIndex"];
     for(NSUInteger open=0;open<20;open++){[refresh storageDetailsView];[refresh requestStorageScanIfNeeded];}
     Check([refresh valueForKey:@"storageIndex"]==runningIndex&&refresh.rootsCalls==1,@"repeated opening reuses the in-flight scan");
-    Await(^BOOL{return [[refresh valueForKey:@"storageFinished"] boolValue];});
+    Await(@"incremental scan completion", ^BOOL{return [[refresh valueForKey:@"storageFinished"] boolValue];});
+    Check(refresh.paints>=4,@"refresh publishes multiple real scan slices before completion");
     Check([[[refresh valueForKey:@"storageResult"] objectForKey:@"complete"] boolValue]&&![[refresh valueForKey:@"storageRetainSnapshot"] boolValue],@"multi-slice refresh completes and retires old measurements");
     for(NSUInteger open=0;open<20;open++)[refresh requestStorageScanIfNeeded];
     Check(refresh.rootsCalls==1,@"repeated opening after completion does not restart the scan");
@@ -118,7 +122,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     [c setValue:window forKey:@"detailsWindow"];
     NSButton *button=[NSButton new];button.identifier=file;
     [c trashStorage:button];[c trashStorage:button];
-    Await(^BOOL{return c.operations==1 && ![c storageBusy];});
+    Await(@"cleanup completion", ^BOOL{return c.operations==1 && ![c storageBusy];});
     Check([NSFileManager.defaultManager fileExistsAtPath:file],@"one direct action; fixture transport never deletes user files");
     Check(![[c valueForKey:@"storageResult"][@"rows"] count],@"trashed item leaves cached ranking immediately");
     [c setValue:result forKey:@"storageResult"];

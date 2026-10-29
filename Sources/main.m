@@ -1750,6 +1750,102 @@ static NSDate *FileMTime(NSString *path) {
     return [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
 }
 
+// Ask the installed signed-in CLI through its public app-server protocol. No token
+// handling, generated turns, or foreground app activation. Bound the child lifetime.
+static NSDictionary *FetchCodexAccountJSON(void) {
+    if (GBLowDataEnabled()) return nil;
+    NSArray *paths = @[@"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                       @"/Applications/Codex.app/Contents/Resources/codex", @"/opt/homebrew/bin/codex", @"/usr/local/bin/codex"];
+    NSString *path = nil;
+    for (NSString *candidate in paths)
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:candidate]) { path = candidate; break; }
+    if (!path) return nil;
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:path];
+    task.arguments = @[@"app-server", @"--stdio"];
+    NSPipe *input = NSPipe.pipe, *output = NSPipe.pipe;
+    task.standardInput = input; task.standardOutput = output;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) return nil;
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:15];
+    __block NSDictionary *result = nil;
+    void (^send)(NSDictionary *) = ^(NSDictionary *message) {
+        NSMutableData *data = [[NSJSONSerialization dataWithJSONObject:message options:0 error:nil] mutableCopy];
+        [data appendBytes:"\n" length:1];
+        [input.fileHandleForWriting writeData:data];
+    };
+    @try {
+        send(@{@"id": @1, @"method": @"initialize", @"params": @{@"clientInfo": @{@"name": @"glancebar", @"version": @"1.1.0"}}});
+        NSMutableData *pending = NSMutableData.data;
+        BOOL finished = NO;
+        while (!finished) {
+            NSData *chunk = output.fileHandleForReading.availableData;
+            if (!chunk.length || pending.length + chunk.length > 1024 * 1024) break;
+            [pending appendData:chunk];
+            NSRange newline;
+            while ((newline = [pending rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(0,pending.length)]).location != NSNotFound) {
+                NSData *line = [pending subdataWithRange:NSMakeRange(0,newline.location)];
+                [pending replaceBytesInRange:NSMakeRange(0,newline.location+1) withBytes:NULL length:0];
+                id message = [NSJSONSerialization JSONObjectWithData:line options:0 error:nil];
+                if (![message isKindOfClass:NSDictionary.class]) continue;
+                if ([message[@"id"] isEqual:@1]) {
+                    if (message[@"error"]) { finished = YES; break; }
+                    send(@{@"method": @"initialized"});
+                    send(@{@"id": @2, @"method": @"account/rateLimits/read", @"params": NSNull.null});
+                } else if ([message[@"id"] isEqual:@2]) {
+                    if ([message[@"result"] isKindOfClass:NSDictionary.class]) result = message[@"result"];
+                    finished = YES; break;
+                }
+            }
+        }
+    } @catch (NSException *exception) { (void)exception; }
+    @finally {
+        [input.fileHandleForWriting closeFile];
+        if (task.running) [task terminate];
+        [task waitUntilExit];
+        [watchdog disarm];
+        [output.fileHandleForReading closeFile];
+    }
+    return result;
+}
+
+// Convert the public camelCase API to the existing independently dated buckets.
+static NSDictionary *CodexAccountBuckets(NSDictionary *response, NSString *stamp) {
+    if (![response isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *all = [response[@"rateLimitsByLimitId"] isKindOfClass:NSDictionary.class] ? response[@"rateLimitsByLimitId"] : nil;
+    if (!all.count && [response[@"rateLimits"] isKindOfClass:NSDictionary.class]) {
+        NSDictionary *single = response[@"rateLimits"];
+        NSString *key = [single[@"limitId"] isKindOfClass:NSString.class] ? single[@"limitId"] : @"codex";
+        all = @{key: single};
+    }
+    NSDictionary *buckets = nil;
+    for (NSString *key in all) {
+        NSDictionary *snapshot = all[key];
+        if (![snapshot isKindOfClass:NSDictionary.class]) continue;
+        NSMutableDictionary *limits = [@{@"limit_id": key} mutableCopy];
+        if ([snapshot[@"planType"] isKindOfClass:NSString.class]) limits[@"plan_type"] = snapshot[@"planType"];
+        for (NSString *window in @[@"primary", @"secondary"]) {
+            NSDictionary *w = snapshot[window];
+            if (![w isKindOfClass:NSDictionary.class] || ![w[@"usedPercent"] isKindOfClass:NSNumber.class]) continue;
+            NSMutableDictionary *mapped = [@{@"used_percent": w[@"usedPercent"]} mutableCopy];
+            if ([w[@"windowDurationMins"] isKindOfClass:NSNumber.class]) mapped[@"window_minutes"] = w[@"windowDurationMins"];
+            if ([w[@"resetsAt"] isKindOfClass:NSNumber.class]) mapped[@"resets_at"] = w[@"resetsAt"];
+            limits[window] = mapped;
+        }
+        if (!limits[@"primary"] && !limits[@"secondary"]) continue;
+        NSDictionary *credits = snapshot[@"credits"];
+        if ([credits isKindOfClass:NSDictionary.class]) {
+            NSMutableDictionary *mapped = NSMutableDictionary.dictionary;
+            for (NSString *field in @[@"hasCredits", @"unlimited", @"balance"])
+                if (credits[field] && credits[field] != NSNull.null)
+                    mapped[[field isEqual:@"hasCredits"] ? @"has_credits" : field] = credits[field];
+            limits[@"credits"] = mapped;
+        }
+        buckets = FoldCodexSnapshotIntoBuckets(buckets, limits, stamp);
+    }
+    return buckets;
+}
+
 // Reads AI usage state. Codex tokens come from the per-turn token_count events in the
 // session rollout JSONLs — the only accurate per-day source (the sqlite tokens_used
 // column is a lifetime counter, so windowing it attributes a resumed thread's whole
@@ -1761,6 +1857,8 @@ static NSDate *FileMTime(NSString *path) {
 static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 
 @interface AIReader : NSObject
+@property BOOL allowCodexAccountFetch;
+@property (copy) NSDictionary *(^codexUsageFetcher)(void);
 @property BOOL useClaudeAccount;
 @property BOOL allowClaudeAccountFetch;
 @property BOOL allowClaudeTranscripts;
@@ -1797,6 +1895,9 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 @end
 
 @implementation AIReader {
+    NSDictionary *_codexAccountBuckets;
+    double _codexNextFetch;
+    NSString *_codexAccountError;
     NSString *_homeDirectory;
     NSString *_applicationSupportDirectory;
     NSString *_statePath;
@@ -1887,6 +1988,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         _days = [NSMutableDictionary dictionary];
         _claudeDays = [NSMutableDictionary dictionary];
         _lastStatusReasons = [NSMutableDictionary dictionary];
+        _codexUsageFetcher = ^NSDictionary *{ return FetchCodexAccountJSON(); };
         _claudeCredentialReader = ^NSDictionary *{ return ClaudeAccessTokenFromKeychain(); };
         _claudeUsageFetcher = ^NSDictionary *(NSString *token){ return FetchClaudeUsageJSON(token); };
         __weak AIReader *weakSelf = self;
@@ -1907,6 +2009,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     _stateFileSeen = mtime;
     NSDictionary *root = JSONDictionaryAtPath(_statePath);
     if ([root[@"version"] integerValue] != 2) return;
+    _codexAccountBuckets = MergeCodexLimitBuckets(_codexAccountBuckets, root[@"codexAccountBuckets"]);
     NSDictionary *claude = [root[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class] ? root[@"claudeUsageJSON"] : nil;
     NSDate *claudeAt = DateFromStatusString([root[@"claudeUsageFetchedAt"] isKindOfClass:NSString.class] ? root[@"claudeUsageFetchedAt"] : nil);
     if (self.useClaudeAccount && claude && claudeAt && claudeAt.timeIntervalSince1970 > _claudeLastSuccessAt + 1) {
@@ -1971,6 +2074,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         _limitsTs = BucketsNewestTs(buckets);
         _limitsNewest = CodexNewestBucketLimits(buckets);
     }
+    _codexAccountBuckets = [root[@"codexAccountBuckets"] isKindOfClass:NSDictionary.class] ? root[@"codexAccountBuckets"] : nil;
     NSDictionary *claudeUsage = [root[@"claudeUsageJSON"] isKindOfClass:NSDictionary.class]
         ? root[@"claudeUsageJSON"] : nil;
     if (claudeUsage) {
@@ -2048,6 +2152,8 @@ static const double kAIStateWriteInterval = 2.0;
         @"claudeFiles": _claudeFiles
     } mutableCopy];
     if (_buckets.count) root[@"codexBuckets"] = _buckets;
+    NSDictionary *accountBuckets = MergeCodexLimitBuckets(_codexAccountBuckets, existingRoot[@"codexAccountBuckets"]);
+    if (accountBuckets.count) root[@"codexAccountBuckets"] = accountBuckets;
     NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
     iso.formatOptions = NSISO8601DateFormatWithInternetDateTime;
     if ([_claudeUsageJSON isKindOfClass:NSDictionary.class]) {
@@ -3289,6 +3395,21 @@ typedef struct {
 
 - (AIUsage *)codexUsage {
     [self refreshDBExtras];
+    double accountNow = NSDate.date.timeIntervalSince1970;
+    NSDate *accountDate = DateFromStatusString(BucketsNewestTs(_codexAccountBuckets));
+    if (self.allowCodexAccountFetch && !GBLowDataEnabled() && accountNow >= _codexNextFetch &&
+        (!accountDate || accountNow - accountDate.timeIntervalSince1970 >= 300)) {
+        _codexNextFetch = accountNow + 300;
+        NSDictionary *incoming = CodexAccountBuckets(self.codexUsageFetcher(), ISOStringFromEpoch(accountNow));
+        if (incoming.count) {
+            _codexAccountBuckets = incoming;
+            _codexAccountError = nil;
+            _stateDirty = YES;
+        } else _codexAccountError = @"Codex account refresh failed; check Codex CLI sign-in";
+    }
+    _buckets = MergeCodexLimitBuckets(_buckets, _codexAccountBuckets);
+    _limitsTs = BucketsNewestTs(_buckets);
+    _limitsNewest = CodexNewestBucketLimits(_buckets);
 
     AIUsage *u = [AIUsage new];
     u.name = @"Codex";
@@ -3296,10 +3417,11 @@ typedef struct {
     u.remainingFraction = -1;
     u.resetText = @"Not exposed locally";
     u.models = _models ?: @[];
-    u.available = _codexFiles.count > 0;
+    u.available = _codexFiles.count > 0 || _codexAccountBuckets.count > 0;
     if (!u.available) {
         u.statusText = @"Local state not found";
         u.statusReason = @"No Codex session logs under ~/.codex";
+        if (_codexAccountError) u.limitRefreshError = _codexAccountError;
         return u;
     }
     if (_codexTotalsIncomplete)
@@ -3438,6 +3560,10 @@ typedef struct {
     if (_codexTotalsIncomplete) [parts addObject:[NSString stringWithFormat:@"indexing %.1f%%",
         _codexTotalBytes ? 100.0 * _codexDoneBytes / _codexTotalBytes : 0.0]];
     u.diagnostics = [parts componentsJoinedByString:@" · "];
+    NSString *accountStamp = _codexAccountBuckets[@"codex"][@"ts"];
+    if (accountStamp && [accountStamp isEqual:_buckets[@"codex"][@"ts"]])
+        u.statusSource = @"Codex app-server account/rateLimits/read";
+    if (_codexAccountError) u.limitRefreshError = _codexAccountError;
     return u;
 }
 
@@ -3846,6 +3972,40 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 - (BOOL)accessibilityPerformPress {
     [self sendAction];
     return YES;
+}
+@end
+
+// Compact labels retain their full value. Show native expansion help only when
+// their actual text is clipped; ordinary labels still have no hover popup.
+@interface GBRecoverableTextField : NSTextField
+- (void)updateClippedTextHelp;
+@end
+@implementation GBRecoverableTextField
+- (void)updateClippedTextHelp {
+    if (!self.cell) return;
+    NSLineBreakMode mode = self.lineBreakMode;
+    BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
+                     mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
+    BOOL clipped = truncates && self.stringValue.length &&
+        self.attributedStringValue.size.width + 4 > NSWidth(self.bounds);
+    [super setToolTip:clipped ? self.stringValue : nil];
+}
+- (void)setStringValue:(NSString *)value { [super setStringValue:value]; [self updateClippedTextHelp]; }
+- (void)setAttributedStringValue:(NSAttributedString *)value { [super setAttributedStringValue:value]; [self updateClippedTextHelp]; }
+- (void)setFont:(NSFont *)font { [super setFont:font]; [self updateClippedTextHelp]; }
+- (void)setFrameSize:(NSSize)size { [super setFrameSize:size]; [self updateClippedTextHelp]; }
+- (void)setLineBreakMode:(NSLineBreakMode)mode { [super setLineBreakMode:mode]; [self updateClippedTextHelp]; }
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+    if (self.selectable) return [super menuForEvent:event];
+    NSMenu *menu = [NSMenu new];
+    NSMenuItem *copy = [menu addItemWithTitle:@"Copy full text" action:@selector(copyFullText:) keyEquivalent:@""];
+    copy.target = self;
+    return menu;
+}
+- (void)copyFullText:(id)sender {
+    (void)sender;
+    [NSPasteboard.generalPasteboard clearContents];
+    [NSPasteboard.generalPasteboard setString:self.stringValue forType:NSPasteboardTypeString];
 }
 @end
 
@@ -5761,6 +5921,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         _lastAllowTranscripts = allowTranscripts;
     }
     dispatch_async(_aiQueue, ^{
+        self->_aiReader.allowCodexAccountFetch = !GBLowDataEnabled();
         self->_aiReader.useClaudeAccount = useAccount;
         self->_aiReader.allowClaudeAccountFetch = allowAccountFetch;
         self->_aiReader.useCursorAccount = useCursorAccount;
@@ -6596,7 +6757,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 // --- layout helpers ---
 - (NSTextField *)text:(NSString *)s font:(NSFont *)f color:(NSColor *)c at:(NSRect)fr align:(NSTextAlignment)a {
-    NSTextField *t = [NSTextField labelWithString:s ?: @""];
+    NSTextField *t = [GBRecoverableTextField labelWithString:s ?: @""];
     t.font = f; if (c) t.textColor = c; t.alignment = a; t.frame = fr;
     t.lineBreakMode = NSLineBreakByTruncatingTail;
     return t;
@@ -6796,7 +6957,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     return nil;
 }
 
-// Extra figures remain available to assistive technology; hover popups are disabled.
+// Extra figures remain in accessibility help. Hover is reserved for recovering clipped text.
 - (NSString *)batteryPopoverTip {
     if (!_bat.valid) return @"No battery";
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
@@ -9040,19 +9201,25 @@ static NSColor *HealthColor(double fraction) {
     NSString *metric = hasTokens ? @"Tokens" : hasSessions ? @"Sessions" : u.todayMessages > 0 ? @"Messages" : @"Tools";
     long long todayCount = hasTokens ? u.todayTokens : hasSessions ? u.todaySessions : u.todayMessages > 0 ? u.todayMessages : u.todayToolCalls;
     long long weekCount = hasTokens ? u.weekTokens : hasSessions ? u.weekSessions : 0;
-    [self detailText:metric font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
-              color:NSColor.secondaryLabelColor frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+    NSFont *metricFont = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    CGFloat metricW = ceil([metric sizeWithAttributes:@{NSFontAttributeName:metricFont}].width) + 4;
+    [self detailText:metric font:metricFont
+              color:NSColor.secondaryLabelColor frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, metricW, 16)
               align:NSTextAlignmentLeft identifier:[rowID stringByAppendingString:@".metric"] in:row].accessibilityHelp = tip;
     NSString *todayText = FmtCompact(todayCount);
     NSString *weekText = (hasTokens || hasSessions) ? FmtCompact(weekCount) : @"—";
-    CGFloat tagW = 46;
-    CGFloat todayTagX = c.valueX - c.gap - tagW;
-    CGFloat todayValueW = MAX(36.0, todayTagX - 4 - c.gaugeX);
     NSFont *figure = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold];
     NSFont *tag = [NSFont systemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    // Give "today" its measured width, not 46pt at the expense of the reading.
+    // 20.8M used to become "20…" in a 42pt field. Large totals can also use the
+    // otherwise empty space after "Tokens", without shrinking the type or adding rows.
+    CGFloat tagW = ceil([@"today" sizeWithAttributes:@{NSFontAttributeName:tag}].width) + 4;
+    CGFloat todayTagX = c.valueX - c.gap - tagW;
+    CGFloat todayValueW = MAX(todayTagX - 4 - c.gaugeX,
+                             ceil([todayText sizeWithAttributes:@{NSFontAttributeName:figure}].width) + 4);
     NSTextField *today = [self detailText:todayText font:figure
                                      color:NSColor.labelColor
-                                     frame:NSMakeRect(c.gaugeX, (c.rowH - c.valueH) / 2.0, todayValueW, c.valueH)
+                                     frame:NSMakeRect(todayTagX - 4 - todayValueW, (c.rowH - c.valueH) / 2.0, todayValueW, c.valueH)
                                      align:NSTextAlignmentRight
                                 identifier:[rowID stringByAppendingString:@".today"] in:row];
     today.accessibilityHelp = tip;
@@ -9061,10 +9228,15 @@ static NSColor *HealthColor(double fraction) {
                                         align:NSTextAlignmentLeft
                                    identifier:[rowID stringByAppendingString:@".todayLabel"] in:row];
     todayTag.accessibilityHelp = tip;
-    [self detailValue:weekText color:((hasTokens || hasSessions) ? NSColor.labelColor : NSColor.tertiaryLabelColor)
+    NSTextField *week = [self detailValue:weekText color:((hasTokens || hasSessions) ? NSColor.labelColor : NSColor.tertiaryLabelColor)
            identifier:[rowID stringByAppendingString:@".value"] tip:tip in:row cols:c];
+    CGFloat weekW = MAX(c.valueW, ceil(week.attributedStringValue.size.width) + 4);
+    week.frame = NSMakeRect(c.valueX, NSMinY(week.frame), weekW, NSHeight(week.frame));
+    NSRect weekTagRect = DetailDatumRect(c);
+    weekTagRect.origin.x = NSMaxX(week.frame) + c.gap;
+    weekTagRect.size.width = c.width - kDetailPad - weekTagRect.origin.x;
     NSTextField *weekTag = [self detailText:@"7d" font:tag color:NSColor.tertiaryLabelColor
-                                       frame:DetailDatumRect(c) align:NSTextAlignmentLeft
+                                       frame:weekTagRect align:NSTextAlignmentLeft
                                   identifier:[rowID stringByAppendingString:@".weekLabel"] in:row];
     weekTag.accessibilityHelp = tip;
     return y + c.rowH;
@@ -9981,6 +10153,7 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     // Consent (toggle) controls whether the last-known account cache is used and whether
     // forget runs. Online permission only gates the network fetch — otherwise offline
     // --dump would call forget and wipe the disk cache.
+    reader.allowCodexAccountFetch = allowOnline;
     reader.useClaudeAccount = accountEnabled;
     reader.allowClaudeAccountFetch = accountRequested;
     reader.useCursorAccount = cursorAccountEnabled;
