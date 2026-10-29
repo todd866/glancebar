@@ -5679,6 +5679,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     RunAppleScript(AppleMusicScript(command), ^(NSString *output, NSString *errorText, int status) {
         if (generation != self->_amGen) return;
         self->_amStatusInFlight = NO;
+        if (status != 0 || command.length)
+            GBLog("apple music: command=%{public}@ status=%d out=%{public}@ err=%{public}@", command, status,
+                  [output stringByReplacingOccurrencesOfString:YouTubeStatusSeparator withString:@"|"], errorText);
         if (ChromeAutomationDenied(errorText)) {
             self->_musicNote = kAppleMusicAutomationNote;
             if (self->_popover.isShown) [self rebuildContent];
@@ -5817,6 +5820,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
+    GBLog("music play: local=%d am=%d yt=%d netKnown=%d online=%d pending=%d", _localMode, _amLoaded, _ytTabOpen,
+          _networkKnown, _networkOnline, _amStartPending);
     if (_localMode) { [self toggleLocalPlayback]; return; }
     if (_amLoaded) {
         _playbackPlaying = !_playbackPlaying;

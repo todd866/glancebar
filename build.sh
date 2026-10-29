@@ -109,7 +109,7 @@ else
     echo "  re-registered each time. See docs/RELEASING.md." >&2
 fi
 
-CODESIGN_ARGS=(--force --sign "$IDENTITY")
+CODESIGN_ARGS=(--force --sign "$IDENTITY" --entitlements "${0:A:h}/Glancebar.entitlements")
 if [[ "${GLANCEBAR_HARDENED_RUNTIME:-1}" == "1" ]]; then
     CODESIGN_ARGS+=(--options runtime)
 elif [[ "${GLANCEBAR_HARDENED_RUNTIME:-1}" != "0" ]]; then
