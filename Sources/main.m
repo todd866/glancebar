@@ -3655,6 +3655,8 @@ static NSColor *PowerFlowColor(BatteryState b, NSColor *ink) {
             return [base blendedColorWithFraction:0.6 + 0.4 * k ofColor:NSColor.systemGreenColor] ?: NSColor.systemGreenColor;
         case PowerFlowPaused:
             return NSColor.systemYellowColor;
+        case PowerFlowShort:
+            return NSColor.systemOrangeColor;
         case PowerFlowDischarging:
             if (b.percent <= 20) return BattBarColor(b.percent);
             if (k < 0.35) return base;
@@ -3830,17 +3832,31 @@ static const CGFloat kBatteryForecastSideRoom = 14;
 }
 @end
 
-// The airspeed-tape trend vector on the battery bar: a line from the charge level to
-// where it will be in an hour at this rate, with a head. Green in, orange out.
+// The airspeed-tape trend vectors on the battery bar, both from the charge level: green
+// right for what the charger brings in, orange left for what the Mac draws, each an
+// hour's worth. Whichever is longer is winning; the forecast times sit on that side.
 @interface TrendArrow : NSView
-@property (nonatomic) double from, to;   // bar fractions
+@property (nonatomic) double from, to, drawTo;   // bar fractions; to = charger in, drawTo = draw (NAN = none)
 @end
 @implementation TrendArrow
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) _drawTo = NAN;
+    return self;
+}
 - (void)setFrom:(double)from { _from = from; self.needsDisplay = YES; }
 - (void)setTo:(double)to { _to = to; self.needsDisplay = YES; }
+- (void)setDrawTo:(double)drawTo { _drawTo = drawTo; self.needsDisplay = YES; }
 - (void)drawRect:(NSRect)dirty {
-    CGFloat inset = 5, w = NSWidth(self.bounds) - 2 * inset, y = NSMidY(self.bounds);
-    CGFloat a = inset + w * _from, b = inset + w * _to;
+    (void)dirty;
+    // Both shown: charger in rides just above the centre line, draw just below.
+    BOOL both = fabs(_to - _from) > 0.005 && isfinite(_drawTo) && fabs(_drawTo - _from) > 0.005;
+    [self drawVectorTo:_to lift:both ? 2.5 : 0];
+    [self drawVectorTo:_drawTo lift:both ? -2.5 : 0];
+}
+- (void)drawVectorTo:(double)target lift:(CGFloat)lift {
+    if (!isfinite(target)) return;
+    CGFloat inset = 5, w = NSWidth(self.bounds) - 2 * inset, y = NSMidY(self.bounds) + lift;
+    CGFloat a = inset + w * _from, b = inset + w * target;
     if (fabs(b - a) < 1) return;
     BOOL up = b > a;
     CGFloat dir = up ? 1 : -1;
@@ -4275,7 +4291,7 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.needsDisplay = YES;
     } else if ([existing isKindOfClass:TrendArrow.class]) {
         TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
-        old.from = new.from; old.to = new.to;
+        old.from = new.from; old.to = new.to; old.drawTo = new.drawTo;
     } else if ([existing isKindOfClass:PowerFlowGauge.class]) {
         PowerFlowGauge *old = (PowerFlowGauge *)existing, *new = (PowerFlowGauge *)fresh;
         old.scaleWatts = new.scaleWatts; old.systemWatts = new.systemWatts;
@@ -4372,13 +4388,14 @@ static CGFloat FittedSymbolPointSize(NSString *name, CGFloat maxPoint, CGFloat m
     return pt;
 }
 
-// Bolt while energy is entering the pack, pause while a plugged-in charge is stalled.
+// Bolt while energy is arriving (orange when the charger falls short of the load), pause
+// while a plugged-in charge is stalled.
 // Held and discharging keep the plain glyph. The badge is drawn in the glyph's own
 // colour inside a knocked-out halo, so it reads at menu-bar size without widening the image.
 static NSImage *BatteryGlyphWithBadge(NSImage *glyph, PowerFlow flow, NSColor *color) {
     if (!glyph || glyph.size.width < 1 || glyph.size.height < 1) return glyph;
     NSString *badgeName = nil;
-    if (flow == PowerFlowCharging) badgeName = @"bolt.fill";
+    if (flow == PowerFlowCharging || flow == PowerFlowShort) badgeName = @"bolt.fill";
     else if (flow == PowerFlowPaused) badgeName = @"pause.fill";
     if (!badgeName) return glyph;
     NSImage *mark = [NSImage imageWithSystemSymbolName:badgeName accessibilityDescription:nil];
@@ -4818,6 +4835,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSUInteger _activityGeneration;
     NSInteger _activitySort;
     BOOL _popoverPrepared, _popoverPreparePending;
+    BOOL _chargerRowShown;   // the popover has a Charger row (plugged in, still draining)
     NSString *_storageNotice;
     NSDictionary *_storageResult, *_storageUndo, *_storageProgress;
     NSMutableDictionary *_storageBlocked;
@@ -6572,7 +6590,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     BatteryState fresh = ReadBattery();
     if (!fresh.valid) { _bat = fresh; [self batteryForecast]; [self refreshVisibleSurfaces]; return; }
     BOOL stateChanged = fresh.acConnected != _bat.acConnected || fresh.isCharging != _bat.isCharging ||
-                        fresh.percent != _bat.percent;
+                        fresh.percent != _bat.percent || ChargerFallsShort(fresh) != _chargerRowShown;
     BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
                         fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
     BOOL wasOnAC = _bat.acConnected;
@@ -6603,6 +6621,8 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(root, @"popover.battery.datum");
         TrendArrow *arrow = (TrendArrow *)ViewWithAccessibilityIdentifier(root, @"popover.battery.trend");
         NSView *chargeBar = ViewWithAccessibilityIdentifier(root, @"popover.battery.gauge");
+        NSView *chargerRow = ViewWithAccessibilityIdentifier(root, @"popover.row.charger");
+        if (chargerRow) [self configureChargerRow:chargerRow];
         if ([datum isKindOfClass:NSTextField.class]) {
             datum.stringValue = [self batteryRateText];
             datum.textColor = [self batteryRateColor];
@@ -7178,14 +7198,26 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     double level = _bat.percent / 100.0;
     BOOL moving = !isnan(bw) && fabs(bw) >= 0.3 && !isnan(fullWh) && fullWh > 0;
     double cap = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? MAX(0.8, level) : 1.0;
-    double to = moving ? MIN(cap, MAX(0, level + bw / fullWh)) : level;
-    arrow.from = level; arrow.to = to;
-    arrow.hidden = !moving || fabs(to - level) < 0.01;
-    // In line with the bar, unless the head would run off its end (draining from very low):
+    // Plugged in with telemetry: the charger's input and the Mac's draw are separate
+    // vectors. Otherwise one vector carries the battery's own rate.
+    BOOL split = _bat.acConnected && _bat.systemPowerIn_mW != LONG_MIN && _bat.systemPowerIn_mW >= 0 &&
+        _bat.systemLoad_mW != LONG_MIN && _bat.systemLoad_mW > 0 && !isnan(fullWh) && fullWh > 0 && moving;
+    double to = level, drawTo = NAN;
+    if (split) {
+        to = MIN(cap, level + _bat.systemPowerIn_mW / 1000.0 / fullWh);
+        drawTo = MAX(0, level - _bat.systemLoad_mW / 1000.0 / fullWh);
+    } else if (moving) {
+        double target = MIN(cap, MAX(0, level + bw / fullWh));
+        if (bw > 0) to = target; else drawTo = target;
+    }
+    BOOL inShows = fabs(to - level) >= 0.01, drawShows = isfinite(drawTo) && fabs(drawTo - level) >= 0.01;
+    arrow.from = level; arrow.to = inShows ? to : level; arrow.drawTo = drawShows ? drawTo : NAN;
+    arrow.hidden = !inShows && !drawShows;
+    // In line with the bar, unless a head would run off its end (draining from very low):
     // then it lifts just above.
-    BOOL roomInLine = NSWidth(gauge.frame) * to >= 6;
-    CGFloat y = roomInLine ? NSMidY(gauge.frame) - 5 : NSMinY(gauge.frame) - 9;
-    arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, 10);
+    BOOL roomInLine = NSWidth(gauge.frame) * (drawShows ? drawTo : to) >= 6;
+    CGFloat y = roomInLine ? NSMidY(gauge.frame) - 7 : NSMinY(gauge.frame) - 9;
+    arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, roomInLine ? 14 : 10);
 }
 - (NSString *)batteryRateText {
     double bw = BatteryWatts(_bat);
@@ -7746,6 +7778,45 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     }
 }
 
+// While plugged in but still draining, the charger is its own plain row under Battery:
+// the bar is the share of the Mac's draw it covers, the value what it delivers.
+- (NSView *)chargerInstrumentRow {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    row.accessibilityIdentifier = @"popover.row.charger";
+    NSTextField *name = [self text:@"Charger" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+                             color:NSColor.secondaryLabelColor
+                                at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
+    name.accessibilityIdentifier = @"popover.charger.name";
+    [row addSubview:name];
+    Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    bar.metricLabel = @"Share of the Mac's draw the charger covers";
+    bar.accessibilityIdentifier = @"popover.charger.gauge";
+    [row addSubview:bar];
+    [self instrumentValue:@"" color:nil identifier:@"popover.charger.value" in:row];
+    [self instrumentDatum:@"" color:NSColor.secondaryLabelColor identifier:@"popover.charger.datum" in:row];
+    [self configureChargerRow:row];
+    return row;
+}
+- (void)configureChargerRow:(NSView *)row {
+    double in = _bat.systemPowerIn_mW / 1000.0, load = _bat.systemLoad_mW / 1000.0;
+    BOOL loadKnown = _bat.systemLoad_mW != LONG_MIN && load > 0;
+    Gauge *bar = (Gauge *)ViewWithAccessibilityIdentifier(row, @"popover.charger.gauge");
+    if ([bar isKindOfClass:Gauge.class]) {
+        bar.fraction = loadKnown ? MIN(1, MAX(0, in / load)) : 0;
+        bar.color = in < 1 ? NSColor.systemRedColor : NSColor.systemGreenColor;
+        bar.needsDisplay = YES;
+    }
+    NSTextField *value = (NSTextField *)ViewWithAccessibilityIdentifier(row, @"popover.charger.value");
+    value.stringValue = [NSString stringWithFormat:@"%.0f W", in];
+    value.textColor = in < 1 ? NSColor.systemYellowColor : NSColor.labelColor;
+    NSTextField *datum = (NSTextField *)ViewWithAccessibilityIdentifier(row, @"popover.charger.datum");
+    datum.stringValue = loadKnown ? [NSString stringWithFormat:@"Mac %.0f W", load] : @"";
+    NSString *tip = _bat.adapterWatts > 0
+        ? [NSString stringWithFormat:@"%ld W charger", _bat.adapterWatts] : @"Charger";
+    row.accessibilityLabel = [NSString stringWithFormat:@"Charger %.0f W of the Mac's %.0f W", in, load];
+    row.accessibilityHelp = tip;
+}
+
 - (ClickRow *)batteryInstrumentRow {
     ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
     row.target = self;
@@ -7865,6 +7936,13 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     batteryRow.frame = NSMakeRect(0, y, kW, kRowH);
     [root addSubview:batteryRow];
     y += kRowH;
+    _chargerRowShown = ChargerFallsShort(_bat);
+    if (_chargerRowShown) {
+        NSView *charger = [self chargerInstrumentRow];
+        charger.frame = NSMakeRect(0, y, kW, kRowH);
+        [root addSubview:charger];
+        y += kRowH;
+    }
 
     y = [self addBurnRowTo:root at:y];
 

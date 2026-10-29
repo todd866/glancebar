@@ -2232,8 +2232,15 @@ PowerFlow PowerFlowFor(BatteryState b) {
     if (!isnan(w) && w > 0.3) return PowerFlowCharging;
     BOOL inputKnown = b.systemPowerIn_mW != LONG_MIN && b.systemPowerIn_mW >= 0;
     if (inputKnown && b.systemPowerIn_mW < 1000) return PowerFlowPaused;   // charger recognised, nothing arriving
-    if (!isnan(w) && w < -0.5) return PowerFlowPaused;                     // plugged in, battery still carrying load
+    if (!isnan(w) && w < -0.5) return inputKnown ? PowerFlowShort          // arriving, but less than the load
+                                                 : PowerFlowPaused;        // plugged in, battery still carrying load
     return PowerFlowHeld;
+}
+
+BOOL ChargerFallsShort(BatteryState b) {
+    double w = BatteryWatts(b);
+    return b.valid && b.acConnected && b.systemPowerIn_mW != LONG_MIN && b.systemPowerIn_mW >= 0 &&
+        !isnan(w) && w < -0.5;
 }
 
 double PowerFlowIntensity(BatteryState b) {
@@ -2241,7 +2248,8 @@ double PowerFlowIntensity(BatteryState b) {
     if (isnan(w)) return 0;
     switch (PowerFlowFor(b)) {
         case PowerFlowCharging:    return MIN(1.0, MAX(0.0, w / 30.0));
-        case PowerFlowDischarging: return MIN(1.0, MAX(0.0, -w / 25.0));
+        case PowerFlowDischarging:
+        case PowerFlowShort:       return MIN(1.0, MAX(0.0, -w / 25.0));
         default:                   return 0;
     }
 }
@@ -2346,15 +2354,18 @@ void BatteryApplySystemTimes(BatteryState *b, NSDictionary *source) {
     BOOL _limit80, _thresholdFromSystem;
 }
 - (BatteryForecast)update:(BatteryState)b limit80:(BOOL)limit80 at:(double)now {
-    BatteryForecast f = {.thresholdPercent=b.acConnected ? 80 : 20, .endpointPercent=b.acConnected ? 100 : 0};
-    f.thresholdReached = b.valid && (b.acConnected ? b.percent >= 80 : b.percent <= 20);
-    f.endpointReached = b.valid && (b.acConnected ? b.fullyCharged || b.percent >= 100 : b.percent <= 0);
-    f.hideLabels = b.valid && b.acConnected && limit80 && b.percent >= 80;
-    f.hypotheticalFull = b.acConnected && limit80 && !f.hideLabels;
+    // Times go on whichever side is winning: a charger that falls short of the load
+    // forecasts 20% and empty, like running on battery.
+    BOOL filling = b.acConnected && !ChargerFallsShort(b);
+    BatteryForecast f = {.thresholdPercent=filling ? 80 : 20, .endpointPercent=filling ? 100 : 0};
+    f.thresholdReached = b.valid && (filling ? b.percent >= 80 : b.percent <= 20);
+    f.endpointReached = b.valid && (filling ? b.fullyCharged || b.percent >= 100 : b.percent <= 0);
+    f.hideLabels = b.valid && filling && limit80 && b.percent >= 80;
+    f.hypotheticalFull = filling && limit80 && !f.hideLabels;
     double watts = BatteryWatts(b);
     BOOL fresh = b.telemetryTimestamp <= 0 || (now - b.telemetryTimestamp >= -5 && now - b.telemetryTimestamp <= 120);
     NSInteger mode = !b.valid || !fresh || f.endpointReached || f.hideLabels ? 0 :
-        b.acConnected ? (b.isCharging && watts >= 0.5 ? 1 : 0) : (!b.isCharging && watts < -0.5 ? -1 : 0);
+        filling ? (b.isCharging && watts >= 0.5 ? 1 : 0) : (!b.isCharging && watts < -0.5 ? -1 : 0);
     double dt = now - _lastUpdate;
     if (!_samples || mode != _mode || limit80 != _limit80 || dt < 0 || dt > 90 || mode == 0) {
         _samples = [NSMutableArray array]; _lastSample = 0;

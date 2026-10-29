@@ -1182,7 +1182,21 @@ int main(void) {
             b.amperage_mA = 0; b.systemPowerIn_mW = 18000;
             check(PowerFlowFor(b) == PowerFlowHeld && PowerFlowIntensity(b) == 0, @"power: plugged, battery resting = held");
             b.amperage_mA = -300; b.systemPowerIn_mW = 18700;
-            check(PowerFlowFor(b) == PowerFlowPaused, @"power: a charger too weak for the load still drains = paused");
+            check(PowerFlowFor(b) == PowerFlowShort && ChargerFallsShort(b),
+                  @"power: a charger too weak for the load still drains = short");
+            {
+                // The plane's USB port: 6 W in, the Mac using 16 W. Times go on the
+                // draining side (20% and empty), not 80%/full.
+                BatteryState s = b; s.percent = 68; s.rawMax_mAh = 4232; s.rawCurrent_mAh = 2878;
+                s.voltage_mV = 11855; s.amperage_mA = -843; s.systemPowerIn_mW = 6000; s.systemLoad_mW = 16000;
+                BatteryForecastTracker *t = [BatteryForecastTracker new];
+                BatteryForecast f = {0};
+                for (int sec = 0; sec <= 90; sec += 15) f = [t update:s limit80:NO at:1000 + sec];
+                check(f.thresholdPercent == 20 && f.endpointPercent == 0 && f.thresholdTime > 1090 && f.endpointTime > f.thresholdTime,
+                      @"power: a short charger forecasts 20% and empty");
+                s.systemPowerIn_mW = LONG_MIN;
+                check(!ChargerFallsShort(s), @"power: unknown input is not called short");
+            }
             b.acConnected = NO; b.amperage_mA = -1400; b.systemPowerIn_mW = 0;
             check(PowerFlowFor(b) == PowerFlowDischarging && fabs(PowerFlowIntensity(b) - 16.8 / 25.0) < 0.01,
                   @"power: on battery, 16.8 W drain");

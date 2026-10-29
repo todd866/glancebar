@@ -33,10 +33,14 @@ typedef NS_ENUM(NSInteger, PowerFlow) {
     PowerFlowHeld,          // plugged in, the charger covers the load, the battery rests (e.g. at its limit)
     PowerFlowPaused,        // plugged in, but no power comes in or the battery still drains
     PowerFlowDischarging,   // on battery
+    PowerFlowShort,         // plugged in, the charger delivers but less than the Mac uses: still draining
 };
 PowerFlow PowerFlowFor(BatteryState b);
 // 0..1: how hard it is charging (30 W = 1) or draining (25 W = 1). 0 for held/paused/unknown.
 double PowerFlowIntensity(BatteryState b);
+// Plugged in with a measured input, and the battery is still carrying part of the load
+// (a weak port, or a charger delivering nothing). The popover then names the charger.
+BOOL ChargerFallsShort(BatteryState b);
 
 // Battery power in watts, signed: + charging, − discharging. NAN when not measurable.
 double BatteryWatts(BatteryState b);

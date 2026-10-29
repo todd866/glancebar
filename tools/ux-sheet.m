@@ -502,6 +502,97 @@ static BOOL TrendSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Net-drain sheet (plugged in, charger weaker than the load)
+
+typedef NS_ENUM(NSInteger, NetDrainStyle) { NetDrainToday, NetDrainBoltTime, NetDrainChargerRow, NetDrainInDatum };
+
+static NSTextField *SheetDatum(Controller *c, NSString *s, NSColor *color) {
+    return [c text:s font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular] color:color
+                at:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2, kDatumW, kDatumH) align:NSTextAlignmentLeft];
+}
+
+// in/load watts; battery watts = in − load. rating = charger watts (0 = on battery).
+static NSArray<NSView *> *NetDrainRows(Controller *c, int pct, double inW, double loadW, long rating, NetDrainStyle style) {
+    BOOL ac = rating > 0;
+    double bw = ac ? inW - loadW : -loadW;
+    BatteryState b = {.valid=YES, .percent=pct, .acConnected=ac, .isCharging=bw > 0.3, .rawCurrent_mAh=4232 * pct / 100,
+        .rawMax_mAh=4232, .designCap_mAh=4629, .voltage_mV=11855, .amperage_mA=(long)(bw * 1e6 / 11855),
+        .systemPowerIn_mW=ac ? (long)(inW * 1000) : 0, .systemLoad_mW=(long)(loadW * 1000), .adapterWatts=rating};
+    [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    NSImage *glyph = [c liveBatteryGlyph];
+    NSColor *tint = PowerFlowColor(b, NSColor.labelColor);
+    BOOL weak = ac && bw < -0.5 && inW >= 1;   // something arrives, but less than the Mac uses
+    if (weak && style != NetDrainToday) {
+        NSImage *plain = [NSImage imageWithSystemSymbolName:BatterySymbolName(pct, NO) accessibilityDescription:nil];
+        plain = [plain imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightRegular]];
+        tint = NSColor.systemOrangeColor;
+        glyph = BatteryGlyphWithBadge(plain, PowerFlowCharging, tint);
+    }
+    NSImageView *iv = [NSImageView imageViewWithImage:glyph];
+    iv.imageScaling = NSImageScaleProportionallyDown;
+    if (glyph.template) iv.contentTintColor = tint;
+    iv.frame = NSMakeRect(kPad, (kRowH - kLeadSymbol) / 2, kLeadW, kLeadSymbol);
+    [row addSubview:iv];
+    [row addSubview:[c text:@"Battery" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                         at:NSMakeRect(kAINameX, (kRowH - 16) / 2, kAINameW, 16) align:NSTextAlignmentLeft]];
+    TrendSketch *t = [[TrendSketch alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+    t.level = pct / 100.0; t.perHour = bw / 50.0; t.limit = 0; t.style = TrendVector;
+    [row addSubview:t];
+    [row addSubview:[c text:[NSString stringWithFormat:@"%d%%", pct] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                      color:BattBarColor(pct) at:NSMakeRect(kValueX, (kRowH - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    NSColor *rateInk = bw > 0.3 ? NSColor.systemGreenColor : bw < -0.3 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    NSString *rate = FormatSignedWatts(bw);
+    int to20 = bw < -0.5 && pct > 20 ? (int)lround((pct - 20) / 100.0 * 50.2 / -bw * 60) : -1;
+    NSString *datum = rate;
+    if (style == NetDrainBoltTime || style == NetDrainChargerRow) {
+        if (to20 >= 0) datum = [NSString stringWithFormat:@"%@ · %@", rate, FmtDuration(to20)];
+    } else if (style == NetDrainInDatum && ac) {
+        datum = [NSString stringWithFormat:@"%.0f in · %@", inW, rate];
+    } else if (style == NetDrainInDatum && to20 >= 0) {
+        datum = [NSString stringWithFormat:@"%@ · %@", rate, FmtDuration(to20)];
+    }
+    [row addSubview:SheetDatum(c, datum, rateInk)];
+    NSMutableArray *rows = [NSMutableArray arrayWithObject:row];
+    if (style == NetDrainChargerRow && ac) {
+        // A second reading is its own plain row: what the charger delivers, of its rating.
+        NSView *sub = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+        [sub addSubview:[c text:@"Charger" font:[NSFont systemFontOfSize:12.5 weight:NSFontWeightRegular] color:NSColor.secondaryLabelColor
+                             at:NSMakeRect(kAINameX, (kRowH - 16) / 2, kAINameW, 16) align:NSTextAlignmentLeft]];
+        TrendSketch *bar = [[TrendSketch alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        double share = loadW > 0 ? MIN(1, inW / loadW) : 1;   // how much of the Mac's draw the charger covers
+        bar.level = share; bar.perHour = 0; bar.style = TrendVector;
+        [sub addSubview:bar];
+        [sub addSubview:[c text:[NSString stringWithFormat:@"%.0f W", inW] font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                          color:inW < 1 ? NSColor.systemYellowColor : NSColor.labelColor
+                             at:NSMakeRect(kValueX, (kRowH - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+        [sub addSubview:SheetDatum(c, [NSString stringWithFormat:@"Mac %.0f W", loadW], NSColor.secondaryLabelColor)];
+        [rows addObject:sub];
+    }
+    return rows;
+}
+
+static BOOL NetDrainSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // percent, charger in W, Mac load W, charger rating (0 = unplugged)
+    NSArray *states = @[@[@68, @6, @16, @8], @[@68, @0, @12, @8], @[@42, @45, @15, @70], @[@63, @0, @13, @0]];
+    NSArray *variants = @[@[@"A  today: amber pause, rate only", @(NetDrainToday)],
+                          @[@"B  orange bolt (charging, losing) + time to 20%", @(NetDrainBoltTime)],
+                          @[@"C  B + Charger row: share of the Mac's draw it covers", @(NetDrainChargerRow)],
+                          @[@"D  orange bolt + \"6 in · −10 W\" in the datum", @(NetDrainInDatum)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states)
+                [rows addObjectsFromArray:NetDrainRows(c, [st[0] intValue], [st[1] doubleValue], [st[2] doubleValue],
+                                                       [st[3] longValue], [v[1] integerValue])];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 #pragma mark - Cursor two-pool sheet
 
 typedef NS_ENUM(NSInteger, PoolStyle) { PoolToday, PoolOverlay, PoolTight, PoolMarker, PoolTwoRows, PoolInnerLine, PoolUnderline, PoolGrokOverlay, PoolApiRow, PoolApiDatum, PoolSplit };
@@ -944,12 +1035,13 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|cursor|energy|burn out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "trend")) return TrendSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "netdrain")) return NetDrainSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "cursor")) return CursorSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "energy")) return EnergySheet(path) ? 0 : 1;
         Controller *c = [Controller new];

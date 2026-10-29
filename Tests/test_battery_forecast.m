@@ -111,7 +111,8 @@ int main(void) { @autoreleasepool {
     b.isCharging=NO;
     b.percent=70; b.amperage_mA=-500;
     f = [t update:b limit80:NO at:30200];
-    check(f.thresholdTime == 0 && f.endpointTime == 0 && f.endpointPercent==100, @"plugged but draining offers no charge prediction");
+    check(f.thresholdPercent==20 && f.endpointPercent==0 && f.endpointTime == 0,
+        @"plugged but draining forecasts the draining side and offers no charge prediction");
     b=Battery(YES); b.percent=95; b.amperage_mA=200; b.minutesToFull=70;
     f = [t update:b limit80:NO at:30300];
     check(f.thresholdReached && f.thresholdTime==0 && f.endpointTime==34500, @"taper near full uses 70min system ETA");

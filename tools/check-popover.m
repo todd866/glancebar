@@ -979,8 +979,11 @@ int main(int argc, const char **argv) {
                 [c rebuildContent];
                 NSView *pop = p.contentViewController.view;
                 BatteryForecastView *fv = (BatteryForecastView *)FindIdentifier(pop, @"popover.battery.forecast");
-                if (!ForecastFits(fv) || fv.forecast.thresholdPercent != (sb.acConnected ? 80 : 20) ||
-                    fv.forecast.endpointPercent != (sb.acConnected ? 100 : 0)) return Fail(__LINE__);
+                // Times sit on the winning side: a charger short of the load forecasts 20%/empty.
+                BOOL filling = sb.acConnected && !ChargerFallsShort(sb);
+                if (!ForecastFits(fv) || fv.forecast.thresholdPercent != (filling ? 80 : 20) ||
+                    fv.forecast.endpointPercent != (filling ? 100 : 0)) return Fail(__LINE__);
+                if ((FindIdentifier(pop, @"popover.row.charger") != nil) != ChargerFallsShort(sb)) return Fail(__LINE__);
                 if (!sb.acConnected && !([fv.endpointText hasSuffix:@"m"] || [fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
                 if (sb.percent <= 20 && !sb.acConnected && fv.thresholdText.length) return Fail(__LINE__);
                 if (sb.acConnected && sb.isCharging && sb.percent<80 &&
@@ -992,7 +995,9 @@ int main(int argc, const char **argv) {
                 BOOL moving = fabs(BatteryWatts(sb)) >= 0.3;
                 if (!FitsChildren(pop) || ![bd.stringValue hasSuffix:@" W"] || ![ta isKindOfClass:TrendArrow.class] ||
                     (moving && sb.percent > 0 && ta.hidden && !(BatteryWatts(sb) > 0 && sb.percent >= 80)) ||
-                    (moving && !ta.hidden && (BatteryWatts(sb) > 0) != (ta.to > ta.from))) {
+                    // Charging shows the green in-vector; draining shows the orange draw-vector.
+                    (moving && !ta.hidden && (BatteryWatts(sb) > 0 ? !(ta.to > ta.from)
+                                                                  : !(isfinite(ta.drawTo) && ta.drawTo < ta.from)))) {
                     fprintf(stderr, "battery state %zu: \"%s\"\n", i, bd.stringValue.UTF8String);
                     return Fail(__LINE__);
                 }
