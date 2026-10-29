@@ -1120,6 +1120,24 @@ int main(void) {
             NSArray *liveOnly = BurnRows(prev, cur, nil, 2.0, group);
             check(liveOnly.count >= 2 && [liveOnly[0][@"wh"] doubleValue] == 0, @"burn: without a baseline rows carry live watts only");
         }
+        {
+            // IDrive's root daemon hides its energy counter; its CPU share is priced at the
+            // readable rows' watts per core (8 W across 200% = 4 W per core).
+            NSArray *readableRows = @[@{@"name": @"node", @"watts": @8.0, @"wh": @0, @"pids": @[@10, @11]}];
+            NSDictionary *cpu = @{@10: @150, @11: @50, @20: @75, @21: @25, @30: @1.5};
+            NSArray *rows = BurnRowsWithUnreadable(readableRows, cpu, [NSSet setWithArray:@[@10, @11]],
+                ^NSString *(pid_t pid) { return pid >= 30 ? @"tiny" : pid >= 20 ? @"IDrive" : @"node"; });
+            check(rows.count == 2 && [rows[0][@"name"] isEqual:@"node"] && [rows[1][@"name"] isEqual:@"IDrive"] &&
+                  fabs([rows[1][@"watts"] doubleValue] - 4.0) < 1e-9 && [rows[1][@"estimated"] boolValue] &&
+                  ![rows[0][@"estimated"] boolValue],
+                  @"burn: unreadable daemons are estimated from CPU at the readable rate, under 2% ignored");
+            NSArray *cold = BurnRowsWithUnreadable(@[], @{@20: @100}, [NSSet set], ^NSString *(pid_t pid) { (void)pid; return @"IDrive"; });
+            check(cold.count == 1 && fabs([cold[0][@"watts"] doubleValue] - 1.5) < 1e-9,
+                  @"burn: with too little readable, an estimate uses 1.5 W per core");
+            check([SupportVendorFromPath(@"/Library/Application Support/IDriveforMac/IDriveHelperTools/bin/newbin/idrive_ver_001") isEqual:@"IDrive"] &&
+                  SupportVendorFromPath(@"/Applications/Safari.app/Contents/MacOS/Safari") == nil,
+                  @"burn: vendor helpers group under the vendor folder");
+        }
 
         // --- ClaudeUsageOverlayingStatusline ---
         NSDictionary *apiBody = @{@"limits": @[

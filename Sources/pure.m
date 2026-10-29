@@ -2277,6 +2277,7 @@ double QuotaWindowSeconds(NSDictionary *window) {
     return 0;
 }
 
+static NSArray<NSDictionary *> *SortedBurnRows(NSArray<NSDictionary *> *rows);
 NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
                                   NSDictionary<NSNumber *, NSNumber *> *cur,
                                   NSDictionary<NSNumber *, NSNumber *> *baseline,
@@ -2305,12 +2306,54 @@ NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
     }
     NSArray *rows = [groups.allValues filteredArrayUsingPredicate:
         [NSPredicate predicateWithFormat:@"watts >= 0.05 OR wh >= 0.01"]];
+    return SortedBurnRows(rows);
+}
+
+static NSArray<NSDictionary *> *SortedBurnRows(NSArray<NSDictionary *> *rows) {
     return [rows sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         double wa = [a[@"watts"] doubleValue], wb = [b[@"watts"] doubleValue];
         if (fabs(wa - wb) > 1e-9) return wa > wb ? NSOrderedAscending : NSOrderedDescending;
         double ha = [a[@"wh"] doubleValue], hb = [b[@"wh"] doubleValue];
         return ha > hb ? NSOrderedAscending : ha < hb ? NSOrderedDescending : [a[@"name"] compare:b[@"name"]];
     }];
+}
+
+NSArray<NSDictionary *> *BurnRowsWithUnreadable(NSArray<NSDictionary *> *rows,
+                                                NSDictionary<NSNumber *, NSNumber *> *cpuByPid,
+                                                NSSet<NSNumber *> *readable,
+                                                NSString *(^groupFor)(pid_t pid)) {
+    double readWatts = 0, readCPU = 0;
+    for (NSDictionary *r in rows) {
+        readWatts += [r[@"watts"] doubleValue];
+        for (NSNumber *pid in r[@"pids"]) readCPU += cpuByPid[pid].doubleValue;
+    }
+    double perCore = readCPU >= 10 ? MIN(6.0, MAX(0.3, readWatts / (readCPU / 100.0))) : 1.5;
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
+    for (NSDictionary *r in rows) groups[r[@"name"]] = [r mutableCopy];
+    for (NSNumber *pid in cpuByPid) {
+        double cpu = cpuByPid[pid].doubleValue;
+        if ([readable containsObject:pid] || !(cpu >= 2)) continue;
+        NSString *name = groupFor ? groupFor(pid.intValue) : nil;
+        if (!name.length) name = @"Other";
+        NSMutableDictionary *g = groups[name];
+        if (!g) groups[name] = g = [@{@"name": name, @"watts": @0.0, @"wh": @0.0, @"pids": @[]} mutableCopy];
+        g[@"pids"] = [g[@"pids"] arrayByAddingObject:pid];
+        g[@"watts"] = @([g[@"watts"] doubleValue] + cpu / 100.0 * perCore);
+        g[@"estimated"] = @YES;
+    }
+    return SortedBurnRows(groups.allValues);
+}
+
+NSString *SupportVendorFromPath(NSString *path) {
+    NSString *prefix = @"/Library/Application Support/";
+    NSRange r = [path rangeOfString:prefix];
+    if (r.location == NSNotFound) return nil;
+    NSArray<NSString *> *parts = [[path substringFromIndex:NSMaxRange(r)] pathComponents];
+    if (parts.count < 2) return nil;
+    NSString *vendor = parts.firstObject;
+    for (NSString *suffix in @[@" for Mac", @"forMac", @"ForMac"])
+        if ([vendor hasSuffix:suffix] && vendor.length > suffix.length) vendor = [vendor substringToIndex:vendor.length - suffix.length];
+    return vendor.length ? vendor : nil;
 }
 
 #pragma mark - Battery arrival forecasts

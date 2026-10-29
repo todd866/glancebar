@@ -710,6 +710,9 @@ static NSString *AppGroupForPid(pid_t pid) {
     if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
     NSString *p = [NSString stringWithUTF8String:path];
     if (!p) return nil;   // executable path was not valid UTF-8
+    // Vendor helpers and daemons (IDrive's backup, its daemon app) group under the vendor.
+    NSString *vendor = SupportVendorFromPath(p);
+    if (vendor) return vendor;
     NSRange app = [p rangeOfString:@".app/"];
     // Not inside a bundle: the executable path still names it better than `top`'s
     // command column does, which prints a bare version number for Claude Code.
@@ -880,6 +883,19 @@ static NSDictionary<NSNumber *, NSNumber *> *SnapshotProcessEnergy(void) {
     }
     free(pids);
     return out;
+}
+
+// pid -> %CPU for every process, root's included (ps needs no privilege for this).
+static NSDictionary<NSNumber *, NSNumber *> *ProcessCPUByPid(void) {
+    NSString *out = RunTaskOutput(@"/bin/ps", @[@"-axo", @"pid=,pcpu="]);
+    NSMutableDictionary *cpu = [NSMutableDictionary dictionary];
+    for (NSString *line in [out ?: @"" componentsSeparatedByString:@"\n"]) {
+        NSArray *f = [[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+            componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        f = [f filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+        if (f.count >= 2 && [f[0] intValue] > 0) cpu[@([f[0] intValue])] = @([f[1] doubleValue]);
+    }
+    return cpu;
 }
 
 static NSDictionary<NSString *, NSArray<NSDictionary *> *> *SampleProcessStats(int topN) {
@@ -6598,7 +6614,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [self batteryForecast];
     _powerTicks++;
     [self noteEnergyBaseline:wasOnAC];
-    if (!_bat.acConnected && _powerTicks % 2 == 0 && ![self activityTabSelected]) [self sampleBurnAsync];
+    if ([self burnActive] && _powerTicks % 2 == 0 && ![self activityTabSelected]) [self sampleBurnAsync];
     if (stateChanged) {
         if (popover) [self rebuildContent];
         if (details) [self rebuildDetails];
@@ -6656,9 +6672,15 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 // Unplugging takes one energy snapshot so "since unplug" has a starting point; plugging
 // in drops it. Launching on battery starts the count from launch instead.
+// Burn attribution runs whenever the battery is carrying load: on battery, or behind a
+// charger that falls short of the Mac's draw.
+- (BOOL)burnActive {
+    return _bat.valid && (!_bat.acConnected || ChargerFallsShort(_bat));
+}
+
 - (void)noteEnergyBaseline:(BOOL)wasOnAC {
     if (!_bat.valid) return;
-    if (_bat.acConnected) {
+    if (![self burnActive]) {
         _energyBaseline = nil; _energyPrev = nil; _energyBaselineAt = nil; _burnRows = nil;
         [_burnGroupCache removeAllObjects];
         return;
@@ -6672,16 +6694,17 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         NSDictionary *snap = SnapshotProcessEnergy();
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_energySampling = NO;
-            if (self->_bat.acConnected) return;   // plugged back in meanwhile
+            if (![self burnActive]) return;   // charging properly again meanwhile
             self->_energyBaseline = snap;
             self->_energyBaselineAt = at;
         });
     });
 }
 
-// The Mac's whole draw on battery: Apple's system-load telemetry, else the discharge.
+// The Mac's whole draw while the battery carries load: Apple's system-load telemetry,
+// else the discharge.
 - (double)burnDrawWatts {
-    if (!_bat.valid || _bat.acConnected) return -1;
+    if (![self burnActive]) return -1;
     if (_bat.systemLoad_mW > 0 && _bat.systemLoad_mW != LONG_MIN) return _bat.systemLoad_mW / 1000.0;
     double bw = BatteryWatts(_bat);
     return !isnan(bw) && bw < 0 ? -bw : -1;
@@ -6696,7 +6719,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 // One live energy sample (panel open, on battery). The first only seeds the delta.
 - (void)sampleBurnAsync {
-    if (!_bat.valid || _bat.acConnected || _energySampling) return;
+    if (![self burnActive] || _energySampling) return;
     _energySampling = YES;
     NSDictionary *prev = _energyPrev, *baseline = _energyBaseline;
     CFAbsoluteTime prevAt = _energyPrevAt;
@@ -6707,15 +6730,18 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         CFAbsoluteTime at = CFAbsoluteTimeGetCurrent();
         NSMutableDictionary *names = [NSMutableDictionary dictionary];
         @synchronized (cache) { [names addEntriesFromDictionary:cache]; }
-        NSArray *rows = BurnRows(prev, cur, baseline, prev ? at - prevAt : 0, ^NSString *(pid_t pid) {
+        NSString *(^group)(pid_t) = ^NSString *(pid_t pid) {
             NSString *name = names[@(pid)];
             if (!name) { name = AppGroupForPid(pid) ?: @""; names[@(pid)] = name; }
             return name;
-        });
+        };
+        NSArray *rows = BurnRows(prev, cur, baseline, prev ? at - prevAt : 0, group);
+        // Root daemons (a backup running with its app closed) hide their energy: estimate them.
+        if (prev) rows = BurnRowsWithUnreadable(rows, ProcessCPUByPid(), [NSSet setWithArray:cur.allKeys], group);
         @synchronized (cache) { [cache addEntriesFromDictionary:names]; }
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_energySampling = NO;
-            if (self->_bat.acConnected) return;
+            if (![self burnActive]) return;
             self->_energyPrev = cur;
             self->_energyPrevAt = at;
             if (prev) { self->_burnRows = rows; [self refreshVisibleSurfaces]; }
@@ -7452,8 +7478,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     for (NSDictionary *row in _burnRows) {
         double w = [row[@"watts"] doubleValue], wh = [row[@"wh"] doubleValue];
         apps += w;
-        [lines addObject:hasWh ? [NSString stringWithFormat:@"%@ %.1f W · %.1f Wh", BurnShortName(row[@"name"]), w, wh]
-                               : [NSString stringWithFormat:@"%@ %.1f W", BurnShortName(row[@"name"]), w]];
+        // A root daemon's watts are estimated from its CPU share; it has no Wh.
+        if ([row[@"estimated"] boolValue])
+            [lines addObject:[NSString stringWithFormat:@"%@ ~%.1f W (from CPU)", BurnShortName(row[@"name"]), w]];
+        else [lines addObject:hasWh ? [NSString stringWithFormat:@"%@ %.1f W · %.1f Wh", BurnShortName(row[@"name"]), w, wh]
+                                    : [NSString stringWithFormat:@"%@ %.1f W", BurnShortName(row[@"name"]), w]];
     }
     double since = [self burnSinceBaselineWh];
     if (draw > 0) {
@@ -7473,7 +7502,17 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSDictionary *top = _burnRows.firstObject;
     double watts = [top[@"watts"] doubleValue];
     int gain = BurnGainMinutes(MinutesTo20(_bat, [self avgAmp]), draw, watts);
-    if (draw <= 0 || !top || gain < 0) return y;
+    // Behind a short charger only the net drain empties the pack; quitting an app that
+    // costs more than that turns the drain into a charge.
+    BOOL turnsToCharge = NO;
+    if (ChargerFallsShort(_bat)) {
+        double net = -BatteryWatts(_bat), fullWh = BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV);
+        int minutes = _bat.percent > 20 && fullWh > 0 && net > 0
+            ? (int)lround((_bat.percent - 20) / 100.0 * fullWh / net * 60.0) : -1;
+        turnsToCharge = watts >= net && watts >= 1;
+        gain = turnsToCharge ? 0 : BurnGainMinutes(minutes, net, watts);
+    }
+    if (draw <= 0 || !top || (gain < 0 && !turnsToCharge)) return y;
     ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
     row.target = self;
     row.action = @selector(showBatteryDetails:);
@@ -7497,10 +7536,12 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     bar.accessibilityIdentifier = @"popover.burn.gauge";
     bar.accessibilityHelp = tip;
     [row addSubview:bar];
+    // Root daemons' watts are estimated from CPU share: say so with "≈".
     NSString *value = [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts];
     [self instrumentValue:value color:watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
                identifier:@"popover.burn.value" in:row].accessibilityHelp = tip;
-    [self instrumentDatum:[@"quit +" stringByAppendingString:FmtDuration(gain)] color:NSColor.secondaryLabelColor
+    [self instrumentDatum:turnsToCharge ? @"quit \u2192 charges" : [@"quit +" stringByAppendingString:FmtDuration(gain)]
+                    color:turnsToCharge ? NSColor.systemGreenColor : NSColor.secondaryLabelColor
                identifier:@"popover.burn.datum" in:row].accessibilityHelp = tip;
     [root addSubview:row];
     return y + kRowH;

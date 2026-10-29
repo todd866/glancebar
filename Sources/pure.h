@@ -251,6 +251,19 @@ NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
                                   NSDictionary<NSNumber *, NSNumber *> *baseline,
                                   double dtSeconds, NSString *(^groupFor)(pid_t pid));
 
+// Root-owned processes (backup and sync daemons) hide their energy counters. Estimate
+// their watts from CPU share (pid -> ps %CPU) at the rate the readable rows burn per core
+// (clamped 0.3–6 W per core, 1.5 when too little was readable to say). Pids in `readable`
+// are already counted; others at 2% CPU or more are grouped by groupFor, merged into the
+// rows by name and marked @"estimated": @YES. Heaviest first, as BurnRows.
+NSArray<NSDictionary *> *BurnRowsWithUnreadable(NSArray<NSDictionary *> *rows,
+                                                NSDictionary<NSNumber *, NSNumber *> *cpuByPid,
+                                                NSSet<NSNumber *> *readable,
+                                                NSString *(^groupFor)(pid_t pid));
+// "/Library/Application Support/IDriveforMac/…/idrive_ver_001" -> "IDrive": the vendor
+// folder of a helper installed outside any app bundle, nil otherwise.
+NSString *SupportVendorFromPath(NSString *path);
+
 // Elapsed Cursor windows (billing cycle ended, or auth buckets with a past cycle marker).
 // Same role as ClaudeStaleLimitWindows. Empty when nothing elapsed-and-usable remains.
 NSArray<NSDictionary *> *CursorStaleLimitWindows(NSDictionary *usage, double nowEpoch);

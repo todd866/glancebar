@@ -166,7 +166,10 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
-    if (view.toolTip.length && !RecoveryTip(view)) return NO;
+    if (view.toolTip.length && !RecoveryTip(view)) {
+        fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
+        return NO;
+    }
     for (NSView *child in view.subviews) {
         // AppKit's segmented control has an empty private hosting view before
         // window layout. It paints no content and NSContainsRect rejects empty rects.
@@ -1159,6 +1162,37 @@ int main(int argc, const char **argv) {
             [c setValue:@[@{@"name": @"Finder", @"watts": @0.2, @"wh": @0.1}] forKey:@"burnRows"];
             [c rebuildContent];
             if (FindIdentifier(p.contentViewController.view, @"popover.row.burn")) return Fail(__LINE__);
+            {
+                // A plane's USB port: 6 W in, the Mac using 16 W, IDrive's root daemon estimated.
+                BatteryState shortCharger = onBattery;
+                shortCharger.acConnected = YES; shortCharger.percent = 68; shortCharger.minutesToEmpty = -1;
+                shortCharger.systemPowerIn_mW = 6000; shortCharger.systemLoad_mW = 16000;
+                shortCharger.amperage_mA = -(long)lround(10.0e6 / shortCharger.voltage_mV);
+                [c setValue:[NSValue valueWithBytes:&shortCharger objCType:@encode(BatteryState)] forKey:@"bat"];
+                for (NSNumber *appW in @[@9, @11]) {
+                    [c setValue:@[@{@"name": @"IDrive", @"watts": appW, @"wh": @0, @"estimated": @YES}] forKey:@"burnRows"];
+                    [c rebuildContent];
+                    pop = p.contentViewController.view;
+                    burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
+                    burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
+                    BOOL charges = appW.doubleValue >= 10;
+                    if (!FindIdentifier(pop, @"popover.row.burn") || !FindIdentifier(pop, @"popover.row.charger") ||
+                        ![burnValue.stringValue hasSuffix:@" W"] ||
+                        (charges ? ![burnDatum.stringValue isEqual:@"quit \u2192 charges"] : ![burnDatum.stringValue hasPrefix:@"quit +"]) ||
+                        [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds) ||
+                        !FitsChildren(pop)) {
+                        fprintf(stderr, "short charger burn: \"%s\" \"%s\" row %d charger %d width %.1f/%.1f fits %d\n", burnValue.stringValue.UTF8String, burnDatum.stringValue.UTF8String,
+                            FindIdentifier(pop, @"popover.row.burn") != nil, FindIdentifier(pop, @"popover.row.charger") != nil,
+                            [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width, NSWidth(burnDatum.bounds), FitsChildren(pop));
+                        return Fail(__LINE__);
+                    }
+                    if (argc > 1) {
+                        NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                        NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                        if (!RenderOffscreen(pop, [stem stringByAppendingFormat:@"-burn-short-%@.png", appW], look)) return Fail(__LINE__);
+                    }
+                }
+            }
             // Keep an actionable sample on AC to prove power source alone hides it.
             [c setValue:@[@{@"name": @"node", @"watts": @14, @"wh": @2}] forKey:@"burnRows"];
             [c setValue:nil forKey:@"energyBaselineAt"];
