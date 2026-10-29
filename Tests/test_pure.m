@@ -1936,6 +1936,35 @@ int main(void) {
                   [paused[@"title"] isEqual:@"Title"] && [paused[@"artist"] isEqual:@"Artist"] &&
                   [paused[@"count"] integerValue] == 0 && [paused[@"denied"] isEqual:@""],
                   @"music: paused status");
+            NSString *amLine = [@[@"playing", @"true", @"Lightning Crashes", @"LIVE", @"Throwing Copper",
+                                  @"324040", @"83500", @"true", @"05B03F325CDA690B", @"Liked"]
+                                componentsJoinedByString:YouTubeStatusSeparator];
+            NSDictionary *am = ParseAppleMusicStatus(amLine);
+            check([am[@"loaded"] boolValue] && [am[@"playing"] boolValue] && [am[@"shuffle"] boolValue] &&
+                  [am[@"favorited"] boolValue] && [am[@"title"] isEqual:@"Lightning Crashes"] &&
+                  [am[@"album"] isEqual:@"Throwing Copper"] && [am[@"trackID"] isEqual:@"05B03F325CDA690B"] &&
+                  [am[@"playlist"] isEqual:@"Liked"] && fabs([am[@"duration"] doubleValue] - 324.04) < 0.001 &&
+                  fabs([am[@"elapsed"] doubleValue] - 83.5) < 0.001,
+                  @"apple music: playing status");
+            NSDictionary *amStopped = ParseAppleMusicStatus([@[@"stopped", @"false"] componentsJoinedByString:YouTubeStatusSeparator]);
+            check(![amStopped[@"loaded"] boolValue] && ![amStopped[@"playing"] boolValue] &&
+                  [amStopped[@"state"] isEqual:@"stopped"] && [amStopped[@"title"] isEqual:@""] &&
+                  !amStopped[@"duration"] && !amStopped[@"elapsed"],
+                  @"apple music: stopped has no track");
+            NSDictionary *amPaused = ParseAppleMusicStatus([@[@"paused", @"false", @"T", @"A", @"", @"x", @"-5"]
+                                                            componentsJoinedByString:YouTubeStatusSeparator]);
+            check([amPaused[@"loaded"] boolValue] && ![amPaused[@"playing"] boolValue] &&
+                  !amPaused[@"duration"] && !amPaused[@"elapsed"] && [amPaused[@"playlist"] isEqual:@""],
+                  @"apple music: paused, unreadable clock fields are absent");
+            check(![ParseAppleMusicStatus(nil)[@"loaded"] boolValue] &&
+                  [ParseAppleMusicStatus(@"execution error: Music got an error (-1743)")[@"state"] isEqual:@""],
+                  @"apple music: nil and error text are not a track");
+            check([AppleScriptQuoted(@"My \"Best\" \\ Mix") isEqual:@"\"My \\\"Best\\\" \\\\ Mix\""] &&
+                  [AppleScriptQuoted(nil) isEqual:@"\"\""],
+                  @"apple music: playlist names are quoted for AppleScript");
+            check([FormatTrackClock(83.5, 243) isEqual:@"1:23"] && [FormatTrackClock(500, 243) isEqual:@"4:03"] &&
+                  [FormatTrackClock(61, 3700) isEqual:@"0:01:01"] && !FormatTrackClock(1, 0),
+                  @"apple music: one clock");
             NSDictionary *none = ParseYouTubeStatus(@"\n", nil);
             check(![none[@"tab"] boolValue] && none[@"playing"] == (id)NSNull.null &&
                   [none[@"title"] isEqual:@""] && [none[@"artist"] isEqual:@""] &&

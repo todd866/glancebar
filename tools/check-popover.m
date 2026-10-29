@@ -520,7 +520,8 @@ int main(int argc, const char **argv) {
         NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");
         if (![claudeDatum.stringValue hasPrefix:@"resets "]) return Fail(__LINE__);
         NSView *output = FindIdentifier(root, @"popover.sound");
-        if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) ||
+        if (!SoundRow(root, @"Favourite Songs", @"Shuffle · Apple Music", NO) ||
+            !FindIdentifier(root, @"popover.music.open") ||
             ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
             ![output.accessibilityHelp isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
@@ -743,8 +744,50 @@ int main(int argc, const char **argv) {
             [c setValue:@NO forKey:@"playbackPlaying"];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (!SoundRow(root, @"Liked Music", @"Shuffle · YouTube Music", NO) || !FitsChildren(root))
+            if (!SoundRow(root, @"Favourite Songs", @"Shuffle · Apple Music", NO) || !FitsChildren(root))
                 return Fail(__LINE__);
+        } else if (musicState && strcmp(musicState, "apple") == 0) {
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@YES forKey:@"amLoaded"];
+            [c setValue:@YES forKey:@"amFavorited"];
+            [c setValue:@YES forKey:@"amShuffle"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Lightning Crashes" forKey:@"amTitle"];
+            [c setValue:@"LIVE" forKey:@"amArtist"];
+            [c setValue:@"Throwing Copper" forKey:@"amAlbum"];
+            [c setValue:@"Favourite Songs" forKey:@"amPlaylist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@324 forKey:@"trackDuration"];
+            const char *art = getenv("GLANCEBAR_MUSIC_ART");
+            if (art) {
+                NSImage *cover = [[NSImage alloc] initWithContentsOfFile:@(art)];
+                cover.size = NSMakeSize(32, 32);
+                [c setValue:cover forKey:@"amArt"];
+            }
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSSlider *position = (NSSlider *)FindIdentifier(root, @"popover.music.position");
+            NSTextField *elapsed = (NSTextField *)FindIdentifier(root, @"popover.music.elapsed");
+            NSTextField *length = (NSTextField *)FindIdentifier(root, @"popover.music.duration");
+            NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            NSButton *shuffle = (NSButton *)FindIdentifier(root, @"popover.music.shuffle");
+            if (!SoundRow(root, @"Lightning Crashes", @"LIVE", YES) || !FitsChildren(root) ||
+                ![position isKindOfClass:NSSlider.class] || fabs(position.doubleValue - 83) > 1 ||
+                ![elapsed.stringValue isEqual:@"1:23"] || ![length.stringValue isEqual:@"5:24"] ||
+                ![heart.accessibilityLabel isEqual:@"Remove from Favourites"] ||
+                ![shuffle.accessibilityValue isEqual:@"on"] ||
+                ![FindIdentifier(root, @"popover.music.open").accessibilityHelp containsString:@"Throwing Copper"])
+                return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(root, [stem stringByAppendingString:@"-music.png"], look)) return Fail(__LINE__);
+            }
+            // The scrubber line is the only extra height; later fixtures measure the idle panel.
+            [c setValue:@NO forKey:@"amLoaded"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
         }
         if (!ActionableMenuImages([c moreMenu])) return Fail(__LINE__);
         // Toolbar tabs, built but not ordered front. Every tab keeps its identifier and a symbol.

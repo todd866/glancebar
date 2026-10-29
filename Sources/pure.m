@@ -1882,6 +1882,52 @@ NSString *FormatTrackTime(double elapsed, double duration) {
             FormatClockPart(duration, withHours)];
 }
 
+static NSNumber *AppleMusicMilliseconds(NSArray<NSString *> *fields, NSUInteger index) {
+    NSString *field = YouTubeStatusField(fields, index);
+    if (!field.length) return nil;
+    NSScanner *scanner = [NSScanner scannerWithString:field];
+    long long value = 0;
+    if (![scanner scanLongLong:&value] || !scanner.isAtEnd || value < 0) return nil;
+    return @(value / 1000.0);
+}
+
+NSDictionary *ParseAppleMusicStatus(NSString *output) {
+    NSString *out = [output isKindOfClass:NSString.class] ? output : @"";
+    NSString *trimmed = [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSArray<NSString *> *fields = [trimmed containsString:YouTubeStatusSeparator]
+        ? [trimmed componentsSeparatedByString:YouTubeStatusSeparator] : @[];
+    NSString *state = YouTubeStatusField(fields, 0).lowercaseString;
+    NSString *title = YouTubeStatusField(fields, 2);
+    BOOL playing = [state isEqual:@"playing"];
+    BOOL loaded = (playing || [state isEqual:@"paused"]) && title.length > 0;
+    NSMutableDictionary *status = [@{
+        @"state": state, @"loaded": @(loaded), @"playing": @(playing),
+        @"shuffle": @([YouTubeStatusField(fields, 1) isEqual:@"true"]),
+        @"title": title, @"artist": YouTubeStatusField(fields, 3), @"album": YouTubeStatusField(fields, 4),
+        @"favorited": @([YouTubeStatusField(fields, 7) isEqual:@"true"]),
+        @"trackID": YouTubeStatusField(fields, 8), @"playlist": YouTubeStatusField(fields, 9),
+    } mutableCopy];
+    NSNumber *duration = AppleMusicMilliseconds(fields, 5);
+    NSNumber *elapsed = AppleMusicMilliseconds(fields, 6);
+    if (duration && duration.doubleValue > 0) status[@"duration"] = duration;
+    if (elapsed) status[@"elapsed"] = elapsed;
+    return status;
+}
+
+NSString *AppleScriptQuoted(NSString *text) {
+    NSString *s = [text isKindOfClass:NSString.class] ? text : @"";
+    s = [s stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    s = [s stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    return [NSString stringWithFormat:@"\"%@\"", s];
+}
+
+NSString *FormatTrackClock(double seconds, double duration) {
+    if (!isfinite(duration) || duration <= 0 || !isfinite(seconds)) return nil;
+    if (seconds < 0) seconds = 0;
+    if (seconds > duration) seconds = duration;
+    return FormatClockPart(seconds, duration >= 3600.0);
+}
+
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing) {
     return localMode && networkOnline && !playing;
 }

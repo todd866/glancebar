@@ -553,6 +553,19 @@ NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText);
 // Elapsed is clamped into [0, duration].
 NSString *FormatTrackTime(double elapsed, double duration);
 
+// --- Apple Music (Music.app over AppleScript) ---
+// One osascript round trip, fields split on YouTubeStatusSeparator: state ("playing", "paused",
+// "stopped", ...), shuffle ("true"/"false"), title, artist, album, duration ms, position ms,
+// favourited ("true"/"false"), persistent ID, playlist name. A stopped player sends only the
+// first two. Keys: state (lowercased, @"" when unreadable), loaded (playing or paused with a
+// title), playing (BOOL), shuffle, favorited (BOOLs), title, artist, album, trackID, playlist
+// (strings, never nil); elapsed and duration (seconds) only when the script sent whole numbers.
+NSDictionary *ParseAppleMusicStatus(NSString *output);
+// An AppleScript string literal: quotes and backslashes escaped, wrapped in double quotes.
+NSString *AppleScriptQuoted(NSString *text);
+// One side of FormatTrackTime ("1:23", or "0:01:23" once the track reaches an hour); nil like it.
+NSString *FormatTrackClock(double seconds, double duration);
+
 // The offline player is in the way: online, local mode, and not actually playing.
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing);
 // lastOpen <= 0 means Glancebar has not opened a tab. Otherwise at most one open per 60s.

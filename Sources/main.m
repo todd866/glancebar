@@ -4710,6 +4710,58 @@ static void PostSystemMediaKey(UInt32 keyCode) {
 static BOOL ChromeIsRunning(void) {
     return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
 }
+static NSString *const kAppleMusicBundleID = @"com.apple.Music";
+static BOOL AppleMusicIsRunning(void) {
+    return [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID].count > 0;
+}
+// Runs command inside Music, then reads the player back in the same round trip, so a
+// button press answers with the state it produced. Fields: ParseAppleMusicStatus.
+// Clocks go out as whole milliseconds: a real would be written in the user's locale.
+static NSString *AppleMusicScript(NSString *command) {
+    return [NSString stringWithFormat:@"tell application \"Music\"\n%@\n"
+        "set sep to character id 31\n"
+        "set pstate to (player state as text)\n"
+        "set shuf to (shuffle enabled as text)\n"
+        "if pstate is \"stopped\" then return pstate & sep & shuf\n"
+        "try\n"
+        "set trk to current track\n"
+        "set fav to \"false\"\n"
+        "try\nset fav to (favorited of trk) as text\nend try\n"
+        "set plist to \"\"\n"
+        "try\nset plist to name of current playlist\nend try\n"
+        "set dur to 0\n"
+        "try\nset dur to ((duration of trk) * 1000) as integer\nend try\n"
+        "set ppos to 0\n"
+        "try\nset ppos to (player position * 1000) as integer\nend try\n"
+        "return pstate & sep & shuf & sep & (name of trk) & sep & (artist of trk) & sep & (album of trk) & sep & dur & sep & ppos & sep & fav & sep & (persistent ID of trk) & sep & plist\n"
+        "on error\nreturn pstate & sep & shuf\nend try\n"
+        "end tell", command ?: @""];
+}
+static NSString *const kAppleMusicAutomationNote = @"Allow Glancebar to control Music: System Settings ▸ Privacy & Security ▸ Automation";
+static NSString *AppleMusicArtPath(void) {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+        ?: [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
+    NSString *dir = [caches stringByAppendingPathComponent:@"com.iantodd.glancebar"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    return [dir stringByAppendingPathComponent:@"now-playing-art"];
+}
+// 1200 px covers come back from Music. Keep a 96 px copy, not the decoded original.
+static NSImage *AppleMusicThumbnail(NSString *path, CGFloat side) {
+    NSImage *full = [[NSImage alloc] initWithContentsOfFile:path];
+    if (!full) return nil;
+    NSInteger px = (NSInteger)ceil(side * 3);
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:px pixelsHigh:px
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+        bytesPerRow:0 bitsPerPixel:0];
+    if (!rep) return nil;
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    [full drawInRect:NSMakeRect(0, 0, px, px) fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1];
+    [NSGraphicsContext restoreGraphicsState];
+    NSImage *small = [[NSImage alloc] initWithSize:NSMakeSize(side, side)];
+    [small addRepresentation:rep];
+    return small;
+}
 static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [NSTask new];
@@ -4917,6 +4969,12 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     double _trackElapsed, _trackDuration;   // last probe; the tick interpolates from _trackSampledAt
     CFAbsoluteTime _trackSampledAt;
     NSTimer *_trackTick;
+    // Apple Music is the play target online. Loaded = Music has a playing or paused track.
+    BOOL _amLoaded, _amFavorited, _amShuffle, _amStatusInFlight, _amStartPending;
+    NSString *_amTitle, *_amArtist, *_amAlbum, *_amPlaylist, *_amTrackID, *_amArtTrackID;
+    NSImage *_amArt;
+    NSTimer *_amProbeTimer;
+    NSUInteger _amGen;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -5047,6 +5105,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
     _musicProbesEnabled = YES;
     [self startNetworkMonitor];
+    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(appleMusicChanged:)
+                                                          name:@"com.apple.Music.playerInfo" object:nil];
     [self startAudioOutputWatch];
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
@@ -5343,6 +5403,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self runYouTubeStatusAfter:0 generation:_musicGen];
 }
 - (void)applyYouTubeStatus:(NSDictionary *)status updateTransport:(BOOL)updateTransport {
+    if (_amLoaded) { [self stopYouTubeProbeTimer]; return; }   // Music owns the row while it has a track
     NSString *denied = [status[@"denied"] isKindOfClass:NSString.class] ? status[@"denied"] : @"";
     // The hint follows the last script. A later success clears it; it is not a one-shot default.
     if ([denied isEqual:@"javascript"]) {
@@ -5559,13 +5620,213 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [self runYouTubeStatusAfter:0.3 generation:generation];
     });
 }
+// --- Apple Music ---
+- (NSString *)appleMusicPlaylistName {
+    NSString *name = [NSUserDefaults.standardUserDefaults stringForKey:@"appleMusicPlaylist"];
+    return name.length ? name : @"Favourite Songs";
+}
+// Popover open: Music first; YouTube is read only when Music has nothing loaded.
+- (void)refreshMusicSources {
+    if (!_musicProbesEnabled) return;
+    if (!AppleMusicIsRunning()) {
+        [self clearAppleMusic];
+        [self runYouTubeStatusAfter:0 generation:_musicGen];
+        return;
+    }
+    [self runAppleMusicCommand:@"" followUp:NO];
+}
+- (void)appleMusicChanged:(NSNotification *)note {
+    NSString *state = [note.userInfo[@"Player State"] isKindOfClass:NSString.class] ? note.userInfo[@"Player State"] : @"";
+    if (!_popover.isShown) {
+        // Nothing is drawn; just stop routing buttons to a player that has stopped.
+        if ([state isEqual:@"Stopped"]) [self clearAppleMusic];
+        return;
+    }
+    [self runAppleMusicCommand:@"" followUp:NO];
+}
+- (void)clearAppleMusic {
+    if (!_amLoaded) return;
+    _amLoaded = NO;
+    _amTitle = _amArtist = _amAlbum = _amTrackID = nil;
+    _playbackKnown = NO;
+    _playbackPlaying = NO;
+    _trackDuration = 0;
+    _trackSampledAt = 0;
+    [self stopAppleMusicProbeTimer];
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)startAppleMusicProbeTimer {
+    if (_amProbeTimer) return;
+    _amProbeTimer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(appleMusicProbeFired:)
+                                                   userInfo:nil repeats:YES];
+}
+- (void)stopAppleMusicProbeTimer {
+    [_amProbeTimer invalidate];
+    _amProbeTimer = nil;
+}
+- (void)appleMusicProbeFired:(NSTimer *)timer {
+    (void)timer;
+    if (!_popover.isShown || !_amLoaded) { [self stopAppleMusicProbeTimer]; return; }
+    if (!_amStatusInFlight) [self runAppleMusicCommand:@"" followUp:NO];
+}
+// A tell block launches Music, so every probe checks it is running first. Commands that
+// change the track read back once more: Music answers before the new track has loaded.
+- (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp {
+    if (!_musicProbesEnabled) return;
+    if (!AppleMusicIsRunning()) { [self clearAppleMusic]; return; }
+    NSUInteger generation = ++_amGen;
+    _amStatusInFlight = YES;
+    RunAppleScript(AppleMusicScript(command), ^(NSString *output, NSString *errorText, int status) {
+        if (generation != self->_amGen) return;
+        self->_amStatusInFlight = NO;
+        if (ChromeAutomationDenied(errorText)) {
+            self->_musicNote = kAppleMusicAutomationNote;
+            if (self->_popover.isShown) [self rebuildContent];
+            return;
+        }
+        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) return;   // timeout: keep what we had
+        [self applyAppleMusicStatus:ParseAppleMusicStatus(output)];
+        if (followUp)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (generation == self->_amGen) [self runAppleMusicCommand:@"" followUp:NO];
+            });
+    });
+}
+- (void)applyAppleMusicStatus:(NSDictionary *)status {
+    if ([_musicNote isEqualToString:kAppleMusicAutomationNote]) _musicNote = nil;
+    _amShuffle = [status[@"shuffle"] boolValue];
+    if (![status[@"loaded"] boolValue]) {
+        BOOL was = _amLoaded;
+        [self clearAppleMusic];
+        if (was || !_ytTabOpen) [self runYouTubeStatusAfter:0 generation:_musicGen];
+        else if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    if (_localMode) {
+        // The offline player keeps the row unless Music is actually playing over it.
+        if (![status[@"playing"] boolValue]) { [self clearAppleMusic]; return; }
+        [self stopLocalForYouTube];
+    }
+    _amLoaded = YES;
+    [self stopYouTubeProbeTimer];
+    _playbackKnown = YES;
+    _playbackPlaying = [status[@"playing"] boolValue];
+    _amTitle = status[@"title"];
+    _amArtist = status[@"artist"];
+    _amAlbum = status[@"album"];
+    _amPlaylist = status[@"playlist"];
+    _amFavorited = [status[@"favorited"] boolValue];
+    _amTrackID = status[@"trackID"];
+    NSNumber *duration = status[@"duration"], *elapsed = status[@"elapsed"];
+    _trackDuration = duration ? duration.doubleValue : 0;
+    _trackElapsed = elapsed ? elapsed.doubleValue : 0;
+    _trackSampledAt = CFAbsoluteTimeGetCurrent();
+    if (_amTrackID.length && ![_amTrackID isEqual:_amArtTrackID]) [self fetchAppleMusicArt];
+    if (_popover.isShown) { [self startAppleMusicProbeTimer]; [self rebuildContent]; }
+}
+- (void)fetchAppleMusicArt {
+    NSString *trackID = _amTrackID;
+    _amArtTrackID = trackID;
+    _amArt = nil;
+    NSString *path = AppleMusicArtPath();
+    NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
+        "set artData to raw data of artwork 1 of current track\n"
+        "set trackID to persistent ID of current track\n"
+        "end tell\n"
+        "set artFile to open for access (POSIX file %@) with write permission\n"
+        "try\nset eof artFile to 0\nwrite artData to artFile\nend try\n"
+        "close access artFile\n"
+        "return trackID", AppleScriptQuoted(path)];
+    RunAppleScript(script, ^(NSString *output, NSString *errorText, int status) {
+        (void)errorText;
+        NSString *got = [output stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (status != 0 || ![got isEqual:trackID] || ![self->_amTrackID isEqual:trackID]) return;
+        self->_amArt = AppleMusicThumbnail(path, 32);
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+- (void)startAppleMusicPlayback {
+    if (!_musicProbesEnabled || _amStartPending) return;
+    NSString *names = [NSString stringWithFormat:@"{%@, \"Favourite Songs\", \"Favorite Songs\"}",
+                       AppleScriptQuoted([self appleMusicPlaylistName])];
+    NSString *start = [NSString stringWithFormat:
+        @"set shuffle enabled to true\n"
+        "set started to false\n"
+        "repeat with pick in %@\n"
+        "if not started and (exists user playlist (contents of pick)) then\n"
+        "play user playlist (contents of pick)\n"
+        "set started to true\n"
+        "end if\n"
+        "end repeat\n"
+        "if not started then play library playlist 1", names];
+    if (AppleMusicIsRunning()) { [self runAppleMusicCommand:start followUp:YES]; return; }
+    NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
+    if (!app) { [self startYouTubePlayback]; return; }
+    // Launched hidden: playing music is not a reason to take the screen.
+    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+    config.activates = NO;
+    config.hides = YES;
+    _amStartPending = YES;
+    [NSWorkspace.sharedWorkspace openApplicationAtURL:app configuration:config
+                                    completionHandler:^(NSRunningApplication *running, NSError *error) {
+        (void)running;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self->_amStartPending = NO;
+            if (error) { [self startYouTubePlayback]; return; }
+            [self runAppleMusicCommand:start followUp:YES];
+        });
+    }];
+}
+- (IBAction)openAppleMusic:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    [_popover performClose:nil];
+    if (!AppleMusicIsRunning()) {
+        NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
+        if (app) [NSWorkspace.sharedWorkspace openApplicationAtURL:app configuration:[NSWorkspaceOpenConfiguration configuration]
+                                                 completionHandler:nil];
+        return;
+    }
+    RunAppleScript(@"tell application \"Music\"\ntry\nreveal current track\nend try\nactivate\nend tell",
+                   ^(NSString *o, NSString *e, int st) { (void)o; (void)e; (void)st; });
+}
+- (IBAction)musicFavorite:(id)sender {
+    (void)sender;
+    if (!_amLoaded) return;
+    _amFavorited = !_amFavorited;   // answer the click now; the read-back confirms it
+    if (_popover.isShown) [self rebuildContent];
+    [self runAppleMusicCommand:[NSString stringWithFormat:@"try\nset favorited of current track to %@\nend try",
+                                _amFavorited ? @"true" : @"false"] followUp:NO];
+}
+- (IBAction)musicShuffle:(id)sender {
+    (void)sender;
+    if (!_amLoaded) return;
+    _amShuffle = !_amShuffle;
+    if (_popover.isShown) [self rebuildContent];
+    [self runAppleMusicCommand:[NSString stringWithFormat:@"set shuffle enabled to %@", _amShuffle ? @"true" : @"false"]
+                      followUp:NO];
+}
+- (IBAction)musicSeek:(id)sender {
+    if (!_amLoaded || ![sender isKindOfClass:NSSlider.class]) return;
+    double seconds = ((NSSlider *)sender).doubleValue;
+    if (!isfinite(seconds) || seconds < 0) return;
+    _trackElapsed = seconds;
+    _trackSampledAt = CFAbsoluteTimeGetCurrent();
+    [self runAppleMusicCommand:[NSString stringWithFormat:@"set player position to %ld", (long)seconds] followUp:NO];
+}
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
     if (_localMode) { [self toggleLocalPlayback]; return; }
+    if (_amLoaded) {
+        _playbackPlaying = !_playbackPlaying;
+        if (_popover.isShown) [self rebuildContent];
+        [self runAppleMusicCommand:@"playpause\ndelay 0.3" followUp:YES];
+        return;
+    }
     if (_ytTabOpen) { [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY]; return; }
     if (_networkKnown && !_networkOnline) { [self startOfflinePlayback]; return; }
-    [self startYouTubePlayback];
+    [self startAppleMusicPlayback];
 }
 - (IBAction)musicPrevious:(id)sender {
     (void)sender;
@@ -5584,12 +5845,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [self playLocalIndex:_localIndex - 1];
         return;
     }
+    if (_amLoaded) { [self runAppleMusicCommand:@"back track\ndelay 0.3" followUp:YES]; return; }
     if (_ytTabOpen) [self sendYouTubeCommand:@"previous" key:NX_KEYTYPE_PREVIOUS];
 }
 - (IBAction)musicNext:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
     if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
+    if (_amLoaded) { [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES]; return; }
     if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
 }
 - (NSButton *)transportButton:(NSString *)symbol pointSize:(CGFloat)pointSize side:(CGFloat)side
@@ -5630,6 +5893,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (![subtitle isKindOfClass:NSTextField.class]) return;
     double elapsed = _trackElapsed;
     if (_trackSampledAt > 0) elapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
+    if (_amLoaded && !_localMode) {
+        NSView *view = _popover.contentViewController.view;
+        NSTextField *now = (NSTextField *)ViewWithAccessibilityIdentifier(view, @"popover.music.elapsed");
+        NSSlider *slider = (NSSlider *)ViewWithAccessibilityIdentifier(view, @"popover.music.position");
+        NSString *clock = FormatTrackClock(elapsed, _trackDuration);
+        if ([now isKindOfClass:NSTextField.class] && clock) now.stringValue = clock;
+        if ([slider isKindOfClass:NSSlider.class]) slider.doubleValue = MIN(elapsed, _trackDuration);
+        return;
+    }
     NSString *time = FormatTrackTime(elapsed, _trackDuration);
     if (!time.length) return;
     NSString *artist = _localMode ? _localArtist : _ytArtist;
@@ -5649,7 +5921,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
     BOOL offline = [self musicOffline];
-    BOOL loaded = _ytTabOpen || _localMode;
+    BOOL am = _amLoaded && !_localMode;
+    BOOL loaded = _ytTabOpen || _localMode || am;
+    // Idle and online, Play starts Apple Music; the cover slot shows Music's icon until then.
+    BOOL amTarget = am || (!_localMode && !_ytTabOpen && !offline);
     if (_musicProbesEnabled && offline && !_localMode) {
         NSArray *tracks = [self offlineTrackPaths];
         _localEmpty = tracks.count == 0;
@@ -5663,6 +5938,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_localMode && _localTitle.length) {
         trackTitle = _localTitle;
         trackArtist = _localArtist;
+    } else if (am) {
+        trackTitle = _amTitle;
+        trackArtist = _amArtist;
     } else if (!_localMode && _ytTabOpen && _ytTitle.length) {
         trackTitle = _ytTitle;
         trackArtist = _ytArtist;
@@ -5699,8 +5977,49 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     output.frame = NSMakeRect(kW - kPad - kLeadW, (kSoundH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
     [row addSubview:output];
     CGFloat textX = NSMaxX(next.frame) + 8;
-    CGFloat textW = NSMinX(output.frame) - 8 - textX;
-    NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
+    CGFloat textRight = NSMinX(output.frame) - 8;
+    NSString *detail = nil;
+    if (am) {
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSString *part in @[_amTitle ?: @"", _amArtist ?: @"", _amAlbum ?: @"", _amPlaylist ?: @""])
+            if (part.length) [parts addObject:part];
+        detail = [parts componentsJoinedByString:@" — "];
+    }
+    if (amTarget) {
+        // Cover art is the way into Music, as in Control Center's Now Playing.
+        const CGFloat side = 32;
+        NSImage *cover = am ? _amArt : nil;
+        if (!cover) {
+            NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
+            cover = app ? [NSWorkspace.sharedWorkspace iconForFile:app.path]
+                        : [NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil];
+        }
+        NSButton *art = [NSButton buttonWithImage:cover target:self action:@selector(openAppleMusic:)];
+        art.title = @"";
+        art.bordered = NO;
+        art.imagePosition = NSImageOnly;
+        art.imageScaling = NSImageScaleProportionallyUpOrDown;
+        art.frame = NSMakeRect(textX, (kSoundH - side) / 2.0, side, side);
+        art.wantsLayer = YES;
+        art.layer.cornerRadius = am && _amArt ? 4 : 0;
+        art.layer.masksToBounds = YES;
+        art.accessibilityIdentifier = @"popover.music.open";
+        art.accessibilityLabel = @"Open Music";
+        art.accessibilityHelp = detail.length ? [@"Open Music — " stringByAppendingString:detail] : @"Open Music";
+        [row addSubview:art];
+        textX = NSMaxX(art.frame) + 8;
+    }
+    if (am) {
+        NSButton *heart = [self transportButton:_amFavorited ? @"heart.fill" : @"heart" pointSize:15 side:22
+                                         action:@selector(musicFavorite:) identifier:@"popover.music.favorite"
+                                          label:_amFavorited ? @"Remove from Favourites" : @"Add to Favourites"];
+        heart.frame = NSOffsetRect(heart.frame, textRight - 22, 0);
+        heart.contentTintColor = _amFavorited ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
+        [row addSubview:heart];
+        textRight = NSMinX(heart.frame) - 6;
+    }
+    CGFloat textW = textRight - textX;
+    NSString *titleText = trackTitle.length ? trackTitle : (amTarget ? [self appleMusicPlaylistName] : @"Liked Music");
     // The row is a plain NSView, so y grows up; the flipped popover only applies to the root.
     // Title and subtitle are one block, centred in the row with the symbols.
     const CGFloat titleH = 15, subtitleH = 14, textGap = 1;
@@ -5714,13 +6033,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     double shownElapsed = _trackElapsed;
     if (loaded && _playbackPlaying && _trackSampledAt > 0)
         shownElapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
-    NSString *time = loaded ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
+    NSString *time = loaded && !am ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
     NSString *subtitleText;
     if (!loaded) {
         if (offline && _localEmpty) subtitleText = @"No offline music";
         else if (offline) subtitleText = [NSString stringWithFormat:@"Shuffle · %lu offline",
                                           (unsigned long)[self offlineTrackPaths].count];
-        else subtitleText = @"Shuffle · YouTube Music";
+        else subtitleText = @"Shuffle · Apple Music";
     } else if (trackArtist.length && time.length) {
         subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
     } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
@@ -5731,8 +6050,49 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     subtitle.accessibilityIdentifier = @"popover.music.subtitle";
     subtitle.accessibilityLabel = subtitleText;
     [row addSubview:subtitle];
+    if (detail.length) { title.accessibilityHelp = detail; subtitle.accessibilityHelp = detail; }
     [root addSubview:row];
-    return [self addMusicNoteTo:root at:y + kSoundH + 2];
+    y += kSoundH;
+    if (am) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
+    return [self addMusicNoteTo:root at:y + 2];
+}
+// Elapsed, a seek slider, the length, and shuffle under the output column.
+- (CGFloat)addAppleMusicScrubberTo:(NSView *)root at:(CGFloat)y elapsed:(double)elapsed {
+    const CGFloat h = 18, clockW = 40;
+    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
+    line.accessibilityIdentifier = @"popover.music.scrubber";
+    NSFont *clockFont = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+    CGFloat shuffleX = kW - kPad - kLeadW;
+    BOOL timed = _trackDuration > 0;
+    NSTextField *now = [self text:timed ? FormatTrackClock(elapsed, _trackDuration) : @"" font:clockFont
+                            color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 2, clockW, 14)
+                            align:NSTextAlignmentLeft];
+    now.accessibilityIdentifier = @"popover.music.elapsed";
+    [line addSubview:now];
+    NSTextField *length = [self text:timed ? FormatTrackClock(_trackDuration, _trackDuration) : @"" font:clockFont
+                               color:NSColor.secondaryLabelColor
+                                  at:NSMakeRect(shuffleX - 8 - clockW, 2, clockW, 14) align:NSTextAlignmentRight];
+    length.accessibilityIdentifier = @"popover.music.duration";
+    [line addSubview:length];
+    if (timed) {
+        NSSlider *slider = [NSSlider sliderWithValue:MIN(MAX(elapsed, 0), _trackDuration) minValue:0
+                                            maxValue:_trackDuration target:self action:@selector(musicSeek:)];
+        slider.controlSize = NSControlSizeSmall;
+        slider.continuous = NO;
+        CGFloat sx = NSMaxX(now.frame) + 4;
+        slider.frame = NSMakeRect(sx, 0, NSMinX(length.frame) - 4 - sx, h);
+        slider.accessibilityIdentifier = @"popover.music.position";
+        slider.accessibilityLabel = @"Position";
+        [line addSubview:slider];
+    }
+    NSButton *shuffle = [self transportButton:@"shuffle" pointSize:13 side:18 action:@selector(musicShuffle:)
+                                   identifier:@"popover.music.shuffle" label:@"Shuffle"];
+    shuffle.frame = NSMakeRect(shuffleX, 0, kLeadW, h);
+    shuffle.contentTintColor = _amShuffle ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
+    shuffle.accessibilityValue = _amShuffle ? @"on" : @"off";
+    [line addSubview:shuffle];
+    [root addSubview:line];
+    return y + h;
 }
 - (NSButton *)outputButton {
     [self ensureAudioDisplay];
@@ -6570,7 +6930,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         if(!self->_popover.isShown || self->_terminating)return;
         [self refresh];
-        if(self->_musicProbesEnabled){[self yieldLocalMusicIfIdle];[self runYouTubeStatusAfter:0 generation:self->_musicGen];}
+        if(self->_musicProbesEnabled){[self yieldLocalMusicIfIdle];[self refreshMusicSources];}
         [self beginSampling];[self startPowerTick];
     });
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
@@ -6667,6 +7027,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
     [self stopYouTubeProbeTimer];
     [self stopTrackTick];
+    [self stopAppleMusicProbeTimer];
     if (!_detailsWindow.isVisible) [self stopPowerTick];
 }
 
