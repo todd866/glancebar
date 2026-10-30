@@ -53,7 +53,7 @@ static NSString *HeatDatumText(NSTextField *field) {
     NSMutableString *out = [NSMutableString string];
     NSArray *names = @[@"[cpu]", @"[battery]"];
     __block NSUInteger marks = 0;
-    [a enumerateAttributesInRange:NSMakeRange(0, a.length) options:0 usingBlock:^(NSDictionary *attrs, NSRange r, BOOL *stop) {
+    [a enumerateAttributesInRange:NSMakeRange(0, a.length) options:0 usingBlock:^(NSDictionary *attrs, NSRange r, __unused BOOL *stop) {
         if (attrs[NSAttachmentAttributeName]) [out appendString:marks < names.count ? names[marks++] : @"[?]"];
         else [out appendString:[a.string substringWithRange:r]];
     }];
