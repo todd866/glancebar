@@ -369,7 +369,8 @@ int main(int argc, const char **argv) {
         [c setValue:@YES forKey:@"volumesUnavailable"];
         [c setValue:[NSDate dateWithTimeIntervalSinceNow:-3600] forKey:@"lastVolumeSuccess"];
         SystemState sys = {.cpuValid=YES, .memValid=YES, .swapValid=YES, .cpu=0.24,
-            .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1};
+            .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1,
+            .tempValid=YES, .cpuTempC=101.4, .thermalValid=YES, .thermalPressure=2};
         [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
         BatteryState b = {.valid=YES, .percent=61, .acConnected=YES, .isCharging=YES,
             .rawCurrent_mAh=2745, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
@@ -515,6 +516,11 @@ int main(int argc, const char **argv) {
             ![popSystemName.stringValue isEqual:@"System"] || !SameColumn(popStorageName, claudeName) ||
             !SameColumn(popBatteryName, claudeName) || !SameColumn(popSystemName, claudeName))
             return Fail(__LINE__);
+        // Heat rides in the System row's datum: the hottest core, red and "slowed" while throttling.
+        NSTextField *heat = (NSTextField *)FindIdentifier(root, @"popover.system.heat");
+        if (![heat.stringValue isEqual:@"101° slowed"] || ![heat.textColor isEqual:NSColor.systemRedColor] ||
+            fabs(heat.frame.origin.x - kDatumX) > 0.5 || !SameColumn(heat, batteryDatum) ||
+            ![heat.accessibilityLabel isEqual:@"Hottest core 101 °C · pressure heavy"]) return Fail(__LINE__);
         if (!HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
             return Fail(__LINE__);
         NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");

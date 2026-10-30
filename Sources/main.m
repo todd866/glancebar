@@ -636,6 +636,57 @@ static BOOL GBSMCReadFloat(const char *key, double *out) {
     *out = f;
     return YES;
 }
+// The hottest CPU core, from the SMC's per-core die sensors (Tp* performance, Te* efficiency
+// cores). Key names vary by chip, so they are found once from the SMC's own key index.
+static NSArray<NSString *> *CPUTempKeys(void) {
+    static NSArray<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableArray *found = [NSMutableArray array];
+        io_connect_t conn = GBSMCConnection();
+        GBSMCParam in = {0}, res = {0};
+        size_t size = sizeof(GBSMCParam);
+        in.key = ('#' << 24) | ('K' << 16) | ('E' << 8) | 'Y';
+        in.keyInfo.dataSize = 4; in.data8 = 5;
+        UInt32 count = 0;
+        if (conn && IOConnectCallStructMethod(conn, 2, &in, sizeof in, &res, &size) == KERN_SUCCESS && !res.result)
+            count = ((UInt32)(UInt8)res.bytes[0] << 24) | ((UInt32)(UInt8)res.bytes[1] << 16) |
+                    ((UInt32)(UInt8)res.bytes[2] << 8) | (UInt8)res.bytes[3];
+        for (UInt32 i = 0; i < MIN(count, 8192u); i++) {
+            GBSMCParam q = {0}, r = {0};
+            q.data8 = 8; q.data32 = i;   // key at index
+            size = sizeof(GBSMCParam);
+            if (IOConnectCallStructMethod(conn, 2, &q, sizeof q, &r, &size) != KERN_SUCCESS || r.result) continue;
+            char name[5] = {(char)(r.key >> 24), (char)(r.key >> 16), (char)(r.key >> 8), (char)r.key, 0};
+            if (name[0] != 'T' || (name[1] != 'p' && name[1] != 'e')) continue;
+            double v;
+            if (GBSMCReadFloat(name, &v) && v > 5 && v < 130) [found addObject:@(name)];
+        }
+        keys = found;
+    });
+    return keys;
+}
+static BOOL ReadCPUTempC(double *out) {
+    double hottest = 0;
+    for (NSString *key in CPUTempKeys()) {
+        double v;
+        if (GBSMCReadFloat(key.UTF8String, &v) && v > 5 && v < 130) hottest = MAX(hottest, v);
+    }
+    if (hottest <= 0) return NO;
+    *out = hottest;
+    return YES;
+}
+static BOOL ReadThermalPressure(int *out) {
+    static int token = -1;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (notify_register_check("com.apple.system.thermalpressurelevel", &token) != NOTIFY_STATUS_OK) token = -1;
+    });
+    uint64_t state = 0;
+    if (token < 0 || notify_get_state(token, &state) != NOTIFY_STATUS_OK) return NO;
+    *out = (int)state;
+    return YES;
+}
 // Lay the live SMC watts over the slow IORegistry figures; anything unreadable keeps its value.
 static void ApplyLivePower(BatteryState *b) {
     if (!b->valid) return;
@@ -979,6 +1030,9 @@ typedef struct {
     double cpu;
     uint64_t memTotal, memUsed, memAvailable, swapUsed;
     int kernPressure;   // kern.memorystatus_vm_pressure_level: 1/2/4, 0 = unknown
+    BOOL tempValid, thermalValid;
+    double cpuTempC;     // hottest CPU core
+    int thermalPressure; // com.apple.system.thermalpressurelevel, see ThermalLevelFor
 } SystemState;
 
 // mach_host_self() returns a send right each call and the urefs are never returned;
@@ -1078,7 +1132,27 @@ static SystemState ReadSystemState(CPUCounters *previous) {
     if (sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &pressureSize, NULL, 0) == 0)
         s.kernPressure = pressure;
 
+    s.tempValid = ReadCPUTempC(&s.cpuTempC);
+    s.thermalValid = ReadThermalPressure(&s.thermalPressure);
     return s;
+}
+
+static ThermalLevel SystemThermalLevel(SystemState s) {
+    return s.thermalValid ? ThermalLevelFor(s.thermalPressure) : ThermalUnknown;
+}
+
+static NSColor *ThermalColor(ThermalLevel level) {
+    if (level == ThermalThrottling) return NSColor.systemRedColor;
+    if (level == ThermalNear) return NSColor.systemOrangeColor;
+    return NSColor.secondaryLabelColor;
+}
+
+// "Hottest core 73 °C · pressure heavy"
+static NSString *ThermalStatusText(SystemState s) {
+    NSMutableArray *parts = [NSMutableArray array];
+    if (s.tempValid) [parts addObject:[NSString stringWithFormat:@"Hottest core %ld °C", lround(s.cpuTempC)]];
+    if (s.thermalValid) [parts addObject:[NSString stringWithFormat:@"pressure %@", ThermalPressureName(s.thermalPressure)]];
+    return parts.count ? [parts componentsJoinedByString:@" · "] : @"Temperature unknown";
 }
 
 static NSString *MemoryPressureLevel(SystemState s) {
@@ -1133,6 +1207,8 @@ static NSString *SystemSummaryText(SystemState s) {
     if ([level isEqualToString:@"Medium"] || [level isEqualToString:@"High"])
         [parts addObject:[NSString stringWithFormat:@"pressure %@", level.lowercaseString]];
     if (s.swapValid) [parts addObject:s.swapUsed == 0 ? @"no swap" : [NSString stringWithFormat:@"swap %@", FmtMemBytes(s.swapUsed)]];
+    if (s.thermalValid && s.thermalPressure > 0)
+        [parts addObject:[NSString stringWithFormat:@"thermal %@", ThermalPressureName(s.thermalPressure)]];
     return parts.count ? [parts componentsJoinedByString:@" · "] : CPUStatusText(s);
 }
 
@@ -7691,9 +7767,19 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     [row addSubview:value];
 
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
-    // CPU only. Memory pressure tints the row's symbol; memory figures live in the System tab.
+    // CPU is the bar. Memory pressure tints the row's symbol; memory figures live in the System tab.
     (void)memTip;
-    (void)datumFrame;
+    // The datum is heat: the hottest core, coloured by macOS's own thermal pressure.
+    ThermalLevel heat = SystemThermalLevel(_sys);
+    NSString *heatText = ThermalDatumText(_sys.tempValid ? _sys.cpuTempC : 0, heat);
+    if (heatText) {
+        NSTextField *datum = [self text:heatText font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                  color:ThermalColor(heat) at:datumFrame align:NSTextAlignmentLeft];
+        datum.accessibilityIdentifier = [stem stringByAppendingString:@".heat"];
+        datum.accessibilityLabel = ThermalStatusText(_sys);
+        datum.accessibilityHelp = tip;
+        [row addSubview:datum];
+    }
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
@@ -10312,6 +10398,22 @@ static NSColor *HealthColor(double fraction) {
         y += c.rowH;
     }
     {
+        ThermalLevel heat = SystemThermalLevel(_sys);
+        NSColor *color = _sys.tempValid || heat != ThermalUnknown ? ThermalColor(heat) : NSColor.tertiaryLabelColor;
+        if (heat == ThermalNominal) color = NSColor.labelColor;
+        NSString *tip = ThermalStatusText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.heat" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:(heat == ThermalThrottling ? @"thermometer.high" : @"thermometer.medium")
+                                          size:c.symbol tint:(heat == ThermalNominal ? NSColor.secondaryLabelColor : color)
+                                         frame:DetailLeadRect(c) identifier:@"details.system.heat.symbol" in:row];
+        mark.accessibilityHelp = tip;
+        [self detailValue:(_sys.tempValid ? [NSString stringWithFormat:@"%ld °C", lround(_sys.cpuTempC)] : @"—")
+                    color:color identifier:@"details.system.heat.value" tip:tip in:row cols:c];
+        NSString *word = heat == ThermalThrottling ? @"slowed" : heat == ThermalNear ? @"near limit" : nil;
+        if (word) [self detailDatum:word color:color identifier:@"details.system.heat.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    {
         NSString *value = @"—";
         if (_sys.swapValid) value = _sys.swapUsed == 0 ? @"0 GB" : FmtMemBytes((long long)_sys.swapUsed);
         NSString *tip = SwapStatusText(_sys);
@@ -10623,6 +10725,9 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
         @"memoryUsedBytes": system.memValid ? @(system.memUsed) : NSNull.null,
         @"memoryAvailableBytes": system.memValid ? @(system.memAvailable) : NSNull.null,
         @"swapUsedBytes": system.swapValid ? @(system.swapUsed) : NSNull.null,
+        @"cpuTempC": system.tempValid ? @(system.cpuTempC) : NSNull.null,
+        @"thermalPressure": system.thermalValid ? ThermalPressureName(system.thermalPressure) : NSNull.null,
+        @"processInfoThermalState": @(NSProcessInfo.processInfo.thermalState),
         @"topCPU": DumpProcessRows(cpuRows, YES),
         @"topMemory": DumpProcessRows(memoryRows, NO),
         @"processSampleAvailable": JSONBool(cpuRows.count > 0 || memoryRows.count > 0)
@@ -10795,7 +10900,11 @@ static void PrintHumanDump(NSDictionary *snapshot) {
     NSString *swap = system[@"swapUsedBytes"] == NSNull.null ? @"Swap unknown"
         : [system[@"swapUsedBytes"] unsignedLongLongValue] == 0 ? @"Swap none"
         : [NSString stringWithFormat:@"Swap %@", FmtMemBytes([system[@"swapUsedBytes"] longLongValue])];
-    printf("system %s · %s · %s\n", UTF8(cpu), UTF8(memory), UTF8(swap));
+    NSString *heat = [NSString stringWithFormat:@"%@ · thermal %@ (state %@)",
+        system[@"cpuTempC"] == NSNull.null ? @"core temp unknown"
+            : [NSString stringWithFormat:@"hottest core %ld °C", lround([system[@"cpuTempC"] doubleValue])],
+        system[@"thermalPressure"] == NSNull.null ? @"unknown" : system[@"thermalPressure"], system[@"processInfoThermalState"]];
+    printf("system %s · %s · %s\n       %s\n", UTF8(cpu), UTF8(memory), UTF8(swap), UTF8(heat));
     NSArray *topCPU = system[@"topCPU"], *topMemory = system[@"topMemory"];
     if (!topCPU.count && !topMemory.count) printf("top apps unavailable\n");
     if (topCPU.count) {

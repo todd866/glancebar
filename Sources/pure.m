@@ -2598,3 +2598,22 @@ NSString *BatteryForecastStatus(BatteryForecast f) {
     if (f.thresholdTime > 0 || f.endpointTime > 0) [parts addObject:@"Approximate arrivals · local time"];
     return [parts componentsJoinedByString:@"\n"];
 }
+
+ThermalLevel ThermalLevelFor(int pressure) {
+    if (pressure < 0) return ThermalUnknown;
+    if (pressure >= 2) return ThermalThrottling;
+    return pressure == 1 ? ThermalNear : ThermalNominal;
+}
+
+NSString *ThermalPressureName(int pressure) {
+    NSArray *names = @[@"nominal", @"moderate", @"heavy", @"trapping", @"sleeping"];
+    if (pressure < 0) return nil;
+    return pressure < (int)names.count ? names[pressure] : [NSString stringWithFormat:@"level %d", pressure];
+}
+
+NSString *ThermalDatumText(double tempC, ThermalLevel level) {
+    if (tempC <= 0) return level == ThermalThrottling ? @"slowed" : level == ThermalNear ? @"near limit" : nil;
+    long t = lround(tempC);
+    return level == ThermalThrottling ? [NSString stringWithFormat:@"%ld° slowed", t]
+                                      : [NSString stringWithFormat:@"%ld °C", t];
+}

@@ -2232,6 +2232,21 @@ int main(void) {
         ])[@"text"] isEqual:@"Second 90% full"],
               @"without a boot volume the secondary line is judged against the first mount");
 
+        // Heat: macOS's pressure level decides the colour; the temperature is the number.
+        check(ThermalLevelFor(-1) == ThermalUnknown, @"thermal: unread pressure is unknown");
+        check(ThermalLevelFor(0) == ThermalNominal, @"thermal: nominal");
+        check(ThermalLevelFor(1) == ThermalNear, @"thermal: moderate is near the limit");
+        check(ThermalLevelFor(2) == ThermalThrottling && ThermalLevelFor(4) == ThermalThrottling,
+              @"thermal: heavy and above throttle");
+        check([ThermalDatumText(46.4, ThermalNominal) isEqual:@"46 °C"], @"thermal: plain temperature");
+        check([ThermalDatumText(66.0, ThermalNear) isEqual:@"66 °C"], @"thermal: near limit keeps the number; colour carries it");
+        check([ThermalDatumText(72.6, ThermalThrottling) isEqual:@"73° slowed"], @"thermal: throttling says so");
+        check([ThermalDatumText(101.2, ThermalThrottling) isEqual:@"101° slowed"], @"thermal: three digits");
+        check([ThermalDatumText(0, ThermalThrottling) isEqual:@"slowed"], @"thermal: no sensor, still says slowed");
+        check(ThermalDatumText(0, ThermalNominal) == nil && ThermalDatumText(0, ThermalUnknown) == nil,
+              @"thermal: nothing to show stays empty");
+        check([ThermalPressureName(2) isEqual:@"heavy"] && ThermalPressureName(-1) == nil, @"thermal: pressure names");
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

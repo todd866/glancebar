@@ -686,3 +686,13 @@ NSDictionary *StarlinkUsageParse(NSData *json, NSDate *now);
 // rate or the allowance would last beyond the cycle end.
 NSDictionary *MeteredAllowanceDatum(uint64_t remainingBytes, double recentBytesPerSecond,
                                      NSDate *now, NSDate *cycleEnd);
+
+// Heat on the System row. pressure is macOS's thermal pressure level
+// (com.apple.system.thermalpressurelevel: 0 nominal, 1 moderate, 2 heavy, 3 trapping,
+// 4 sleeping; < 0 unread). Heavy and above slow the chip. A fanless Air reaches heavy with
+// its cores near 70 °C, so the level, not a fixed temperature, decides near and throttling.
+typedef NS_ENUM(NSInteger, ThermalLevel) { ThermalUnknown = 0, ThermalNominal, ThermalNear, ThermalThrottling };
+ThermalLevel ThermalLevelFor(int pressure);
+NSString *ThermalPressureName(int pressure);   // "nominal" … "sleeping", nil when unread
+// "46 °C", "73° slowed"; without a temperature (tempC <= 0) "near limit" / "slowed" / nil.
+NSString *ThermalDatumText(double tempC, ThermalLevel level);

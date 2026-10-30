@@ -1031,12 +1031,94 @@ static BOOL BurnSheet(NSString *path) {
     return ok;
 }
 
+#pragma mark - Thermal sheet
+
+typedef NS_ENUM(NSInteger, ThermStyle) { ThermDatum, ThermRowBar, ThermRowSegments };
+
+// state: 0 nominal, 1 fair (near the limit), 2 serious (throttling), 3 critical.
+static NSColor *ThermSketchColor(int state) {
+    return state >= 2 ? NSColor.systemRedColor : state == 1 ? NSColor.systemOrangeColor
+                      : [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+}
+static NSString *ThermSketchWord(int state) { return state >= 2 ? @"throttling" : state == 1 ? @"near limit" : @""; }
+
+// Four lamps, lit up to the current state: cool · warm · near limit · throttling.
+@interface ThermSegments : NSView
+@property (nonatomic) int state;
+@end
+@implementation ThermSegments
+- (void)drawRect:(NSRect)dirty {
+    CGFloat gap = 3, w = (NSWidth(self.bounds) - 3 * gap) / 4, h = NSHeight(self.bounds);
+    for (int i = 0; i < 4; i++) {
+        NSBezierPath *p = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(i * (w + gap), 0, w, h) xRadius:h / 2 yRadius:h / 2];
+        [(i <= _state ? ThermSketchColor(_state) : [NSColor.labelColor colorWithAlphaComponent:0.12]) setFill];
+        [p fill];
+    }
+}
+@end
+
+static NSView *ThermRow(Controller *c, double cpu, double temp, int state, ThermStyle style, BOOL systemRow) {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    CGFloat h = kRowH;
+    NSColor *tc = ThermSketchColor(state);
+    NSFont *valueFont = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold];
+    if (systemRow) {
+        [c instrumentSymbol:@"cpu" tint:CPUColor(cpu) identifier:@"s" in:row];
+        [c instrumentName:@"System" identifier:@"n" in:row];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        g.fraction = cpu; g.color = CPUColor(cpu); [row addSubview:g];
+        [row addSubview:[c text:[NSString stringWithFormat:@"%.0f%%", cpu * 100] font:valueFont color:CPUColor(cpu)
+                             at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+        if (style == ThermDatum)   // the datum column was empty; the word appears only when it matters
+            [row addSubview:SheetDatum(c, state >= 2 ? [NSString stringWithFormat:@"%.0f° slowed", temp] : [NSString stringWithFormat:@"%.0f °C", temp],
+                                       state ? tc : NSColor.secondaryLabelColor)];
+        return row;
+    }
+    [c instrumentSymbol:@"thermometer.medium" tint:tc identifier:@"s" in:row];
+    [c instrumentName:@"Temp" identifier:@"n" in:row];
+    if (style == ThermRowBar) {
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        g.fraction = MAX(0, MIN(1, (temp - 30) / 75.0)); g.color = tc; [row addSubview:g];
+    } else {
+        ThermSegments *s = [[ThermSegments alloc] initWithFrame:NSMakeRect(kGaugeX, (h - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        s.state = MIN(state, 3); [row addSubview:s];
+    }
+    [row addSubview:[c text:[NSString stringWithFormat:@"%.0f°", temp] font:valueFont color:tc
+                         at:NSMakeRect(kValueX, (h - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    [row addSubview:SheetDatum(c, ThermSketchWord(state), state ? tc : NSColor.secondaryLabelColor)];
+    return row;
+}
+
+static BOOL ThermalSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // cpu, die °C, OS thermal state
+    NSArray *states = @[@[@0.12, @46, @0], @[@0.55, @66, @1], @[@0.92, @73, @2], @[@1.0, @101, @3]];
+    NSArray *variants = @[@[@"A  temp in the System row's empty datum (+0 rows)", @(ThermDatum)],
+                          @[@"B  own Temp row: bar = die temp 30–105°", @(ThermRowBar)],
+                          @[@"C  own Temp row: four lamps cool·warm·near·throttling", @(ThermRowSegments)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        ThermStyle style = [v[1] integerValue];
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states) {
+                [rows addObject:ThermRow(c, [st[0] doubleValue], [st[1] doubleValue], [st[2] intValue], style, YES)];
+                if (style != ThermDatum)
+                    [rows addObject:ThermRow(c, [st[0] doubleValue], [st[1] doubleValue], [st[2] intValue], style, NO)];
+            }
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
+        if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
