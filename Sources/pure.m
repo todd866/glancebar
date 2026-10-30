@@ -2631,6 +2631,22 @@ NSString *BatteryHeatText(double tempC) {
     return BatteryHeatFor(tempC) == BatteryHeatNone ? nil : [NSString stringWithFormat:@"%ld °C", lround(tempC)];
 }
 
+BOOL HeatShowing(ThermalLevel chip, double cellC) {
+    return chip == ThermalNear || chip == ThermalThrottling || BatteryHeatFor(cellC) != BatteryHeatNone;
+}
+
+NSString *ChipDatumText(double tempC, ThermalLevel level, BOOL showing) {
+    NSString *pressure = ThermalDatumText(tempC, level);
+    if (pressure || !showing || tempC <= 0) return pressure;
+    return [NSString stringWithFormat:@"%ld °C", lround(tempC)];
+}
+
+NSString *CellsDatumText(double cellC, NSString *watts) {
+    if (cellC <= 0) return nil;
+    long t = lround(cellC);
+    return watts.length ? [NSString stringWithFormat:@"%ld° · %@", t, watts] : [NSString stringWithFormat:@"%ld °C", t];
+}
+
 HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state) {
     BOOL cool = tempC > 0 && tempC <= kBatteryCoolC;
     switch (*state) {

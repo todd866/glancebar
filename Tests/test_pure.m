@@ -2253,6 +2253,18 @@ int main(void) {
         check([BatteryHeatText(38.2) isEqual:@"38 °C"] && BatteryHeatFor(38.2) == BatteryHeatWarm, @"battery heat: warm");
         check(BatteryHeatFor(42) == BatteryHeatHot && BatteryHeatFor(41.6) == BatteryHeatHot,
               @"battery heat: hot, judged on the degree shown");
+        // Chip and cells show together once either is warm.
+        check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat pair: quiet while both cool");
+        check(HeatShowing(ThermalThrottling, 31) && HeatShowing(ThermalNear, 0) && HeatShowing(ThermalNominal, 37.6),
+              @"heat pair: either warm shows both");
+        check(ChipDatumText(60.4, ThermalNominal, NO) == nil, @"heat pair: cool chip hidden");
+        check([ChipDatumText(60.4, ThermalNominal, YES) isEqual:@"60 °C"], @"heat pair: cool chip shown beside warm cells");
+        check([ChipDatumText(88, ThermalThrottling, YES) isEqual:@"88° slowed"], @"heat pair: pressure wording wins");
+        check(ChipDatumText(0, ThermalNominal, YES) == nil, @"heat pair: unread chip stays empty");
+        check([CellsDatumText(31.3, nil) isEqual:@"31 °C"] && [CellsDatumText(31.3, @"") isEqual:@"31 °C"],
+              @"heat pair: cells alone");
+        check([CellsDatumText(39, @"\u22129.5 W") isEqual:@"39° · \u22129.5 W"], @"heat pair: cells with watts");
+        check(CellsDatumText(0, @"+3 W") == nil, @"heat pair: unread cells");
         {
             HeatGuardState st = HeatGuardIdle;
             check(HeatGuardStep(NO, 45, NO, &st) == HeatGuardNothing && st == HeatGuardIdle, @"guard: off does nothing");

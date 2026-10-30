@@ -700,11 +700,20 @@ NSString *ThermalPressureName(int pressure);   // "nominal" … "sleeping", nil 
 NSString *ThermalDatumText(double tempC, ThermalLevel level);
 
 // Battery heat. Lithium cells age faster when warm, worst when warm and full.
-// Warm (38 °C) and hot (42 °C) take the Battery row's datum; below that it stays on watts.
+// Warm from 38 °C, hot from 42 °C.
 typedef NS_ENUM(NSInteger, BatteryHeat) { BatteryHeatNone = 0, BatteryHeatWarm, BatteryHeatHot };
 BatteryHeat BatteryHeatFor(double tempC);
 // "38 °C" when warm or hot, nil otherwise.
 NSString *BatteryHeatText(double tempC);
+
+// Chip and cell temperatures show together: once either is warm, both datums carry heat;
+// while both are cool, neither does.
+BOOL HeatShowing(ThermalLevel chip, double cellC);
+// The System datum: ThermalDatumText under pressure, else "60 °C" while showing, else nil.
+NSString *ChipDatumText(double tempC, ThermalLevel level, BOOL showing);
+// The Battery datum while showing: "31 °C", or "39° · −9.5 W" with the battery's watts.
+// nil when the cells are unread.
+NSString *CellsDatumText(double cellC, NSString *watts);
 
 // The heat guard turns Low Power Mode on while the battery is warm and back off once it
 // has cooled to 35 °C, undoing only what it switched on itself. If the user switches

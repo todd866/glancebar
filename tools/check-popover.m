@@ -521,14 +521,25 @@ int main(int argc, const char **argv) {
         if (![heat.stringValue isEqual:@"101° slowed"] || ![heat.textColor isEqual:NSColor.systemRedColor] ||
             fabs(heat.frame.origin.x - kDatumX) > 0.5 || !SameColumn(heat, batteryDatum) ||
             ![heat.accessibilityLabel isEqual:@"Hottest core 101 °C · pressure heavy"]) return Fail(__LINE__);
-        {   // A warm battery takes the Battery datum; the watts move to hover.
+        {   // A warm chip brings the cells in beside the watts; unread cells leave the watts alone.
+            BatteryState warm = b; warm.tempC = 31.3;
+            [c setValue:[NSValue valueWithBytes:&warm objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            NSTextField *pairDatum = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.battery.datum");
+            if (![pairDatum.stringValue isEqual:@"31° · +12 W"] || ![pairDatum.textColor isEqual:NSColor.systemGreenColor])
+                return Fail(__LINE__);
+        }
+        {   // Hot cells colour the paired datum; the widest form still fits the column.
             BatteryState hot = b; hot.tempC = 41.6;
             [c setValue:[NSValue valueWithBytes:&hot objCType:@encode(BatteryState)] forKey:@"bat"];
             [c rebuildContent];
             NSView *hotRoot = p.contentViewController.view;
             NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.battery.datum");
-            if (![hotDatum.stringValue isEqual:@"42 °C"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
-                !HasTip(hotRoot, @"cells 42 °C") || !HasTip(hotRoot, @"battery +12 W") || !FitsChildren(hotRoot)) return Fail(__LINE__);
+            if (![hotDatum.stringValue isEqual:@"42° · +12 W"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
+                !HasTip(hotRoot, @"cells 42 °C") || !FitsChildren(hotRoot)) return Fail(__LINE__);
+            NSTextField *wide = [c text:@"42° · \u22129.5 W" font:hotDatum.font color:hotDatum.textColor
+                                     at:hotDatum.frame align:NSTextAlignmentLeft];
+            if (wide.intrinsicContentSize.width > NSWidth(hotDatum.frame)) return Fail(__LINE__);
             if (argc > 1) {
                 NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-battery-hot.png"];
                 if (!RenderOffscreen(hotRoot, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);

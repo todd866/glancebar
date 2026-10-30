@@ -1112,13 +1112,83 @@ static BOOL ThermalSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Always-on temperatures sheet
+
+typedef NS_ENUM(NSInteger, TempsStyle) { TempsDatums, TempsHeatRow, TempsTwoRows };
+
+static NSColor *CellSketchColor(double c) {
+    return c >= 42 ? NSColor.systemRedColor : c >= 38 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+}
+
+static NSArray<NSView *> *TempsRows(Controller *c, NSArray *st, TempsStyle style) {
+    double cpu = [st[0] doubleValue], chip = [st[1] doubleValue], cells = [st[2] doubleValue], watts = [st[4] doubleValue];
+    int state = [st[3] intValue];
+    NSColor *chipColor = state ? ThermSketchColor(state) : NSColor.secondaryLabelColor;
+    NSString *chipText = state >= 2 ? [NSString stringWithFormat:@"%.0f° slowed", chip] : [NSString stringWithFormat:@"%.0f °C", chip];
+    NSString *wattText = fabs(watts) < 0.5 ? @"" : [NSString stringWithFormat:@"%+.0f W", watts];
+    NSColor *wattColor = watts > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+
+    NSView *system = ThermRow(c, cpu, chip, state, ThermRowBar, YES);   // System row, datum filled below
+    NSMutableArray *rows = [NSMutableArray arrayWithObject:system];
+    NSView *battery = BurnBaseRow(c, @"battery.75", @"Battery", 0.80, BattBarColor(80), @"80%", @"");
+    [rows addObject:battery];
+    // Both temperatures appear together when either is hot; while both are cool, neither shows.
+    BOOL show = state > 0 || cells >= 38;
+    if (!show) {
+        if (wattText.length) [battery addSubview:SheetDatum(c, wattText, wattColor)];
+        return rows;
+    }
+    if (style == TempsDatums) {
+        [system addSubview:SheetDatum(c, chipText, chipColor)];
+        NSString *b = wattText.length ? [NSString stringWithFormat:@"%.0f° · %@", cells, wattText] : [NSString stringWithFormat:@"%.0f °C", cells];
+        [battery addSubview:SheetDatum(c, b, cells >= 38 ? CellSketchColor(cells) : wattText.length ? wattColor : NSColor.secondaryLabelColor)];
+        return rows;
+    }
+    if (state >= 2) [system addSubview:SheetDatum(c, @"slowed", chipColor)];
+    else if (state == 1) [system addSubview:SheetDatum(c, @"near limit", chipColor)];
+    if (wattText.length) [battery addSubview:SheetDatum(c, wattText, wattColor)];
+    NSColor *barChip = state ? chipColor : [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+    if (style == TempsHeatRow) {
+        [rows addObject:BurnBaseRow(c, @"thermometer.medium", @"Heat", MAX(0, MIN(1, (chip - 30) / 75.0)), barChip,
+                                    [NSString stringWithFormat:@"%.0f°", chip], @"")];
+        [rows.lastObject addSubview:SheetDatum(c, [NSString stringWithFormat:@"cells %.0f°", cells], CellSketchColor(cells))];
+    } else {
+        [rows addObject:BurnBaseRow(c, @"cpu", @"Chip", MAX(0, MIN(1, (chip - 30) / 75.0)), barChip,
+                                    [NSString stringWithFormat:@"%.0f°", chip], @"")];
+        NSColor *cc = cells >= 38 ? CellSketchColor(cells) : [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+        [rows addObject:BurnBaseRow(c, @"thermometer.medium", @"Cells", MAX(0, MIN(1, (cells - 20) / 30.0)), cc,
+                                    [NSString stringWithFormat:@"%.0f°", cells], @"")];
+    }
+    return rows;
+}
+
+static BOOL TempsSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // cpu, chip °C, cells °C, OS pressure (0 nominal, 1 near, 2 slowed), battery W (+ in)
+    NSArray *states = @[@[@0.15, @52, @29, @0, @-6], @[@0.92, @88, @31, @2, @0], @[@0.40, @60, @39, @0, @-9]];
+    NSArray *variants = @[@[@"A  both in datums, either hot shows both (+0 rows)", @(TempsDatums)],
+                          @[@"B  Heat row appears: chip bar, cells datum (+1 when hot)", @(TempsHeatRow)],
+                          @[@"C  Chip and Cells rows appear, own bars (+2 when hot)", @(TempsTwoRows)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        TempsStyle style = [v[1] integerValue];
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states) [rows addObjectsFromArray:TempsRows(c, st, style)];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;

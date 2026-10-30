@@ -7470,9 +7470,6 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [parts addObject:[NSString stringWithFormat:@"health %d%%", (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh)]];
     if (_bat.tempC > 0) {
         [parts addObject:[NSString stringWithFormat:@"cells %ld °C", lround(_bat.tempC)]];
-        double bw = BatteryWatts(_bat);   // the heat took the datum; keep the watts on hover
-        if (BatteryHeatText(_bat.tempC) && !isnan(bw))
-            [parts addObject:[@"battery " stringByAppendingString:fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw)]];
     }
     if (_heatGuard == HeatGuardEngaged) [parts addObject:@"Low Power on for heat"];
     if (!parts.count) return @"Battery";
@@ -7701,21 +7698,25 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     CGFloat y = roomInLine ? NSMidY(gauge.frame) - 7 : NSMinY(gauge.frame) - 9;
     arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, roomInLine ? 14 : 10);
 }
-// A warm battery takes the datum from the watts, the way a problem takes an AI row's reset.
-// The Battery tab keeps the watts: its Cells row carries the heat.
+// Once the chip or the cells are warm, the datum carries the cell temperature beside the
+// watts. The Battery tab keeps the watts: its Cells row carries the heat.
 - (NSString *)batteryRateText { return [self batteryRateTextWithHeat:YES]; }
 - (NSColor *)batteryRateColor { return [self batteryRateColorWithHeat:YES]; }
+- (BOOL)heatShowing { return HeatShowing(SystemThermalLevel(_sys), _bat.tempC); }
 - (NSString *)batteryRateTextWithHeat:(BOOL)withHeat {
-    NSString *heat = withHeat ? BatteryHeatText(_bat.tempC) : nil;
-    if (heat) return heat;
     double bw = BatteryWatts(_bat);
-    if (isnan(bw)) return @"";
-    return fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
+    NSString *watts = isnan(bw) ? @"" : fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
+    // Beside a warm chip or warm cells, the datum leads with the cells; idle watts drop out.
+    NSString *heat = withHeat && [self heatShowing]
+        ? CellsDatumText(_bat.tempC, isnan(bw) || fabs(bw) < 0.3 ? nil : watts) : nil;
+    return heat ?: watts;
 }
 - (NSColor *)batteryRateColorWithHeat:(BOOL)withHeat {
     BatteryHeat heat = withHeat ? BatteryHeatFor(_bat.tempC) : BatteryHeatNone;
     if (heat != BatteryHeatNone) return heat == BatteryHeatHot ? NSColor.systemRedColor : NSColor.systemOrangeColor;
     double bw = BatteryWatts(_bat);
+    if (withHeat && [self heatShowing] && _bat.tempC > 0 && (isnan(bw) || fabs(bw) < 0.3))
+        return NSColor.secondaryLabelColor;
     return isnan(bw) || fabs(bw) < 0.3 ? NSColor.secondaryLabelColor
          : bw > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
 }
@@ -7794,7 +7795,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     (void)memTip;
     // The datum is heat: the hottest core, coloured by macOS's own thermal pressure.
     ThermalLevel heat = SystemThermalLevel(_sys);
-    NSString *heatText = ThermalDatumText(_sys.tempValid ? _sys.cpuTempC : 0, heat);
+    NSString *heatText = ChipDatumText(_sys.tempValid ? _sys.cpuTempC : 0, heat, [self heatShowing]);
     if (heatText) {
         NSTextField *datum = [self text:heatText font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
                                   color:ThermalColor(heat) at:datumFrame align:NSTextAlignmentLeft];
@@ -10745,7 +10746,8 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
         @"minutesUntil20Percent": minutesTo20 >= 0 ? @(minutesTo20) : NSNull.null,
         @"powerWatts": JSONValue(watts),
         @"healthPercent": JSONValue(health),
-        @"cycleCount": battery.valid && battery.cycleCount >= 0 ? @(battery.cycleCount) : NSNull.null
+        @"cycleCount": battery.valid && battery.cycleCount >= 0 ? @(battery.cycleCount) : NSNull.null,
+        @"cellTempC": battery.valid && battery.tempC > 0 ? @(battery.tempC) : NSNull.null
     };
 
     NSArray *hogs = SampleHogs(5);
@@ -10947,6 +10949,8 @@ static void PrintHumanDump(NSDictionary *snapshot) {
                        [battery[@"cycleCount"] longValue]);
             else printf("      health %d%%\n", (int)lround([battery[@"healthPercent"] doubleValue]));
         }
+        if (battery[@"cellTempC"] != NSNull.null)
+            printf("      cells %ld °C\n", lround([battery[@"cellTempC"] doubleValue]));
     }
 
     printf("sampled energy impact:\n");
