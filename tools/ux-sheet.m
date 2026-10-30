@@ -1181,14 +1181,115 @@ static BOOL TempsSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Thermal row sheet
+
+typedef NS_ENUM(NSInteger, ThermRowStyle) { TRSpeedBar, TRTempBar, TRCeilingBar, TRLamps };
+
+// The speed bar with the lost speed drawn as a dim red ceiling above the current level.
+@interface CeilingGauge : NSView
+@property (nonatomic) double fraction;
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation CeilingGauge
+- (void)drawRect:(NSRect)dirty {
+    NSRect b = self.bounds; CGFloat r = NSHeight(b) / 2;
+    [[NSColor.labelColor colorWithAlphaComponent:0.10] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:b xRadius:r yRadius:r] fill];
+    NSRect lost = b; lost.origin.x = NSWidth(b) * _fraction; lost.size.width = NSWidth(b) * (1 - _fraction);
+    if (_fraction < 0.98) {
+        [[NSColor.systemRedColor colorWithAlphaComponent:0.25] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:lost xRadius:r yRadius:r] fill];
+    }
+    NSRect fill = b; fill.size.width = NSWidth(b) * _fraction;
+    [_color setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:fill xRadius:r yRadius:r] fill];
+}
+@end
+
+static NSView *ThermalRowSketch(Controller *c, NSArray *st, ThermRowStyle style) {
+    int state = [st[0] intValue];
+    double speed = [st[1] doubleValue], ghz = [st[2] doubleValue], chip = [st[3] doubleValue], cells = [st[4] doubleValue];
+    NSColor *tc = state ? ThermSketchColor(state) : [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    [c instrumentSymbol:@"thermometer.medium" tint:tc identifier:nil in:row];
+    [c instrumentName:@"Heat" identifier:nil in:row];
+    NSRect g = NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH);
+    NSString *temps = [NSString stringWithFormat:@"%.0f° · %.0f°", chip, cells];
+    NSString *value = [NSString stringWithFormat:@"%.0f%%", speed * 100], *datum = temps;
+    if (style == TRSpeedBar) {
+        Gauge *bar = [[Gauge alloc] initWithFrame:g]; bar.fraction = speed; bar.color = tc; bar.markerFraction = -1;
+        [row addSubview:bar];
+    } else if (style == TRTempBar) {
+        Gauge *bar = [[Gauge alloc] initWithFrame:g]; bar.fraction = MAX(0, MIN(1, (chip - 30) / 75.0)); bar.color = tc;
+        bar.markerFraction = -1; [row addSubview:bar];
+        value = [NSString stringWithFormat:@"%.0f°", chip];
+        datum = speed > 0.97 ? [NSString stringWithFormat:@"cells %.0f°", cells] : [NSString stringWithFormat:@"−%.0f%% · %.0f°", (1 - speed) * 100, cells];
+    } else if (style == TRCeilingBar) {
+        CeilingGauge *bar = [[CeilingGauge alloc] initWithFrame:g]; bar.fraction = speed; bar.color = tc; [row addSubview:bar];
+        value = [NSString stringWithFormat:@"%.1f", ghz];
+        datum = [NSString stringWithFormat:@"GHz  %@", temps];
+    } else {
+        ThermSegments *lamps = [[ThermSegments alloc] initWithFrame:g]; lamps.state = state; [row addSubview:lamps];
+    }
+    [row addSubview:[c text:value font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold] color:tc
+                         at:NSMakeRect(kValueX, (kRowH - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    [row addSubview:SheetDatum(c, datum, state ? tc : NSColor.secondaryLabelColor)];
+    return row;
+}
+
+static NSView *DetailRow(Controller *c, NSString *symbol, NSString *name, double fraction, NSColor *color,
+                         NSString *value, NSString *datum, NSColor *datumColor) {
+    NSView *row = BurnBaseRow(c, symbol, name, fraction, color, value, @"");
+    [row addSubview:SheetDatum(c, datum, datumColor ?: NSColor.secondaryLabelColor)];
+    return row;
+}
+
+static BOOL ThermalRowSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // pressure (0 nominal, 1 near, 2 slowed), fast-core speed fraction, GHz, chip °C, cells °C
+    NSArray *states = @[@[@0, @1.0, @4.4, @58, @29], @[@1, @0.82, @3.7, @72, @33], @[@2, @0.52, @2.3, @78, @34]];
+    NSArray *variants = @[@[@"A  bar + value = fast-core speed; datum chip · cells", @(TRSpeedBar)],
+                          @[@"B  bar + value = chip temp; datum speed lost · cells", @(TRTempBar)],
+                          @[@"C  speed bar, lost speed shaded red; value GHz", @(TRCeilingBar)],
+                          @[@"D  pressure lamps; value speed; datum chip · cells", @(TRLamps)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states) [rows addObject:ThermalRowSketch(c, st, [v[1] integerValue])];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    [builders addObject:^NSView *(NSAppearanceName look) {
+        NSColor *red = NSColor.systemRedColor, *orange = NSColor.systemOrangeColor, *green = [NSColor.systemGreenColor colorWithAlphaComponent:0.85];
+        NSMutableArray *rows = [NSMutableArray array];
+        ThermSegments *lamps = [[ThermSegments alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH)];
+        lamps.state = 2;
+        NSView *pressure = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+        [c instrumentSymbol:@"gauge.with.dots.needle.67percent" tint:red identifier:nil in:pressure];
+        [c instrumentName:@"State" identifier:nil in:pressure];
+        [pressure addSubview:lamps];
+        [pressure addSubview:SheetDatum(c, @"heavy · 41m", red)];
+        [rows addObject:pressure];
+        [rows addObject:DetailRow(c, @"hare", @"P-cores", 0.52, red, @"2.3", @"of 4.5 GHz", nil)];
+        [rows addObject:DetailRow(c, @"tortoise", @"E-cores", 0.72, orange, @"2.2", @"of 3.0 GHz", nil)];
+        [rows addObject:DetailRow(c, @"cpu", @"Chip", (78 - 30) / 75.0, red, @"78°", @"hottest core", nil)];
+        [rows addObject:DetailRow(c, @"battery.75", @"Cells", (34 - 20) / 30.0, green, @"34°", @"Low Power off", nil)];
+        [rows addObject:DetailRow(c, @"bolt", @"Power", 0.45, orange, @"9.1 W", @"CPU", nil)];
+        return TitledPanel(@"Thermal tab (for any variant)", rows, look, c);
+    }];
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "thermrow")) return ThermalRowSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;

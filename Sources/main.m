@@ -9,6 +9,7 @@
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <notify.h>
+#import <dlfcn.h>
 #import <Network/Network.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <net/if.h>
@@ -687,6 +688,129 @@ static BOOL ReadThermalPressure(int *out) {
     *out = (int)state;
     return YES;
 }
+// Core clocks from IOReport, the counters powermetrics reads, without root. The library
+// is private, so it is opened at run time; anything missing leaves the clocks unread.
+typedef struct {
+    BOOL valid;
+    double pMHz, pMaxMHz, pBusy;   // fast cores: active MHz, top clock, active share
+    double eMHz, eMaxMHz, eBusy;   // efficiency cores
+} CoreClocks;
+
+typedef struct IOReportSubscriptionRef *IOReportSubscriptionRef;
+static struct {
+    CFMutableDictionaryRef (*copyChannels)(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
+    IOReportSubscriptionRef (*subscribe)(void *, CFMutableDictionaryRef, CFMutableDictionaryRef *, uint64_t, CFTypeRef);
+    CFDictionaryRef (*samples)(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef);
+    CFDictionaryRef (*delta)(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+    CFStringRef (*channelName)(CFDictionaryRef);
+    int32_t (*stateCount)(CFDictionaryRef);
+    CFStringRef (*stateName)(CFDictionaryRef, int32_t);
+    int64_t (*residency)(CFDictionaryRef, int32_t);
+} IOR;
+
+// The DVFS tables live on the device tree's pmgr node; a cluster's table is the one with
+// one entry per performance state (its state count less IDLE).
+static NSArray<NSArray<NSNumber *> *> *DVFSTables(void) {
+    static NSArray *tables;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableArray *found = [NSMutableArray array];
+        io_registry_entry_t pmgr = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/arm-io/pmgr");
+        if (pmgr) {
+            CFMutableDictionaryRef props = NULL;
+            if (IORegistryEntryCreateCFProperties(pmgr, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                NSDictionary *d = (__bridge_transfer NSDictionary *)props;
+                for (NSString *key in d)
+                    if ([key hasPrefix:@"voltage-states"] && [key hasSuffix:@"-sram"] && [d[key] isKindOfClass:NSData.class]) {
+                        NSArray *mhz = DVFSTableMHz(d[key]);
+                        if (mhz.count) [found addObject:mhz];
+                    }
+            }
+            IOObjectRelease(pmgr);
+        }
+        tables = found;
+    });
+    return tables;
+}
+
+static NSArray<NSNumber *> *DVFSTableForStates(NSUInteger states, BOOL fast) {
+    NSArray *best = nil;
+    for (NSArray<NSNumber *> *t in DVFSTables()) {
+        if (t.count + 1 != states) continue;
+        if (!best || (fast ? t.lastObject.doubleValue > [best.lastObject doubleValue]
+                           : t.lastObject.doubleValue < [best.lastObject doubleValue])) best = t;
+    }
+    return best;
+}
+
+// Clocks averaged since the previous call. The first call only sets the baseline.
+static CoreClocks ReadCoreClocks(void) {
+    static IOReportSubscriptionRef sub;
+    static CFMutableDictionaryRef subbed;
+    static CFDictionaryRef previous;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *lib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
+        if (!lib) return;
+        IOR.copyChannels = dlsym(lib, "IOReportCopyChannelsInGroup");
+        IOR.subscribe = dlsym(lib, "IOReportCreateSubscription");
+        IOR.samples = dlsym(lib, "IOReportCreateSamples");
+        IOR.delta = dlsym(lib, "IOReportCreateSamplesDelta");
+        IOR.channelName = dlsym(lib, "IOReportChannelGetChannelName");
+        IOR.stateCount = dlsym(lib, "IOReportStateGetCount");
+        IOR.stateName = dlsym(lib, "IOReportStateGetNameForIndex");
+        IOR.residency = dlsym(lib, "IOReportStateGetResidency");
+        if (!IOR.copyChannels || !IOR.subscribe || !IOR.samples || !IOR.delta || !IOR.channelName ||
+            !IOR.stateCount || !IOR.stateName || !IOR.residency) return;
+        CFMutableDictionaryRef channels = IOR.copyChannels(CFSTR("CPU Stats"), CFSTR("CPU Core Performance States"), 0, 0, 0);
+        if (!channels) return;
+        sub = IOR.subscribe(NULL, channels, &subbed, 0, NULL);
+        CFRelease(channels);
+    });
+    // Refresh fires from several sources at once; a window under two seconds is noise.
+    static CoreClocks last;
+    static CFAbsoluteTime lastAt;
+    if (last.valid && CFAbsoluteTimeGetCurrent() - lastAt < 2) return last;
+    CoreClocks out = {0};
+    if (!sub) return out;
+    CFDictionaryRef now = IOR.samples(sub, subbed, NULL);
+    if (!now) return out;
+    if (!previous) { previous = now; return out; }
+    NSDictionary *delta = (__bridge_transfer NSDictionary *)IOR.delta(previous, now, NULL);
+    CFRelease(previous);
+    previous = now;
+    // Cores in a cluster share one clock; sum their residencies per cluster.
+    NSMutableArray *pNames = nil, *eNames = nil, *pRes = nil, *eRes = nil;
+    for (NSDictionary *item in delta[@"IOReportChannels"]) {
+        CFDictionaryRef ch = (__bridge CFDictionaryRef)item;
+        NSString *name = (__bridge NSString *)IOR.channelName(ch);
+        BOOL fast = [name hasPrefix:@"PCPU"], efficient = [name hasPrefix:@"ECPU"];
+        if (!fast && !efficient) continue;
+        int32_t n = IOR.stateCount(ch);
+        NSMutableArray *names = [NSMutableArray array], *res = fast ? pRes : eRes;
+        BOOL first = !res;
+        if (first) res = [NSMutableArray array];
+        for (int32_t i = 0; i < n; i++) {
+            [names addObject:(__bridge NSString *)IOR.stateName(ch, i) ?: @""];
+            double r = (double)IOR.residency(ch, i);
+            if (first) [res addObject:@(r)];
+            else if (i < (int32_t)res.count) res[i] = @([res[i] doubleValue] + r);
+        }
+        if (fast) { pNames = names; pRes = res; } else { eNames = names; eRes = res; }
+    }
+    NSArray *pTable = DVFSTableForStates(pNames.count, YES), *eTable = DVFSTableForStates(eNames.count, NO);
+    if (!pTable) return out;
+    out.pMHz = ClusterActiveMHz(pNames, pRes, pTable, &out.pBusy);
+    out.pMaxMHz = [pTable.lastObject doubleValue];
+    if (eTable) {
+        out.eMHz = ClusterActiveMHz(eNames, eRes, eTable, &out.eBusy);
+        out.eMaxMHz = [eTable.lastObject doubleValue];
+    }
+    out.valid = YES;
+    last = out; lastAt = CFAbsoluteTimeGetCurrent();
+    return out;
+}
+
 // Lay the live SMC watts over the slow IORegistry figures; anything unreadable keeps its value.
 static void ApplyLivePower(BatteryState *b) {
     if (!b->valid) return;
@@ -1037,6 +1161,7 @@ typedef struct {
     BOOL tempValid, thermalValid;
     double cpuTempC;     // hottest CPU core
     int thermalPressure; // com.apple.system.thermalpressurelevel, see ThermalLevelFor
+    CoreClocks clocks;
 } SystemState;
 
 // mach_host_self() returns a send right each call and the urefs are never returned;
@@ -1138,17 +1263,12 @@ static SystemState ReadSystemState(CPUCounters *previous) {
 
     s.tempValid = ReadCPUTempC(&s.cpuTempC);
     s.thermalValid = ReadThermalPressure(&s.thermalPressure);
+    s.clocks = ReadCoreClocks();
     return s;
 }
 
 static ThermalLevel SystemThermalLevel(SystemState s) {
     return s.thermalValid ? ThermalLevelFor(s.thermalPressure) : ThermalUnknown;
-}
-
-static NSColor *ThermalColor(ThermalLevel level) {
-    if (level == ThermalThrottling) return NSColor.systemRedColor;
-    if (level == ThermalNear) return NSColor.systemOrangeColor;
-    return NSColor.secondaryLabelColor;
 }
 
 // "Hottest core 73 °C · pressure heavy"
@@ -3778,6 +3898,21 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
     return [NSString stringWithFormat:@"battery.%d", bucket];
 }
 
+// macOS thermal pressure as four lamps: nominal · moderate · heavy · trapping, lit up to the level.
+@interface PressureLamps : NSView
+@property (nonatomic) int lit;
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation PressureLamps
+- (void)drawRect:(NSRect)dirty {
+    CGFloat gap = 3, h = NSHeight(self.bounds), w = (NSWidth(self.bounds) - 3 * gap) / 4, y = 0;
+    for (int i = 0; i < 4; i++) {
+        [(i < _lit ? _color : [NSColor.labelColor colorWithAlphaComponent:0.12]) setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(i * (w + gap), y, w, h) xRadius:h / 2 yRadius:h / 2] fill];
+    }
+}
+@end
+
 @interface Gauge : NSView
 @property (nonatomic) double fraction;
 @property (nonatomic) double markerFraction; // negative: no tick. 0.8 draws the 80% charge-limit mark
@@ -4999,6 +5134,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
     HeatGuardState _heatGuard;   // Low Power switched on by the battery heat guard
+    double _heatSpeed;           // fast cores' speed against their top clock; <0 unknown
+    CFAbsoluteTime _pressureSince;   // when macOS last began reporting thermal pressure; 0 = none
     BOOL _barShowDisk, _barShowBattery, _barShowSystem;
     // Keep Awake IS the system SleepDisabled setting (no idle or lid-close sleep), read off-main.
     // One live state, so the bar's cup and the footer button can never disagree.
@@ -5107,6 +5244,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
     _heatGuard = (HeatGuardState)MIN(MAX([ud integerForKey:@"heatGuardState"], 0), 2);
+    _heatSpeed = -1;
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
     _barShowBattery = [ud boolForKey:@"barShowBattery"];
     _barShowSystem = [ud boolForKey:@"barShowSystem"];
@@ -6349,6 +6487,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (s.cpuValid) { _lastCPU = s.cpu; _lastCPUValid = YES; }
     else if (_lastCPUValid) { s.cpu = _lastCPU; s.cpuValid = YES; }
     _sys = s;
+    ThermalLevel thermal = SystemThermalLevel(s);
+    _heatSpeed = HeatSpeedFraction(thermal, s.clocks.valid ? s.clocks.pMHz : 0, s.clocks.pMaxMHz,
+                                   s.clocks.valid ? s.clocks.pBusy : 0, _heatSpeed);
+    if (thermal != ThermalNear && thermal != ThermalThrottling) _pressureSince = 0;
+    else if (!_pressureSince) _pressureSince = CFAbsoluteTimeGetCurrent();
     _lastMachineRefresh = NSDate.date;
     [self refreshAIUsageAsync];
     [self refreshLidAwakeAsync];
@@ -7698,25 +7841,13 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     CGFloat y = roomInLine ? NSMidY(gauge.frame) - 7 : NSMinY(gauge.frame) - 9;
     arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, roomInLine ? 14 : 10);
 }
-// Once the chip or the cells are warm, the datum carries the cell temperature beside the
-// watts. The Battery tab keeps the watts: its Cells row carries the heat.
-- (NSString *)batteryRateText { return [self batteryRateTextWithHeat:YES]; }
-- (NSColor *)batteryRateColor { return [self batteryRateColorWithHeat:YES]; }
-- (BOOL)heatShowing { return HeatShowing(SystemThermalLevel(_sys), _bat.tempC); }
-- (NSString *)batteryRateTextWithHeat:(BOOL)withHeat {
+- (NSString *)batteryRateText {
     double bw = BatteryWatts(_bat);
-    NSString *watts = isnan(bw) ? @"" : fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
-    // Beside a warm chip or warm cells, the datum leads with the cells; idle watts drop out.
-    NSString *heat = withHeat && [self heatShowing]
-        ? CellsDatumText(_bat.tempC, isnan(bw) || fabs(bw) < 0.3 ? nil : watts) : nil;
-    return heat ?: watts;
+    if (isnan(bw)) return @"";
+    return fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
 }
-- (NSColor *)batteryRateColorWithHeat:(BOOL)withHeat {
-    BatteryHeat heat = withHeat ? BatteryHeatFor(_bat.tempC) : BatteryHeatNone;
-    if (heat != BatteryHeatNone) return heat == BatteryHeatHot ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+- (NSColor *)batteryRateColor {
     double bw = BatteryWatts(_bat);
-    if (withHeat && [self heatShowing] && _bat.tempC > 0 && (isnan(bw) || fabs(bw) < 0.3))
-        return NSColor.secondaryLabelColor;
     return isnan(bw) || fabs(bw) < 0.3 ? NSColor.secondaryLabelColor
          : bw > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
 }
@@ -7735,10 +7866,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     forecast.accessibilityIdentifier = [stem stringByAppendingString:@".forecast"];
     [self configureBatteryForecast:forecast];
     [row addSubview:forecast];
-    BOOL withHeat = ![stem hasPrefix:@"details.battery."];
-    NSTextField *rate = [self text:[self batteryRateTextWithHeat:withHeat]
+    NSTextField *rate = [self text:[self batteryRateText]
                               font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                             color:[self batteryRateColorWithHeat:withHeat] at:datum align:NSTextAlignmentLeft];
+                             color:[self batteryRateColor] at:datum align:NSTextAlignmentLeft];
     rate.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
     rate.accessibilityHelp = tip;
     [row addSubview:rate];
@@ -7793,17 +7923,82 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     NSString *memTip = [NSString stringWithFormat:@"%@\n%@", MemoryStatusText(_sys), SwapStatusText(_sys)];
     // CPU is the bar. Memory pressure tints the row's symbol; memory figures live in the System tab.
     (void)memTip;
-    // The datum is heat: the hottest core, coloured by macOS's own thermal pressure.
-    ThermalLevel heat = SystemThermalLevel(_sys);
-    NSString *heatText = ChipDatumText(_sys.tempValid ? _sys.cpuTempC : 0, heat, [self heatShowing]);
-    if (heatText) {
-        NSTextField *datum = [self text:heatText font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                                  color:ThermalColor(heat) at:datumFrame align:NSTextAlignmentLeft];
-        datum.accessibilityIdentifier = [stem stringByAppendingString:@".heat"];
-        datum.accessibilityLabel = ThermalStatusText(_sys);
+}
+
+// The Heat instrument: fast-core speed as the bar and percent, then chip · cells
+// temperatures. It appears once macOS reports pressure or the cells reach 38 °C.
+- (BOOL)heatShowing { return HeatShowing(SystemThermalLevel(_sys), _bat.valid ? _bat.tempC : 0); }
+- (NSColor *)heatSpeedColor {
+    if (_heatSpeed < 0) return NSColor.tertiaryLabelColor;
+    ThermalLevel level = SystemThermalLevel(_sys);
+    return level == ThermalThrottling ? NSColor.systemRedColor
+         : level == ThermalNear ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
+}
+// The worse of the chip's pressure and the cells' heat.
+- (NSColor *)heatTempsColor {
+    ThermalLevel level = SystemThermalLevel(_sys);
+    BatteryHeat cells = BatteryHeatFor(_bat.valid ? _bat.tempC : 0);
+    if (level == ThermalThrottling || cells == BatteryHeatHot) return NSColor.systemRedColor;
+    if (level == ThermalNear || cells == BatteryHeatWarm) return NSColor.systemOrangeColor;
+    return NSColor.secondaryLabelColor;
+}
+- (NSString *)heatPressureAge {
+    return _pressureSince > 0 ? BatteryForecastDuration(CFAbsoluteTimeGetCurrent(), _pressureSince) : nil;
+}
+// "Fast cores 2.3 of 4.5 GHz (52%)\nHottest core 78 °C · cells 34 °C · pressure heavy for 40m"
+- (NSString *)heatTip {
+    NSMutableArray *lines = [NSMutableArray array];
+    CoreClocks k = _sys.clocks;
+    ThermalLevel level = SystemThermalLevel(_sys);
+    if (level == ThermalNominal) [lines addObject:@"Fast cores at full speed"];
+    else if (_heatSpeed >= 0)
+        [lines addObject:[NSString stringWithFormat:@"Fast cores at %d%% of top speed", (int)lround(_heatSpeed * 100)]];
+    if (k.valid && k.pMHz > 0)
+        [lines addObject:[NSString stringWithFormat:@"now %.1f of %.1f GHz", k.pMHz / 1000, k.pMaxMHz / 1000]];
+    NSMutableArray *parts = [NSMutableArray array];
+    if (_sys.tempValid) [parts addObject:[NSString stringWithFormat:@"Hottest core %ld °C", lround(_sys.cpuTempC)]];
+    if (_bat.valid && _bat.tempC > 0) [parts addObject:[NSString stringWithFormat:@"cells %ld °C", lround(_bat.tempC)]];
+    if (_sys.thermalValid) {
+        NSString *p = [@"pressure " stringByAppendingString:ThermalPressureName(_sys.thermalPressure)];
+        NSString *age = [self heatPressureAge];
+        [parts addObject:age && ![age isEqual:@"—"] ? [p stringByAppendingFormat:@" for %@", age] : p];
+    }
+    if (parts.count) [lines addObject:[parts componentsJoinedByString:@" · "]];
+    return lines.count ? [lines componentsJoinedByString:@"\n"] : @"Heat unknown";
+}
+- (void)addHeatInstrumentTo:(NSView *)row gauge:(NSRect)gaugeFrame value:(NSRect)valueFrame
+                      datum:(NSRect)datumFrame stem:(NSString *)stem tip:(NSString *)tip {
+    NSColor *speedColor = [self heatSpeedColor];
+    Gauge *g = [[Gauge alloc] initWithFrame:gaugeFrame];
+    g.fraction = MAX(0, _heatSpeed);
+    g.color = speedColor;
+    g.metricLabel = @"Speed";
+    g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+    g.accessibilityHelp = tip;
+    [row addSubview:g];
+    NSTextField *value = [self text:(_heatSpeed >= 0 ? [NSString stringWithFormat:@"%d%%", (int)lround(_heatSpeed * 100)] : @"—")
+                               font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+                              color:speedColor at:valueFrame align:NSTextAlignmentRight];
+    value.accessibilityIdentifier = [stem stringByAppendingString:@".value"];
+    value.accessibilityLabel = @"Fast-core speed";
+    value.accessibilityHelp = tip;
+    [row addSubview:value];
+    NSString *temps = HeatTempsText(_sys.tempValid ? _sys.cpuTempC : 0, _bat.valid ? _bat.tempC : 0);
+    if (temps) {
+        NSTextField *datum = [self text:temps font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+                                  color:[self heatTempsColor] at:datumFrame align:NSTextAlignmentLeft];
+        datum.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
+        datum.accessibilityLabel = @"Hottest core · battery cells";
         datum.accessibilityHelp = tip;
         [row addSubview:datum];
     }
+}
+- (NSString *)heatSymbol {
+    return SystemThermalLevel(_sys) == ThermalThrottling ? @"thermometer.high" : @"thermometer.medium";
+}
+- (NSColor *)heatSymbolColor {
+    NSColor *c = [self heatTempsColor];
+    return c == NSColor.secondaryLabelColor ? [self heatSpeedColor] : c;
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
@@ -8484,6 +8679,25 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:row];
         y += kRowH;
     }
+    if ([self heatShowing]) {
+        NSString *tip = [self heatTip];
+        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        row.target = self;
+        row.action = @selector(showThermalDetails:);
+        row.accessibilityRole = NSAccessibilityButtonRole;
+        row.accessibilityIdentifier = @"popover.row.heat";
+        row.accessibilityHelp = tip;
+        row.accessibilityLabel = tip;
+        [self instrumentSymbol:[self heatSymbol] tint:[self heatSymbolColor] identifier:@"popover.heat.symbol" in:row];
+        [self instrumentName:@"Heat" identifier:@"popover.heat.name" in:row];
+        [self addHeatInstrumentTo:row
+                            gauge:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)
+                            value:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH)
+                            datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
+                             stem:@"popover.heat" tip:tip];
+        [root addSubview:row];
+        y += kRowH;
+    }
 
     y = [self addMeteredTo:root at:y];
 
@@ -9027,6 +9241,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     if ([key isEqualToString:@"battery"]) return @"battery.100";
     if ([key isEqualToString:@"system"] || [key isEqualToString:@"top-cpu"]) return @"cpu";
     if ([key isEqualToString:@"top-memory"]) return @"memorychip";
+    if ([key isEqualToString:@"thermal"]) return @"thermometer.medium";
     if ([key isEqualToString:@"energy"]) return @"bolt";
     if ([key isEqualToString:@"top-signals"]) return @"chart.bar";
     if ([key isEqualToString:@"sources"] || [key isEqualToString:@"privacy"]) return @"checkmark.circle";
@@ -9284,6 +9499,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     if ([identifier isEqualToString:@"storage"]) return @"internaldrive";
     if ([identifier isEqualToString:@"battery"]) return @"battery.100";
     if ([identifier isEqualToString:@"system"]) return @"cpu";
+    if ([identifier isEqualToString:@"thermal"]) return @"thermometer.medium";
     if ([identifier isEqualToString:@"activity"]) return @"waveform.path.ecg";
     if ([identifier isEqualToString:@"ai"]) return @"sparkle";   // the section, not one provider
     return @"circle.dashed";
@@ -9314,6 +9530,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @[@"storage", @"Storage"],
         @[@"battery", @"Battery"],
         @[@"system", @"System"],
+        @[@"thermal", @"Thermal"],
         @[@"activity", @"Activity"],
         @[@"ai", @"AI"],
     ];
@@ -9985,6 +10202,21 @@ static NSColor *HealthColor(double fraction) {
                               datum:DetailDatumRect(c) stem:@"details.overview.system" tip:tip];
         y += c.rowH;
     }
+    if ([self heatShowing]) {
+        NSString *tip = [self heatTip];
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.overview.row.heat" tip:tip in:root];
+        NSImageView *mark = [self detailSymbol:[self heatSymbol] size:c.symbol tint:[self heatSymbolColor]
+                                         frame:DetailLeadRect(c) identifier:@"details.overview.heat.symbol" in:row];
+        mark.accessibilityHelp = tip;
+        NSTextField *heatName = [self detailText:@"Heat" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                           color:NSColor.labelColor
+                                           frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                           align:NSTextAlignmentLeft identifier:@"details.overview.heat.name" in:row];
+        heatName.accessibilityHelp = tip;
+        [self addHeatInstrumentTo:row gauge:DetailGaugeRect(c) value:DetailValueRect(c)
+                            datum:DetailDatumRect(c) stem:@"details.overview.heat" tip:tip];
+        y += c.rowH;
+    }
 
     if ([_metered[@"onLink"] boolValue]) {
         NSString *link = _metered[@"link"];
@@ -10464,22 +10696,6 @@ static NSColor *HealthColor(double fraction) {
         y += c.rowH;
     }
     {
-        ThermalLevel heat = SystemThermalLevel(_sys);
-        NSColor *color = _sys.tempValid || heat != ThermalUnknown ? ThermalColor(heat) : NSColor.tertiaryLabelColor;
-        if (heat == ThermalNominal) color = NSColor.labelColor;
-        NSString *tip = ThermalStatusText(_sys);
-        NSView *row = [self detailRowAt:y cols:c identifier:@"details.system.row.heat" tip:tip in:root];
-        NSImageView *mark = [self detailSymbol:(heat == ThermalThrottling ? @"thermometer.high" : @"thermometer.medium")
-                                          size:c.symbol tint:(heat == ThermalNominal ? NSColor.secondaryLabelColor : color)
-                                         frame:DetailLeadRect(c) identifier:@"details.system.heat.symbol" in:row];
-        mark.accessibilityHelp = tip;
-        [self detailValue:(_sys.tempValid ? [NSString stringWithFormat:@"%ld °C", lround(_sys.cpuTempC)] : @"—")
-                    color:color identifier:@"details.system.heat.value" tip:tip in:row cols:c];
-        NSString *word = heat == ThermalThrottling ? @"slowed" : heat == ThermalNear ? @"near limit" : nil;
-        if (word) [self detailDatum:word color:color identifier:@"details.system.heat.datum" tip:tip in:row cols:c];
-        y += c.rowH;
-    }
-    {
         NSString *value = @"—";
         if (_sys.swapValid) value = _sys.swapUsed == 0 ? @"0 GB" : FmtMemBytes((long long)_sys.swapUsed);
         NSString *tip = SwapStatusText(_sys);
@@ -10546,12 +10762,119 @@ static NSColor *HealthColor(double fraction) {
     return [self detailScrollForRoot:root height:y];
 }
 
+// Thermal: macOS's pressure as four lamps, each core cluster's clock against its top
+// speed, then the hottest core and the battery cells.
+- (NSScrollView *)thermalDetailsView {
+    FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 300)];
+    root.accessibilityIdentifier = @"details.thermal";
+    DetailColumns c = DetailLayout(kDetailW);
+    CGFloat y = kDetailPad;
+    [self addDetailHeading:@"Thermal" key:@"thermal" to:root y:&y width:kDetailW];
+    NSString *tip = [self heatTip];
+    ThermalLevel level = SystemThermalLevel(_sys);
+    NSColor *levelColor = level == ThermalThrottling ? NSColor.systemRedColor
+        : level == ThermalNear ? NSColor.systemOrangeColor
+        : level == ThermalNominal ? NSColor.systemGreenColor : NSColor.tertiaryLabelColor;
+    {
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.thermal.row.pressure" tip:tip in:root];
+        [self detailSymbol:@"gauge.with.dots.needle.67percent" size:c.symbol tint:levelColor frame:DetailLeadRect(c)
+                identifier:@"details.thermal.pressure.symbol" in:row];
+        [self detailText:@"Pressure" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                   frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16) align:NSTextAlignmentLeft
+              identifier:@"details.thermal.pressure.name" in:row];
+        PressureLamps *lamps = [[PressureLamps alloc] initWithFrame:DetailGaugeRect(c)];
+        lamps.lit = _sys.thermalValid ? MIN(MAX(_sys.thermalPressure, 0), 3) + 1 : 0;
+        lamps.color = levelColor;
+        lamps.accessibilityIdentifier = @"details.thermal.pressure.lamps";
+        lamps.accessibilityHelp = tip;
+        [row addSubview:lamps];
+        [self detailValue:(_sys.thermalValid ? ThermalPressureName(_sys.thermalPressure) : @"—") color:levelColor
+               identifier:@"details.thermal.pressure.value" tip:tip in:row cols:c];
+        NSString *age = [self heatPressureAge];
+        if (age && ![age isEqual:@"—"])
+            [self detailDatum:[@"for " stringByAppendingString:age] color:levelColor
+                   identifier:@"details.thermal.pressure.datum" tip:tip in:row cols:c];
+        y += c.rowH;
+    }
+    CoreClocks k = _sys.clocks;
+    NSArray *clusters = @[@[@"fast", @"P-cores", @"hare", @(k.pMHz), @(k.pMaxMHz)],
+                          @[@"efficient", @"E-cores", @"tortoise", @(k.eMHz), @(k.eMaxMHz)]];
+    for (NSArray *cl in clusters) {
+        double mhz = [cl[3] doubleValue], top = [cl[4] doubleValue];
+        BOOL known = k.valid && top > 0;
+        NSColor *color = known && mhz > 0 ? [self heatSpeedColor] : NSColor.tertiaryLabelColor;
+        if (level == ThermalNominal && known) color = NSColor.systemGreenColor;
+        NSString *rowTip = known ? [NSString stringWithFormat:@"%@ averaged %.2f GHz while active, %d%% of the time · top %.2f GHz",
+                                    cl[1], mhz / 1000, (int)lround(100 * ([cl[0] isEqual:@"fast"] ? k.pBusy : k.eBusy)), top / 1000]
+                             : @"Clock speed unavailable";
+        NSString *stem = [@"details.thermal." stringByAppendingString:cl[0]];
+        NSView *row = [self detailRowAt:y cols:c identifier:[@"details.thermal.row." stringByAppendingString:cl[0]] tip:rowTip in:root];
+        [self detailSymbol:cl[2] size:c.symbol tint:color frame:DetailLeadRect(c)
+                identifier:[stem stringByAppendingString:@".symbol"] in:row];
+        [self detailText:cl[1] font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                   frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16) align:NSTextAlignmentLeft
+              identifier:[stem stringByAppendingString:@".name"] in:row];
+        if (known)
+            [self detailGauge:DetailGaugeRect(c) fraction:MIN(1, mhz / top) color:color label:rowTip
+                   identifier:[stem stringByAppendingString:@".gauge"] tip:rowTip in:row];
+        [self detailValue:(known && mhz > 0 ? [NSString stringWithFormat:@"%.1f", mhz / 1000] : @"—") color:color
+               identifier:[stem stringByAppendingString:@".value"] tip:rowTip in:row cols:c];
+        if (known)
+            [self detailDatum:[NSString stringWithFormat:@"of %.1f GHz", top / 1000] color:NSColor.secondaryLabelColor
+                   identifier:[stem stringByAppendingString:@".datum"] tip:rowTip in:row cols:c];
+        y += c.rowH;
+    }
+    {
+        BOOL known = _sys.tempValid;
+        NSColor *color = known ? (level == ThermalNominal ? NSColor.systemGreenColor : levelColor) : NSColor.tertiaryLabelColor;
+        NSString *rowTip = ThermalStatusText(_sys);
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.thermal.row.chip" tip:rowTip in:root];
+        [self detailSymbol:@"cpu" size:c.symbol tint:color frame:DetailLeadRect(c) identifier:@"details.thermal.chip.symbol" in:row];
+        [self detailText:@"Chip" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                   frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16) align:NSTextAlignmentLeft
+              identifier:@"details.thermal.chip.name" in:row];
+        if (known)
+            [self detailGauge:DetailGaugeRect(c) fraction:MAX(0, MIN(1, (_sys.cpuTempC - 30) / 75.0)) color:color label:rowTip
+                   identifier:@"details.thermal.chip.gauge" tip:rowTip in:row];
+        [self detailValue:(known ? [NSString stringWithFormat:@"%ld°", lround(_sys.cpuTempC)] : @"—") color:color
+               identifier:@"details.thermal.chip.value" tip:rowTip in:row cols:c];
+        if (known)
+            [self detailDatum:@"hottest core" color:NSColor.secondaryLabelColor
+                   identifier:@"details.thermal.chip.datum" tip:rowTip in:row cols:c];
+        y += c.rowH;
+    }
+    if (_bat.valid) {
+        BOOL known = _bat.tempC > 0;
+        BatteryHeat heat = BatteryHeatFor(_bat.tempC);
+        NSColor *color = !known ? NSColor.tertiaryLabelColor : heat == BatteryHeatHot ? NSColor.systemRedColor
+            : heat == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
+        NSString *rowTip = known ? [NSString stringWithFormat:@"Battery cells %ld °C · warm from 38 °C, hot from 42 °C", lround(_bat.tempC)]
+                                 : @"Cell temperature unavailable";
+        NSView *row = [self detailRowAt:y cols:c identifier:@"details.thermal.row.cells" tip:rowTip in:root];
+        [self detailSymbol:@"battery.75" size:c.symbol tint:color frame:DetailLeadRect(c) identifier:@"details.thermal.cells.symbol" in:row];
+        [self detailText:@"Cells" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] color:NSColor.labelColor
+                   frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16) align:NSTextAlignmentLeft
+              identifier:@"details.thermal.cells.name" in:row];
+        if (known)
+            [self detailGauge:DetailGaugeRect(c) fraction:MAX(0, MIN(1, (_bat.tempC - 20) / 30.0)) color:color label:rowTip
+                   identifier:@"details.thermal.cells.gauge" tip:rowTip in:row];
+        [self detailValue:(known ? [NSString stringWithFormat:@"%ld°", lround(_bat.tempC)] : @"—") color:color
+               identifier:@"details.thermal.cells.value" tip:rowTip in:row cols:c];
+        NSString *lp = _heatGuard == HeatGuardEngaged ? @"Low Power for heat" : LowPowerModeEnabled() ? @"Low Power on" : nil;
+        if (lp)
+            [self detailDatum:lp color:NSColor.secondaryLabelColor identifier:@"details.thermal.cells.datum" tip:rowTip in:row cols:c];
+        y += c.rowH;
+    }
+    return [self detailScrollForRoot:root height:y];
+}
+
 - (NSScrollView *)detailViewForIdentifier:(NSString *)identifier {
     if ([identifier isEqualToString:@"activity"]) return [self activityDetailsView];
     if ([identifier isEqualToString:@"overview"]) return [self overviewDetailsView];
     if ([identifier isEqualToString:@"storage"]) return [self storageDetailsView];
     if ([identifier isEqualToString:@"battery"]) return [self batteryDetailsView];
     if ([identifier isEqualToString:@"system"]) return [self systemDetailsView];
+    if ([identifier isEqualToString:@"thermal"]) return [self thermalDetailsView];
     if ([identifier isEqualToString:@"ai"]) return [self aiDetailsView];
     return nil;
 }
@@ -10602,6 +10925,7 @@ static NSColor *HealthColor(double fraction) {
 - (void)showStorageDetails:(id)sender { [self showDetailsTab:@"storage" sender:sender]; }
 - (void)showBatteryDetails:(id)sender { [self showDetailsTab:@"battery" sender:sender]; }
 - (void)showSystemDetails:(id)sender { [self showDetailsTab:@"system" sender:sender]; }
+- (void)showThermalDetails:(id)sender { [self showDetailsTab:@"thermal" sender:sender]; }
 - (void)showDetailsTab:(NSString *)tab sender:(id)sender {
     [self showDetails:sender];
     if (!tab.length || ![_detailsWindow.contentViewController isKindOfClass:NSTabViewController.class]) return;
@@ -10772,6 +11096,7 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
     };
 
     CPUCounters previous = ReadCPUCounters();
+    (void)ReadCoreClocks();   // baseline; ReadSystemState measures the quarter second after it
     [NSThread sleepForTimeInterval:0.25];
     SystemState system = ReadSystemState(&previous);
     NSDictionary *stats = SampleProcessStats(5);
@@ -10795,6 +11120,11 @@ static NSDictionary *DumpSnapshot(BOOL allowOnline) {
         @"cpuTempC": system.tempValid ? @(system.cpuTempC) : NSNull.null,
         @"thermalPressure": system.thermalValid ? ThermalPressureName(system.thermalPressure) : NSNull.null,
         @"processInfoThermalState": @(NSProcessInfo.processInfo.thermalState),
+        @"fastCoreMHz": system.clocks.valid && system.clocks.pMHz > 0 ? @(system.clocks.pMHz) : NSNull.null,
+        @"fastCoreTopMHz": system.clocks.valid ? @(system.clocks.pMaxMHz) : NSNull.null,
+        @"fastCoreBusy": system.clocks.valid ? @(system.clocks.pBusy) : NSNull.null,
+        @"efficiencyCoreMHz": system.clocks.valid && system.clocks.eMHz > 0 ? @(system.clocks.eMHz) : NSNull.null,
+        @"efficiencyCoreTopMHz": system.clocks.valid && system.clocks.eMaxMHz > 0 ? @(system.clocks.eMaxMHz) : NSNull.null,
         @"topCPU": DumpProcessRows(cpuRows, YES),
         @"topMemory": DumpProcessRows(memoryRows, NO),
         @"processSampleAvailable": JSONBool(cpuRows.count > 0 || memoryRows.count > 0)
@@ -10974,6 +11304,16 @@ static void PrintHumanDump(NSDictionary *snapshot) {
             : [NSString stringWithFormat:@"hottest core %ld °C", lround([system[@"cpuTempC"] doubleValue])],
         system[@"thermalPressure"] == NSNull.null ? @"unknown" : system[@"thermalPressure"], system[@"processInfoThermalState"]];
     printf("system %s · %s · %s\n       %s\n", UTF8(cpu), UTF8(memory), UTF8(swap), UTF8(heat));
+    if (system[@"fastCoreTopMHz"] != NSNull.null) {
+        NSString *(^clock)(NSString *, NSString *, NSString *) = ^NSString *(NSString *label, NSString *now, NSString *top) {
+            return system[top] == NSNull.null ? nil : [NSString stringWithFormat:@"%@ %@ of %.1f GHz", label,
+                system[now] == NSNull.null ? @"idle" : [NSString stringWithFormat:@"%.1f", [system[now] doubleValue] / 1000],
+                [system[top] doubleValue] / 1000];
+        };
+        NSString *fast = clock(@"fast cores", @"fastCoreMHz", @"fastCoreTopMHz");
+        NSString *slow = clock(@"efficiency cores", @"efficiencyCoreMHz", @"efficiencyCoreTopMHz");
+        printf("       %s%s%s\n", UTF8(fast), slow ? " · " : "", slow ? UTF8(slow) : "");
+    }
     NSArray *topCPU = system[@"topCPU"], *topMemory = system[@"topMemory"];
     if (!topCPU.count && !topMemory.count) printf("top apps unavailable\n");
     if (topCPU.count) {

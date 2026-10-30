@@ -370,8 +370,10 @@ int main(int argc, const char **argv) {
         [c setValue:[NSDate dateWithTimeIntervalSinceNow:-3600] forKey:@"lastVolumeSuccess"];
         SystemState sys = {.cpuValid=YES, .memValid=YES, .swapValid=YES, .cpu=0.24,
             .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1,
-            .tempValid=YES, .cpuTempC=101.4, .thermalValid=YES, .thermalPressure=2};
+            .tempValid=YES, .cpuTempC=101.4, .thermalValid=YES, .thermalPressure=2,
+            .clocks={.valid=YES, .pMHz=2321, .pMaxMHz=4464, .pBusy=0.9, .eMHz=2100, .eMaxMHz=3048, .eBusy=0.95}};
         [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
+        [c setValue:@0.52 forKey:@"heatSpeed"];
         BatteryState b = {.valid=YES, .percent=61, .acConnected=YES, .isCharging=YES,
             .rawCurrent_mAh=2745, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
             .cycleCount=120, .systemPowerIn_mW=18800, .systemLoad_mW=6800, .adapterWatts=20};
@@ -404,7 +406,7 @@ int main(int argc, const char **argv) {
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
                (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
-        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 5 ||
+        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 6 ||   // + Heat, under pressure
             HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
         if (FindIdentifier(root,@"popover.ai.codex.gauge") ||
             ![((NSTextField *)FindIdentifier(root,@"popover.ai.codex.value")).stringValue isEqual:@"—"]) return Fail(__LINE__);
@@ -516,34 +518,73 @@ int main(int argc, const char **argv) {
             ![popSystemName.stringValue isEqual:@"System"] || !SameColumn(popStorageName, claudeName) ||
             !SameColumn(popBatteryName, claudeName) || !SameColumn(popSystemName, claudeName))
             return Fail(__LINE__);
-        // Heat rides in the System row's datum: the hottest core, red and "slowed" while throttling.
-        NSTextField *heat = (NSTextField *)FindIdentifier(root, @"popover.system.heat");
-        if (![heat.stringValue isEqual:@"101° slowed"] || ![heat.textColor isEqual:NSColor.systemRedColor] ||
-            fabs(heat.frame.origin.x - kDatumX) > 0.5 || !SameColumn(heat, batteryDatum) ||
-            ![heat.accessibilityLabel isEqual:@"Hottest core 101 °C · pressure heavy"]) return Fail(__LINE__);
-        {   // A warm chip brings the cells in beside the watts; unread cells leave the watts alone.
+        // Under pressure a Heat row follows System: fast-core speed, then chip · cells.
+        NSTextField *heatValue = (NSTextField *)FindIdentifier(root, @"popover.heat.value");
+        NSTextField *heatDatum = (NSTextField *)FindIdentifier(root, @"popover.heat.datum");
+        NSTextField *heatName = (NSTextField *)FindIdentifier(root, @"popover.heat.name");
+        if (!FindIdentifier(root, @"popover.row.heat") || ![heatName.stringValue isEqual:@"Heat"] ||
+            ![heatValue.stringValue isEqual:@"52%"] || ![heatValue.textColor isEqual:NSColor.systemRedColor] ||
+            ![heatDatum.stringValue isEqual:@"101°"] || ![heatDatum.textColor isEqual:NSColor.systemRedColor] ||
+            !SameColumn(heatDatum, batteryDatum) || !SameColumn(heatName, popSystemName) ||
+            FindIdentifier(root, @"popover.system.heat") || !HasTip(root, @"Fast cores at 52% of top speed"))
+            return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-heat.png"];
+            if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        {   // The Thermal tab: pressure lamps, both clusters against their top clocks, chip.
+            NSView *thermal = [c thermalDetailsView].documentView;
+            NSTextField *(^field)(NSString *) = ^NSTextField *(NSString *ident) {
+                return (NSTextField *)FindIdentifier(thermal, [@"details.thermal." stringByAppendingString:ident]);
+            };
+            if (![field(@"pressure.value").stringValue isEqual:@"heavy"] || !FindIdentifier(thermal, @"details.thermal.pressure.lamps") ||
+                ![field(@"fast.value").stringValue isEqual:@"2.3"] || ![field(@"fast.datum").stringValue isEqual:@"of 4.5 GHz"] ||
+                ![field(@"efficient.value").stringValue isEqual:@"2.1"] || ![field(@"efficient.datum").stringValue isEqual:@"of 3.0 GHz"] ||
+                ![field(@"chip.value").stringValue isEqual:@"101°"] || ![field(@"fast.value").textColor isEqual:NSColor.systemRedColor] ||
+                !SameColumn(field(@"fast.value"), field(@"chip.value")) || FindIdentifier([c systemDetailsView].documentView, @"details.system.row.heat") ||
+                !FitsChildren(thermal)) return Fail(__LINE__);
+            const char *thermalOut = getenv("GLANCEBAR_RENDER_THERMAL");
+            if (thermalOut && thermalOut[0] && !RenderOffscreen(thermal, [NSString stringWithUTF8String:thermalOut],
+                                                               argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        {   // Cells join the chip in the Heat datum; the Battery datum keeps its watts.
             BatteryState warm = b; warm.tempC = 31.3;
             [c setValue:[NSValue valueWithBytes:&warm objCType:@encode(BatteryState)] forKey:@"bat"];
             [c rebuildContent];
-            NSTextField *pairDatum = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.battery.datum");
-            if (![pairDatum.stringValue isEqual:@"31° · +12 W"] || ![pairDatum.textColor isEqual:NSColor.systemGreenColor])
-                return Fail(__LINE__);
+            NSView *warmRoot = p.contentViewController.view;
+            NSTextField *pair = (NSTextField *)FindIdentifier(warmRoot, @"popover.heat.datum");
+            NSTextField *watts = (NSTextField *)FindIdentifier(warmRoot, @"popover.battery.datum");
+            if (![pair.stringValue isEqual:@"101° · 31°"] || ![watts.stringValue isEqual:@"+12 W"] ||
+                ![watts.textColor isEqual:NSColor.systemGreenColor]) return Fail(__LINE__);
         }
-        {   // Hot cells colour the paired datum; the widest form still fits the column.
+        {   // Hot cells with a cool chip still bring the row; the cells set its colour.
+            SystemState cool = sys; cool.thermalPressure = 0; cool.cpuTempC = 61;
+            [c setValue:[NSValue valueWithBytes:&cool objCType:@encode(SystemState)] forKey:@"sys"];
             BatteryState hot = b; hot.tempC = 41.6;
             [c setValue:[NSValue valueWithBytes:&hot objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:@1.0 forKey:@"heatSpeed"];
             [c rebuildContent];
             NSView *hotRoot = p.contentViewController.view;
-            NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.battery.datum");
-            if (![hotDatum.stringValue isEqual:@"42° · +12 W"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
+            NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.datum");
+            NSTextField *hotValue = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.value");
+            if (![hotDatum.stringValue isEqual:@"61° · 42°"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
+                ![hotValue.stringValue isEqual:@"100%"] || ![hotValue.textColor isEqual:NSColor.systemGreenColor] ||
                 !HasTip(hotRoot, @"cells 42 °C") || !FitsChildren(hotRoot)) return Fail(__LINE__);
-            NSTextField *wide = [c text:@"42° · \u22129.5 W" font:hotDatum.font color:hotDatum.textColor
-                                     at:hotDatum.frame align:NSTextAlignmentLeft];
-            if (wide.intrinsicContentSize.width > NSWidth(hotDatum.frame)) return Fail(__LINE__);
             if (argc > 1) {
                 NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-battery-hot.png"];
                 if (!RenderOffscreen(hotRoot, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
             }
+            [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
+            [c setValue:@0.52 forKey:@"heatSpeed"];
+        }
+        {   // Both cool: no Heat row.
+            SystemState cool = sys; cool.thermalPressure = 0; cool.cpuTempC = 55;
+            BatteryState mild = b; mild.tempC = 30;
+            [c setValue:[NSValue valueWithBytes:&cool objCType:@encode(SystemState)] forKey:@"sys"];
+            [c setValue:[NSValue valueWithBytes:&mild objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.heat")) return Fail(__LINE__);
+            // The rest of the checks run cool, without the Heat row.
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
             [c rebuildContent];
             root = p.contentViewController.view;
@@ -834,11 +875,11 @@ int main(int argc, const char **argv) {
         [c rebuildDetails];
         NSTabViewController *tabs = (NSTabViewController *)details.contentViewController;
         if (![tabs isKindOfClass:NSTabViewController.class] ||
-            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 6)
+            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 7)
             return Fail(__LINE__);
         [c rebuildDetails];   // in-place refresh must keep the symbols and the documents
-        if (tabs.tabViewItems.count != 6) return Fail(__LINE__);
-        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]];
+        if (tabs.tabViewItems.count != 7) return Fail(__LINE__);
+        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]];
         for (NSTabViewItem *item in tabs.tabViewItems) {
             if (!item.image || ![item.identifier isKindOfClass:NSString.class] ||
                 ![idents containsObject:item.identifier]) return Fail(__LINE__);
@@ -1088,7 +1129,7 @@ int main(int argc, const char **argv) {
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
         PrimeBatteryForecast(c, b, YES);
             [c rebuildContent];
-            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]) {
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]) {
                 NSView *doc = ((NSScrollView *)[c detailViewForIdentifier:tab]).documentView;
                 if (!FitsChildren(doc)) { fprintf(stderr, "details tab %s\n", tab.UTF8String); return Fail(__LINE__); }
             }
@@ -1318,7 +1359,7 @@ int main(int argc, const char **argv) {
         const char *detailsPrefix = getenv("GLANCEBAR_RENDER_DETAILS");
         if (detailsPrefix && detailsPrefix[0]) {
             NSAppearanceName appearance = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
-            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"activity", @"ai"]) {
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]) {
                 NSScrollView *scroll = [c detailViewForIdentifier:tab];
                 NSView *doc = [scroll isKindOfClass:NSScrollView.class] ? scroll.documentView : scroll;
                 NSString *path = [NSString stringWithFormat:@"%s-%@.png", detailsPrefix, tab];

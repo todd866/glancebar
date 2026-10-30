@@ -2253,18 +2253,32 @@ int main(void) {
         check([BatteryHeatText(38.2) isEqual:@"38 °C"] && BatteryHeatFor(38.2) == BatteryHeatWarm, @"battery heat: warm");
         check(BatteryHeatFor(42) == BatteryHeatHot && BatteryHeatFor(41.6) == BatteryHeatHot,
               @"battery heat: hot, judged on the degree shown");
-        // Chip and cells show together once either is warm.
-        check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat pair: quiet while both cool");
+        // The Heat row: appears once either is warm.
+        check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat: quiet while both cool");
         check(HeatShowing(ThermalThrottling, 31) && HeatShowing(ThermalNear, 0) && HeatShowing(ThermalNominal, 37.6),
-              @"heat pair: either warm shows both");
-        check(ChipDatumText(60.4, ThermalNominal, NO) == nil, @"heat pair: cool chip hidden");
-        check([ChipDatumText(60.4, ThermalNominal, YES) isEqual:@"60 °C"], @"heat pair: cool chip shown beside warm cells");
-        check([ChipDatumText(88, ThermalThrottling, YES) isEqual:@"88° slowed"], @"heat pair: pressure wording wins");
-        check(ChipDatumText(0, ThermalNominal, YES) == nil, @"heat pair: unread chip stays empty");
-        check([CellsDatumText(31.3, nil) isEqual:@"31 °C"] && [CellsDatumText(31.3, @"") isEqual:@"31 °C"],
-              @"heat pair: cells alone");
-        check([CellsDatumText(39, @"\u22129.5 W") isEqual:@"39° · \u22129.5 W"], @"heat pair: cells with watts");
-        check(CellsDatumText(0, @"+3 W") == nil, @"heat pair: unread cells");
+              @"heat: either warm shows the row");
+        check([HeatTempsText(78.4, 34.2) isEqual:@"78° · 34°"], @"heat: chip · cells");
+        check([HeatTempsText(78, 0) isEqual:@"78°"] && [HeatTempsText(0, 34) isEqual:@"cells 34°"] && !HeatTempsText(0, 0),
+              @"heat: unread sensors drop out");
+        {
+            uint8_t raw[24] = {0x60,0xf5,0x13,0,0x16,0x03,0,0,  0,0,0,0,0,0,0,0,  0x80,0x1d,0x44,0,0x16,0x03,0,0};   // 1308000, 0, 4464000 kHz
+            NSArray *mhz = DVFSTableMHz([NSData dataWithBytes:raw length:sizeof raw]);
+            check(mhz.count == 2 && fabs([mhz[0] doubleValue] - 1308) < 0.01 && fabs([mhz[1] doubleValue] - 4464) < 0.01,
+                  @"clocks: DVFS table in kHz, zero entries dropped");
+        }
+        {
+            NSArray *table = @[@1308, @1608, @1932, @2220];
+            double busy = -1;
+            double mhz = ClusterActiveMHz(@[@"IDLE", @"V0P3", @"V1P2", @"V2P1", @"V3P0"], @[@25, @0, @0, @50, @25], table, &busy);
+            check(fabs(mhz - (50 * 1932 + 25 * 2220) / 75.0) < 0.01 && fabs(busy - 0.75) < 1e-9, @"clocks: residency-weighted while active");
+            check(ClusterActiveMHz(@[@"IDLE", @"V0P3"], @[@100, @0], table, &busy) == 0 && busy == 0, @"clocks: idle cluster");
+            check(ClusterActiveMHz(@[@"IDLE", @"V9P0"], @[@0, @10], table, &busy) == 0, @"clocks: unknown state ignored");
+        }
+        check(HeatSpeedFraction(ThermalNominal, 1300, 4464, 0.1, -1) == 1, @"speed: no pressure, full speed");
+        check(fabs(HeatSpeedFraction(ThermalThrottling, 2321, 4464, 0.9, -1) - 0.52) < 0.001, @"speed: busy under pressure is measured");
+        check(HeatSpeedFraction(ThermalThrottling, 1300, 4464, 0.2, 0.52) == 0.52, @"speed: idle keeps the last measurement");
+        check(HeatSpeedFraction(ThermalNear, 1300, 4464, 0.2, -1) < 0, @"speed: never measured stays unknown");
+        check(HeatSpeedFraction(ThermalUnknown, 4000, 4464, 1, 0.9) < 0, @"speed: unread pressure is unknown");
         {
             HeatGuardState st = HeatGuardIdle;
             check(HeatGuardStep(NO, 45, NO, &st) == HeatGuardNothing && st == HeatGuardIdle, @"guard: off does nothing");

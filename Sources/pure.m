@@ -2635,16 +2635,44 @@ BOOL HeatShowing(ThermalLevel chip, double cellC) {
     return chip == ThermalNear || chip == ThermalThrottling || BatteryHeatFor(cellC) != BatteryHeatNone;
 }
 
-NSString *ChipDatumText(double tempC, ThermalLevel level, BOOL showing) {
-    NSString *pressure = ThermalDatumText(tempC, level);
-    if (pressure || !showing || tempC <= 0) return pressure;
-    return [NSString stringWithFormat:@"%ld °C", lround(tempC)];
+NSString *HeatTempsText(double chipC, double cellC) {
+    if (chipC > 0 && cellC > 0) return [NSString stringWithFormat:@"%ld° · %ld°", lround(chipC), lround(cellC)];
+    if (chipC > 0) return [NSString stringWithFormat:@"%ld°", lround(chipC)];
+    return cellC > 0 ? [NSString stringWithFormat:@"cells %ld°", lround(cellC)] : nil;
 }
 
-NSString *CellsDatumText(double cellC, NSString *watts) {
-    if (cellC <= 0) return nil;
-    long t = lround(cellC);
-    return watts.length ? [NSString stringWithFormat:@"%ld° · %@", t, watts] : [NSString stringWithFormat:@"%ld °C", t];
+NSArray<NSNumber *> *DVFSTableMHz(NSData *blob) {
+    NSMutableArray *out = [NSMutableArray array];
+    const uint8_t *bytes = blob.bytes;
+    for (NSUInteger i = 0; i + 8 <= blob.length; i += 8) {
+        uint32_t kHz = (uint32_t)bytes[i] | (uint32_t)bytes[i + 1] << 8 | (uint32_t)bytes[i + 2] << 16 | (uint32_t)bytes[i + 3] << 24;
+        if (kHz) [out addObject:@(kHz / 1000.0)];
+    }
+    return out;
+}
+
+double ClusterActiveMHz(NSArray<NSString *> *states, NSArray<NSNumber *> *residency,
+                        NSArray<NSNumber *> *tableMHz, double *busy) {
+    double total = 0, active = 0, weighted = 0;
+    for (NSUInteger i = 0; i < states.count && i < residency.count; i++) {
+        double r = MAX(0, residency[i].doubleValue);
+        total += r;
+        NSString *name = states[i];
+        if (![name hasPrefix:@"V"]) continue;   // IDLE, OFF, DOWN
+        NSInteger k = [[name substringFromIndex:1] integerValue];
+        if (k < 0 || k >= (NSInteger)tableMHz.count) continue;
+        active += r;
+        weighted += r * tableMHz[k].doubleValue;
+    }
+    if (busy) *busy = total > 0 ? active / total : 0;
+    return active > 0 ? weighted / active : 0;
+}
+
+double HeatSpeedFraction(ThermalLevel level, double activeMHz, double maxMHz, double busy, double last) {
+    if (level == ThermalUnknown) return -1;
+    if (level == ThermalNominal) return 1;
+    if (busy >= 0.5 && activeMHz > 0 && maxMHz > 0) return MIN(1, activeMHz / maxMHz);
+    return last;
 }
 
 HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state) {

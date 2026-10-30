@@ -706,14 +706,24 @@ BatteryHeat BatteryHeatFor(double tempC);
 // "38 °C" when warm or hot, nil otherwise.
 NSString *BatteryHeatText(double tempC);
 
-// Chip and cell temperatures show together: once either is warm, both datums carry heat;
-// while both are cool, neither does.
+// The Heat row appears once either is warm: macOS reports thermal pressure, or the cells
+// reach 38 °C. While both are cool it stays away.
 BOOL HeatShowing(ThermalLevel chip, double cellC);
-// The System datum: ThermalDatumText under pressure, else "60 °C" while showing, else nil.
-NSString *ChipDatumText(double tempC, ThermalLevel level, BOOL showing);
-// The Battery datum while showing: "31 °C", or "39° · −9.5 W" with the battery's watts.
-// nil when the cells are unread.
-NSString *CellsDatumText(double cellC, NSString *watts);
+// "78° · 34°" (hottest core · battery cells); "78°" or "cells 34°" with one unread; nil with neither.
+NSString *HeatTempsText(double chipC, double cellC);
+
+// Core clocks, from IOReport's CPU performance-state residency (no root needed).
+// A DVFS table is the device tree's voltage-states blob: 8-byte entries whose first
+// uint32 is the frequency in kHz. Returns MHz, ascending, zero entries dropped.
+NSArray<NSNumber *> *DVFSTableMHz(NSData *blob);
+// States are named IDLE/OFF/DOWN or V<k>P<m>, k indexing the DVFS table. Returns the
+// residency-weighted MHz while active (0 when never active); *busy is the active share.
+double ClusterActiveMHz(NSArray<NSString *> *states, NSArray<NSNumber *> *residency,
+                        NSArray<NSNumber *> *tableMHz, double *busy);
+// The fast cores' speed as a fraction of their top clock. No pressure means nothing is
+// held back: 1. Under pressure, a busy cluster (half its time active or more) is
+// measured; an idle one can't show its ceiling, so the last measurement stands. <0 unknown.
+double HeatSpeedFraction(ThermalLevel level, double activeMHz, double maxMHz, double busy, double last);
 
 // The heat guard turns Low Power Mode on while the battery is warm and back off once it
 // has cooled to 35 °C, undoing only what it switched on itself. If the user switches
