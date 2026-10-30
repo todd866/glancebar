@@ -2618,3 +2618,32 @@ NSString *ThermalDatumText(double tempC, ThermalLevel level) {
     return level == ThermalThrottling ? [NSString stringWithFormat:@"%ld° slowed", t]
                                       : [NSString stringWithFormat:@"%ld °C", t];
 }
+
+static const double kBatteryWarmC = 38, kBatteryHotC = 42, kBatteryCoolC = 35;
+
+BatteryHeat BatteryHeatFor(double tempC) {
+    tempC = round(tempC);   // judge the whole degree the row shows, so "42 °C" is never orange
+    if (tempC >= kBatteryHotC) return BatteryHeatHot;
+    return tempC >= kBatteryWarmC ? BatteryHeatWarm : BatteryHeatNone;
+}
+
+NSString *BatteryHeatText(double tempC) {
+    return BatteryHeatFor(tempC) == BatteryHeatNone ? nil : [NSString stringWithFormat:@"%ld °C", lround(tempC)];
+}
+
+HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state) {
+    BOOL cool = tempC > 0 && tempC <= kBatteryCoolC;
+    switch (*state) {
+        case HeatGuardEngaged:
+            if (!lowPowerOn) { *state = HeatGuardStoodDown; return HeatGuardNothing; }   // the user switched it off
+            if (!enabled || cool) { *state = HeatGuardIdle; return HeatGuardDisable; }
+            return HeatGuardNothing;
+        case HeatGuardStoodDown:
+            if (!enabled || cool) *state = HeatGuardIdle;
+            return HeatGuardNothing;
+        case HeatGuardIdle:
+        default:
+            if (enabled && !lowPowerOn && tempC >= kBatteryWarmC) { *state = HeatGuardEngaged; return HeatGuardEnable; }
+            return HeatGuardNothing;
+    }
+}

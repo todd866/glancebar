@@ -521,6 +521,22 @@ int main(int argc, const char **argv) {
         if (![heat.stringValue isEqual:@"101° slowed"] || ![heat.textColor isEqual:NSColor.systemRedColor] ||
             fabs(heat.frame.origin.x - kDatumX) > 0.5 || !SameColumn(heat, batteryDatum) ||
             ![heat.accessibilityLabel isEqual:@"Hottest core 101 °C · pressure heavy"]) return Fail(__LINE__);
+        {   // A warm battery takes the Battery datum; the watts move to hover.
+            BatteryState hot = b; hot.tempC = 41.6;
+            [c setValue:[NSValue valueWithBytes:&hot objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            NSView *hotRoot = p.contentViewController.view;
+            NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.battery.datum");
+            if (![hotDatum.stringValue isEqual:@"42 °C"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
+                !HasTip(hotRoot, @"cells 42 °C") || !HasTip(hotRoot, @"battery +12 W") || !FitsChildren(hotRoot)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-battery-hot.png"];
+                if (!RenderOffscreen(hotRoot, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+        }
         if (!HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
             return Fail(__LINE__);
         NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");

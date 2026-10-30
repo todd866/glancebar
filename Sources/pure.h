@@ -23,6 +23,7 @@ typedef struct {
     long systemPowerIn_mW;
     long systemLoad_mW;
     long adapterWatts;     // the charger's rating, 0 when unplugged/unknown
+    double tempC;          // hottest battery cell sensor, 0 when unread
 } BatteryState;
 
 // What the power is actually doing, from the telemetry rather than the IsCharging flag,
@@ -697,3 +698,18 @@ NSString *ThermalPressureName(int pressure);   // "nominal" … "sleeping", nil 
 // The System row's datum, shown only from moderate pressure up: "66 °C" (near the limit),
 // "73° slowed"; without a temperature (tempC <= 0) "near limit" / "slowed". nil while nominal.
 NSString *ThermalDatumText(double tempC, ThermalLevel level);
+
+// Battery heat. Lithium cells age faster when warm, worst when warm and full.
+// Warm (38 °C) and hot (42 °C) take the Battery row's datum; below that it stays on watts.
+typedef NS_ENUM(NSInteger, BatteryHeat) { BatteryHeatNone = 0, BatteryHeatWarm, BatteryHeatHot };
+BatteryHeat BatteryHeatFor(double tempC);
+// "38 °C" when warm or hot, nil otherwise.
+NSString *BatteryHeatText(double tempC);
+
+// The heat guard turns Low Power Mode on while the battery is warm and back off once it
+// has cooled to 35 °C, undoing only what it switched on itself. If the user switches
+// Low Power off while it is engaged, the guard stands down until the battery cools.
+typedef NS_ENUM(NSInteger, HeatGuardState) { HeatGuardIdle = 0, HeatGuardEngaged, HeatGuardStoodDown };
+typedef NS_ENUM(NSInteger, HeatGuardAction) { HeatGuardNothing = 0, HeatGuardEnable, HeatGuardDisable };
+// Returns the action and updates *state. tempC <= 0 (unread) never acts.
+HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state);

@@ -696,6 +696,10 @@ static void ApplyLivePower(BatteryState *b) {
     if (GBSMCReadFloat("PSTR", &load) && load > 0) b->systemLoad_mW = lround(load * 1000);
     if (GBSMCReadFloat("SBAP", &batt) && b->voltage_mV > 0)
         b->amperage_mA = lround(-batt * 1e6 / b->voltage_mV);   // SBAP < 0 = into the battery
+    double cell;   // TB0T…TB2T: the pack's cell sensors
+    const char *cells[] = {"TB0T", "TB1T", "TB2T"};
+    for (size_t i = 0; i < sizeof cells / sizeof *cells; i++)
+        if (GBSMCReadFloat(cells[i], &cell) && cell > 5 && cell < 90) b->tempC = MAX(b->tempC, cell);
 }
 
 static BatteryState ReadBattery(void) {
@@ -4994,6 +4998,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSUInteger _sampleGen;
     CFAbsoluteTime _lastSampleTime;
     BOOL _showWatts, _showHealth, _hogsLoading, _hogsUnavailable;
+    HeatGuardState _heatGuard;   // Low Power switched on by the battery heat guard
     BOOL _barShowDisk, _barShowBattery, _barShowSystem;
     // Keep Awake IS the system SleepDisabled setting (no idle or lid-close sleep), read off-main.
     // One live state, so the bar's cup and the footer button can never disagree.
@@ -5101,6 +5106,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     [self noteEnergyBaseline:NO];
     _showWatts = [ud boolForKey:@"showWatts"];
     _showHealth = [ud boolForKey:@"showHealth"];
+    _heatGuard = (HeatGuardState)MIN(MAX([ud integerForKey:@"heatGuardState"], 0), 2);
     _barShowDisk = [ud boolForKey:@"barShowDisk"];
     _barShowBattery = [ud boolForKey:@"barShowBattery"];
     _barShowSystem = [ud boolForKey:@"barShowSystem"];
@@ -6329,6 +6335,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self refreshVolumesAsync];
     BOOL wasOnAC = _bat.valid && _bat.acConnected;
     _bat = ReadBattery();
+    [self runHeatGuard];
     [self batteryForecast];
     [self noteEnergyBaseline:wasOnAC];
     [self captureBatteryDiagnosticIfRequested];
@@ -7461,6 +7468,13 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [parts addObject:[NSString stringWithFormat:@"Mac %.0f W", _bat.systemLoad_mW / 1000.0]];
     if (_bat.designCap_mAh > 0)
         [parts addObject:[NSString stringWithFormat:@"health %d%%", (int)lround(100.0 * _bat.rawMax_mAh / _bat.designCap_mAh)]];
+    if (_bat.tempC > 0) {
+        [parts addObject:[NSString stringWithFormat:@"cells %ld °C", lround(_bat.tempC)]];
+        double bw = BatteryWatts(_bat);   // the heat took the datum; keep the watts on hover
+        if (BatteryHeatText(_bat.tempC) && !isnan(bw))
+            [parts addObject:[@"battery " stringByAppendingString:fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw)]];
+    }
+    if (_heatGuard == HeatGuardEngaged) [parts addObject:@"Low Power on for heat"];
     if (!parts.count) return @"Battery";
     if (eta.length && parts.count > 1) return [NSString stringWithFormat:@"%@\n%@", parts.firstObject,
         [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@" · "]];
@@ -7687,12 +7701,20 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     CGFloat y = roomInLine ? NSMidY(gauge.frame) - 7 : NSMinY(gauge.frame) - 9;
     arrow.frame = NSMakeRect(NSMinX(gauge.frame) - 5, y, NSWidth(gauge.frame) + 10, roomInLine ? 14 : 10);
 }
-- (NSString *)batteryRateText {
+// A warm battery takes the datum from the watts, the way a problem takes an AI row's reset.
+// The Battery tab keeps the watts: its Cells row carries the heat.
+- (NSString *)batteryRateText { return [self batteryRateTextWithHeat:YES]; }
+- (NSColor *)batteryRateColor { return [self batteryRateColorWithHeat:YES]; }
+- (NSString *)batteryRateTextWithHeat:(BOOL)withHeat {
+    NSString *heat = withHeat ? BatteryHeatText(_bat.tempC) : nil;
+    if (heat) return heat;
     double bw = BatteryWatts(_bat);
     if (isnan(bw)) return @"";
     return fabs(bw) < 0.3 ? @"0 W" : FormatSignedWatts(bw);
 }
-- (NSColor *)batteryRateColor {
+- (NSColor *)batteryRateColorWithHeat:(BOOL)withHeat {
+    BatteryHeat heat = withHeat ? BatteryHeatFor(_bat.tempC) : BatteryHeatNone;
+    if (heat != BatteryHeatNone) return heat == BatteryHeatHot ? NSColor.systemRedColor : NSColor.systemOrangeColor;
     double bw = BatteryWatts(_bat);
     return isnan(bw) || fabs(bw) < 0.3 ? NSColor.secondaryLabelColor
          : bw > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
@@ -7712,9 +7734,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     forecast.accessibilityIdentifier = [stem stringByAppendingString:@".forecast"];
     [self configureBatteryForecast:forecast];
     [row addSubview:forecast];
-    NSTextField *rate = [self text:[self batteryRateText]
+    BOOL withHeat = ![stem hasPrefix:@"details.battery."];
+    NSTextField *rate = [self text:[self batteryRateTextWithHeat:withHeat]
                               font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                             color:[self batteryRateColor] at:datum align:NSTextAlignmentLeft];
+                             color:[self batteryRateColorWithHeat:withHeat] at:datum align:NSTextAlignmentLeft];
     rate.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
     rate.accessibilityHelp = tip;
     [row addSubview:rate];
@@ -8653,6 +8676,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self addSection:m title:@"Battery"];
     [self settingsItem:m title:@"Current draw" symbol:@"bolt" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
     [self settingsItem:m title:@"Health" symbol:@"heart" action:@selector(toggleHealth:) on:_showHealth].enabled = _bat.valid;
+    NSMenuItem *guard = [self settingsItem:m title:@"Low Power when battery is hot" symbol:@"thermometer.medium"
+                                    action:@selector(toggleHeatGuard:) on:[ud boolForKey:@"heatGuard"]];
+    guard.enabled = _bat.valid && PmsetRuleInstalled();
+    guard.accessibilityHelp = PmsetRuleInstalled() ? @"On at 38 °C, off again at 35 °C"
+                                                   : @"Needs Keep Awake & Low Power without a password";
     [self settingsItem:m title:@"Keep Awake & Low Power without a password" symbol:@"lock.open"
                     action:@selector(togglePmsetRule:)
                     on:PmsetRuleInstalled()].accessibilityHelp = @"Installs or removes a sudoers rule limited to four pmset commands (needs your password once).";
@@ -8784,6 +8812,26 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [self refreshLidAwakeForced:YES];
     }];
 }
+// The battery heat guard: Low Power on while the cells are warm, off once cool, undoing only
+// its own switch. It acts only through the sudoers rule, never with a password prompt.
+- (void)runHeatGuard {
+    if (!ShouldStartPmset(_pmsetInFlight)) return;   // judge Low Power once the last switch has landed
+    BOOL enabled = [NSUserDefaults.standardUserDefaults boolForKey:@"heatGuard"] && PmsetRuleInstalled();
+    HeatGuardAction action = HeatGuardStep(enabled, _bat.tempC, LowPowerModeEnabled(), &_heatGuard);
+    [NSUserDefaults.standardUserDefaults setInteger:_heatGuard forKey:@"heatGuardState"];
+    if (action == HeatGuardNothing) return;
+    BOOL on = action == HeatGuardEnable;
+    [self applyPmset:@"lowpowermode" on:on reason:on ? @"turn on Low Power Mode" : @"turn off Low Power Mode" then:^{
+        [self syncPowerButtons];
+        [self updateBar];
+    }];
+}
+- (void)toggleHeatGuard:(id)s {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setBool:![ud boolForKey:@"heatGuard"] forKey:@"heatGuard"];
+    [self runHeatGuard];
+}
+
 // Flips system Low Power Mode from the footer toggle. Like the lid toggle, the live system
 // state is the only truth: nothing is stored, and a cancelled admin prompt just re-reads
 // it so the toggle snaps back.
@@ -10221,6 +10269,23 @@ static NSColor *HealthColor(double fraction) {
             [self detailDatum:[NSString stringWithFormat:@"%ld cycles", (long)_bat.cycleCount]
                         color:NSColor.secondaryLabelColor identifier:@"details.battery.health.datum"
                           tip:healthTip in:healthRow cols:c];
+            y += c.rowH;
+        }
+        if (_bat.tempC > 0) {
+            BatteryHeat heat = BatteryHeatFor(_bat.tempC);
+            NSColor *color = heat == BatteryHeatHot ? NSColor.systemRedColor
+                           : heat == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.labelColor;
+            NSString *heatTip = [NSString stringWithFormat:@"Hottest cell %.1f °C · warm from 38 °C, hot from 42 °C", _bat.tempC];
+            NSView *heatRow = [self detailRowAt:y cols:c identifier:@"details.battery.row.heat" tip:heatTip in:root];
+            [self detailSymbol:@"thermometer.medium" size:c.symbol
+                          tint:(heat == BatteryHeatNone ? NSColor.secondaryLabelColor : color) frame:DetailLeadRect(c)
+                    identifier:@"details.battery.heat.symbol" in:heatRow].accessibilityHelp = heatTip;
+            [self detailRowName:@"Cells" cols:c identifier:@"details.battery.heat.name" in:heatRow];
+            [self detailValue:[NSString stringWithFormat:@"%ld °C", lround(_bat.tempC)] color:color
+                   identifier:@"details.battery.heat.value" tip:heatTip in:heatRow cols:c];
+            if (_heatGuard == HeatGuardEngaged)
+                [self detailDatum:@"Low Power on" color:NSColor.secondaryLabelColor
+                       identifier:@"details.battery.heat.datum" tip:heatTip in:heatRow cols:c];
             y += c.rowH;
         }
         // Real units: energy in watt-hours, and the power flow in watts.

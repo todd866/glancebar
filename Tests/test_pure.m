@@ -2248,6 +2248,35 @@ int main(void) {
               @"thermal: nothing to show stays empty");
         check([ThermalPressureName(2) isEqual:@"heavy"] && ThermalPressureName(-1) == nil, @"thermal: pressure names");
 
+        // Battery heat takes the datum only from 38 °C.
+        check(BatteryHeatText(34.5) == nil && BatteryHeatText(0) == nil, @"battery heat: quiet while cool or unread");
+        check([BatteryHeatText(38.2) isEqual:@"38 °C"] && BatteryHeatFor(38.2) == BatteryHeatWarm, @"battery heat: warm");
+        check(BatteryHeatFor(42) == BatteryHeatHot && BatteryHeatFor(41.6) == BatteryHeatHot,
+              @"battery heat: hot, judged on the degree shown");
+        {
+            HeatGuardState st = HeatGuardIdle;
+            check(HeatGuardStep(NO, 45, NO, &st) == HeatGuardNothing && st == HeatGuardIdle, @"guard: off does nothing");
+            check(HeatGuardStep(YES, 37, NO, &st) == HeatGuardNothing, @"guard: below warm does nothing");
+            check(HeatGuardStep(YES, 0, NO, &st) == HeatGuardNothing, @"guard: unread temperature never acts");
+            check(HeatGuardStep(YES, 38, NO, &st) == HeatGuardEnable && st == HeatGuardEngaged, @"guard: warm engages");
+            check(HeatGuardStep(YES, 36, YES, &st) == HeatGuardNothing, @"guard: holds between 35 and 38");
+            check(HeatGuardStep(YES, 35, YES, &st) == HeatGuardDisable && st == HeatGuardIdle, @"guard: cool releases");
+            st = HeatGuardIdle;
+            check(HeatGuardStep(YES, 40, YES, &st) == HeatGuardNothing && st == HeatGuardIdle,
+                  @"guard: Low Power the user turned on is left alone");
+            check(HeatGuardStep(YES, 33, YES, &st) == HeatGuardNothing, @"guard: never turns off the user's Low Power");
+            st = HeatGuardIdle;
+            HeatGuardStep(YES, 40, NO, &st);
+            check(HeatGuardStep(YES, 40, NO, &st) == HeatGuardNothing && st == HeatGuardStoodDown,
+                  @"guard: the user switching Low Power off stands it down");
+            check(HeatGuardStep(YES, 41, NO, &st) == HeatGuardNothing, @"guard: stays stood down while warm");
+            check(HeatGuardStep(YES, 35, NO, &st) == HeatGuardNothing && st == HeatGuardIdle, @"guard: re-arms once cool");
+            st = HeatGuardIdle;
+            HeatGuardStep(YES, 40, NO, &st);
+            check(HeatGuardStep(NO, 40, YES, &st) == HeatGuardDisable && st == HeatGuardIdle,
+                  @"guard: unticking undoes its own Low Power");
+        }
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;
