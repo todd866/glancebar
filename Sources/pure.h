@@ -694,5 +694,6 @@ NSDictionary *MeteredAllowanceDatum(uint64_t remainingBytes, double recentBytesP
 typedef NS_ENUM(NSInteger, ThermalLevel) { ThermalUnknown = 0, ThermalNominal, ThermalNear, ThermalThrottling };
 ThermalLevel ThermalLevelFor(int pressure);
 NSString *ThermalPressureName(int pressure);   // "nominal" … "sleeping", nil when unread
-// "46 °C", "73° slowed"; without a temperature (tempC <= 0) "near limit" / "slowed" / nil.
+// The System row's datum, shown only from moderate pressure up: "66 °C" (near the limit),
+// "73° slowed"; without a temperature (tempC <= 0) "near limit" / "slowed". nil while nominal.
 NSString *ThermalDatumText(double tempC, ThermalLevel level);

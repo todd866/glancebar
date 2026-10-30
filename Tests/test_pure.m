@@ -2238,7 +2238,8 @@ int main(void) {
         check(ThermalLevelFor(1) == ThermalNear, @"thermal: moderate is near the limit");
         check(ThermalLevelFor(2) == ThermalThrottling && ThermalLevelFor(4) == ThermalThrottling,
               @"thermal: heavy and above throttle");
-        check([ThermalDatumText(46.4, ThermalNominal) isEqual:@"46 °C"], @"thermal: plain temperature");
+        check(ThermalDatumText(46.4, ThermalNominal) == nil && ThermalDatumText(80, ThermalUnknown) == nil,
+              @"thermal: nothing shown while macOS reports no pressure");
         check([ThermalDatumText(66.0, ThermalNear) isEqual:@"66 °C"], @"thermal: near limit keeps the number; colour carries it");
         check([ThermalDatumText(72.6, ThermalThrottling) isEqual:@"73° slowed"], @"thermal: throttling says so");
         check([ThermalDatumText(101.2, ThermalThrottling) isEqual:@"101° slowed"], @"thermal: three digits");

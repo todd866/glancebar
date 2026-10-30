@@ -2612,6 +2612,7 @@ NSString *ThermalPressureName(int pressure) {
 }
 
 NSString *ThermalDatumText(double tempC, ThermalLevel level) {
+    if (level != ThermalNear && level != ThermalThrottling) return nil;   // quiet while cool
     if (tempC <= 0) return level == ThermalThrottling ? @"slowed" : level == ThermalNear ? @"near limit" : nil;
     long t = lround(tempC);
     return level == ThermalThrottling ? [NSString stringWithFormat:@"%ld° slowed", t]
