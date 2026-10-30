@@ -7983,12 +7983,40 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     value.accessibilityLabel = @"Fast-core speed";
     value.accessibilityHelp = tip;
     [row addSubview:value];
-    NSString *temps = HeatTempsText(_sys.tempValid ? _sys.cpuTempC : 0, _bat.valid ? _bat.tempC : 0);
-    if (temps) {
-        NSTextField *datum = [self text:temps font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
-                                  color:[self heatTempsColor] at:datumFrame align:NSTextAlignmentLeft];
+    // Each temperature carries its own symbol and colour: chip for the hottest core, battery for the cells.
+    ThermalLevel level = SystemThermalLevel(_sys);
+    BatteryHeat cellHeat = BatteryHeatFor(_bat.valid ? _bat.tempC : 0);
+    NSColor *chipColor = level == ThermalThrottling ? NSColor.systemRedColor
+        : level == ThermalNear ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    NSColor *cellColor = cellHeat == BatteryHeatHot ? NSColor.systemRedColor
+        : cellHeat == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    NSMutableAttributedString *temps = [NSMutableAttributedString new];
+    void (^reading)(NSString *, double, NSColor *) = ^(NSString *symbol, double c, NSColor *color) {
+        if (c <= 0) return;
+        if (temps.length) [temps appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:@{NSFontAttributeName: font}]];
+        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:kDatumFont - 2.5 weight:NSFontWeightRegular]
+            configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[color]]];
+        NSImage *glyph = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+        if (glyph) {
+            NSTextAttachment *mark = [NSTextAttachment new];
+            mark.image = glyph;
+            mark.bounds = NSMakeRect(0, (font.capHeight - glyph.size.height) / 2, glyph.size.width, glyph.size.height);
+            [temps appendAttributedString:[NSAttributedString attributedStringWithAttachment:mark]];
+        }
+        [temps appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%ld°", lround(c)]
+            attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: color}]];
+    };
+    reading(@"cpu", _sys.tempValid ? _sys.cpuTempC : 0, chipColor);
+    reading(@"battery.75", _bat.valid ? _bat.tempC : 0, cellColor);
+    if (temps.length) {
+        NSTextField *datum = [self text:@"" font:font color:NSColor.secondaryLabelColor at:datumFrame align:NSTextAlignmentLeft];
+        datum.attributedStringValue = temps;
         datum.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
-        datum.accessibilityLabel = @"Hottest core · battery cells";
+        NSMutableArray *said = [NSMutableArray array];
+        if (_sys.tempValid) [said addObject:[NSString stringWithFormat:@"Hottest core %ld °C", lround(_sys.cpuTempC)]];
+        if (_bat.valid && _bat.tempC > 0) [said addObject:[NSString stringWithFormat:@"battery cells %ld °C", lround(_bat.tempC)]];
+        datum.accessibilityLabel = [said componentsJoinedByString:@", "];
         datum.accessibilityHelp = tip;
         [row addSubview:datum];
     }

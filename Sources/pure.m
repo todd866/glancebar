@@ -2635,12 +2635,6 @@ BOOL HeatShowing(ThermalLevel chip, double cellC) {
     return chip == ThermalNear || chip == ThermalThrottling || BatteryHeatFor(cellC) != BatteryHeatNone;
 }
 
-NSString *HeatTempsText(double chipC, double cellC) {
-    if (chipC > 0 && cellC > 0) return [NSString stringWithFormat:@"%ld° · %ld°", lround(chipC), lround(cellC)];
-    if (chipC > 0) return [NSString stringWithFormat:@"%ld°", lround(chipC)];
-    return cellC > 0 ? [NSString stringWithFormat:@"cells %ld°", lround(cellC)] : nil;
-}
-
 NSArray<NSNumber *> *DVFSTableMHz(NSData *blob) {
     NSMutableArray *out = [NSMutableArray array];
     const uint8_t *bytes = blob.bytes;

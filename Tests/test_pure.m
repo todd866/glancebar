@@ -2257,9 +2257,6 @@ int main(void) {
         check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat: quiet while both cool");
         check(HeatShowing(ThermalThrottling, 31) && HeatShowing(ThermalNear, 0) && HeatShowing(ThermalNominal, 37.6),
               @"heat: either warm shows the row");
-        check([HeatTempsText(78.4, 34.2) isEqual:@"78° · 34°"], @"heat: chip · cells");
-        check([HeatTempsText(78, 0) isEqual:@"78°"] && [HeatTempsText(0, 34) isEqual:@"cells 34°"] && !HeatTempsText(0, 0),
-              @"heat: unread sensors drop out");
         {
             uint8_t raw[24] = {0x60,0xf5,0x13,0,0x16,0x03,0,0,  0,0,0,0,0,0,0,0,  0x80,0x1d,0x44,0,0x16,0x03,0,0};   // 1308000, 0, 4464000 kHz
             NSArray *mhz = DVFSTableMHz([NSData dataWithBytes:raw length:sizeof raw]);

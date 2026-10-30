@@ -47,6 +47,29 @@ static BOOL ForecastFits(BatteryForecastView *view) {
     }
     return YES;
 }
+// The Heat datum as text, each symbol shown as [cpu] / [battery], and the colour of its nth reading.
+static NSString *HeatDatumText(NSTextField *field) {
+    NSAttributedString *a = field.attributedStringValue;
+    NSMutableString *out = [NSMutableString string];
+    NSArray *names = @[@"[cpu]", @"[battery]"];
+    __block NSUInteger marks = 0;
+    [a enumerateAttributesInRange:NSMakeRange(0, a.length) options:0 usingBlock:^(NSDictionary *attrs, NSRange r, BOOL *stop) {
+        if (attrs[NSAttachmentAttributeName]) [out appendString:marks < names.count ? names[marks++] : @"[?]"];
+        else [out appendString:[a.string substringWithRange:r]];
+    }];
+    return [out stringByReplacingOccurrencesOfString:@"\u2009" withString:@" "];
+}
+static NSColor *HeatDatumColor(NSTextField *field, NSUInteger index) {
+    NSAttributedString *a = field.attributedStringValue;
+    __block NSUInteger seen = 0; __block NSColor *found = nil;
+    [a enumerateAttribute:NSForegroundColorAttributeName inRange:NSMakeRange(0, a.length) options:0
+               usingBlock:^(id value, NSRange r, BOOL *stop) {
+        if (!value || ![[a.string substringWithRange:r] containsString:@"°"]) return;
+        if (seen++ == index) { found = value; *stop = YES; }
+    }];
+    return found;
+}
+
 static NSUInteger CountGauges(NSView *view) {
     NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) ? 1 : 0;
     for (NSView *child in view.subviews) count += CountGauges(child);
@@ -524,7 +547,7 @@ int main(int argc, const char **argv) {
         NSTextField *heatName = (NSTextField *)FindIdentifier(root, @"popover.heat.name");
         if (!FindIdentifier(root, @"popover.row.heat") || ![heatName.stringValue isEqual:@"Heat"] ||
             ![heatValue.stringValue isEqual:@"52%"] || ![heatValue.textColor isEqual:NSColor.systemRedColor] ||
-            ![heatDatum.stringValue isEqual:@"101°"] || ![heatDatum.textColor isEqual:NSColor.systemRedColor] ||
+            ![HeatDatumText(heatDatum) isEqual:@"[cpu]101°"] || ![HeatDatumColor(heatDatum, 0) isEqual:NSColor.systemRedColor] ||
             !SameColumn(heatDatum, batteryDatum) || !SameColumn(heatName, popSystemName) ||
             FindIdentifier(root, @"popover.system.heat") || !HasTip(root, @"Fast cores at 52% of top speed"))
             return Fail(__LINE__);
@@ -554,7 +577,8 @@ int main(int argc, const char **argv) {
             NSView *warmRoot = p.contentViewController.view;
             NSTextField *pair = (NSTextField *)FindIdentifier(warmRoot, @"popover.heat.datum");
             NSTextField *watts = (NSTextField *)FindIdentifier(warmRoot, @"popover.battery.datum");
-            if (![pair.stringValue isEqual:@"101° · 31°"] || ![watts.stringValue isEqual:@"+12 W"] ||
+            if (![HeatDatumText(pair) isEqual:@"[cpu]101° [battery]31°"] || ![HeatDatumColor(pair, 1) isEqual:NSColor.secondaryLabelColor] ||
+                ![watts.stringValue isEqual:@"+12 W"] || !FitsChildren(warmRoot) ||
                 ![watts.textColor isEqual:NSColor.systemGreenColor]) return Fail(__LINE__);
         }
         {   // Hot cells with a cool chip still bring the row; the cells set its colour.
@@ -567,7 +591,8 @@ int main(int argc, const char **argv) {
             NSView *hotRoot = p.contentViewController.view;
             NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.datum");
             NSTextField *hotValue = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.value");
-            if (![hotDatum.stringValue isEqual:@"61° · 42°"] || ![hotDatum.textColor isEqual:NSColor.systemRedColor] ||
+            if (![HeatDatumText(hotDatum) isEqual:@"[cpu]61° [battery]42°"] || ![HeatDatumColor(hotDatum, 0) isEqual:NSColor.secondaryLabelColor] ||
+                ![HeatDatumColor(hotDatum, 1) isEqual:NSColor.systemRedColor] || hotDatum.intrinsicContentSize.width > NSWidth(hotDatum.frame) ||
                 ![hotValue.stringValue isEqual:@"100%"] || ![hotValue.textColor isEqual:NSColor.systemGreenColor] ||
                 !HasTip(hotRoot, @"cells 42 °C") || !FitsChildren(hotRoot)) return Fail(__LINE__);
             if (argc > 1) {

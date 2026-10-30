@@ -709,8 +709,6 @@ NSString *BatteryHeatText(double tempC);
 // The Heat row appears once either is warm: macOS reports thermal pressure, or the cells
 // reach 38 °C. While both are cool it stays away.
 BOOL HeatShowing(ThermalLevel chip, double cellC);
-// "78° · 34°" (hottest core · battery cells); "78°" or "cells 34°" with one unread; nil with neither.
-NSString *HeatTempsText(double chipC, double cellC);
 
 // Core clocks, from IOReport's CPU performance-state residency (no root needed).
 // A DVFS table is the device tree's voltage-states blob: 8-byte entries whose first
