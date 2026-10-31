@@ -7834,8 +7834,22 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 #pragma mark popover
 
-// F3 opens Glancebar: the Mission Control key on Apple keyboards (key code 160) and F3
-// itself, as global hot keys (no Accessibility permission). Opt-in: popoverHotKey.
+// F3 opens Glancebar. On Apple keyboards F3 is the Mission Control key: it sends a HID usage
+// (consumer 0x29F, or Apple vendor 0xFF01/0x10 on older keyboards) that macOS acts on before
+// any app sees a key, so Glancebar remaps it to F13 with hidutil (re-applied each launch,
+// since the mapping lasts until restart; never over someone's own mapping) and registers
+// F13, plus plain F3 for fn-F3, as global hot keys. No Accessibility permission. Opt-in:
+// popoverHotKey.
+static NSString *const kMissionControlToF13 =
+    @"{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":0xC0000029F,\"HIDKeyboardModifierMappingDst\":0x700000068},"
+     "{\"HIDKeyboardModifierMappingSrc\":0xFF0100000010,\"HIDKeyboardModifierMappingDst\":0x700000068}]}";
+static void RemapMissionControlKey(void) {
+    NSString *current = RunTaskOutput(@"/usr/bin/hidutil", @[@"property", @"--get", @"UserKeyMapping"]) ?: @"";
+    BOOL ours = [current containsString:@"0x700000068"] || [current containsString:@"30064771176"];
+    BOOL others = !ours && ([current containsString:@"HIDKeyboardModifierMappingSrc"]);
+    if (ours || others) return;
+    RunTaskOutput(@"/usr/bin/hidutil", @[@"property", @"--set", kMissionControlToF13]);
+}
 static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event, void *client) {
     (void)next; (void)event;
     Controller *controller = (__bridge Controller *)client;
@@ -7849,8 +7863,9 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     installed = YES;
     EventTypeSpec pressed = {kEventClassKeyboard, kEventHotKeyPressed};
     InstallApplicationEventHandler(&GBPopoverHotKeyPressed, 1, &pressed, (__bridge void *)self, NULL);
-    UInt32 codes[] = {160, kVK_F3};
-    for (UInt32 i = 0; i < 2; i++) {
+    RemapMissionControlKey();
+    UInt32 codes[] = {kVK_F13, kVK_F3, 160};
+    for (UInt32 i = 0; i < 3; i++) {
         EventHotKeyRef ref = NULL;
         EventHotKeyID hid = {'GBar', i + 1};
         OSStatus status = RegisterEventHotKey(codes[i], 0, hid, GetApplicationEventTarget(), 0, &ref);
