@@ -11430,13 +11430,61 @@ static BOOL PrintJSONDump(NSDictionary *snapshot) {
     return PrintJSON(snapshot);
 }
 
+// One compact JSON line of the machine's state, for a per-minute logger: CPU, memory,
+// thermal pressure, core clocks, temperatures and battery. No process or AI sampling.
+// A number written with the given decimals, so the JSON says 35.9, not 35.899999999999999.
+static NSDecimalNumber *Decimal(double x, int places) {
+    return [NSDecimalNumber decimalNumberWithString:[NSString stringWithFormat:@"%.*f", places, x]
+                                             locale:@{NSLocaleDecimalSeparator: @"."}];
+}
+
+static int PrintSampleLine(void) {
+    CPUCounters previous = ReadCPUCounters();
+    (void)ReadCoreClocks();   // baseline for the clocks, like --dump
+    [NSThread sleepForTimeInterval:0.5];
+    SystemState s = ReadSystemState(&previous);
+    BatteryState b = ReadBattery();
+    double load[3] = {0};
+    getloadavg(load, 3);
+    double watts = BatteryWatts(b);
+    NSMutableDictionary *line = [@{
+        @"t": @((long long)NSDate.date.timeIntervalSince1970),
+        @"load": @[Decimal(load[0], 2), Decimal(load[1], 2), Decimal(load[2], 2)],
+        @"thermal": s.thermalValid ? (ThermalPressureName(s.thermalPressure) ?: NSNull.null) : NSNull.null,
+        @"lowPower": JSONBool(LowPowerModeEnabled()),
+    } mutableCopy];
+    if (s.cpuValid) line[@"cpu"] = Decimal(s.cpu * 100, 1);
+    if (s.memValid) { line[@"memUsedGB"] = Decimal(s.memUsed / 1e9, 1); line[@"memTotalGB"] = Decimal(s.memTotal / 1e9, 1); }
+    line[@"memPressure"] = MemoryPressureLevel(s);
+    if (s.swapValid) line[@"swapGB"] = Decimal(s.swapUsed / 1e9, 1);
+    if (s.tempValid) line[@"chipC"] = Decimal(s.cpuTempC, 1);
+    if (s.clocks.valid) {
+        line[@"pMHz"] = @(lround(s.clocks.pMHz)); line[@"pTopMHz"] = @(lround(s.clocks.pMaxMHz));
+        line[@"pBusy"] = Decimal(s.clocks.pBusy, 2);
+        line[@"eMHz"] = @(lround(s.clocks.eMHz)); line[@"eTopMHz"] = @(lround(s.clocks.eMaxMHz));
+        line[@"eBusy"] = Decimal(s.clocks.eBusy, 2);
+    }
+    if (b.valid) {
+        line[@"batt"] = @(b.percent); line[@"ac"] = JSONBool(b.acConnected); line[@"charging"] = JSONBool(b.isCharging);
+        if (b.tempC > 0) line[@"cellsC"] = Decimal(b.tempC, 1);
+        if (!isnan(watts)) line[@"battW"] = Decimal(watts, 1);
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:line options:NSJSONWritingSortedKeys error:nil];
+    if (!data) return 70;
+    fwrite(data.bytes, 1, data.length, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
+
 static void PrintUsage(FILE *stream) {
     fprintf(stream,
         "Glancebar %s\n"
         "Usage: Glancebar [--dump [--json] [--strict] [--online]]\n"
+        "       Glancebar --sample\n"
         "       Glancebar --version\n"
         "       Glancebar --help\n\n"
         "  --activity-json  Take one read-only app CPU/network snapshot.\n"
+        "  --sample   Print one JSON line: CPU, memory, thermal pressure, clocks, temperatures, battery.\n"
         "  --dump     Print a local machine and AI status snapshot.\n"
         "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
         "  --strict   Exit 2 when any sampled source is partial/unavailable.\n"
@@ -11495,6 +11543,7 @@ int main(int argc, const char **argv) {
         BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--activity-json") == 0) activityJSON = YES;
+            else if (strcmp(argv[i], "--sample") == 0) return PrintSampleLine();
             else if (strcmp(argv[i], "--dump") == 0) dump = YES;
             else if (strcmp(argv[i], "--json") == 0) json = YES;
             else if (strcmp(argv[i], "--strict") == 0) strict = YES;

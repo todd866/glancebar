@@ -1281,15 +1281,85 @@ static BOOL ThermalRowSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Speed row sheet (what does the Heat row's percent mean?)
+
+typedef NS_ENUM(NSInteger, SpeedStyle) { SpeedToday, SpeedRenamed, SpeedCeiling, SpeedLoss };
+
+static NSAttributedString *SketchTemps(double chip, NSColor *chipColor, double cells, NSColor *cellColor) {
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    NSMutableAttributedString *out = [NSMutableAttributedString new];
+    NSArray *parts = @[@[@"cpu", @(chip), chipColor], @[@"battery.75", @(cells), cellColor]];
+    for (NSArray *part in parts) {
+        if (out.length) [out appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:@{NSFontAttributeName: font}]];
+        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:kDatumFont - 2.5 weight:NSFontWeightRegular]
+            configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[part[2]]]];
+        NSTextAttachment *mark = [NSTextAttachment new];
+        mark.image = [[NSImage imageWithSystemSymbolName:part[0] accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+        mark.bounds = NSMakeRect(0, (font.capHeight - mark.image.size.height) / 2, mark.image.size.width, mark.image.size.height);
+        [out appendAttributedString:[NSAttributedString attributedStringWithAttachment:mark]];
+        [out appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%.0f°", [part[1] doubleValue]]
+                                                                     attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: part[2]}]];
+    }
+    return out;
+}
+
+static NSView *SpeedRowSketch(Controller *c, NSArray *st, SpeedStyle style) {
+    int state = [st[0] intValue];
+    double speed = [st[1] doubleValue], chip = [st[2] doubleValue], cells = [st[3] doubleValue];
+    NSColor *tc = state >= 2 ? NSColor.systemRedColor : state == 1 ? NSColor.systemOrangeColor : NSColor.systemGreenColor;
+    NSColor *chipColor = state ? tc : NSColor.secondaryLabelColor;
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, kRowH)];
+    BOOL renamed = style != SpeedToday && style != SpeedLoss;
+    [c instrumentSymbol:(renamed ? @"gauge.with.dots.needle.33percent" : @"thermometer.medium") tint:tc identifier:nil in:row];
+    [c instrumentName:(renamed ? @"Speed" : style == SpeedLoss ? @"Slowed" : @"Heat") identifier:nil in:row];
+    NSRect g = NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2, kGaugeW, kGaugeH);
+    NSString *value = [NSString stringWithFormat:@"%.0f%%", speed * 100];
+    if (style == SpeedCeiling) {
+        CeilingGauge *bar = [[CeilingGauge alloc] initWithFrame:g]; bar.fraction = speed; bar.color = tc; [row addSubview:bar];
+    } else if (style == SpeedLoss) {
+        Gauge *bar = [[Gauge alloc] initWithFrame:g]; bar.fraction = 1 - speed; bar.color = tc; bar.markerFraction = -1; [row addSubview:bar];
+        value = speed > 0.995 ? @"0%" : [NSString stringWithFormat:@"−%.0f%%", (1 - speed) * 100];
+        if (speed > 0.995) tc = NSColor.systemGreenColor;
+    } else {
+        Gauge *bar = [[Gauge alloc] initWithFrame:g]; bar.fraction = speed; bar.color = tc; bar.markerFraction = -1; [row addSubview:bar];
+    }
+    [row addSubview:[c text:value font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold] color:tc
+                         at:NSMakeRect(kValueX, (kRowH - kValueH) / 2, kValueW, kValueH) align:NSTextAlignmentRight]];
+    NSTextField *datum = SheetDatum(c, @"", NSColor.secondaryLabelColor);
+    datum.attributedStringValue = SketchTemps(chip, chipColor, cells, cells >= 42 ? NSColor.systemRedColor : cells >= 38 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor);
+    [row addSubview:datum];
+    return row;
+}
+
+static BOOL SpeedSheet(NSString *path) {
+    Controller *c = [Controller new];
+    // pressure (0 none, 1 near, 2 slowed), fast-core speed fraction, chip °C, cells °C
+    NSArray *states = @[@[@0, @1.0, @58, @33], @[@1, @0.82, @70, @34], @[@2, @0.39, @75, @36]];
+    NSArray *variants = @[@[@"A  today: Heat, bar + 39% = speed left", @(SpeedToday)],
+                          @[@"B  renamed: Speed 39%, gauge symbol", @(SpeedRenamed)],
+                          @[@"C  Speed, and the lost speed shaded red", @(SpeedCeiling)],
+                          @[@"D  Slowed −61%: bar and value are the loss", @(SpeedLoss)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states) [rows addObject:SpeedRowSketch(c, st, [v[1] integerValue])];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "thermrow")) return ThermalRowSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "speed")) return SpeedSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;
