@@ -6966,7 +6966,7 @@ static NSColor *ReadinessColor(double score) {
 - (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
     [self ensureMixSeeds];
     if (!_mixSeeds.count) return y;
-    const CGFloat side = 54, capH = 41, top = 6;   // two 10pt title lines (~25pt) + the artist (13pt)
+    const CGFloat side = 54, capH = 30, top = 6;   // title row + artist row, 14pt each
     CGFloat gap = (kW - 2 * kPad - 5 * side) / 4;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
     line.accessibilityIdentifier = @"popover.mix";
@@ -7018,28 +7018,20 @@ static NSColor *ReadinessColor(double score) {
         tile.layer.masksToBounds = YES;
         tile.frame = NSMakeRect(x, capH, side, side);
         [line addSubview:tile];
-        // Song title (up to two lines), then the artist; a clipped one shows in full on hover.
-        CGFloat capW = side + gap - 4, capX = x - (gap - 4) / 2, artistH = picks ? 0 : 13;
-        NSTextField *cap = [GBRecoverableTextField wrappingLabelWithString:picks ? @"New picks" : SeedCaption(seed[@"title"])];
-        cap.font = capFont;
-        cap.textColor = playing ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
-        cap.alignment = NSTextAlignmentCenter;
-        cap.maximumNumberOfLines = 2;
-        cap.cell.truncatesLastVisibleLine = YES;
-        cap.frame = NSMakeRect(capX, artistH, capW, capH - 2 - artistH);
-        [(GBRecoverableTextField *)cap updateClippedTextHelp];
-        cap.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.caption.%lu", (unsigned long)i];
-        [line addSubview:cap];
-        if (picks) continue;
-        NSTextField *by = [GBRecoverableTextField labelWithString:seed[@"artist"] ?: @""];
-        by.font = capFont;
-        by.textColor = playing ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
-        by.alignment = NSTextAlignmentCenter;
-        by.lineBreakMode = NSLineBreakByTruncatingTail;
-        by.frame = NSMakeRect(capX, 0, capW, artistH);
-        [(GBRecoverableTextField *)by updateClippedTextHelp];
-        by.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.artist.%lu", (unsigned long)i];
-        [line addSubview:by];
+        // Title over artist, one line each in aligned rows; the title reads first. A clipped one shows in full on hover.
+        CGFloat capW = side + gap - 4, capX = x - (gap - 4) / 2, rowH = 14;
+        NSArray *lines = picks ? @[@"New picks"] : @[SeedCaption(seed[@"title"]), seed[@"artist"] ?: @""];
+        for (NSUInteger l = 0; l < lines.count; l++) {
+            NSTextField *cap = [GBRecoverableTextField labelWithString:lines[l]];
+            cap.font = capFont;
+            cap.textColor = playing ? NSColor.controlAccentColor : (l || picks ? NSColor.secondaryLabelColor : NSColor.labelColor);
+            cap.alignment = NSTextAlignmentCenter;
+            cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
+            [(GBRecoverableTextField *)cap updateClippedTextHelp];
+            cap.accessibilityIdentifier = [NSString stringWithFormat:l ? @"popover.mix.artist.%lu" : @"popover.mix.caption.%lu", (unsigned long)i];
+            [line addSubview:cap];
+        }
     }
     [root addSubview:line];
     return y + top + side + capH;

@@ -692,8 +692,9 @@ int main(int argc, const char **argv) {
                 ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
                 ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] ||
                 ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
-                !c0.cell.wraps || c0.maximumNumberOfLines != 2 || NSMinY(a0.frame) >= NSMinY(c0.frame) - 0.5 || NSMinY(a0.frame) < 0 ||
-                NSHeight(c0.frame) < 2 * ceil(c0.font.ascender - c0.font.descender + c0.font.leading) ||
+                c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
+                fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || NSHeight(c0.frame) < ceil(c0.font.ascender - c0.font.descender) ||
+                ![c0.textColor isEqual:NSColor.labelColor] || ![a0.textColor isEqual:NSColor.secondaryLabelColor] ||
                 ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail) return Fail(__LINE__);
             {   // A cover tile carries its image for the large hover view.
                 NSImage *art = [NSImage imageWithSize:NSMakeSize(60, 60) flipped:NO drawingHandler:^BOOL(NSRect r) { [NSColor.systemRedColor setFill]; NSRectFill(r); return YES; }];
@@ -1101,7 +1102,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 457 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +101 seed tiles (title + artist)
+            root.bounds.size.height > 446 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row)
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {

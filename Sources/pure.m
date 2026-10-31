@@ -2807,20 +2807,26 @@ NSURL *MixArtSearchURL(NSString *artist, NSString *title) {
     return c.URL;
 }
 
-// The cover URL at `px` square from a search reply, preferring a result by the same artist.
+// The cover URL at `px` square from a search reply: the same artist exactly beats a looser match, and
+// instrumental/karaoke/tribute releases never win (Kiss Me More got an instrumental's cover, 1 Nov 2026).
 NSString *MixArtURLFromSearch(NSData *json, NSString *artist, NSUInteger px) {
     NSDictionary *reply = json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:nil] : nil;
     NSArray *results = [reply isKindOfClass:NSDictionary.class] ? reply[@"results"] : nil;
     if (![results isKindOfClass:NSArray.class]) return nil;
-    NSString *want = artist.lowercaseString ?: @"", *url = nil;
+    NSString *want = artist.lowercaseString ?: @"", *best = nil;
+    NSInteger bestScore = -1;
     for (NSDictionary *r in results) {
         if (![r isKindOfClass:NSDictionary.class] || ![r[@"artworkUrl100"] isKindOfClass:NSString.class]) continue;
         NSString *by = [r[@"artistName"] isKindOfClass:NSString.class] ? [r[@"artistName"] lowercaseString] : @"";
-        BOOL same = want.length && ([by containsString:want] || [want containsString:by]);
-        if (same || !url) url = r[@"artworkUrl100"];
-        if (same) break;
+        NSString *names = [NSString stringWithFormat:@"%@ %@ %@", by, [r[@"trackName"] isKindOfClass:NSString.class] ? r[@"trackName"] : @"",
+                           [r[@"collectionName"] isKindOfClass:NSString.class] ? r[@"collectionName"] : @""].lowercaseString;
+        BOOL cover = NO;
+        for (NSString *k in @[@"instrumental", @"karaoke", @"tribute", @"made famous", @"in the style of", @"backing track"])
+            cover |= [names containsString:k];
+        NSInteger score = cover ? 0 : [by isEqualToString:want] ? 3 : (want.length && ([by containsString:want] || [want containsString:by])) ? 2 : 1;
+        if (score > bestScore) { bestScore = score; best = r[@"artworkUrl100"]; }
     }
-    return [url stringByReplacingOccurrencesOfString:@"100x100bb" withString:[NSString stringWithFormat:@"%lux%lubb", (unsigned long)px, (unsigned long)px]];
+    return [best stringByReplacingOccurrencesOfString:@"100x100bb" withString:[NSString stringWithFormat:@"%lux%lubb", (unsigned long)px, (unsigned long)px]];
 }
 
 static BOOL MixTrackInSeed(NSDictionary *t, NSDictionary *seed) {

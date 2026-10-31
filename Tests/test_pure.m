@@ -2312,6 +2312,9 @@ int main(void) {
             NSData *reply = [@"{\"results\":[{\"artistName\":\"Someone Else\",\"artworkUrl100\":\"https://a/x/100x100bb.jpg\"},"
                               "{\"artistName\":\"Pete Murray\",\"artworkUrl100\":\"https://a/y/100x100bb.jpg\"}]}" dataUsingEncoding:NSUTF8StringEncoding];
             check([MixArtURLFromSearch(reply, @"Pete Murray", 300) isEqual:@"https://a/y/300x300bb.jpg"], @"mix art: prefers the same artist, sized up");
+            NSData *karaoke = [@"{\"results\":[{\"artistName\":\"Doja Cat Karaoke Band\",\"trackName\":\"Kiss Me More (Instrumental)\",\"artworkUrl100\":\"https://a/k/100x100bb.jpg\"},"
+                                "{\"artistName\":\"Doja Cat\",\"trackName\":\"Kiss Me More (feat. SZA)\",\"artworkUrl100\":\"https://a/d/100x100bb.jpg\"}]}" dataUsingEncoding:NSUTF8StringEncoding];
+            check([MixArtURLFromSearch(karaoke, @"Doja Cat", 600) isEqual:@"https://a/d/600x600bb.jpg"], @"mix art: the real release beats an instrumental or karaoke one");
             check([MixArtURLFromSearch(reply, @"Nobody", 300) isEqual:@"https://a/x/300x300bb.jpg"] &&
                   MixArtURLFromSearch([@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding], @"X", 300) == nil &&
                   MixArtURLFromSearch(nil, @"X", 300) == nil, @"mix art: first result otherwise; nothing from an empty reply");
