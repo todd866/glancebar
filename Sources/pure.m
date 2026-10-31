@@ -2911,3 +2911,28 @@ NSString *SeedCaption(NSString *title) {
     return t.length ? t : (title ?: @"");
 }
 
+NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger freeSlots, NSInteger slots) {
+    NSMutableArray *factors = [NSMutableArray array];   // @[headroom, label]
+    if (sample[@"cpu"]) [factors addObject:@[@(MAX(0, 1 - [sample[@"cpu"] doubleValue] / 100)), @"CPU busy"]];
+    NSString *thermal = sample[@"thermal"];
+    if ([thermal isKindOfClass:NSString.class] && ![thermal isEqual:@"nominal"]) {
+        double heat = [thermal isEqual:@"moderate"] ? 0.6 : 0.4;
+        double top = [sample[@"pTopMHz"] doubleValue], mhz = [sample[@"pMHz"] doubleValue];
+        if (![thermal isEqual:@"moderate"] && [sample[@"pBusy"] doubleValue] >= 0.5 && top > 0 && mhz > 0) heat = MIN(0.6, mhz / top);
+        [factors addObject:@[@(heat), @"hot"]];
+    }
+    NSString *mem = sample[@"memPressure"];
+    if ([mem isEqual:@"High"]) [factors addObject:@[@0.2, @"low memory"]];
+    else if ([mem isEqual:@"Medium"]) [factors addObject:@[@0.55, @"low memory"]];
+    double free = [sample[@"diskFreeGB"] doubleValue], total = [sample[@"diskTotalGB"] doubleValue];
+    if (total > 0) [factors addObject:@[@(MIN(1, free / total / 0.15)), @"disk full"]];
+    if (sample[@"batt"] && ![sample[@"ac"] boolValue])
+        [factors addObject:@[@(MIN(1, [sample[@"batt"] doubleValue] / 50)), @"low battery"]];
+    if (slots > 0) [factors addObject:@[@(freeSlots <= 0 ? 0.2 : MIN(1, 0.4 + 0.6 * freeSlots / (double)slots)), @"slots full"]];
+    if ([mode isEqual:@"gentle"]) [factors addObject:@[@0.3, @"in use"]];
+    double score = 1; NSString *limit = @"ready";
+    for (NSArray *f in factors) if ([f[0] doubleValue] < score) { score = [f[0] doubleValue]; limit = f[1]; }
+    if (score >= 0.8) limit = @"ready";
+    return @{@"score": @(score), @"limit": limit};
+}
+

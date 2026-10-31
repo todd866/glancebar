@@ -5371,6 +5371,9 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
     NSString *_mixPlayingKey, *_mixStartingKey;
     dispatch_queue_t _mixQueue;
+    NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
+    NSMutableSet<NSString *> *_remoteInFlight;
+    CFAbsoluteTime _remotePolledAt;
     NSUInteger _audioSettleGen;
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
     BOOL _networkKnown, _networkOnline;
@@ -5537,6 +5540,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     _mixPreparing = [NSMutableSet set];
     _mixArt = [NSMutableDictionary dictionary];
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
+    _remote = [NSMutableDictionary dictionary];
+    _remoteInFlight = [NSMutableSet set];
     [self startNetworkMonitor];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(appleMusicChanged:)
                                                           name:@"com.apple.Music.playerInfo" object:nil];
@@ -6672,6 +6677,179 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (amTarget && !offline) y = [self addSeedTilesTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
 }
+#pragma mark Other Macs
+
+// The worker Macs to show, from `defaults write com.iantodd.glancebar remoteMachines`:
+// an array of {name, host}, host being an ssh alias. Empty by default.
+- (NSArray<NSDictionary *> *)remoteMachines {
+    NSArray *list = [NSUserDefaults.standardUserDefaults arrayForKey:@"remoteMachines"];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id m in list) if ([m isKindOfClass:NSDictionary.class] && [m[@"host"] length]) [out addObject:m];
+    return out;
+}
+// One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots.
+// At most every 25 s, and only while the popover is open.
+- (void)pollRemoteMachinesIfDue {
+    if (!_musicProbesEnabled || CFAbsoluteTimeGetCurrent() - _remotePolledAt < 25) return;
+    _remotePolledAt = CFAbsoluteTimeGetCurrent();
+    for (NSDictionary *m in [self remoteMachines]) {
+        NSString *host = m[@"host"];
+        if ([_remoteInFlight containsObject:host]) continue;
+        [_remoteInFlight addObject:host];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSTask *task = [NSTask new];
+            task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ssh"];
+            task.arguments = @[@"-o", @"BatchMode=yes", @"-o", @"ConnectTimeout=5", host,
+                (@"G=/Applications/Glancebar.app/Contents/MacOS/Glancebar; [ -x \"$G\" ] || G=\"$HOME/Applications/Glancebar.app/Contents/MacOS/Glancebar\"; "
+                  "\"$G\" --sample; echo @@; cat ~/.local/state/heavy-slot/mode 2>/dev/null; echo @@; ~/.local/bin/heavy-slot status 2>/dev/null")];
+            NSPipe *out = [NSPipe pipe];
+            task.standardOutput = out;
+            task.standardError = [NSFileHandle fileHandleWithNullDevice];
+            task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+            NSDictionary *reading = nil;
+            if ([task launchAndReturnError:NULL]) {
+                GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:12];
+                NSString *text = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+                [task waitUntilExit];
+                [watchdog disarm];
+                NSArray *parts = [text componentsSeparatedByString:@"@@"];
+                NSData *json = [[parts.firstObject stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] dataUsingEncoding:NSUTF8StringEncoding];
+                id sample = json.length ? [NSJSONSerialization JSONObjectWithData:json options:0 error:nil] : nil;
+                if ([sample isKindOfClass:NSDictionary.class]) {
+                    NSString *mode = parts.count > 1 ? [parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+                    NSInteger slots = 0, free = 0;
+                    if (parts.count > 2) for (NSString *l in [parts[2] componentsSeparatedByString:@"\n"]) {
+                        if (![l hasPrefix:@"slot "]) continue;
+                        slots++; if ([l hasSuffix:@": free"]) free++;
+                    }
+                    reading = @{@"sample": sample, @"mode": mode ?: @"", @"free": @(free), @"slots": @(slots), @"at": @(CFAbsoluteTimeGetCurrent())};
+                }
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self->_remoteInFlight removeObject:host];
+                if (reading) self->_remote[host] = reading;
+                if (self->_popover.isShown) [self rebuildContent];
+            });
+        });
+    }
+}
+- (void)toggleRemoteMachine:(ClickRow *)row {
+    NSString *host = [row.accessibilityIdentifier stringByReplacingOccurrencesOfString:@"popover.row.remote." withString:@""];
+    NSString *key = [@"remoteOpen." stringByAppendingString:host];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setBool:![ud boolForKey:key] forKey:key];
+    [self rebuildContent];
+}
+static NSColor *ReadinessColor(double score) {
+    return score >= 0.7 ? NSColor.systemGreenColor : score >= 0.4 ? NSColor.systemOrangeColor : NSColor.systemRedColor;
+}
+// One row per Mac: name and chevron, a readiness bar, the score and what limits it.
+// Clicking opens that Mac's Storage, Battery, System and Speed rows beneath.
+- (CGFloat)addRemoteMachinesTo:(NSView *)root at:(CGFloat)y {
+    NSArray *machines = [self remoteMachines];
+    if (!machines.count) return y;
+    [self pollRemoteMachinesIfDue];
+    y += 4;   // a thin rule separates this Mac from the others
+    NSBox *rule = [self dividerAt:y];
+    rule.accessibilityIdentifier = @"popover.divider.remote";
+    [root addSubview:rule];
+    y += 4;
+    for (NSDictionary *m in machines) {
+        NSString *host = m[@"host"], *name = [m[@"name"] length] ? m[@"name"] : host;
+        NSString *stem = [@"popover.remote." stringByAppendingString:host];
+        NSDictionary *reading = _remote[host];
+        BOOL fresh = reading && CFAbsoluteTimeGetCurrent() - [reading[@"at"] doubleValue] < 120;
+        NSDictionary *sample = reading[@"sample"];
+        NSDictionary *ready = fresh ? WorkerReadiness(sample, reading[@"mode"], [reading[@"free"] integerValue], [reading[@"slots"] integerValue]) : nil;
+        double score = [ready[@"score"] doubleValue];
+        NSColor *color = ready ? ReadinessColor(score) : NSColor.tertiaryLabelColor;
+        BOOL open = [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
+        NSString *tip = ready ? [NSString stringWithFormat:@"%@ · %@ ready · limited by %@ · click for details", name,
+                                 [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)], ready[@"limit"]]
+                              : [NSString stringWithFormat:@"%@ · not reachable over ssh (%@)", name, host];
+        ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        row.target = self;
+        row.action = @selector(toggleRemoteMachine:);
+        row.accessibilityRole = NSAccessibilityButtonRole;
+        row.accessibilityIdentifier = [@"popover.row.remote." stringByAppendingString:host];
+        row.accessibilityLabel = tip;
+        row.accessibilityHelp = tip;
+        [self instrumentSymbol:@"laptopcomputer" tint:color identifier:[stem stringByAppendingString:@".symbol"] in:row];
+        NSTextField *nameField = [self instrumentName:name identifier:[stem stringByAppendingString:@".name"] in:row];
+        CGFloat nameW = ceil([name sizeWithAttributes:@{NSFontAttributeName: nameField.font}].width);
+        NSImageView *chevron = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:(open ? @"chevron.down" : @"chevron.right") accessibilityDescription:nil]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightSemibold]]];
+        chevron.contentTintColor = NSColor.tertiaryLabelColor;
+        chevron.frame = NSMakeRect(NSMinX(nameField.frame) + nameW + 6, (kRowH - 12) / 2.0, 12, 12);
+        chevron.accessibilityIdentifier = [stem stringByAppendingString:@".chevron"];
+        [row addSubview:chevron];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        g.fraction = ready ? score : 0; g.color = color; g.markerFraction = -1; g.metricLabel = @"Readiness";
+        g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+        [row addSubview:g];
+        [self instrumentValue:(ready ? [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)] : @"—") color:color
+                   identifier:[stem stringByAppendingString:@".value"] in:row];
+        [self instrumentDatum:(ready ? ready[@"limit"] : @"away")
+                        color:(ready && [ready[@"limit"] isEqual:@"ready"] ? NSColor.secondaryLabelColor : color)
+                   identifier:[stem stringByAppendingString:@".datum"] in:row];
+        [root addSubview:row];
+        y += kRowH;
+        if (!open || !fresh) continue;
+        y = [self addRemoteDetailRows:sample stem:stem to:root at:y];
+    }
+    return y;
+}
+// The opened drawer: the same four instruments as this Mac's, from the worker's sample.
+- (CGFloat)addRemoteDetailRows:(NSDictionary *)s stem:(NSString *)stem to:(NSView *)root at:(CGFloat)y {
+    NSMutableArray *rows = [NSMutableArray array];
+    double total = [s[@"diskTotalGB"] doubleValue], free = [s[@"diskFreeGB"] doubleValue];
+    if (total > 0) {
+        double used = MAX(0, MIN(1, 1 - free / total));
+        [rows addObject:@[@"internaldrive", @"Storage", @(used), DiskColor(used), [NSString stringWithFormat:@"%d%%", (int)lround(used * 100)],
+                          [NSString stringWithFormat:@"%.0f GB free", free], NSColor.secondaryLabelColor, @"storage"]];
+    }
+    if (s[@"batt"]) {
+        int pct = [s[@"batt"] intValue];
+        double watts = [s[@"battW"] doubleValue];
+        NSString *w = fabs(watts) < 0.3 ? @"0 W" : (FormatSignedWatts(watts) ?: @"");
+        [rows addObject:@[[s[@"ac"] boolValue] ? @"battery.100.bolt" : @"battery.75", @"Battery", @(pct / 100.0), BattBarColor(pct),
+                          [NSString stringWithFormat:@"%d%%", pct], w,
+                          fabs(watts) < 0.3 ? NSColor.secondaryLabelColor : watts > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor, @"battery"]];
+    }
+    if (s[@"cpu"]) {
+        double cpu = [s[@"cpu"] doubleValue] / 100;
+        [rows addObject:@[@"cpu", @"System", @(cpu), CPUColor(cpu), [NSString stringWithFormat:@"%d%%", (int)lround(cpu * 100)], @"", NSColor.secondaryLabelColor, @"system"]];
+    }
+    NSString *thermal = s[@"thermal"];
+    double top = [s[@"pTopMHz"] doubleValue], mhz = [s[@"pMHz"] doubleValue];
+    double speed = [thermal isEqual:@"nominal"] ? 1 : (top > 0 && mhz > 0 && [s[@"pBusy"] doubleValue] >= 0.5 ? MIN(1, mhz / top) : -1);
+    if (speed >= 0) {
+        NSColor *sc = [thermal isEqual:@"nominal"] ? NSColor.systemGreenColor : [thermal isEqual:@"moderate"] ? NSColor.systemOrangeColor : NSColor.systemRedColor;
+        NSMutableArray *temps = [NSMutableArray array];
+        if (s[@"chipC"]) [temps addObject:[NSString stringWithFormat:@"%ld°", lround([s[@"chipC"] doubleValue])]];
+        if (s[@"cellsC"]) [temps addObject:[NSString stringWithFormat:@"%ld°", lround([s[@"cellsC"] doubleValue])]];
+        [rows addObject:@[@"gauge.with.dots.needle.67percent", @"Speed", @(speed), sc, [NSString stringWithFormat:@"%d%%", (int)lround(speed * 100)],
+                          [temps componentsJoinedByString:@" · "], NSColor.secondaryLabelColor, @"speed"]];
+    }
+    for (NSArray *r in rows) {
+        NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        NSString *rs = [NSString stringWithFormat:@"%@.%@", stem, r[7]];
+        row.accessibilityIdentifier = rs;
+        [self instrumentSymbol:r[0] tint:r[3] identifier:[rs stringByAppendingString:@".symbol"] in:row];
+        // Grey names: these rows belong to the Mac above, not this one.
+        [self instrumentName:r[1] identifier:[rs stringByAppendingString:@".name"] in:row].textColor = NSColor.secondaryLabelColor;
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        g.fraction = [r[2] doubleValue]; g.color = r[3]; g.markerFraction = -1; g.metricLabel = r[1];
+        g.accessibilityIdentifier = [rs stringByAppendingString:@".gauge"];
+        [row addSubview:g];
+        [self instrumentValue:r[4] color:r[3] identifier:[rs stringByAppendingString:@".value"] in:row];
+        if ([r[5] length]) [self instrumentDatum:r[5] color:r[6] identifier:[rs stringByAppendingString:@".datum"] in:row];
+        [root addSubview:row];
+        y += kRowH;
+    }
+    return y;
+}
+
 // Four seeds (a song or an album, cover and name) and New picks. A click plays a long
 // mix built around that seed; the playing seed is outlined.
 - (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
@@ -9245,6 +9423,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:row];
         y += kRowH;
     }
+    y = [self addRemoteMachinesTo:root at:y];
 
     y = [self addMeteredTo:root at:y];
 
@@ -11976,6 +12155,12 @@ static int PrintSampleLine(void) {
     if (s.memValid) { line[@"memUsedGB"] = Decimal(s.memUsed / 1e9, 1); line[@"memTotalGB"] = Decimal(s.memTotal / 1e9, 1); }
     line[@"memPressure"] = MemoryPressureLevel(s);
     if (s.swapValid) line[@"swapGB"] = Decimal(s.swapUsed / 1e9, 1);
+    NSDictionary *volume = [[NSURL fileURLWithPath:NSHomeDirectory()] resourceValuesForKeys:
+        @[NSURLVolumeAvailableCapacityForImportantUsageKey, NSURLVolumeTotalCapacityKey] error:nil];
+    if ([volume[NSURLVolumeTotalCapacityKey] doubleValue] > 0) {
+        line[@"diskFreeGB"] = Decimal([volume[NSURLVolumeAvailableCapacityForImportantUsageKey] doubleValue] / 1e9, 1);
+        line[@"diskTotalGB"] = Decimal([volume[NSURLVolumeTotalCapacityKey] doubleValue] / 1e9, 1);
+    }
     if (s.tempValid) line[@"chipC"] = Decimal(s.cpuTempC, 1);
     if (s.clocks.valid) {
         line[@"pMHz"] = @(lround(s.clocks.pMHz)); line[@"pTopMHz"] = @(lround(s.clocks.pMaxMHz));

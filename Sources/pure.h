@@ -764,3 +764,9 @@ NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary 
 // A tile caption: the title without "(feat. …)", "(… Remastered)", " - Single", " EP" and the like.
 NSString *SeedCaption(NSString *title);
 
+// How ready a worker Mac is for more work, from its `Glancebar --sample` line plus its
+// heavy-slot governor mode ("gentle" while someone else is using it) and free slots.
+// score 0…1 is the worst of the headrooms (CPU, heat, memory, disk, battery, slots, in use);
+// limit names that factor ("CPU busy", "hot", …) or "ready" when nothing is below 0.8.
+NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger freeSlots, NSInteger slots);
+

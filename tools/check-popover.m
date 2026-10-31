@@ -697,6 +697,41 @@ int main(int argc, const char **argv) {
             [c setValue:nil forKey:@"amPlaylist"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
+        {   // Other Macs: one readiness row each (name, chevron, bar, score, what limits it); a click opens its four rows.
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            [ud setObject:@[@{@"name": @"M2", @"host": @"m2"}] forKey:@"remoteMachines"];
+            [ud setBool:NO forKey:@"remoteOpen.m2"];
+            [c setValue:@(CFAbsoluteTimeGetCurrent()) forKey:@"remotePolledAt"];   // no real ssh from the harness
+            NSDictionary *sample = @{@"cpu": @91, @"thermal": @"heavy", @"pMHz": @1188, @"pTopMHz": @3504, @"pBusy": @0.8, @"memPressure": @"Low",
+                                     @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES, @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37};
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *rv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.value");
+            NSTextField *rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+            NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");
+            if (!FindIdentifier(root, @"popover.row.remote.m2") || ![rn.stringValue isEqual:@"M2"] || !FindIdentifier(root, @"popover.remote.m2.chevron") ||
+                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue isEqual:@"CPU busy"] || ![rd.textColor isEqual:NSColor.systemRedColor] ||
+                FindIdentifier(root, @"popover.remote.m2.storage") || !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
+                !FitsChildren(root)) return Fail(__LINE__);
+            [ud setBool:YES forKey:@"remoteOpen.m2"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *sv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.value");
+            NSTextField *sd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.datum");
+            NSTextField *pv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.speed.value");
+            if (![sv.stringValue isEqual:@"56%"] || ![sd.stringValue isEqual:@"218 GB free"] || ![pv.stringValue isEqual:@"34%"] ||
+                !FindIdentifier(root, @"popover.remote.m2.battery") || !FindIdentifier(root, @"popover.remote.m2.system") ||
+                !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-remote.png"];
+                if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent() - 600)}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+            if (![rd.stringValue isEqual:@"away"] || FindIdentifier(root, @"popover.remote.m2.storage")) return Fail(__LINE__);
+            [ud removeObjectForKey:@"remoteMachines"]; [ud removeObjectForKey:@"remoteOpen.m2"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");

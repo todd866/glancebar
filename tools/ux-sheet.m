@@ -1609,11 +1609,68 @@ static BOOL SeedSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Remote machines drawer
+
+typedef NS_ENUM(NSInteger, DrawerStyle) { DrawerPlain, DrawerSummary };
+
+static NSView *DrawerHeader(Controller *c, NSString *name, BOOL open, DrawerStyle style, BOOL hot) {
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, 24)];
+    NSImageView *chev = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:(open ? @"chevron.down" : @"chevron.right") accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:11 weight:NSFontWeightSemibold]]];
+    chev.contentTintColor = NSColor.secondaryLabelColor; chev.frame = NSMakeRect(kPad + 4, 5, 14, 14); [row addSubview:chev];
+    NSImageView *mac = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:@"laptopcomputer" accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]]];
+    mac.contentTintColor = NSColor.secondaryLabelColor; mac.frame = NSMakeRect(kPad + 22, 4, 22, 16); [row addSubview:mac];
+    [row addSubview:[c text:name font:[NSFont systemFontOfSize:12.5 weight:NSFontWeightSemibold] color:NSColor.labelColor at:NSMakeRect(kPad + 50, 4, 120, 16) align:NSTextAlignmentLeft]];
+    if (style == DrawerSummary && !open) {
+        // Closed: the four readings in miniature, each in its own colour.
+        NSFont *f = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+        NSArray *bits = @[@[@"internaldrive", @"41%", NSColor.systemBlueColor], @[@"battery.100", @"100%", NSColor.systemGreenColor],
+                          @[@"cpu", @"18%", NSColor.systemGreenColor], @[@"thermometer.medium", hot ? @"91°" : @"62°", hot ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor]];
+        CGFloat x = kW - kPad;
+        for (NSArray *b in bits.reverseObjectEnumerator) {
+            CGFloat w = ceil([b[1] sizeWithAttributes:@{NSFontAttributeName: f}].width) + 6;
+            x -= w;
+            [row addSubview:[c text:b[1] font:f color:b[2] at:NSMakeRect(x, 4, w, 16) align:NSTextAlignmentRight]];
+            NSImageView *iv = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:b[0] accessibilityDescription:nil]
+                imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightRegular]]];
+            iv.contentTintColor = b[2]; x -= 18; iv.frame = NSMakeRect(x, 5, 16, 14); [row addSubview:iv];
+            x -= 8;
+        }
+    }
+    return row;
+}
+
+static BOOL DrawerSheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSArray *variants = @[@[@"A  closed: name only; open: the M2's four rows", @(DrawerPlain)],
+                          @[@"B  closed: name + the four readings in miniature", @(DrawerSummary)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        DrawerStyle style = [v[1] integerValue];
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            [rows addObject:DrawerHeader(c, @"M2 Air", NO, style, NO)];
+            [rows addObject:DrawerHeader(c, @"M1 Pro", NO, style, YES)];
+            [rows addObject:[[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, 12)]];
+            [rows addObject:DrawerHeader(c, @"M2 Air", YES, style, NO)];
+            [rows addObject:BurnBaseRow(c, @"internaldrive", @"Storage", 0.41, DiskColor(0.41), @"41%", @"218 GB free")];
+            NSView *batt = BurnBaseRow(c, @"battery.100", @"Battery", 1.0, BattBarColor(100), @"100%", @"");
+            [batt addSubview:SheetDatum(c, @"0 W", NSColor.secondaryLabelColor)]; [rows addObject:batt];
+            [rows addObject:BurnBaseRow(c, @"cpu", @"System", 0.18, CPUColor(0.18), @"18%", @"")];
+            NSView *heat = BurnBaseRow(c, @"gauge.with.dots.needle.100percent", @"Speed", 1.0, NSColor.systemGreenColor, @"100%", @"");
+            [heat addSubview:SheetDatum(c, @"62° · 28°", NSColor.secondaryLabelColor)]; [rows addObject:heat];
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed|volume|steer|seeds out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed|volume|steer|seeds|drawer out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
@@ -1622,6 +1679,7 @@ int main(int argc, const char **argv) {
         if (!strcmp(argv[1], "volume")) return VolumeSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "steer")) return SteerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "seeds")) return SeedSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "drawer")) return DrawerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;

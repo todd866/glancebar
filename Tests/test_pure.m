@@ -2328,6 +2328,27 @@ int main(void) {
               [SeedCaption(@"Youth - Single") isEqual:@"Youth"] && [SeedCaption(@"Animal Magic") isEqual:@"Animal Magic"] &&
               [SeedCaption(@"Lightning Crashes (Live)") isEqual:@"Lightning Crashes"] && [SeedCaption(@"(feat. X)") isEqual:@"(feat. X)"],
               @"mix: captions drop features, versions and release types");
+        // Worker readiness.
+        {
+            NSDictionary *calm = @{@"cpu": @12, @"thermal": @"nominal", @"memPressure": @"Low", @"diskFreeGB": @200, @"diskTotalGB": @500, @"ac": @YES, @"batt": @80};
+            NSDictionary *r = WorkerReadiness(calm, @"full", 3, 3);
+            check([r[@"limit"] isEqual:@"ready"] && [r[@"score"] doubleValue] >= 0.85, @"worker: a calm Mac is ready");
+            NSMutableDictionary *busy = [calm mutableCopy]; busy[@"cpu"] = @91;
+            r = WorkerReadiness(busy, @"full", 3, 3);
+            check([r[@"limit"] isEqual:@"CPU busy"] && fabs([r[@"score"] doubleValue] - 0.09) < 0.001, @"worker: the busiest factor sets the score");
+            NSMutableDictionary *hot = [calm mutableCopy]; hot[@"thermal"] = @"heavy"; hot[@"pMHz"] = @1188; hot[@"pTopMHz"] = @3504; hot[@"pBusy"] = @0.79;
+            r = WorkerReadiness(hot, @"full", 3, 3);
+            check([r[@"limit"] isEqual:@"hot"] && fabs([r[@"score"] doubleValue] - 1188.0 / 3504) < 0.001, @"worker: throttled clocks read as hot");
+            r = WorkerReadiness(calm, @"gentle", 2, 2);
+            check([r[@"limit"] isEqual:@"in use"] && [r[@"score"] doubleValue] < 0.35, @"worker: someone at the screen means in use");
+            NSMutableDictionary *full = [calm mutableCopy]; full[@"diskFreeGB"] = @10;
+            check([WorkerReadiness(full, @"full", 3, 3)[@"limit"] isEqual:@"disk full"], @"worker: little disk left");
+            NSMutableDictionary *flat = [calm mutableCopy]; flat[@"ac"] = @NO; flat[@"batt"] = @15;
+            check([WorkerReadiness(flat, @"full", 3, 3)[@"limit"] isEqual:@"low battery"], @"worker: on a low battery");
+            check([WorkerReadiness(calm, @"full", 0, 3)[@"limit"] isEqual:@"slots full"], @"worker: every heavy slot taken");
+            NSMutableDictionary *mem = [calm mutableCopy]; mem[@"memPressure"] = @"High";
+            check([WorkerReadiness(mem, @"full", 3, 3)[@"limit"] isEqual:@"low memory"], @"worker: memory pressure");
+        }
         // Output volume line.
         check([OutputVolumeText(0.554, NO) isEqual:@"55%"] && [OutputVolumeText(1.2, NO) isEqual:@"100%"],
               @"volume: whole percent, capped");
