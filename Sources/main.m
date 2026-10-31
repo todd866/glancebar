@@ -4239,50 +4239,101 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 
 // Compact labels retain their full value. Show native expansion help only when
 // their actual text is clipped; ordinary labels still have no hover popup.
-// A seed tile: hovering its cover shows it large in a popover beside the tile.
+// A seed tile. Hovering the tile or its caption shows the cover large with the full title and artist:
+// the captions are one line and may clip, and tooltips don't show while a menu-bar app is inactive.
 @interface GBSeedTile : NSButton
 @property (nonatomic, strong) NSImage *cover;
+@property (nonatomic, copy) NSString *songTitle, *songArtist, *seedKey;
+- (void)showLarge;
+- (void)hideLarge;
+- (NSView *)largeCard;
++ (void)closeLarge;
 @end
-@implementation GBSeedTile {
-    NSPopover *_large;
+// One large view for all tiles, keyed by seed. A refresh that rebuilds the tiles re-anchors it to the new
+// tile instead of closing and reopening it, and its window ignores the mouse so it never takes the hover:
+// both had made it flicker (Ian, 1 Nov 2026: "it should be rock solid").
+static NSPopover *gSeedLarge;
+static NSString *gSeedLargeKey;
+@implementation GBSeedTile
+- (void)showLarge {
+    if (!self.window || (!self.cover && !self.songTitle.length)) return;
+    if (gSeedLarge.shown && [gSeedLargeKey isEqual:self.seedKey]) {   // same song: just move it to this tile
+        [gSeedLarge showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+        return;
+    }
+    [GBSeedTile closeLarge];
+    NSViewController *vc = [NSViewController new];
+    vc.view = [self largeCard];
+    gSeedLarge = [NSPopover new];
+    gSeedLarge.contentViewController = vc;
+    gSeedLarge.behavior = NSPopoverBehaviorApplicationDefined;
+    gSeedLarge.animates = NO;
+    gSeedLargeKey = [self.seedKey copy];
+    [gSeedLarge showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+    vc.view.window.ignoresMouseEvents = YES;
 }
+// The cover at 220 pt over the full title and artist.
+- (NSView *)largeCard {
+    const CGFloat side = 220, pad = 8;
+    NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
+    CGFloat y = pad;
+    NSArray *texts = @[self.songArtist ?: @"", self.songTitle ?: @""];   // built bottom-up
+    for (NSUInteger i = 0; i < texts.count; i++) {
+        if (![texts[i] length]) continue;
+        NSTextField *t = [NSTextField wrappingLabelWithString:texts[i]];
+        t.font = i ? [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold] : [NSFont systemFontOfSize:12];
+        t.textColor = i ? NSColor.labelColor : NSColor.secondaryLabelColor;
+        t.alignment = NSTextAlignmentCenter;
+        t.preferredMaxLayoutWidth = side;
+        NSSize fit = [t.cell cellSizeForBounds:NSMakeRect(0, 0, side, 400)];
+        t.frame = NSMakeRect(pad, y, side, ceil(fit.height));
+        t.accessibilityIdentifier = i ? @"popover.mix.large.title" : @"popover.mix.large.artist";
+        [content addSubview:t];
+        y = NSMaxY(t.frame) + 2;
+    }
+    if (self.cover) {
+        NSImageView *view = [NSImageView imageViewWithImage:self.cover];
+        view.imageScaling = NSImageScaleProportionallyUpOrDown;
+        view.frame = NSMakeRect(pad, y + 4, side, side);
+        view.wantsLayer = YES;
+        view.layer.cornerRadius = 6;
+        view.layer.masksToBounds = YES;
+        view.accessibilityIdentifier = @"popover.mix.cover.large";
+        [content addSubview:view];
+        y = NSMaxY(view.frame);
+    }
+    content.frame = NSMakeRect(0, 0, side + 2 * pad, y + pad);
+    return content;
+}
+- (void)hideLarge {
+    if ([gSeedLargeKey isEqual:self.seedKey]) [GBSeedTile closeLarge];
+}
++ (void)closeLarge { [gSeedLarge close]; gSeedLarge = nil; gSeedLargeKey = nil; }
+@end
+
+// Clicks pass through to the tile; only the hover is caught, over the tile and both caption lines.
+@interface GBSeedHover : NSView
+@property (nonatomic, weak) GBSeedTile *tile;
+@end
+@implementation GBSeedHover
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
     for (NSTrackingArea *a in self.trackingAreas) [self removeTrackingArea:a];
     [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
         options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil]];
 }
-- (void)mouseEntered:(NSEvent *)event {
-    [super mouseEntered:event];
-    if (!self.cover || !self.window) return;
-    const CGFloat side = 220;
-    NSImageView *view = [NSImageView imageViewWithImage:self.cover];
-    view.imageScaling = NSImageScaleProportionallyUpOrDown;
-    view.frame = NSMakeRect(0, 0, side, side);
-    view.wantsLayer = YES;
-    view.layer.cornerRadius = 6;
-    view.layer.masksToBounds = YES;
-    view.accessibilityIdentifier = @"popover.mix.cover.large";
-    NSViewController *vc = [NSViewController new];
-    NSView *pad = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, side + 12, side + 12)];
-    view.frameOrigin = NSMakePoint(6, 6);
-    [pad addSubview:view];
-    vc.view = pad;
-    _large = [NSPopover new];
-    _large.contentViewController = vc;
-    _large.behavior = NSPopoverBehaviorApplicationDefined;
-    _large.animates = NO;
-    [_large showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+- (BOOL)pointerInside {
+    if (!self.window) return NO;
+    NSPoint p = [self convertPoint:[self.window convertPointFromScreen:NSEvent.mouseLocation] fromView:nil];
+    return NSPointInRect(p, self.bounds);
 }
-- (void)mouseExited:(NSEvent *)event {
-    [super mouseExited:event];
-    [_large close];
-    _large = nil;
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.pointerInside) [self.tile showLarge];   // rebuilt under the pointer: keep the view, re-anchored
 }
-- (void)viewWillMoveToWindow:(NSWindow *)window {
-    if (!window) { [_large close]; _large = nil; }
-    [super viewWillMoveToWindow:window];
-}
+- (void)mouseEntered:(NSEvent *)event { (void)event; [self.tile showLarge]; }
+- (void)mouseExited:(NSEvent *)event { (void)event; if (!self.pointerInside) [self.tile hideLarge]; }
 @end
 
 @interface GBRecoverableTextField : NSTextField
@@ -4563,7 +4614,12 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         }
         old.imageScaling = new.imageScaling;
         if ([old isKindOfClass:GBSeedTile.class] && [new isKindOfClass:GBSeedTile.class])
+        {
             ((GBSeedTile *)old).cover = ((GBSeedTile *)new).cover;
+            ((GBSeedTile *)old).songTitle = ((GBSeedTile *)new).songTitle;
+            ((GBSeedTile *)old).songArtist = ((GBSeedTile *)new).songArtist;
+            ((GBSeedTile *)old).seedKey = ((GBSeedTile *)new).seedKey;
+        }
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
@@ -5452,6 +5508,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSTimer *_trackTick;
     // Apple Music is the play target online. Loaded = Music has a playing or paused track.
     BOOL _amLoaded, _amFavorited, _amShuffle, _amStatusInFlight, _amStartPending;
+    int _burnLatch;   // 0 undecided, 1 shown, 2 hidden: the burn row holds still while the popover is open
     NSString *_amTitle, *_amArtist, *_amAlbum, *_amPlaylist, *_amTrackID, *_amArtTrackID;
     NSImage *_amArt;
     NSTimer *_amProbeTimer;
@@ -6995,7 +7052,10 @@ static NSColor *ReadinessColor(double score) {
             GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
                                                        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
                                       target:self action:@selector(playSeedMix:)];
-            seedTile.cover = cover;   // hover shows it large
+            seedTile.cover = cover;   // hover shows it large, with the full names
+            seedTile.songTitle = SeedCaption(seed[@"title"]);
+            seedTile.songArtist = seed[@"artist"];
+            seedTile.seedKey = seed[@"key"];
             tile = seedTile;
             tile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
             if (!cover) tile.contentTintColor = NSColor.tertiaryLabelColor;
@@ -7019,7 +7079,7 @@ static NSColor *ReadinessColor(double score) {
         tile.frame = NSMakeRect(x, capH, side, side);
         [line addSubview:tile];
         // Title over artist, one line each in aligned rows; the title reads first. A clipped one shows in full on hover.
-        CGFloat capW = side + gap - 4, capX = x - (gap - 4) / 2, rowH = 14;
+        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2, rowH = 14;   // the tile's full pitch
         NSArray *lines = picks ? @[@"New picks"] : @[SeedCaption(seed[@"title"]), seed[@"artist"] ?: @""];
         for (NSUInteger l = 0; l < lines.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:lines[l]];
@@ -7027,10 +7087,17 @@ static NSColor *ReadinessColor(double score) {
             cap.textColor = playing ? NSColor.controlAccentColor : (l || picks ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.allowsDefaultTighteningForTruncation = YES;   // squeeze a little before clipping
             cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
             [(GBRecoverableTextField *)cap updateClippedTextHelp];
             cap.accessibilityIdentifier = [NSString stringWithFormat:l ? @"popover.mix.artist.%lu" : @"popover.mix.caption.%lu", (unsigned long)i];
             [line addSubview:cap];
+        }
+        if ([tile isKindOfClass:GBSeedTile.class]) {
+            GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
+            hover.tile = (GBSeedTile *)tile;
+            hover.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.hover.%lu", (unsigned long)i];
+            [line addSubview:hover];
         }
     }
     [root addSubview:line];
@@ -8097,6 +8164,8 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
 // apart from the mouse-UP that trails a transient dismiss. Fires on every close path —
 // outside click, second icon click, or Escape — which is exactly the set we want to guard.
 - (void)popoverWillClose:(NSNotification *)note {
+    _burnLatch = 0;
+    [GBSeedTile closeLarge];
     (void)note;
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
     [self stopYouTubeProbeTimer];
@@ -9058,7 +9127,14 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         turnsToCharge = watts >= net && watts >= 1;
         gain = turnsToCharge ? 0 : BurnGainMinutes(minutes, net, watts);
     }
-    if (draw <= 0 || !top || (gain < 0 && !turnsToCharge)) return y;
+    BOOL want = draw > 0 && top && (gain >= 0 || turnsToCharge);
+    // The gain hovers around its half-hour bar, and the row popping in and out moved everything under
+    // the pointer (Ian, 1 Nov 2026): decide once when the popover opens, hold until it closes.
+    if (_popover.isShown) {
+        if (_burnLatch) want = _burnLatch == 1 && draw > 0 && top;
+        else _burnLatch = want ? 1 : 2;
+    }
+    if (!want) return y;
     ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
     row.target = self;
     row.action = @selector(showBatteryDetails:);
@@ -9086,7 +9162,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSString *value = [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts];
     [self instrumentValue:value color:watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
                identifier:@"popover.burn.value" in:row].accessibilityHelp = tip;
-    [self instrumentDatum:turnsToCharge ? @"quit \u2192 charges" : [@"quit +" stringByAppendingString:FmtDuration(gain)]
+    [self instrumentDatum:turnsToCharge ? @"quit \u2192 charges" : gain >= 0 ? [@"quit +" stringByAppendingString:FmtDuration(gain)] : @""
                     color:turnsToCharge ? NSColor.systemGreenColor : NSColor.secondaryLabelColor
                identifier:@"popover.burn.datum" in:row].accessibilityHelp = tip;
     [root addSubview:row];

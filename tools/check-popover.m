@@ -702,6 +702,12 @@ int main(int argc, const char **argv) {
                 [c rebuildContent]; root = p.contentViewController.view;
                 GBSeedTile *t0 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.0"), *t2 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.2");
                 if (![t0 isKindOfClass:GBSeedTile.class] || t0.cover != art || t2.cover) return Fail(__LINE__);
+                // The hover card names the song in full: the zone spans tile and captions, clicks pass through.
+                GBSeedHover *h3 = (GBSeedHover *)FindIdentifier(root, @"popover.mix.hover.3");
+                GBSeedTile *t3 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.3");
+                if (![h3 isKindOfClass:GBSeedHover.class] || h3.tile != t3 || [h3 hitTest:NSMakePoint(NSMidX(h3.frame), NSMidY(h3.frame))] ||
+                    ![t3.songTitle isEqual:@"So Long, See You Tomorrow Anniversary"] || ![t3.songArtist isEqual:@"Bombay Bicycle Club"] ||
+                    NSMaxY(h3.frame) < NSMaxY(t3.frame) - 0.5 || NSMinY(h3.frame) > 0.5) return Fail(__LINE__);
                 [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
                 [c rebuildContent]; root = p.contentViewController.view;
             }
@@ -1028,6 +1034,12 @@ int main(int argc, const char **argv) {
                 NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
                 NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
                 if (!RenderOffscreen(root, [stem stringByAppendingString:@"-music.png"], look)) return Fail(__LINE__);
+            }
+            if (mixRender && argc > 1) {   // and the hover card for the last seed, full names under the cover
+                GBSeedTile *last = nil;
+                for (NSUInteger i = 0; i < 4; i++) { NSView *v = FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i]); if (v) last = (GBSeedTile *)v; }
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                if (last && !RenderOffscreen([last largeCard], [stem stringByAppendingString:@"-card.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
             }
             if (mixRender) { [c setValue:frozenSeeds forKey:@"mixSeeds"]; [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"]; [c rebuildContent]; root = p.contentViewController.view; }
             // The scrubber line is the only extra height; later fixtures measure the idle panel.
