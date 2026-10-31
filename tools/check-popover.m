@@ -400,6 +400,7 @@ int main(int argc, const char **argv) {
         Controller *c = [Controller new];
         // Seed tiles from a fixture: the harness never reads the real Music library.
         [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:@YES forKey:@"audioFrozen"];   // never read this Mac's live volume mid-check
         [c setValue:@[@{@"key": @"song:A1", @"kind": @"song", @"title": @"Muse (feat. Kate Morgan)", @"subtitle": @"Rezident", @"trackID": @"A1", @"artist": @"Rezident", @"album": @"Only For A Moment EP", @"family": @"dance"},
                       @{@"key": @"song:B1", @"kind": @"song", @"title": @"Kota", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
                       @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},

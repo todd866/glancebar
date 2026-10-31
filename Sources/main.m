@@ -5471,7 +5471,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     BOOL _volumeRebuildPending;
     NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
     CFAbsoluteTime _mixLibraryAt;
-    BOOL _mixLibraryLoading, _mixFrozen;       // _mixFrozen: tests set seeds by hand, no background work
+    BOOL _mixLibraryLoading, _mixFrozen, _audioFrozen;   // frozen: tests set seeds / own the volume reading, no live reads
     NSArray<NSDictionary *> *_mixSeeds;        // the four tiles
     NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
     NSMutableSet<NSString *> *_mixPreparing;
@@ -5731,7 +5731,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 // Listen to the current output's volume and mute, moving the listener when the output changes.
 - (void)watchOutputVolume {
-    if (!_musicProbesEnabled) return;
+    if (!_musicProbesEnabled || _audioFrozen) return;
     AudioObjectID device = [self defaultOutputDeviceID];
     if (device == _volumeWatched) return;
     void (^each)(AudioObjectID, BOOL) = ^(AudioObjectID d, BOOL add) {
@@ -5751,7 +5751,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)refreshOutputVolume {
     AudioObjectID device = [self defaultOutputDeviceID];
-    if (!_musicProbesEnabled || device == kAudioObjectUnknown) return;   // keep the last reading
+    if (!_musicProbesEnabled || _audioFrozen || device == kAudioObjectUnknown) return;   // keep the last reading
     BOOL muted = NO;
     _outputVolume = ReadOutputVolume(device, &muted);
     _outputMuted = muted;
