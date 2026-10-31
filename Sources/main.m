@@ -30,6 +30,14 @@
 #import "storage_cleanup.h"
 #import "storage_index.h"
 
+// Built against a macOS 13 SDK (the M1 worker's command-line tools), NSMenuItem has no
+// declaration for the macOS 14 section header; the call site checks @available at run time.
+#if __MAC_OS_X_VERSION_MAX_ALLOWED < 140000
+@interface NSMenuItem (GBSectionHeader)
++ (NSMenuItem *)sectionHeaderWithTitle:(NSString *)title API_AVAILABLE(macos(14.0));
+@end
+#endif
+
 // This preference governs Glancebar's optional requests only, never system networking.
 static BOOL GBLowDataEnabled(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"lowData"]; }
 static NSString *const GBLowDataTip = @"Glancebar only: defer account refreshes and dish discovery.\nLocal readings and cached figures remain. Other apps are unaffected.";
@@ -8619,7 +8627,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 - (void)rebuildContent {
     _popoverPrepared=YES;
     [self refreshChargeShortcutsIfStale];
-    NSView *previousView = _popover.contentViewController.view;
+    // macOS 13 throws if a bare NSViewController is asked for a view it never loaded
+    // (it looks for a nib); 14 quietly makes an empty one. The first build has none.
+    NSViewController *previous = _popover.contentViewController;
+    NSView *previousView = previous.isViewLoaded ? previous.view : nil;
     NSWindow *popoverWindow = previousView.window;
     NSDictionary *focusSnapshot = [self focusSnapshotForWindow:popoverWindow rootView:previousView];
     FlippedView *root = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
