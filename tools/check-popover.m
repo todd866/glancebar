@@ -545,7 +545,8 @@ int main(int argc, const char **argv) {
         NSTextField *heatValue = (NSTextField *)FindIdentifier(root, @"popover.heat.value");
         NSTextField *heatDatum = (NSTextField *)FindIdentifier(root, @"popover.heat.datum");
         NSTextField *heatName = (NSTextField *)FindIdentifier(root, @"popover.heat.name");
-        if (!FindIdentifier(root, @"popover.row.heat") || ![heatName.stringValue isEqual:@"Heat"] ||
+        if (!FindIdentifier(root, @"popover.row.heat") || ![heatName.stringValue isEqual:@"Speed"] ||
+            !((Gauge *)FindIdentifier(root, @"popover.heat.gauge")).lossColor ||
             ![heatValue.stringValue isEqual:@"52%"] || ![heatValue.textColor isEqual:NSColor.systemRedColor] ||
             ![HeatDatumText(heatDatum) isEqual:@"[cpu]101°"] || ![HeatDatumColor(heatDatum, 0) isEqual:NSColor.systemRedColor] ||
             !SameColumn(heatDatum, batteryDatum) || !SameColumn(heatName, popSystemName) ||

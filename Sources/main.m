@@ -3919,6 +3919,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 @property (nonatomic) double innerFraction;  // negative: none. A secondary reading as a thin line inside the bar
 @property (nonatomic, strong) NSColor *color;
 @property (nonatomic, copy) NSString *metricLabel;
+@property (nonatomic, strong) NSColor *lossColor;   // nil: plain track. Tints the track past the fill: what's missing
 @end
 @implementation Gauge
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -3941,6 +3942,7 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
 - (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
 - (void)setMarkerFraction:(double)markerFraction { _markerFraction = markerFraction; self.needsDisplay = YES; }
 - (void)setInnerFraction:(double)innerFraction { _innerFraction = innerFraction; self.needsDisplay = YES; }
+- (void)setLossColor:(NSColor *)lossColor { _lossColor = lossColor; self.needsDisplay = YES; }
 - (void)setMetricLabel:(NSString *)metricLabel {
     _metricLabel = [metricLabel copy];
     [self setAccessibilityLabel:_metricLabel.length ? _metricLabel : @"Progress"];
@@ -3951,6 +3953,10 @@ static NSString *BatterySymbolName(int percent, BOOL plugged) {
     NSRect r = self.bounds; CGFloat rad = r.size.height/2;
     [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill];
     [[NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad] fill];
+    if (self.lossColor && self.fraction < 0.98) {
+        [[self.lossColor colorWithAlphaComponent:0.3] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:r xRadius:rad yRadius:rad] fill];
+    }
     NSRect f = r; f.size.width = MAX(r.size.height, r.size.width*self.fraction);
     [(self.color ?: NSColor.controlAccentColor) setFill];
     [[NSBezierPath bezierPathWithRoundedRect:f xRadius:rad yRadius:rad] fill];
@@ -7925,8 +7931,9 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     (void)memTip;
 }
 
-// The Heat instrument: fast-core speed as the bar and percent, then chip · cells
-// temperatures. It appears once macOS reports pressure or the cells reach 38 °C.
+// The Speed instrument: the fast cores' speed against their top clock as the bar and
+// percent, the speed held back shaded red behind the bar, then chip and cell temperatures.
+// It appears once macOS reports thermal pressure or the cells reach 38 °C.
 - (BOOL)heatShowing { return HeatShowing(SystemThermalLevel(_sys), _bat.valid ? _bat.tempC : 0); }
 - (NSColor *)heatSpeedColor {
     if (_heatSpeed < 0) return NSColor.tertiaryLabelColor;
@@ -7973,6 +7980,7 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
     g.fraction = MAX(0, _heatSpeed);
     g.color = speedColor;
     g.metricLabel = @"Speed";
+    if (_heatSpeed >= 0 && _heatSpeed < 0.98) g.lossColor = NSColor.systemRedColor;   // the speed macOS is holding back
     g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
     g.accessibilityHelp = tip;
     [row addSubview:g];
@@ -8021,8 +8029,10 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
         [row addSubview:datum];
     }
 }
+// A speedometer whose needle sits where the fast cores are.
 - (NSString *)heatSymbol {
-    return SystemThermalLevel(_sys) == ThermalThrottling ? @"thermometer.high" : @"thermometer.medium";
+    if (_heatSpeed < 0 || _heatSpeed >= 0.9) return @"gauge.with.dots.needle.100percent";
+    return _heatSpeed >= 0.6 ? @"gauge.with.dots.needle.67percent" : @"gauge.with.dots.needle.33percent";
 }
 - (NSColor *)heatSymbolColor {
     NSColor *c = [self heatTempsColor];
@@ -8717,7 +8727,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         row.accessibilityHelp = tip;
         row.accessibilityLabel = tip;
         [self instrumentSymbol:[self heatSymbol] tint:[self heatSymbolColor] identifier:@"popover.heat.symbol" in:row];
-        [self instrumentName:@"Heat" identifier:@"popover.heat.name" in:row];
+        [self instrumentName:@"Speed" identifier:@"popover.heat.name" in:row];
         [self addHeatInstrumentTo:row
                             gauge:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)
                             value:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH)
@@ -10236,7 +10246,7 @@ static NSColor *HealthColor(double fraction) {
         NSImageView *mark = [self detailSymbol:[self heatSymbol] size:c.symbol tint:[self heatSymbolColor]
                                          frame:DetailLeadRect(c) identifier:@"details.overview.heat.symbol" in:row];
         mark.accessibilityHelp = tip;
-        NSTextField *heatName = [self detailText:@"Heat" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+        NSTextField *heatName = [self detailText:@"Speed" font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                                            color:NSColor.labelColor
                                            frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
                                            align:NSTextAlignmentLeft identifier:@"details.overview.heat.name" in:row];
