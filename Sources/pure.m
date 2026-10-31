@@ -2724,64 +2724,81 @@ static double MixTrackWeight(NSDictionary *t) {
     return w;
 }
 
+// Seeds are songs Ian will recognise: ones he has actually played here, weighted by plays and how
+// recently. Favourites alone mean little (1,240 of 1,412 were bulk-imported YouTube likes, 30 Oct 2026),
+// so they only fill in when too few played songs are left.
 NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray<NSString *> *recentKeys,
                                         NSUInteger count, uint64_t salt) {
     NSSet *recent = [NSSet setWithArray:recentKeys ?: @[]];
-    NSMutableDictionary<NSString *, NSMutableArray *> *albums = [NSMutableDictionary dictionary];
-    NSMutableArray *songs = [NSMutableArray array];
+    NSMutableArray *played = [NSMutableArray array], *favs = [NSMutableArray array];   // candidate seeds with a weight
     for (NSDictionary *t in tracks) {
-        if ([t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
-        NSString *album = t[@"album"], *artist = t[@"artist"];
-        if (album.length && artist.length) {
-            NSString *k = [NSString stringWithFormat:@"album:%@␟%@", artist.lowercaseString, album.lowercaseString];
-            if (!albums[k]) albums[k] = [NSMutableArray array];
-            [albums[k] addObject:t];
-        }
-        if ([t[@"fav"] boolValue]) [songs addObject:t];
-    }
-    NSMutableArray *pool = [NSMutableArray array];   // candidate seeds with a weight
-    for (NSDictionary *t in songs) {
+        if ([t[@"dislike"] boolValue] || ![t[@"id"] length] || ![t[@"title"] length]) continue;
         NSString *key = [@"song:" stringByAppendingString:t[@"id"]];
         if ([recent containsObject:key]) continue;
-        [pool addObject:@{@"key": key, @"kind": @"song", @"title": t[@"title"] ?: @"", @"subtitle": t[@"artist"] ?: @"",
-                          @"trackID": t[@"id"], @"artist": t[@"artist"] ?: @"", @"album": t[@"album"] ?: @"",
-                          @"family": GenreFamily(t[@"genre"]), @"weight": @(MixTrackWeight(t))}];
+        NSInteger plays = [t[@"plays"] integerValue], idle = [t[@"idleDays"] integerValue];
+        double weight = (1 + log1p(plays)) * ([t[@"fav"] boolValue] ? 1.5 : 1);
+        if (plays > 0 && idle >= 0) weight *= 1 + 2.0 / (1 + idle / 30.0);   // played this month counts most
+        NSDictionary *seed = @{@"key": key, @"kind": @"song", @"title": t[@"title"], @"subtitle": t[@"artist"] ?: @"",
+                               @"trackID": t[@"id"], @"artist": t[@"artist"] ?: @"", @"album": t[@"album"] ?: @"",
+                               @"family": GenreFamily(t[@"genre"]), @"weight": @(weight)};
+        if (plays > 0) [played addObject:seed];
+        else if ([t[@"fav"] boolValue]) [favs addObject:seed];
     }
-    for (NSString *k in albums) {
-        NSArray *ts = albums[k];
-        if (ts.count < 4 || [recent containsObject:k]) continue;
-        NSDictionary *best = ts.firstObject; double weight = 0;
-        for (NSDictionary *t in ts) { double w = MixTrackWeight(t); weight += w; if (w > MixTrackWeight(best)) best = t; }
-        [pool addObject:@{@"key": k, @"kind": @"album", @"title": best[@"album"], @"subtitle": best[@"artist"],
-                          @"trackID": best[@"id"], @"artist": best[@"artist"], @"album": best[@"album"],
-                          @"family": GenreFamily(best[@"genre"]), @"weight": @(weight / ts.count * 1.5)}];
-    }
-    [pool sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"key"] compare:b[@"key"]]; }];
+    NSComparator byKey = ^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"key"] compare:b[@"key"]]; };
+    [played sortUsingComparator:byKey]; [favs sortUsingComparator:byKey];
     uint64_t state = salt ^ 0x9E3779B97F4A7C15ULL;
     NSMutableArray *chosen = [NSMutableArray array];
     NSMutableSet *families = [NSMutableSet set], *artists = [NSMutableSet set];
-    // Alternate songs and albums; prefer a family and artist not yet shown.
-    for (NSUInteger round = 0; chosen.count < count && pool.count && round < count * 40; round++) {
-        NSString *wantKind = chosen.count % 2 ? @"album" : @"song";
-        double total = 0;
-        NSMutableArray *eligible = [NSMutableArray array];
-        for (NSDictionary *s in pool) {
-            BOOL fresh = ![families containsObject:s[@"family"]] || families.count >= 4;
-            if ([artists containsObject:[s[@"artist"] lowercaseString]]) continue;
-            if (round < count * 20 && (![s[@"kind"] isEqual:wantKind] || !fresh)) continue;
-            [eligible addObject:s]; total += [s[@"weight"] doubleValue];
+    for (NSMutableArray *pool in @[played, favs]) {
+        // Prefer a family not yet shown; never the same artist twice.
+        for (NSUInteger round = 0; chosen.count < count && pool.count && round < count * 40; round++) {
+            double total = 0;
+            NSMutableArray *eligible = [NSMutableArray array];
+            for (NSDictionary *s in pool) {
+                if ([artists containsObject:[s[@"artist"] lowercaseString]]) continue;
+                BOOL fresh = ![families containsObject:s[@"family"]] || families.count >= 4;
+                if (round < count * 20 && !fresh) continue;
+                [eligible addObject:s]; total += [s[@"weight"] doubleValue];
+            }
+            if (!eligible.count) continue;
+            double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
+            NSDictionary *pick = eligible.lastObject;
+            for (NSDictionary *s in eligible) { r -= [s[@"weight"] doubleValue]; if (r <= 0) { pick = s; break; } }
+            NSMutableDictionary *seed = [pick mutableCopy]; [seed removeObjectForKey:@"weight"];
+            [chosen addObject:seed];
+            [families addObject:pick[@"family"]];
+            [artists addObject:[pick[@"artist"] lowercaseString]];
+            [pool removeObject:pick];
         }
-        if (!eligible.count) continue;
-        double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
-        NSDictionary *pick = eligible.lastObject;
-        for (NSDictionary *s in eligible) { r -= [s[@"weight"] doubleValue]; if (r <= 0) { pick = s; break; } }
-        NSMutableDictionary *seed = [pick mutableCopy]; [seed removeObjectForKey:@"weight"];
-        [chosen addObject:seed];
-        [families addObject:pick[@"family"]];
-        [artists addObject:[pick[@"artist"] lowercaseString]];
-        [pool removeObject:pick];
     }
     return chosen;
+}
+
+// A seed's cover when Music has none on this Mac (streamed tracks report artwork "downloaded: false"):
+// Apple's public iTunes search, no account.
+NSURL *MixArtSearchURL(NSString *artist, NSString *title) {
+    NSURLComponents *c = [NSURLComponents componentsWithString:@"https://itunes.apple.com/search"];
+    c.queryItems = @[[NSURLQueryItem queryItemWithName:@"term" value:[NSString stringWithFormat:@"%@ %@", artist ?: @"", SeedCaption(title)]],
+                     [NSURLQueryItem queryItemWithName:@"entity" value:@"song"],
+                     [NSURLQueryItem queryItemWithName:@"limit" value:@"5"],
+                     [NSURLQueryItem queryItemWithName:@"country" value:@"au"]];
+    return c.URL;
+}
+
+// The cover URL at `px` square from a search reply, preferring a result by the same artist.
+NSString *MixArtURLFromSearch(NSData *json, NSString *artist, NSUInteger px) {
+    NSDictionary *reply = json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:nil] : nil;
+    NSArray *results = [reply isKindOfClass:NSDictionary.class] ? reply[@"results"] : nil;
+    if (![results isKindOfClass:NSArray.class]) return nil;
+    NSString *want = artist.lowercaseString ?: @"", *url = nil;
+    for (NSDictionary *r in results) {
+        if (![r isKindOfClass:NSDictionary.class] || ![r[@"artworkUrl100"] isKindOfClass:NSString.class]) continue;
+        NSString *by = [r[@"artistName"] isKindOfClass:NSString.class] ? [r[@"artistName"] lowercaseString] : @"";
+        BOOL same = want.length && ([by containsString:want] || [want containsString:by]);
+        if (same || !url) url = r[@"artworkUrl100"];
+        if (same) break;
+    }
+    return [url stringByReplacingOccurrencesOfString:@"100x100bb" withString:[NSString stringWithFormat:@"%lux%lubb", (unsigned long)px, (unsigned long)px]];
 }
 
 static BOOL MixTrackInSeed(NSDictionary *t, NSDictionary *seed) {

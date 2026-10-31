@@ -232,7 +232,9 @@ static BOOL FitsChildren(NSView *view) {
             CGFloat need = field.attributedStringValue.length
                 ? field.attributedStringValue.size.width
                 : [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
-            if (need > field.bounds.size.width - 4) {
+            // A one-line label clipped at the tail is recoverable only when it carries the full text as a tip.
+            BOOL recoverable = [field.toolTip isEqual:field.stringValue] && field.lineBreakMode == NSLineBreakByTruncatingTail;
+            if (need > field.bounds.size.width - 4 && !recoverable) {
                 fprintf(stderr, "truncated %s: \"%s\" needs %.1f of %.1f\n", field.accessibilityIdentifier.UTF8String,
                         field.stringValue.UTF8String, need, field.bounds.size.width - 4);
                 return NO;
@@ -399,9 +401,9 @@ int main(int argc, const char **argv) {
         // Seed tiles from a fixture: the harness never reads the real Music library.
         [c setValue:@YES forKey:@"mixFrozen"];
         [c setValue:@[@{@"key": @"song:A1", @"kind": @"song", @"title": @"Muse (feat. Kate Morgan)", @"subtitle": @"Rezident", @"trackID": @"A1", @"artist": @"Rezident", @"album": @"Only For A Moment EP", @"family": @"dance"},
-                      @{@"key": @"album:bonobo", @"kind": @"album", @"title": @"Animal Magic", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
+                      @{@"key": @"song:B1", @"kind": @"song", @"title": @"Kota", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
                       @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},
-                      @{@"key": @"album:daughter", @"kind": @"album", @"title": @"So Long, See You Tomorrow (Deluxe Edition) Remastered Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
+                      @{@"key": @"song:D1", @"kind": @"song", @"title": @"So Long, See You Tomorrow Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
               forKey:@"mixSeeds"];
         [c setValue:@"limit80" forKey:@"chargeMode"];
         [c setValue:@YES forKey:@"chargeModeLoaded"];
@@ -676,19 +678,33 @@ int main(int argc, const char **argv) {
             [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
-        {   // Seed tiles: four covers + New picks under the output line, captions tidy, playing seed outlined.
+        {   // Seed tiles: four covers + New picks under the output line; title over artist, one line each, playing seed outlined.
             NSView *mix = FindIdentifier(root, @"popover.mix");
             NSView *line = FindIdentifier(root, @"popover.sound.line");
             NSTextField *c0 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.0");
+            NSTextField *a0 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.0");
             NSTextField *c3 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.3");
+            NSTextField *a3 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.3");
             NSButton *s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
             if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !FindIdentifier(root, @"popover.mix.newpicks") ||
                 !FindIdentifier(root, @"popover.mix.seed.3") || FindIdentifier(root, @"popover.mix.seed.4") ||
-                ![c0.stringValue isEqual:@"Muse"] || ![s1.accessibilityLabel containsString:@"the album Animal Magic by Bonobo"] ||
-                ![c3.toolTip isEqual:c3.stringValue] || !FitsChildren(root) ||
-                !c0.cell.wraps || c0.lineBreakMode != NSLineBreakByWordWrapping || c0.maximumNumberOfLines != 2 ||
-                NSHeight(c0.frame) < 2 * ceil(c0.font.ascender - c0.font.descender + c0.font.leading)) return Fail(__LINE__);
-            [c setValue:@"album:bonobo" forKey:@"mixPlayingKey"];
+                FindIdentifier(root, @"popover.mix.artist.4") ||
+                ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
+                ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] ||
+                ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
+                !c0.cell.wraps || c0.maximumNumberOfLines != 2 || NSMinY(a0.frame) >= NSMinY(c0.frame) - 0.5 || NSMinY(a0.frame) < 0 ||
+                NSHeight(c0.frame) < 2 * ceil(c0.font.ascender - c0.font.descender + c0.font.leading) ||
+                ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail) return Fail(__LINE__);
+            {   // A cover tile carries its image for the large hover view.
+                NSImage *art = [NSImage imageWithSize:NSMakeSize(60, 60) flipped:NO drawingHandler:^BOOL(NSRect r) { [NSColor.systemRedColor setFill]; NSRectFill(r); return YES; }];
+                [c setValue:[@{@"A1": art} mutableCopy] forKey:@"mixArt"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                GBSeedTile *t0 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.0"), *t2 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.2");
+                if (![t0 isKindOfClass:GBSeedTile.class] || t0.cover != art || t2.cover) return Fail(__LINE__);
+                [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
+                [c rebuildContent]; root = p.contentViewController.view;
+            }
+            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
             [c setValue:@"Glancebar Mix" forKey:@"amPlaylist"];
             [c rebuildContent]; root = p.contentViewController.view;
             s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
@@ -973,6 +989,20 @@ int main(int argc, const char **argv) {
                 cover.size = NSMakeSize(32, 32);
                 [c setValue:cover forKey:@"amArt"];
             }
+            // Render-only: real seed tiles from a JSON list of {trackID,title,artist,art} (see GLANCEBAR_MUSIC_ART).
+            const char *mixRender = getenv("GLANCEBAR_MIX_SEEDS");
+            NSArray *frozenSeeds = [c valueForKey:@"mixSeeds"];
+            if (mixRender) {
+                NSArray *list = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@(mixRender)] options:0 error:nil];
+                NSMutableArray *seeds = [NSMutableArray array]; NSMutableDictionary *covers = [NSMutableDictionary dictionary];
+                for (NSDictionary *s in list) {
+                    [seeds addObject:@{@"key": [@"song:" stringByAppendingString:s[@"trackID"]], @"kind": @"song", @"title": s[@"title"],
+                                       @"subtitle": s[@"artist"], @"trackID": s[@"trackID"], @"artist": s[@"artist"], @"album": @"", @"family": @"other"}];
+                    NSImage *img = [[NSImage alloc] initWithContentsOfFile:s[@"art"]];
+                    if (img) covers[s[@"trackID"]] = img;
+                }
+                [c setValue:seeds forKey:@"mixSeeds"]; [c setValue:covers forKey:@"mixArt"];
+            }
             [c rebuildContent];
             root = p.contentViewController.view;
             NSSlider *position = (NSSlider *)FindIdentifier(root, @"popover.music.position");
@@ -992,6 +1022,7 @@ int main(int argc, const char **argv) {
                 NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
                 if (!RenderOffscreen(root, [stem stringByAppendingString:@"-music.png"], look)) return Fail(__LINE__);
             }
+            if (mixRender) { [c setValue:frozenSeeds forKey:@"mixSeeds"]; [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"]; [c rebuildContent]; root = p.contentViewController.view; }
             // The scrubber line is the only extra height; later fixtures measure the idle panel.
             [c setValue:@NO forKey:@"amLoaded"];
             [c setValue:@NO forKey:@"playbackKnown"];
@@ -1064,7 +1095,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 446 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles
+            root.bounds.size.height > 457 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +101 seed tiles (title + artist)
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {

@@ -4239,6 +4239,52 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 
 // Compact labels retain their full value. Show native expansion help only when
 // their actual text is clipped; ordinary labels still have no hover popup.
+// A seed tile: hovering its cover shows it large in a popover beside the tile.
+@interface GBSeedTile : NSButton
+@property (nonatomic, strong) NSImage *cover;
+@end
+@implementation GBSeedTile {
+    NSPopover *_large;
+}
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *a in self.trackingAreas) [self removeTrackingArea:a];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
+        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil]];
+}
+- (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
+    if (!self.cover || !self.window) return;
+    const CGFloat side = 220;
+    NSImageView *view = [NSImageView imageViewWithImage:self.cover];
+    view.imageScaling = NSImageScaleProportionallyUpOrDown;
+    view.frame = NSMakeRect(0, 0, side, side);
+    view.wantsLayer = YES;
+    view.layer.cornerRadius = 6;
+    view.layer.masksToBounds = YES;
+    view.accessibilityIdentifier = @"popover.mix.cover.large";
+    NSViewController *vc = [NSViewController new];
+    NSView *pad = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, side + 12, side + 12)];
+    view.frameOrigin = NSMakePoint(6, 6);
+    [pad addSubview:view];
+    vc.view = pad;
+    _large = [NSPopover new];
+    _large.contentViewController = vc;
+    _large.behavior = NSPopoverBehaviorApplicationDefined;
+    _large.animates = NO;
+    [_large showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+}
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    [_large close];
+    _large = nil;
+}
+- (void)viewWillMoveToWindow:(NSWindow *)window {
+    if (!window) { [_large close]; _large = nil; }
+    [super viewWillMoveToWindow:window];
+}
+@end
+
 @interface GBRecoverableTextField : NSTextField
 - (void)updateClippedTextHelp;
 @end
@@ -4513,7 +4559,11 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         if (new.wantsLayer && old.layer && new.layer) {   // a cover tile's outline marks the playing seed
             old.layer.borderWidth = new.layer.borderWidth;
             old.layer.borderColor = new.layer.borderColor;
+            old.layer.backgroundColor = new.layer.backgroundColor;   // placeholder grey goes once the cover lands
         }
+        old.imageScaling = new.imageScaling;
+        if ([old isKindOfClass:GBSeedTile.class] && [new isKindOfClass:GBSeedTile.class])
+            ((GBSeedTile *)old).cover = ((GBSeedTile *)new).cover;
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
@@ -5700,14 +5750,34 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         _mixSeeds = seeds;
         [_mixPrepared removeAllObjects];
     }
-    for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed[@"trackID"]]; [self prepareMix:seed then:nil]; }
+    for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed]; [self prepareMix:seed then:nil]; }
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)loadMixArt:(NSString *)trackID {
+- (void)loadMixArt:(NSDictionary *)seed {
+    NSString *trackID = seed[@"trackID"];
     if (!trackID.length || _mixArt[trackID]) return;
     NSString *path = [MixDirectory(@"art") stringByAppendingPathComponent:[trackID stringByAppendingPathExtension:@"jpg"]];
     NSImage *cached = [NSFileManager.defaultManager fileExistsAtPath:path] ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
     if (cached) { _mixArt[trackID] = cached; return; }
+    void (^show)(void) = ^{
+        NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
+        if (!img) return;
+        self->_mixArt[trackID] = img;
+        if (self->_popover.isShown) [self rebuildContent];
+    };
+    // Streamed tracks have no artwork data on this Mac, so fall back to Apple's catalogue cover.
+    void (^fromCatalogue)(void) = ^{
+        NSURLSession *session = NSURLSession.sharedSession;
+        [[session dataTaskWithURL:MixArtSearchURL(seed[@"artist"], seed[@"title"])
+                completionHandler:^(NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            NSString *art = MixArtURLFromSearch(data, seed[@"artist"], 600);   // sharp at the hover size
+            if (!art) return;
+            [[session dataTaskWithURL:[NSURL URLWithString:art] completionHandler:^(NSData *jpg, __unused NSURLResponse *r, __unused NSError *e) {
+                if (jpg.length < 1000 || ![jpg writeToFile:path atomically:YES]) return;
+                dispatch_async(dispatch_get_main_queue(), show);
+            }] resume];
+        }] resume];
+    };
     NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
         "set t to (first track of library playlist 1 whose persistent ID is %@)\n"
         "set a to raw data of artwork 1 of t\n"
@@ -5715,10 +5785,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         "set fh to open for access (POSIX file %@) with write permission\n"
         "set eof fh to 0\nwrite a to fh\nclose access fh\nreturn \"ok\"", AppleScriptQuoted(trackID), AppleScriptQuoted(path)];
     RunAppleScriptTimed(script, 20, ^(__unused NSString *output, __unused NSString *errorText, int status) {
-        NSImage *img = status == 0 ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
-        if (!img) return;
-        self->_mixArt[trackID] = img;
-        if (self->_popover.isShown) [self rebuildContent];
+        if (status == 0 && [[NSImage alloc] initWithContentsOfFile:path]) show();
+        else { [NSFileManager.defaultManager removeItemAtPath:path error:nil]; fromCatalogue(); }
     });
 }
 // Mixes are built ahead in the background (Claude can take a while), one at a time.
@@ -6852,12 +6920,12 @@ static NSColor *ReadinessColor(double score) {
     return y;
 }
 
-// Four seeds (a song or an album, cover and name) and New picks. A click plays a long
+// Four seed songs (cover, title, artist) and New picks. A click plays a long
 // mix built around that seed; the playing seed is outlined.
 - (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
     [self ensureMixSeeds];
     if (!_mixSeeds.count) return y;
-    const CGFloat side = 54, capH = 30, top = 6;   // two 10pt lines need ~25pt
+    const CGFloat side = 54, capH = 41, top = 6;   // two 10pt title lines (~25pt) + the artist (13pt)
     CGFloat gap = (kW - 2 * kPad - 5 * side) / 4;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
     line.accessibilityIdentifier = @"popover.mix";
@@ -6883,9 +6951,11 @@ static NSColor *ReadinessColor(double score) {
             tile.accessibilityHelp = @"Four new songs and albums to start a mix from";
         } else {
             NSImage *cover = _mixArt[seed[@"trackID"]];
-            tile = [NSButton buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
+            GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
                                                        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
                                       target:self action:@selector(playSeedMix:)];
+            seedTile.cover = cover;   // hover shows it large
+            tile = seedTile;
             tile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
             if (!cover) tile.contentTintColor = NSColor.tertiaryLabelColor;
             tile.tag = (NSInteger)i;
@@ -6907,18 +6977,28 @@ static NSColor *ReadinessColor(double score) {
         tile.layer.masksToBounds = YES;
         tile.frame = NSMakeRect(x, capH, side, side);
         [line addSubview:tile];
-        NSString *text = picks ? @"New picks" : SeedCaption(seed[@"title"]);
-        CGFloat capW = side + gap - 4;
-        NSTextField *cap = [GBRecoverableTextField wrappingLabelWithString:text];
+        // Song title (up to two lines), then the artist; a clipped one shows in full on hover.
+        CGFloat capW = side + gap - 4, capX = x - (gap - 4) / 2, artistH = picks ? 0 : 13;
+        NSTextField *cap = [GBRecoverableTextField wrappingLabelWithString:picks ? @"New picks" : SeedCaption(seed[@"title"])];
         cap.font = capFont;
         cap.textColor = playing ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
         cap.alignment = NSTextAlignmentCenter;
         cap.maximumNumberOfLines = 2;
         cap.cell.truncatesLastVisibleLine = YES;
-        cap.frame = NSMakeRect(x - (gap - 4) / 2, 0, capW, capH - 2);
-        [(GBRecoverableTextField *)cap updateClippedTextHelp];   // full name on hover only when two lines can't hold it
+        cap.frame = NSMakeRect(capX, artistH, capW, capH - 2 - artistH);
+        [(GBRecoverableTextField *)cap updateClippedTextHelp];
         cap.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.caption.%lu", (unsigned long)i];
         [line addSubview:cap];
+        if (picks) continue;
+        NSTextField *by = [GBRecoverableTextField labelWithString:seed[@"artist"] ?: @""];
+        by.font = capFont;
+        by.textColor = playing ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
+        by.alignment = NSTextAlignmentCenter;
+        by.lineBreakMode = NSLineBreakByTruncatingTail;
+        by.frame = NSMakeRect(capX, 0, capW, artistH);
+        [(GBRecoverableTextField *)by updateClippedTextHelp];
+        by.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.artist.%lu", (unsigned long)i];
+        [line addSubview:by];
     }
     [root addSubview:line];
     return y + top + side + capH;
