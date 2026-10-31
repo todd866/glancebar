@@ -2689,3 +2689,11 @@ HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatG
             return HeatGuardNothing;
     }
 }
+
+NSString *OutputVolumeText(double volume, BOOL muted) {
+    if (muted) return @"mute";
+    if (volume < 0) return @"—";
+    return [NSString stringWithFormat:@"%ld%%", lround(MIN(1, volume) * 100)];
+}
+
+BOOL OutputVolumeLoud(double volume) { return lround(volume * 100) >= 80; }

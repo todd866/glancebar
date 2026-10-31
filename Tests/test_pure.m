@@ -2253,6 +2253,13 @@ int main(void) {
         check([BatteryHeatText(38.2) isEqual:@"38 °C"] && BatteryHeatFor(38.2) == BatteryHeatWarm, @"battery heat: warm");
         check(BatteryHeatFor(42) == BatteryHeatHot && BatteryHeatFor(41.6) == BatteryHeatHot,
               @"battery heat: hot, judged on the degree shown");
+        // Output volume line.
+        check([OutputVolumeText(0.554, NO) isEqual:@"55%"] && [OutputVolumeText(1.2, NO) isEqual:@"100%"],
+              @"volume: whole percent, capped");
+        check([OutputVolumeText(0.6, YES) isEqual:@"mute"] && [OutputVolumeText(-1, NO) isEqual:@"—"],
+              @"volume: mute wins; no control reads as a dash");
+        check(OutputVolumeLoud(0.8) && OutputVolumeLoud(0.795) && !OutputVolumeLoud(0.79) && !OutputVolumeLoud(-1),
+              @"volume: loud from the 80% shown");
         // The Heat row: appears once either is warm.
         check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat: quiet while both cool");
         check(HeatShowing(ThermalThrottling, 31) && HeatShowing(ThermalNear, 0) && HeatShowing(ThermalNominal, 37.6),

@@ -4507,6 +4507,14 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
+    } else if ([existing isKindOfClass:NSSlider.class]) {
+        // Sliders (seek, volume) carry their reading in the value; leave it alone mid-drag.
+        NSSlider *old = (NSSlider *)existing, *new = (NSSlider *)fresh;
+        old.minValue = new.minValue; old.maxValue = new.maxValue;
+        if (!(NSEvent.pressedMouseButtons & 1)) old.doubleValue = new.doubleValue;
+        old.enabled = new.enabled;
+        old.trackFillColor = new.trackFillColor;
+        old.target = new.target; old.action = new.action;
     } else if ([existing isKindOfClass:NSSegmentedControl.class]) {
         NSSegmentedControl *old = (NSSegmentedControl *)existing, *new = (NSSegmentedControl *)fresh;
         old.selectedSegment = new.selectedSegment;
@@ -4781,6 +4789,7 @@ static void *kBarAppearanceContext = &kBarAppearanceContext;
 - (void)restoreFocus:(NSDictionary *)snapshot
              inView:(NSView *)root window:(NSWindow *)window;
 - (void)audioDevicesChanged;
+- (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 @end
 
@@ -4899,6 +4908,65 @@ static BOOL SwitchToNewOutputs(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud registerDefaults:@{@"switchToNewOutputs": @YES}];
     return [ud boolForKey:@"switchToNewOutputs"];
+}
+// Output volume: the device's main volume element when it has one, else the average of its
+// first two channels (built-in speakers and most Bluetooth outputs only have channels).
+static NSArray<NSNumber *> *OutputVolumeElements(AudioObjectID device) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+    if (AudioObjectHasProperty(device, &a)) return @[@(kAudioObjectPropertyElementMain)];
+    NSMutableArray *out = [NSMutableArray array];
+    for (UInt32 e = 1; e <= 2; e++) {
+        a.mElement = e;
+        if (AudioObjectHasProperty(device, &a)) [out addObject:@(e)];
+    }
+    return out;
+}
+// 0…1, or -1 when the device has no volume control; *muted from the device's mute switch.
+static double ReadOutputVolume(AudioObjectID device, BOOL *muted) {
+    if (muted) {
+        *muted = NO;
+        AudioObjectPropertyAddress m = {kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+        UInt32 v = 0, size = sizeof v;
+        if (device && AudioObjectHasProperty(device, &m) && AudioObjectGetPropertyData(device, &m, 0, NULL, &size, &v) == noErr)
+            *muted = v != 0;
+    }
+    if (!device) return -1;
+    double sum = 0; int n = 0;
+    for (NSNumber *e in OutputVolumeElements(device)) {
+        AudioObjectPropertyAddress a = {kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyScopeOutput, e.unsignedIntValue};
+        Float32 v = 0; UInt32 size = sizeof v;
+        if (AudioObjectGetPropertyData(device, &a, 0, NULL, &size, &v) == noErr) { sum += v; n++; }
+    }
+    return n ? sum / n : -1;
+}
+// Sets every volume element; raising it from zero also lifts mute, as the volume keys do.
+static void SetOutputVolume(AudioObjectID device, double volume) {
+    if (!device) return;
+    Float32 v = (Float32)MIN(1, MAX(0, volume));
+    for (NSNumber *e in OutputVolumeElements(device)) {
+        AudioObjectPropertyAddress a = {kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyScopeOutput, e.unsignedIntValue};
+        AudioObjectSetPropertyData(device, &a, 0, NULL, sizeof v, &v);
+    }
+    AudioObjectPropertyAddress m = {kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+    UInt32 mute = v > 0 ? 0 : 1;
+    if (AudioObjectHasProperty(device, &m)) AudioObjectSetPropertyData(device, &m, 0, NULL, sizeof mute, &mute);
+}
+// Loud (80% and up) in orange, muted in red; the % text and the slider's fill agree.
+static NSColor *OutputVolumeColor(double volume, BOOL muted) {
+    if (muted) return NSColor.systemRedColor;
+    if (volume < 0) return NSColor.tertiaryLabelColor;
+    return OutputVolumeLoud(volume) ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+}
+static NSColor *OutputVolumeFill(double volume, BOOL muted) {
+    if (muted) return NSColor.systemRedColor;
+    return OutputVolumeLoud(volume) ? NSColor.systemOrangeColor : NSColor.controlAccentColor;
+}
+static OSStatus OutputVolumeChanged(AudioObjectID object, UInt32 count,
+                                   const AudioObjectPropertyAddress *addresses, void *client) {
+    (void)object; (void)count; (void)addresses;
+    Controller *controller = (__bridge Controller *)client;
+    dispatch_async(dispatch_get_main_queue(), ^{ [controller outputVolumeChanged]; });
+    return noErr;
 }
 static OSStatus AudioHardwareChanged(AudioObjectID object, UInt32 count,
                                     const AudioObjectPropertyAddress *addresses, void *client) {
@@ -5177,6 +5245,11 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSArray<NSDictionary *> *_audioDevices;    // last settled device set, including input-only
     NSArray<NSDictionary *> *_audioPrevious;   // comparison baseline for auto-switch
     NSString *_defaultOutputUID;
+    double _outputVolume;          // default output's volume 0…1; <0 when it has none
+    BOOL _outputMuted;
+    AudioObjectID _volumeWatched;  // device whose volume and mute we listen to
+    CFAbsoluteTime _volumeSetAt;   // last change from our own slider, so its echo doesn't rebuild
+    BOOL _volumeRebuildPending;
     NSUInteger _audioSettleGen;
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
     BOOL _networkKnown, _networkOnline;
@@ -5338,6 +5411,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
     _musicProbesEnabled = YES;
+    _outputVolume = -1;
     [self startNetworkMonitor];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(appleMusicChanged:)
                                                           name:@"com.apple.Music.playerInfo" object:nil];
@@ -5409,6 +5483,62 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _defaultOutputUID = DefaultOutputUID(_audioDevices ?: ReadAudioDevices());
     if (!_audioDevices) _audioDevices = ReadAudioDevices();
     if (_popover.isShown) [self rebuildContent];
+}
+- (AudioObjectID)defaultOutputDeviceID {
+    for (NSDictionary *row in _audioDevices)
+        if ([row[@"uid"] isEqual:_defaultOutputUID]) return (AudioObjectID)[row[@"deviceID"] unsignedIntValue];
+    return kAudioObjectUnknown;
+}
+// Listen to the current output's volume and mute, moving the listener when the output changes.
+- (void)watchOutputVolume {
+    if (!_musicProbesEnabled) return;
+    AudioObjectID device = [self defaultOutputDeviceID];
+    if (device == _volumeWatched) return;
+    void (^each)(AudioObjectID, BOOL) = ^(AudioObjectID d, BOOL add) {
+        NSMutableArray *addresses = [NSMutableArray array];
+        for (NSNumber *e in OutputVolumeElements(d)) [addresses addObject:@[@(kAudioDevicePropertyVolumeScalar), e]];
+        [addresses addObject:@[@(kAudioDevicePropertyMute), @(kAudioObjectPropertyElementMain)]];
+        for (NSArray *pair in addresses) {
+            AudioObjectPropertyAddress a = {[pair[0] unsignedIntValue], kAudioDevicePropertyScopeOutput, [pair[1] unsignedIntValue]};
+            if (!AudioObjectHasProperty(d, &a)) continue;
+            if (add) AudioObjectAddPropertyListener(d, &a, OutputVolumeChanged, (__bridge void *)self);
+            else AudioObjectRemovePropertyListener(d, &a, OutputVolumeChanged, (__bridge void *)self);
+        }
+    };
+    if (_volumeWatched != kAudioObjectUnknown) each(_volumeWatched, NO);
+    if (device != kAudioObjectUnknown) each(device, YES);
+    _volumeWatched = device;
+}
+- (void)refreshOutputVolume {
+    AudioObjectID device = [self defaultOutputDeviceID];
+    if (!_musicProbesEnabled || device == kAudioObjectUnknown) return;   // keep the last reading
+    BOOL muted = NO;
+    _outputVolume = ReadOutputVolume(device, &muted);
+    _outputMuted = muted;
+}
+// Volume keys send a burst of changes: rebuild once, and not for our own slider's echo.
+- (void)outputVolumeChanged {
+    [self refreshOutputVolume];
+    if (!_popover.isShown || _volumeRebuildPending || CFAbsoluteTimeGetCurrent() - _volumeSetAt < 0.5) return;
+    _volumeRebuildPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self->_volumeRebuildPending = NO;
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+- (IBAction)setOutputVolumeFromSlider:(NSSlider *)slider {
+    _volumeSetAt = CFAbsoluteTimeGetCurrent();
+    SetOutputVolume([self defaultOutputDeviceID], slider.doubleValue);
+    _outputVolume = slider.doubleValue;
+    _outputMuted = NO;
+    NSTextField *level = nil;
+    for (NSView *v in slider.superview.subviews)
+        if ([v.accessibilityIdentifier isEqual:@"popover.sound.level"] && [v isKindOfClass:NSTextField.class]) level = (NSTextField *)v;
+    if (level) {
+        level.stringValue = OutputVolumeText(_outputVolume, NO);
+        level.textColor = OutputVolumeColor(_outputVolume, NO);
+    }
+    slider.trackFillColor = OutputVolumeFill(_outputVolume, NO);
 }
 - (void)ensureAudioDisplay {
     if (_audioDevices) return;
@@ -6211,12 +6341,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     next.enabled = loaded;
     if (!loaded) next.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:next];
-    NSButton *output = [self outputButton];
-    // 22pt, right edge on the same inset as every other row. The box matches the lead column.
-    output.frame = NSMakeRect(kW - kPad - kLeadW, (kSoundH - kLeadSymbol) / 2.0, kLeadW, kLeadSymbol);
-    [row addSubview:output];
+    // The output device and its volume have their own line below; the title runs to the edge.
     CGFloat textX = NSMaxX(next.frame) + 8;
-    CGFloat textRight = NSMinX(output.frame) - 8;
+    CGFloat textRight = kW - kPad;
     NSString *detail = nil;
     if (am) {
         NSMutableArray *parts = [NSMutableArray array];
@@ -6293,7 +6420,58 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [root addSubview:row];
     y += kSoundH;
     if (am) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
+    y = [self addOutputLineTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
+}
+// Where it will play and how loud, before anything starts: the output device (its symbol and
+// name; click to cycle, right-click for the list), a volume slider, and the level.
+- (CGFloat)addOutputLineTo:(NSView *)root at:(CGFloat)y {
+    [self ensureAudioDisplay];
+    [self watchOutputVolume];
+    [self refreshOutputVolume];
+    const CGFloat h = 22, levelW = 40, sliderW = 104;
+    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
+    line.accessibilityIdentifier = @"popover.sound.line";
+    NSButton *output = [self outputButton];
+    NSString *name = [output.accessibilityLabel hasPrefix:@"Sound output, "]
+        ? [output.accessibilityLabel substringFromIndex:@"Sound output, ".length] : @"Output";
+    if (_outputMuted) {
+        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+        output.image = [[NSImage imageWithSystemSymbolName:@"speaker.slash" accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+        output.contentTintColor = NSColor.systemRedColor;
+    } else {
+        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+        output.image = [output.image imageWithSymbolConfiguration:cfg] ?: output.image;
+    }
+    output.imagePosition = NSImageLeading;
+    output.imageHugsTitle = YES;
+    output.alignment = NSTextAlignmentLeft;
+    output.attributedTitle = [[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:name] attributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
+    CGFloat sliderX = kW - kPad - levelW - 6 - sliderW;
+    output.frame = NSMakeRect(kPad - 2, 1, sliderX - 8 - (kPad - 2), 20);
+    [line addSubview:output];
+    BOOL known = _outputVolume >= 0;
+    NSSlider *slider = [NSSlider sliderWithValue:known ? _outputVolume : 0 minValue:0 maxValue:1
+                                          target:self action:@selector(setOutputVolumeFromSlider:)];
+    slider.controlSize = NSControlSizeSmall;
+    slider.continuous = YES;
+    slider.enabled = known;
+    slider.trackFillColor = OutputVolumeFill(_outputVolume, _outputMuted);
+    slider.frame = NSMakeRect(sliderX, 2, sliderW, 18);
+    slider.accessibilityIdentifier = @"popover.sound.volume";
+    slider.accessibilityLabel = @"Volume";
+    slider.accessibilityHelp = [NSString stringWithFormat:@"Volume on %@", name];
+    [line addSubview:slider];
+    NSTextField *level = [self text:OutputVolumeText(_outputVolume, _outputMuted)
+                               font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
+                              color:OutputVolumeColor(_outputVolume, _outputMuted)
+                                 at:NSMakeRect(kW - kPad - levelW, 3, levelW, 16) align:NSTextAlignmentRight];
+    level.accessibilityIdentifier = @"popover.sound.level";
+    level.accessibilityLabel = _outputMuted ? @"Muted" : [NSString stringWithFormat:@"Volume %@", level.stringValue];
+    [line addSubview:level];
+    [root addSubview:line];
+    return y + h;
 }
 // Elapsed, a seek slider, the length, and shuffle under the output column.
 - (CGFloat)addAppleMusicScrubberTo:(NSView *)root at:(CGFloat)y elapsed:(double)elapsed {

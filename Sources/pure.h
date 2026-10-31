@@ -730,3 +730,8 @@ typedef NS_ENUM(NSInteger, HeatGuardState) { HeatGuardIdle = 0, HeatGuardEngaged
 typedef NS_ENUM(NSInteger, HeatGuardAction) { HeatGuardNothing = 0, HeatGuardEnable, HeatGuardDisable };
 // Returns the action and updates *state. tempC <= 0 (unread) never acts.
 HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state);
+
+// The output line's level: "55%", "mute", or "—" for a device without a volume control.
+NSString *OutputVolumeText(double volume, BOOL muted);
+// 80% and up counts as loud: worth a colour before something starts playing.
+BOOL OutputVolumeLoud(double volume);

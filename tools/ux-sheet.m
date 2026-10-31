@@ -1350,16 +1350,204 @@ static BOOL SpeedSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Volume sheet (where will it play, and how loud)
+
+typedef NS_ENUM(NSInteger, VolStyle) { VolToday, VolPercent, VolLine, VolColumn };
+
+static NSColor *VolColor(double v, BOOL muted) {
+    if (muted) return NSColor.systemRedColor;
+    return v >= 0.8 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+}
+
+// A thin vertical level, filled from the bottom.
+@interface VolColumnView : NSView
+@property (nonatomic) double level;
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation VolColumnView
+- (void)drawRect:(NSRect)dirty {
+    NSRect b = self.bounds; CGFloat r = NSWidth(b) / 2;
+    [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:b xRadius:r yRadius:r] fill];
+    NSRect f = b; f.size.height = MAX(NSWidth(b), NSHeight(b) * _level);
+    f.origin.y = NSMaxY(b) - NSHeight(f);   // flipped container: fill from the bottom
+    [_color setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:f xRadius:r yRadius:r] fill];
+}
+- (BOOL)isFlipped { return YES; }
+@end
+
+static NSView *VolumeSketch(Controller *c, NSArray *st, VolStyle style) {
+    NSDictionary *dev = st[0];
+    double vol = [st[1] doubleValue]; BOOL muted = [st[2] boolValue];
+    [c setValue:@[dev] forKey:@"audioDevices"];
+    [c setValue:dev[@"uid"] forKey:@"defaultOutputUID"];
+    [c setValue:@NO forKey:@"ytTabOpen"]; [c setValue:@YES forKey:@"amLoaded"];
+    [c setValue:@YES forKey:@"amFavorited"]; [c setValue:@YES forKey:@"amShuffle"];
+    [c setValue:@YES forKey:@"playbackKnown"]; [c setValue:@NO forKey:@"playbackPlaying"];
+    [c setValue:@"Lightning Crashes" forKey:@"amTitle"]; [c setValue:@"LIVE" forKey:@"amArtist"];
+    [c setValue:@83 forKey:@"trackElapsed"]; [c setValue:@324 forKey:@"trackDuration"];
+    FlippedView *box = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, 120)];
+    CGFloat h = [c addMusicControlsTo:box at:0];
+    NSView *output = nil, *heart = nil, *title = nil, *subtitle = nil;
+    NSMutableArray *stack = [box.subviews mutableCopy];
+    while (stack.count) {
+        NSView *v = stack.lastObject; [stack removeLastObject]; [stack addObjectsFromArray:v.subviews];
+        NSString *ident = v.accessibilityIdentifier;
+        if ([ident isEqual:@"popover.sound"]) output = v;
+        else if ([ident isEqual:@"popover.music.favorite"]) heart = v;
+        else if ([ident isEqual:@"popover.music.title"]) title = v;
+        else if ([ident isEqual:@"popover.music.subtitle"]) subtitle = v;
+    }
+    NSString *pct = muted ? @"mute" : [NSString stringWithFormat:@"%.0f%%", vol * 100];
+    NSFont *mono = [NSFont monospacedDigitSystemFontOfSize:12.5 weight:NSFontWeightRegular];
+    if (muted && style != VolToday && [output isKindOfClass:NSButton.class]) {
+        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
+        ((NSButton *)output).image = [[NSImage imageWithSystemSymbolName:@"speaker.slash" accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+        ((NSButton *)output).contentTintColor = NSColor.systemRedColor;
+    }
+    void (^shrinkText)(CGFloat) = ^(CGFloat by) {
+        for (NSView *v in @[title ?: NSNull.null, subtitle ?: NSNull.null]) {
+            if (![v isKindOfClass:NSView.class]) continue;
+            NSRect f = v.frame; f.size.width -= by; v.frame = f;
+        }
+        if (heart) heart.frame = NSOffsetRect(heart.frame, -by, 0);
+    };
+    if (style == VolPercent) {
+        CGFloat w = 36; shrinkText(w);
+        NSRect o = output.frame;
+        NSTextField *t = [c text:pct font:mono color:VolColor(vol, muted)
+                              at:NSMakeRect(NSMinX(o) - w, NSMidY(o) - 8, w - 2, 16) align:NSTextAlignmentRight];
+        [output.superview addSubview:t];
+    } else if (style == VolColumn) {
+        CGFloat w = 8; shrinkText(w);
+        output.frame = NSOffsetRect(output.frame, -w, 0);
+        NSRect o = output.frame;
+        VolColumnView *col = [[VolColumnView alloc] initWithFrame:NSMakeRect(NSMaxX(o) + 2, NSMidY(o) - 11, 5, 22)];
+        col.level = muted ? 0 : vol; col.color = muted ? NSColor.systemRedColor : (vol >= 0.8 ? NSColor.systemOrangeColor : NSColor.controlAccentColor);
+        [output.superview addSubview:col];
+    } else if (style == VolLine) {
+        output.hidden = YES;   // the line below names the device; don't state it twice
+        shrinkText(-(kLeadW + 6));
+        CGFloat lh = 22;
+        NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, h, kW, lh)];
+        NSImageView *icon = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:(muted ? @"speaker.slash" : @"hifispeaker") accessibilityDescription:nil]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]]];
+        if ([dev[@"transport"] integerValue] == GlanceAudioTransportBluetooth && [dev[@"name"] containsString:@"AirPods"])
+            icon.image = [[NSImage imageWithSystemSymbolName:@"airpodspro" accessibilityDescription:nil] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]];
+        if ([dev[@"transport"] integerValue] == GlanceAudioTransportBuiltIn && !muted)
+            icon.image = [[NSImage imageWithSystemSymbolName:@"laptopcomputer" accessibilityDescription:nil] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]];
+        icon.contentTintColor = muted ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+        icon.frame = NSMakeRect(kPad, 2, 22, 18);
+        [line addSubview:icon];
+        [line addSubview:[c text:dev[@"name"] font:[NSFont systemFontOfSize:12.5] color:NSColor.secondaryLabelColor
+                              at:NSMakeRect(kPad + 28, 3, 170, 16) align:NSTextAlignmentLeft]];
+        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kW - kPad - 40 - 6 - 110, 7, 110, 8)];
+        g.fraction = muted ? 0 : vol; g.color = muted ? NSColor.systemRedColor : (vol >= 0.8 ? NSColor.systemOrangeColor : NSColor.controlAccentColor);
+        g.markerFraction = -1;
+        [line addSubview:g];
+        [line addSubview:[c text:pct font:mono color:VolColor(vol, muted) at:NSMakeRect(kW - kPad - 40, 3, 40, 16) align:NSTextAlignmentRight]];
+        [box addSubview:line];
+        h += lh;
+    }
+    NSRect f = box.frame; f.size.height = h; box.frame = f;
+    return box;
+}
+
+static BOOL VolumeSheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSDictionary *bose = @{@"uid": @"bose", @"name": @"Bose Flex SoundLink", @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""};
+    NSDictionary *pods = @{@"uid": @"pods", @"name": @"Ian's AirPods Pro", @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""};
+    NSDictionary *mac = @{@"uid": @"mac", @"name": @"MacBook Air Speakers", @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2, @"dataSource": @""};
+    NSArray *states = @[@[bose, @0.85, @NO], @[pods, @0.40, @NO], @[mac, @0.60, @YES]];
+    NSArray *variants = @[@[@"Today: device symbol only (name in tooltip)", @(VolToday)],
+                          @[@"A  volume % beside the output symbol", @(VolPercent)],
+                          @[@"B  output line: device, volume bar, %  (+1 thin line)", @(VolLine)],
+                          @[@"D  vertical level beside the output symbol", @(VolColumn)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            NSMutableArray *rows = [NSMutableArray array];
+            for (NSArray *st in states) {
+                [rows addObject:VolumeSketch(c, st, [v[1] integerValue])];
+                NSView *gap = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kW, 10)]; [rows addObject:gap];
+            }
+            return TitledPanel(v[0], rows, look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
+#pragma mark - Steering tiles sheet
+
+typedef NS_ENUM(NSInteger, SteerStyle) { SteerChips, SteerIcons, SteerChipsLess };
+
+static NSView *SteerTile(Controller *c, NSString *symbol, NSString *label, BOOL on, CGFloat w, BOOL iconOnly) {
+    NSView *t = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, 26)];
+    t.wantsLayer = YES; t.layer.cornerRadius = 7;
+    t.layer.backgroundColor = (on ? [NSColor.controlAccentColor colorWithAlphaComponent:0.9]
+                                  : [NSColor.labelColor colorWithAlphaComponent:0.08]).CGColor;
+    NSColor *fg = on ? NSColor.whiteColor : NSColor.labelColor;
+    NSImageView *iv = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightMedium]]];
+    iv.contentTintColor = fg;
+    if (iconOnly) { iv.frame = NSMakeRect((w - 18) / 2, 4, 18, 18); [t addSubview:iv]; return t; }
+    NSFont *font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    CGFloat tw = ceil([label sizeWithAttributes:@{NSFontAttributeName: font}].width) + 6;   // NSTextField's own inset
+    CGFloat x = MAX(2, (w - (14 + 2 + tw)) / 2);
+    iv.frame = NSMakeRect(x, 6, 14, 14); [t addSubview:iv];
+    [t addSubview:[c text:label font:font color:fg at:NSMakeRect(x + 16, 5, tw, 16) align:NSTextAlignmentLeft]];
+    return t;
+}
+
+static NSView *SteerSketch(Controller *c, SteerStyle style, NSInteger active) {
+    NSDictionary *bose = @{@"uid": @"bose", @"name": @"Bose Flex SoundLink", @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""};
+    NSView *music = VolumeSketch(c, @[bose, @0.55, @NO], VolLine);
+    CGFloat h = NSHeight(music.frame) + 4;
+    FlippedView *box = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, h + 30)];
+    [box addSubview:music];
+    NSArray *tiles = @[@[@"waveform", @"Dance"], @[@"guitars", @"Alt"], @[@"music.mic", @"Rap"],
+                       @[@"chart.line.uptrend.xyaxis", @"Top"], @[@"sparkles", @"New"]];
+    if (style == SteerChipsLess) tiles = [tiles subarrayWithRange:NSMakeRange(0, 4)];
+    NSInteger n = tiles.count + (style == SteerChipsLess ? 1 : 0);
+    CGFloat gap = 5, w = (kW - 2 * kPad - (n - 1) * gap) / n, x = kPad;
+    for (NSInteger i = 0; i < (NSInteger)tiles.count; i++) {
+        NSView *t = SteerTile(c, tiles[i][0], tiles[i][1], i == active, w, style == SteerIcons);
+        t.frame = NSMakeRect(x, h, w, 26); [box addSubview:t]; x += w + gap;
+    }
+    if (style == SteerChipsLess) {
+        NSView *t = SteerTile(c, @"hand.thumbsdown", @"Less", NO, w, NO);
+        t.frame = NSMakeRect(x, h, w, 26); [box addSubview:t];
+    }
+    return box;
+}
+
+static BOOL SteerSheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSArray *variants = @[@[@"A  five tiles from your library: symbol + word", @(SteerChips)],
+                          @[@"B  five icon-only tiles (names on hover)", @(SteerIcons)],
+                          @[@"C  four tiles + Less (dislike & skip)", @(SteerChipsLess)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants) {
+        [builders addObject:^NSView *(NSAppearanceName look) {
+            return TitledPanel(v[0], @[SteerSketch(c, [v[1] integerValue], 0)], look, c);
+        }];
+    }
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed|volume|steer out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "thermrow")) return ThermalRowSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "speed")) return SpeedSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "volume")) return VolumeSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "steer")) return SteerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;

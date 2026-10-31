@@ -183,7 +183,11 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
         ![next isKindOfClass:NSButton.class] || !output || !row) return NO;
     if (row.frame.size.height > kSoundH + 2 || CountIdentifier(root, @"popover.sound.row") != 1) return NO;
     if (prev.superview != row || play.superview != row || next.superview != row ||
-        output.superview != row || titleField.superview != row || subtitleField.superview != row) return NO;
+        titleField.superview != row || subtitleField.superview != row) return NO;
+    // The output device has its own line under the track: symbol + name, volume, level.
+    NSView *line = FindIdentifier(root, @"popover.sound.line");
+    if (!line || output.superview != line || !FindIdentifier(line, @"popover.sound.volume") ||
+        !FindIdentifier(line, @"popover.sound.level") || NSMinY(line.frame) < NSMaxY(row.frame) - 0.5) return NO;
     if (prev.enabled != transportOn || next.enabled != transportOn) return NO;
     return FindIdentifier(root, @"popover.sound.chevron") == nil &&
            FindIdentifier(root, @"popover.sound.name") == nil;
@@ -624,6 +628,29 @@ int main(int argc, const char **argv) {
             !FindIdentifier(root, @"popover.music.open") ||
             ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
             ![output.accessibilityHelp isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
+        {   // Where it will play and how loud: name beside the symbol, level coloured when loud or muted.
+            NSButton *outputButton = (NSButton *)output;
+            NSSlider *volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
+            NSTextField *level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
+            if (![outputButton.title containsString:@"Bose Flex SoundLink"] || fabs(volume.doubleValue - 0.55) > 0.001 ||
+                !volume.enabled || ![level.stringValue isEqual:@"55%"] || ![level.textColor isEqual:NSColor.secondaryLabelColor] ||
+                outputButton.attributedTitle.size.width + 22 > NSWidth(outputButton.frame) || !FitsChildren(root)) return Fail(__LINE__);
+            [c setValue:@0.85 forKey:@"outputVolume"]; [c rebuildContent]; root = p.contentViewController.view;
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            if (![level.stringValue isEqual:@"85%"] || ![level.textColor isEqual:NSColor.systemOrangeColor]) return Fail(__LINE__);
+            [c setValue:@YES forKey:@"outputMuted"]; [c rebuildContent]; root = p.contentViewController.view;
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
+            if (![level.stringValue isEqual:@"mute"] || ![level.textColor isEqual:NSColor.systemRedColor] ||
+                ![outputButton.contentTintColor isEqual:NSColor.systemRedColor]) return Fail(__LINE__);
+            [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
         NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
         NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
@@ -956,7 +983,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 334 || !InstrumentRowsFit(root)) return Fail(__LINE__);
+            root.bounds.size.height > 356 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22: output line
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {
