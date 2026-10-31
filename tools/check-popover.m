@@ -1017,6 +1017,12 @@ int main(int argc, const char **argv) {
                 ![shuffle.accessibilityValue isEqual:@"on"] ||
                 ![FindIdentifier(root, @"popover.music.open").accessibilityHelp containsString:@"Throwing Copper"])
                 return Fail(__LINE__);
+            {   // 👍 sits just left of ♥ and doesn't crowd the title.
+                NSView *thumb = FindIdentifier(root, @"popover.music.thumbsup");
+                NSView *title = FindIdentifier(root, @"popover.music.title");
+                if (!thumb || NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame) ||
+                    ![thumb.accessibilityLabel hasPrefix:@"Thumbs-up"]) return Fail(__LINE__);
+            }
             if (argc > 1) {
                 NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
                 NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;

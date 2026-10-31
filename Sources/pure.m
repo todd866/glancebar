@@ -2736,12 +2736,13 @@ NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray
         NSString *key = [@"song:" stringByAppendingString:t[@"id"]];
         if ([recent containsObject:key]) continue;
         NSInteger plays = [t[@"plays"] integerValue], idle = [t[@"idleDays"] integerValue];
-        double weight = (1 + log1p(plays)) * ([t[@"fav"] boolValue] ? 1.5 : 1);
+        BOOL thumb = [t[@"thumb"] boolValue];   // 👍 in Glancebar: Ian said he likes it
+        double weight = (1 + log1p(plays)) * ([t[@"fav"] boolValue] ? 1.5 : 1) * (thumb ? 3 : 1);
         if (plays > 0 && idle >= 0) weight *= 1 + 2.0 / (1 + idle / 30.0);   // played this month counts most
         NSDictionary *seed = @{@"key": key, @"kind": @"song", @"title": t[@"title"], @"subtitle": t[@"artist"] ?: @"",
                                @"trackID": t[@"id"], @"artist": t[@"artist"] ?: @"", @"album": t[@"album"] ?: @"",
                                @"family": GenreFamily(t[@"genre"]), @"weight": @(weight)};
-        if (plays > 0) [played addObject:seed];
+        if (plays > 0 || thumb) [played addObject:seed];
         else if ([t[@"fav"] boolValue]) [favs addObject:seed];
     }
     NSComparator byKey = ^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"key"] compare:b[@"key"]]; };
@@ -2772,6 +2773,27 @@ NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray
         }
     }
     return chosen;
+}
+
+// 👍 feedback for the curator, one JSON object per line in mix/feedback.jsonl; the last line for a
+// track wins, so un-liking is just another line.
+NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at) {
+    NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
+    NSDictionary *o = @{@"at": [f stringFromDate:at ?: NSDate.date], @"trackID": trackID ?: @"", @"title": title ?: @"",
+                        @"artist": artist ?: @"", @"liked": @(liked)};
+    NSData *d = [NSJSONSerialization dataWithJSONObject:o options:NSJSONWritingSortedKeys error:nil];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+}
+
+NSSet<NSString *> *MixLikedIDs(NSString *jsonl) {
+    NSMutableSet *liked = [NSMutableSet set];
+    for (NSString *line in [jsonl ?: @"" componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *o = line.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if (![o isKindOfClass:NSDictionary.class] || ![o[@"trackID"] isKindOfClass:NSString.class] || ![o[@"trackID"] length]) continue;
+        if ([o[@"liked"] boolValue]) [liked addObject:o[@"trackID"]]; else [liked removeObject:o[@"trackID"]];
+    }
+    return liked;
 }
 
 // A seed's cover when Music has none on this Mac (streamed tracks report artwork "downloaded: false"):

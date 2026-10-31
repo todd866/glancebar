@@ -2296,6 +2296,16 @@ int main(void) {
             for (NSDictionary *sd in ChooseMixSeeds(lib, @[], 12, 3)) [wide addObject:sd[@"trackID"]];
             check([wide containsObject:@"LORDE"] && ![wide containsObject:@"NEVER"] && wide.count == 7,
                   @"mix: favourites fill in after played songs run out; never-played non-favourites never");
+            NSString *fb = [@[MixFeedbackLine(@"A", @"Song A", @"X", YES, [NSDate dateWithTimeIntervalSince1970:0]),
+                              MixFeedbackLine(@"B", @"Song B", @"Y", YES, nil), @"not json", @"",
+                              MixFeedbackLine(@"A", @"Song A", @"X", NO, nil)] componentsJoinedByString:@"\n"];
+            check([MixLikedIDs(fb) isEqual:[NSSet setWithObject:@"B"]] && [MixFeedbackLine(@"A", @"t", @"a", YES, [NSDate dateWithTimeIntervalSince1970:0]) containsString:@"\"liked\":true"],
+                  @"mix feedback: last line per track wins; junk lines ignored");
+            NSMutableArray *thumbLib = [NSMutableArray array];
+            for (NSDictionary *tr in lib) { NSMutableDictionary *m = [tr mutableCopy]; if ([tr[@"id"] isEqual:@"NEVER"]) m[@"thumb"] = @YES; [thumbLib addObject:m]; }
+            NSMutableSet *thumbWide = [NSMutableSet set];
+            for (NSDictionary *sd in ChooseMixSeeds(thumbLib, @[], 12, 3)) [thumbWide addObject:sd[@"trackID"]];
+            check([thumbWide containsObject:@"NEVER"], @"mix: a thumbs-up makes a never-played song a seed candidate");
             NSString *query = MixArtSearchURL(@"Pete Murray", @"Better Days (Remastered)").absoluteString;
             check([query hasPrefix:@"https://itunes.apple.com/search?"] && [query containsString:@"Pete%20Murray%20Better%20Days&"] &&
                   [query containsString:@"entity=song"], @"mix art: search names the artist and the plain title");

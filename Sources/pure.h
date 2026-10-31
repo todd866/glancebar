@@ -747,6 +747,8 @@ NSString *GenreFamily(NSString *genre);
 NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray<NSString *> *recentKeys,
                                         NSUInteger count, uint64_t salt);
 NSURL *MixArtSearchURL(NSString *artist, NSString *title);
+NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at);
+NSSet<NSString *> *MixLikedIDs(NSString *jsonl);
 NSString *MixArtURLFromSearch(NSData *json, NSString *artist, NSUInteger px);
 // Tracks that suit the seed, best first: same artist, same family, near years, favourites
 // and plays; nothing disliked or played in the last minIdleDays (the seed's own tracks excepted).

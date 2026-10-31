@@ -5420,6 +5420,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
     NSMutableSet<NSString *> *_mixPreparing;
     NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
+    NSMutableSet<NSString *> *_mixLiked;                       // track ids given a 👍 (mix/feedback.jsonl)
     NSString *_mixPlayingKey, *_mixStartingKey;
     dispatch_queue_t _mixQueue;
     NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
@@ -5720,7 +5721,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             self->_mixLibraryLoading = NO;
             NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
             if (tracks.count < 20) return;   // Music closed, or permission not given yet
-            self->_mixLibrary = tracks;
+            NSSet *liked = [self mixLiked];
+            NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
+            for (NSDictionary *t in tracks) {
+                if (![liked containsObject:t[@"id"]]) { [marked addObject:t]; continue; }
+                NSMutableDictionary *m = [t mutableCopy]; m[@"thumb"] = @YES; [marked addObject:m];
+            }
+            self->_mixLibrary = marked;
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             [self chooseMixSeeds:NO];
         });
@@ -6488,6 +6495,32 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self runAppleMusicCommand:[NSString stringWithFormat:@"try\nset favorited of current track to %@\nend try",
                                 _amFavorited ? @"true" : @"false"] followUp:NO];
 }
+- (NSMutableSet<NSString *> *)mixLiked {
+    if (!_mixLiked) {
+        NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+        _mixLiked = [MixLikedIDs([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]) mutableCopy];
+    }
+    return _mixLiked;
+}
+- (IBAction)musicThumbsUp:(id)sender {
+    (void)sender;
+    if (!_amLoaded || !_amTrackID.length) return;
+    BOOL liked = ![[self mixLiked] containsObject:_amTrackID];
+    if (liked) [_mixLiked addObject:_amTrackID]; else [_mixLiked removeObject:_amTrackID];
+    NSString *line = MixFeedbackLine(_amTrackID, _amTitle, _amArtist, liked, NSDate.date);
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+    for (NSUInteger i = 0; i < _mixLibrary.count; i++)   // the next seed draw counts it straight away
+        if ([_mixLibrary[i][@"id"] isEqual:_amTrackID]) {
+            NSMutableArray *lib = [_mixLibrary mutableCopy]; NSMutableDictionary *t = [lib[i] mutableCopy];
+            t[@"thumb"] = @(liked); lib[i] = t; _mixLibrary = lib; break;
+        }
+    if (_popover.isShown) [self rebuildContent];
+}
 - (IBAction)musicShuffle:(id)sender {
     (void)sender;
     if (!_amLoaded) return;
@@ -6705,7 +6738,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         heart.frame = NSOffsetRect(heart.frame, textRight - 22, 0);
         heart.contentTintColor = _amFavorited ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
         [row addSubview:heart];
-        textRight = NSMinX(heart.frame) - 6;
+        // 👍 tells the curator "I like this", apart from ♥ (which keeps it in the library).
+        BOOL liked = _amTrackID.length && [[self mixLiked] containsObject:_amTrackID];
+        NSButton *thumb = [self transportButton:liked ? @"hand.thumbsup.fill" : @"hand.thumbsup" pointSize:14 side:22
+                                         action:@selector(musicThumbsUp:) identifier:@"popover.music.thumbsup"
+                                          label:liked ? @"Remove thumbs-up" : @"Thumbs-up: mixes should play more like this"];
+        thumb.frame = NSOffsetRect(heart.frame, -22, 0);
+        thumb.contentTintColor = liked ? NSColor.systemBlueColor : NSColor.secondaryLabelColor;
+        [row addSubview:thumb];
+        textRight = NSMinX(thumb.frame) - 6;
     }
     CGFloat textW = textRight - textX;
     NSString *titleText = trackTitle.length ? trackTitle : (amTarget ? [self appleMusicPlaylistName] : @"Liked Music");
