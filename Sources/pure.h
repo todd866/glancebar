@@ -735,3 +735,32 @@ HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatG
 NSString *OutputVolumeText(double volume, BOOL muted);
 // 80% and up counts as loud: worth a colour before something starts playing.
 BOOL OutputVolumeLoud(double volume);
+
+// Seed mixes. A library track is a dictionary: id (Music's persistent ID), title, artist,
+// album, genre, year, plays, idleDays (days since last played; -1 never), fav, dislike.
+// A genre's family ("dance", "alt", "rap", "pop", "other") so near genres count together.
+NSString *GenreFamily(NSString *genre);
+// count seeds (songs and albums; an album needs 4+ tracks here), favourites first, spread
+// across families, none whose key is in recentKeys. Deterministic for a given salt. A seed:
+// key, kind ("song"/"album"), title, subtitle, trackID (cover and first track), artist,
+// album, family.
+NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray<NSString *> *recentKeys,
+                                        NSUInteger count, uint64_t salt);
+// Tracks that suit the seed, best first: same artist, same family, near years, favourites
+// and plays; nothing disliked or played in the last minIdleDays (the seed's own tracks excepted).
+NSArray<NSDictionary *> *MixCandidates(NSArray<NSDictionary *> *tracks, NSDictionary *seed,
+                                       NSInteger minIdleDays, NSUInteger limit);
+// Without Claude: the seed's track(s) first, then a weighted draw from the candidates with
+// no artist twice in a row. Returns track ids.
+NSArray<NSString *> *RuleMix(NSArray<NSDictionary *> *candidates, NSDictionary *seed,
+                             NSArray<NSDictionary *> *tracks, NSUInteger length, uint64_t salt);
+// The prompt that asks Claude to order a mix from the candidates.
+NSString *MixPrompt(NSDictionary *seed, NSArray<NSDictionary *> *candidates, NSUInteger length);
+// The ids in Claude's reply (a JSON array, possibly wrapped in prose or a code fence), kept
+// only if allowed, deduplicated, at most maxLength.
+NSArray<NSString *> *ParseMixReply(NSString *reply, NSSet<NSString *> *allowed, NSUInteger maxLength);
+// A seed's own tracks to open its mix: the song, or an album's standouts (up to four).
+NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary *> *tracks);
+// A tile caption: the title without "(feat. …)", "(… Remastered)", " - Single", " EP" and the like.
+NSString *SeedCaption(NSString *title);
+

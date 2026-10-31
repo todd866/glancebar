@@ -1536,11 +1536,84 @@ static BOOL SteerSheet(NSString *path) {
     return WriteSheet(builders, path);
 }
 
+#pragma mark - Seed tiles sheet (a song or an album; a long mix built around it)
+
+typedef NS_ENUM(NSInteger, SeedStyle) { SeedCaptioned, SeedBare, SeedWithRotate };
+
+static NSView *SeedCover(Controller *c, NSString *file, NSString *caption, BOOL album, BOOL playing, CGFloat side, BOOL captioned, BOOL mark) {
+    CGFloat capH = 28, h = side + (captioned ? capH : 0);
+    NSView *t = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, side, h)];
+    NSImage *img = [[NSImage alloc] initWithContentsOfFile:file];
+    NSImageView *iv = [NSImageView imageViewWithImage:img ?: [NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]];
+    iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+    iv.frame = NSMakeRect(0, captioned ? capH : 0, side, side);
+    iv.wantsLayer = YES; iv.layer.cornerRadius = album ? 4 : side / 2 * 0.0 + 4; iv.layer.masksToBounds = YES;
+    if (playing) { iv.layer.borderWidth = 2; iv.layer.borderColor = NSColor.controlAccentColor.CGColor; }
+    [t addSubview:iv];
+    if (mark) {
+        NSImageView *badge = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:(album ? @"square.stack.fill" : @"music.note") accessibilityDescription:nil]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:8 weight:NSFontWeightBold]]];
+        badge.contentTintColor = NSColor.whiteColor;
+        badge.wantsLayer = YES; badge.layer.backgroundColor = [NSColor colorWithWhite:0 alpha:0.55].CGColor; badge.layer.cornerRadius = 7;
+        badge.frame = NSMakeRect(side - 16, (captioned ? capH : 0) + 2, 14, 14);
+        [t addSubview:badge];
+    }
+    if (captioned) {
+        NSTextField *cap = [c text:caption font:[NSFont systemFontOfSize:10] color:(playing ? NSColor.controlAccentColor : NSColor.secondaryLabelColor)
+                                at:NSMakeRect(-8, 0, side + 16, capH - 2) align:NSTextAlignmentCenter];
+        cap.maximumNumberOfLines = 2; cap.lineBreakMode = NSLineBreakByWordWrapping; cap.usesSingleLineMode = NO;
+        [t addSubview:cap];
+    }
+    return t;
+}
+
+static NSView *SeedSketch(Controller *c, SeedStyle style) {
+    NSString *dir = @"/private/tmp/claude-501/-Users-iantodd-Projects-glancebar/6f36f0a0-6605-4013-aed6-e79d902c6afa/scratchpad/covers/";
+    NSDictionary *bose = @{@"uid": @"bose", @"name": @"Bose Flex SoundLink", @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""};
+    NSView *music = VolumeSketch(c, @[bose, @0.55, @NO], VolToday);   // the shipped section already has the output line
+    CGFloat y = NSHeight(music.frame) + 6;
+    NSArray *seeds = @[@[@"c1.jpg", @"Crowbar", @NO], @[@"c2.jpg", @"Animal Magic", @YES], @[@"c4.jpg", @"Muse", @NO],
+                       @[@"c5.jpg", @"If You Leave", @YES], @[@"c1.jpg", @"Tigers Blood", @YES]];
+    BOOL captioned = style == SeedCaptioned || style == SeedWithRotate;
+    NSInteger n = style == SeedWithRotate ? 4 : 5;
+    CGFloat side = 54, gap = (kW - 2 * kPad - 5 * side) / 4;
+    FlippedView *box = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kW, y + side + (captioned ? 28 : 0) + 4)];
+    [box addSubview:music];
+    CGFloat x = kPad;
+    for (NSInteger i = 0; i < n; i++) {
+        NSView *t = SeedCover(c, [dir stringByAppendingString:seeds[i][0]], seeds[i][1], [seeds[i][2] boolValue], i == 1, side, captioned, style == SeedBare);
+        t.frame = NSMakeRect(x, y, NSWidth(t.frame), NSHeight(t.frame)); [box addSubview:t]; x += side + gap;
+    }
+    if (style == SeedWithRotate) {
+        NSView *t = [[NSView alloc] initWithFrame:NSMakeRect(x, y, side, side + 28)];
+        NSView *sq = [[NSView alloc] initWithFrame:NSMakeRect(0, 28, side, side)];
+        sq.wantsLayer = YES; sq.layer.cornerRadius = 4; sq.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
+        NSImageView *iv = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:@"arrow.triangle.2.circlepath" accessibilityDescription:nil]
+            imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]];
+        iv.contentTintColor = NSColor.secondaryLabelColor; iv.frame = NSMakeRect((side - 24) / 2, (side - 24) / 2, 24, 24);
+        [sq addSubview:iv]; [t addSubview:sq];
+        [t addSubview:[c text:@"New picks" font:[NSFont systemFontOfSize:10] color:NSColor.secondaryLabelColor at:NSMakeRect(-8, 12, side + 16, 14) align:NSTextAlignmentCenter]];
+        [box addSubview:t];
+    }
+    return box;
+}
+
+static BOOL SeedSheet(NSString *path) {
+    Controller *c = [Controller new];
+    NSArray *variants = @[@[@"A  five seeds: cover + name (Animal Magic playing)", @(SeedCaptioned)],
+                          @[@"B  five covers; song/album mark, name on hover", @(SeedBare)],
+                          @[@"C  four seeds + New picks", @(SeedWithRotate)]];
+    NSMutableArray *builders = [NSMutableArray array];
+    for (NSArray *v in variants)
+        [builders addObject:^NSView *(NSAppearanceName look) { return TitledPanel(v[0], @[SeedSketch(c, [v[1] integerValue])], look, c); }];
+    return WriteSheet(builders, path);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed|volume|steer out.png\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: ux-sheet pace|power|system|trend|netdrain|cursor|energy|burn|thermal|temps|thermrow|speed|volume|steer|seeds out.png\n"); return 2; }
         NSString *path = [NSString stringWithUTF8String:argv[2]];
         if (!strcmp(argv[1], "thermal")) return ThermalSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "temps")) return TempsSheet(path) ? 0 : 1;
@@ -1548,6 +1621,7 @@ int main(int argc, const char **argv) {
         if (!strcmp(argv[1], "speed")) return SpeedSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "volume")) return VolumeSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "steer")) return SteerSheet(path) ? 0 : 1;
+        if (!strcmp(argv[1], "seeds")) return SeedSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "burn")) return BurnSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "power")) return PowerSheet(path) ? 0 : 1;
         if (!strcmp(argv[1], "system")) return SystemSheet(path) ? 0 : 1;

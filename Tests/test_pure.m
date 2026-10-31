@@ -2253,6 +2253,81 @@ int main(void) {
         check([BatteryHeatText(38.2) isEqual:@"38 °C"] && BatteryHeatFor(38.2) == BatteryHeatWarm, @"battery heat: warm");
         check(BatteryHeatFor(42) == BatteryHeatHot && BatteryHeatFor(41.6) == BatteryHeatHot,
               @"battery heat: hot, judged on the degree shown");
+        // Seed mixes.
+        {
+            NSDictionary *(^T)(NSString *, NSString *, NSString *, NSString *, NSString *, NSInteger, NSInteger, NSInteger, BOOL, BOOL) =
+                ^NSDictionary *(NSString *i, NSString *title, NSString *artist, NSString *album, NSString *genre, NSInteger year,
+                                NSInteger plays, NSInteger idle, BOOL fav, BOOL dislike) {
+                    return @{@"id": i, @"title": title, @"artist": artist, @"album": album, @"genre": genre, @"year": @(year),
+                             @"plays": @(plays), @"idleDays": @(idle), @"fav": @(fav), @"dislike": @(dislike)};
+                };
+            NSMutableArray *lib = [NSMutableArray array];
+            for (int i = 0; i < 5; i++) [lib addObject:T([NSString stringWithFormat:@"BON%d", i], [NSString stringWithFormat:@"Kota %d", i], @"Bonobo", @"Animal Magic", @"Electronic", 2000, 10 + i, 30, YES, NO)];
+            for (int i = 0; i < 4; i++) [lib addObject:T([NSString stringWithFormat:@"WAX%d", i], [NSString stringWithFormat:@"Crowbar %d", i], @"Waxahatchee", @"Tigers Blood", @"Alternative", 2024, 5, 30, YES, NO)];
+            [lib addObject:T(@"FRED", @"Delilah", @"Fred again..", @"Actual Life 3", @"Dance", 2022, 40, 20, YES, NO)];
+            [lib addObject:T(@"KEND", @"HUMBLE.", @"Kendrick Lamar", @"DAMN.", @"Hip-Hop/Rap", 2017, 30, 10, YES, NO)];
+            [lib addObject:T(@"RECENT", @"Played Yesterday", @"Rezident", @"Only For A Moment", @"House", 2021, 50, 1, YES, NO)];
+            [lib addObject:T(@"NOPE", @"Disliked", @"Someone", @"X", @"Electronic", 2001, 99, 30, YES, YES)];
+            [lib addObject:T(@"DAUG", @"Youth", @"Daughter", @"If You Leave", @"Alternative", 2013, 20, 40, YES, NO)];
+
+            check([GenreFamily(@"Electronic") isEqual:@"dance"] && [GenreFamily(@"Hip-Hop/Rap") isEqual:@"rap"] &&
+                  [GenreFamily(@"Indie Rock") isEqual:@"alt"] && [GenreFamily(@"R&B/Soul") isEqual:@"rap"] &&
+                  [GenreFamily(@"Pop") isEqual:@"pop"] && [GenreFamily(@"Soundtrack") isEqual:@"other"], @"mix: genre families");
+
+            NSArray *seeds = ChooseMixSeeds(lib, @[], 4, 7);
+            NSMutableSet *artists = [NSMutableSet set]; BOOL hasAlbum = NO, hasSong = NO, disliked = NO;
+            for (NSDictionary *sd in seeds) {
+                [artists addObject:sd[@"artist"]];
+                hasAlbum |= [sd[@"kind"] isEqual:@"album"]; hasSong |= [sd[@"kind"] isEqual:@"song"];
+                disliked |= [sd[@"trackID"] isEqual:@"NOPE"];
+            }
+            check(seeds.count == 4 && artists.count == 4 && hasAlbum && hasSong && !disliked, @"mix: four seeds, mixed kinds, distinct artists");
+            check([seeds isEqual:ChooseMixSeeds(lib, @[], 4, 7)], @"mix: seeds are deterministic for a salt");
+            NSMutableArray *keys = [NSMutableArray array]; for (NSDictionary *sd in seeds) [keys addObject:sd[@"key"]];
+            BOOL repeat = NO;
+            for (NSDictionary *sd in ChooseMixSeeds(lib, keys, 4, 7)) repeat |= [keys containsObject:sd[@"key"]];
+            check(!repeat, @"mix: recent seeds are not offered again");
+
+            NSDictionary *bonobo = nil;
+            for (NSDictionary *sd in ChooseMixSeeds(lib, @[], 12, 3)) if ([sd[@"key"] hasPrefix:@"album:bonobo"]) bonobo = sd;
+            check(bonobo && [bonobo[@"title"] isEqual:@"Animal Magic"] && [bonobo[@"trackID"] hasPrefix:@"BON"], @"mix: an album seed carries its album and a cover track");
+
+            NSDictionary *songSeed = @{@"key": @"song:FRED", @"kind": @"song", @"trackID": @"FRED", @"title": @"Delilah",
+                                       @"artist": @"Fred again..", @"album": @"Actual Life 3", @"family": @"dance"};
+            NSArray *cands = MixCandidates(lib, songSeed, 3, 50);
+            NSMutableSet *candIDs = [NSMutableSet set]; for (NSDictionary *c in cands) [candIDs addObject:c[@"id"]];
+            check([candIDs containsObject:@"BON0"] && ![candIDs containsObject:@"FRED"] && ![candIDs containsObject:@"NOPE"] &&
+                  ![candIDs containsObject:@"RECENT"] && ![candIDs containsObject:@"KEND"], @"mix: candidates fit, skip seed/disliked/recent/far");
+            check([cands.firstObject[@"artist"] isEqual:@"Bonobo"], @"mix: same-family tracks rank first");
+
+            NSArray *mix = RuleMix(cands, songSeed, lib, 6, 1);
+            BOOL spaced = YES; NSString *prev = nil;
+            NSMutableDictionary *byID = [NSMutableDictionary dictionary]; for (NSDictionary *t in lib) byID[t[@"id"]] = t;
+            for (NSString *i in mix) { NSString *a = byID[i][@"artist"]; if ([a isEqual:prev]) spaced = NO; prev = a; }
+            check([mix.firstObject isEqual:@"FRED"] && mix.count >= 2 && [[NSSet setWithArray:mix] count] == mix.count,
+                  @"mix: fallback opens with the seed, no repeats");
+            check(spaced, @"mix: fallback never repeats an artist back to back");
+
+            NSDictionary *albumSeed = @{@"key": @"album:bonobo", @"kind": @"album", @"trackID": @"BON0", @"title": @"Animal Magic",
+                                        @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"};
+            NSArray *amix = RuleMix(MixCandidates(lib, albumSeed, 3, 50), albumSeed, lib, 8, 2);
+            NSUInteger fromAlbum = 0; for (NSString *i in amix) if ([i hasPrefix:@"BON"]) fromAlbum++;
+            check([amix.firstObject hasPrefix:@"BON"] && fromAlbum >= 2 && fromAlbum <= 4, @"mix: an album seed opens with its standouts, woven in");
+
+            NSString *prompt = MixPrompt(songSeed, cands, 30);
+            check([prompt containsString:@"\"Delilah\" by Fred again.."] && [prompt containsString:@"BON0 | Bonobo |"] &&
+                  [prompt containsString:@"JSON array of 30"], @"mix: prompt names the seed and lists candidates");
+
+            NSSet *ok = [NSSet setWithArray:@[@"A", @"B", @"C"]];
+            check([ParseMixReply(@"Here you go:\n```json\n[\"A\", \"X\", \"B\", \"A\", \"C\"]\n```", ok, 10) isEqual:(@[@"A", @"B", @"C"])],
+                  @"mix: reply parsed from a fence, unknown and duplicate ids dropped");
+            check([ParseMixReply(@"[\"A\",\"B\",\"C\"]", ok, 2) isEqual:(@[@"A", @"B"])] && ParseMixReply(@"no json", ok, 5).count == 0,
+                  @"mix: reply capped; junk yields nothing");
+        }
+        check([SeedCaption(@"Muse (feat. Kate Morgan)") isEqual:@"Muse"] && [SeedCaption(@"Only For A Moment EP") isEqual:@"Only For A Moment"] &&
+              [SeedCaption(@"Youth - Single") isEqual:@"Youth"] && [SeedCaption(@"Animal Magic") isEqual:@"Animal Magic"] &&
+              [SeedCaption(@"Lightning Crashes (Live)") isEqual:@"Lightning Crashes"] && [SeedCaption(@"(feat. X)") isEqual:@"(feat. X)"],
+              @"mix: captions drop features, versions and release types");
         // Output volume line.
         check([OutputVolumeText(0.554, NO) isEqual:@"55%"] && [OutputVolumeText(1.2, NO) isEqual:@"100%"],
               @"volume: whole percent, capped");

@@ -86,9 +86,18 @@ static BOOL HasText(NSView *view, NSString *text) {
     return NO;
 }
 // Recovery of clipped text is required; unsolicited explanatory popups stay off.
+// The height a wrapping field's text needs at its width (its own paragraph style truncates).
+static CGFloat WrappedHeight(NSTextField *field) {
+    return NSHeight([field.stringValue boundingRectWithSize:NSMakeSize(NSWidth(field.bounds) - 4, 1000)
+                                                    options:NSStringDrawingUsesLineFragmentOrigin
+                                                 attributes:@{NSFontAttributeName: field.font}]);
+}
 static BOOL RecoveryTip(NSView *view) {
     if (![view isKindOfClass:NSTextField.class]) return NO;
     NSTextField *field = (NSTextField *)view;
+    if (field.maximumNumberOfLines > 1)   // a wrapping caption that two lines can't hold
+        return [view.toolTip isEqual:field.stringValue] &&
+            WrappedHeight(field) > NSHeight(field.bounds);
     return [view.toolTip isEqual:field.stringValue] &&
         field.attributedStringValue.size.width + 4 > NSWidth(field.bounds);
 }
@@ -209,7 +218,16 @@ static BOOL FitsChildren(NSView *view) {
         }
         if (!FitsChildren(child)) return NO;
         // No cut-off text anywhere: every label's whole string fits its frame.
-        if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
+        if ([child isKindOfClass:NSTextField.class] && !child.hidden && ((NSTextField *)child).maximumNumberOfLines > 1) {
+            // A wrapping caption fits if its lines fit its height, or it carries the full text as a tip.
+            NSTextField *field = (NSTextField *)child;
+            CGFloat need = WrappedHeight(field);
+            if (need > NSHeight(field.bounds) + 0.5 && ![field.toolTip isEqual:field.stringValue]) {
+                fprintf(stderr, "truncated %s: \"%s\" needs %.1f high of %.1f\n", field.accessibilityIdentifier.UTF8String,
+                        field.stringValue.UTF8String, need, NSHeight(field.bounds));
+                return NO;
+            }
+        } else if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
             NSTextField *field = (NSTextField *)child;
             CGFloat need = field.attributedStringValue.length
                 ? field.attributedStringValue.size.width
@@ -378,6 +396,13 @@ int main(int argc, const char **argv) {
             fabs(lowOpus.greenComponent-amber.greenComponent)>0.03 ||
             fabs(lowOpus.blueComponent-amber.blueComponent)>0.03) return Fail(__LINE__);
         Controller *c = [Controller new];
+        // Seed tiles from a fixture: the harness never reads the real Music library.
+        [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:@[@{@"key": @"song:A1", @"kind": @"song", @"title": @"Muse (feat. Kate Morgan)", @"subtitle": @"Rezident", @"trackID": @"A1", @"artist": @"Rezident", @"album": @"Only For A Moment EP", @"family": @"dance"},
+                      @{@"key": @"album:bonobo", @"kind": @"album", @"title": @"Animal Magic", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
+                      @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},
+                      @{@"key": @"album:daughter", @"kind": @"album", @"title": @"So Long, See You Tomorrow (Deluxe Edition) Remastered Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
+              forKey:@"mixSeeds"];
         [c setValue:@"limit80" forKey:@"chargeMode"];
         [c setValue:@YES forKey:@"chargeModeLoaded"];
         NSPopover *p = [NSPopover new];
@@ -649,6 +674,27 @@ int main(int argc, const char **argv) {
             if (![level.stringValue isEqual:@"mute"] || ![level.textColor isEqual:NSColor.systemRedColor] ||
                 ![outputButton.contentTintColor isEqual:NSColor.systemRedColor]) return Fail(__LINE__);
             [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
+        {   // Seed tiles: four covers + New picks under the output line, captions tidy, playing seed outlined.
+            NSView *mix = FindIdentifier(root, @"popover.mix");
+            NSView *line = FindIdentifier(root, @"popover.sound.line");
+            NSTextField *c0 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.0");
+            NSTextField *c3 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.3");
+            NSButton *s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !FindIdentifier(root, @"popover.mix.newpicks") ||
+                !FindIdentifier(root, @"popover.mix.seed.3") || FindIdentifier(root, @"popover.mix.seed.4") ||
+                ![c0.stringValue isEqual:@"Muse"] || ![s1.accessibilityLabel containsString:@"the album Animal Magic by Bonobo"] ||
+                ![c3.toolTip isEqual:c3.stringValue] || !FitsChildren(root) ||
+                !c0.cell.wraps || c0.lineBreakMode != NSLineBreakByWordWrapping || c0.maximumNumberOfLines != 2 ||
+                NSHeight(c0.frame) < 2 * ceil(c0.font.ascender - c0.font.descender + c0.font.leading)) return Fail(__LINE__);
+            [c setValue:@"album:bonobo" forKey:@"mixPlayingKey"];
+            [c setValue:@"Glancebar Mix" forKey:@"amPlaylist"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            NSTextField *c1 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.1");
+            if (s1.layer.borderWidth < 1.9 || ![c1.textColor isEqual:NSColor.controlAccentColor]) return Fail(__LINE__);
+            [c setValue:nil forKey:@"amPlaylist"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
         // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
@@ -983,7 +1029,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 356 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22: output line
+            root.bounds.size.height > 446 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {

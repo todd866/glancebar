@@ -4249,6 +4249,10 @@ static NSColor *ClaudeQuotaColor(double fraction) {
                      mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
     BOOL clipped = truncates && self.stringValue.length &&
         self.attributedStringValue.size.width + 4 > NSWidth(self.bounds);
+    if (self.maximumNumberOfLines > 1 && self.stringValue.length && self.font)   // a wrapping label clips past its last line
+        clipped = NSHeight([self.stringValue boundingRectWithSize:NSMakeSize(NSWidth(self.bounds) - 4, 1000)
+                                                          options:NSStringDrawingUsesLineFragmentOrigin
+                                                       attributes:@{NSFontAttributeName: self.font}]) > NSHeight(self.bounds) + 0.5;
     [super setToolTip:clipped ? self.stringValue : nil];
 }
 - (void)setStringValue:(NSString *)value { [super setStringValue:value]; [self updateClippedTextHelp]; }
@@ -4504,6 +4508,11 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
             [a selectItemAtIndex:b.indexOfSelectedItem];
         }
         old.contentTintColor = new.contentTintColor;
+        old.alphaValue = new.alphaValue;
+        if (new.wantsLayer && old.layer && new.layer) {   // a cover tile's outline marks the playing seed
+            old.layer.borderWidth = new.layer.borderWidth;
+            old.layer.borderColor = new.layer.borderColor;
+        }
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
@@ -5059,7 +5068,11 @@ static NSImage *AppleMusicThumbnail(NSString *path, CGFloat side) {
     [small addRepresentation:rep];
     return small;
 }
+static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status));
 static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
+    RunAppleScriptTimed(source, 10, done);
+}
+static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [NSTask new];
         task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
@@ -5072,8 +5085,8 @@ static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSSt
             return;
         }
         // osascript has no deadline. A hung Chrome, or a permission dialog nobody answers,
-        // would block this queue forever; terminate at 10s and force-kill at 11s.
-        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:10];
+        // would block this queue forever; terminate at the deadline and force-kill a second later.
+        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:seconds];
         NSString *output = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
         NSString *errorText = [[NSString alloc] initWithData:[err.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
         [task waitUntilExit];
@@ -5086,6 +5099,105 @@ static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSSt
         dispatch_async(dispatch_get_main_queue(), ^{ done(output, errorText, status); });
     });
 }
+#pragma mark - Seed mixes (Apple Music)
+
+static NSString *const kMixPlaylistName = @"Glancebar Mix";
+
+// One bulk read of the library: per track, id, title, artist, album, genre, year, plays,
+// days since played (-1 never), favourite, dislike; unit/record separators between.
+static NSString *const kMixLibraryScript =
+    @"tell application \"Music\"\n"
+     "set lib to library playlist 1\n"
+     "set ids to persistent ID of every track of lib\n"
+     "set ns to name of every track of lib\n"
+     "set ars to artist of every track of lib\n"
+     "set als to album of every track of lib\n"
+     "set gs to genre of every track of lib\n"
+     "set ys to year of every track of lib\n"
+     "set pcs to played count of every track of lib\n"
+     "set pds to played date of every track of lib\n"
+     "set fs to favorited of every track of lib\n"
+     "set ds to disliked of every track of lib\n"
+     "end tell\n"
+     "set nowDate to current date\n"
+     "set us to character id 31\n"
+     "set out to {}\n"
+     "repeat with i from 1 to count of ids\n"
+     "set pd to item i of pds\n"
+     "if pd is missing value then\nset daysIdle to -1\nelse\nset daysIdle to ((nowDate - pd) div 86400)\nend if\n"
+     "set end of out to (item i of ids) & us & (item i of ns) & us & (item i of ars) & us & (item i of als) & us & (item i of gs) & us & ((item i of ys) as text) & us & ((item i of pcs) as text) & us & (daysIdle as text) & us & ((item i of fs) as text) & us & ((item i of ds) as text)\n"
+     "end repeat\n"
+     "set AppleScript's text item delimiters to (character id 30)\n"
+     "return out as text\n";
+
+static NSArray<NSDictionary *> *ParseMixLibrary(NSString *text) {
+    NSMutableArray *tracks = [NSMutableArray array];
+    NSString *us = [NSString stringWithFormat:@"%C", (unichar)31], *rs = [NSString stringWithFormat:@"%C", (unichar)30];
+    for (NSString *record in [[text stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsSeparatedByString:rs]) {
+        NSArray *f = [record componentsSeparatedByString:us];
+        if (f.count < 10 || ![f[0] length]) continue;
+        [tracks addObject:@{@"id": f[0], @"title": f[1], @"artist": f[2], @"album": f[3], @"genre": f[4],
+                            @"year": @([f[5] integerValue]), @"plays": @([f[6] integerValue]), @"idleDays": @([f[7] integerValue]),
+                            @"fav": @([f[8] isEqual:@"true"]), @"dislike": @([f[9] isEqual:@"true"])}];
+    }
+    return tracks;
+}
+
+static NSString *MixDirectory(NSString *sub) {
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:
+                     [@"Library/Application Support/Glancebar/mix" stringByAppendingPathComponent:sub ?: @""]];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+// Claude orders the mix: `claude -p` on the owner's own subscription, a fast model, no tools.
+// Runs off the main thread; nil when the CLI is missing, fails or times out.
+static NSString *RunClaudeForMix(NSString *prompt) {
+    NSString *claude = [GBHomeDirectory() stringByAppendingPathComponent:@".local/bin/claude"];
+    if (![NSFileManager.defaultManager isExecutableFileAtPath:claude]) return nil;
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:claude];
+    task.arguments = @[@"-p", @"--tools", @"", @"--model", @"haiku", prompt];
+    task.currentDirectoryURL = [NSURL fileURLWithPath:MixDirectory(@"work")];
+    NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy];
+    env[@"PATH"] = [NSString stringWithFormat:@"%@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin", GBHomeDirectory()];
+    task.environment = env;
+    NSPipe *out = [NSPipe pipe];
+    task.standardOutput = out;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+    if (![task launchAndReturnError:NULL]) return nil;
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:120];
+    NSData *data = [out.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    [watchdog disarm];
+    if (task.terminationReason != NSTaskTerminationReasonExit || task.terminationStatus != 0) return nil;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+// A seed's mix: Claude's order from the candidates when it answers well, else the rule-based
+// draw. Always opens with the seed (its song, or an album standout).
+static NSArray<NSString *> *BuildSeedMix(NSArray<NSDictionary *> *tracks, NSDictionary *seed, BOOL useClaude, uint64_t salt) {
+    const NSUInteger length = 40;
+    NSArray *candidates = MixCandidates(tracks, seed, 3, 220);
+    NSArray *openers = MixSeedTracks(seed, tracks);
+    NSArray *ids = nil;
+    if (useClaude && candidates.count >= 10) {
+        NSMutableArray *offer = [candidates mutableCopy];
+        if ([seed[@"kind"] isEqual:@"album"]) [offer addObjectsFromArray:openers];
+        NSMutableSet *allowed = [NSMutableSet set];
+        for (NSDictionary *c in offer) [allowed addObject:c[@"id"]];
+        NSString *reply = RunClaudeForMix(MixPrompt(seed, offer, length));
+        NSArray *picked = reply ? ParseMixReply(reply, allowed, length) : @[];
+        if (picked.count >= 15) ids = picked;
+    }
+    if (!ids) return RuleMix(candidates, seed, tracks, length, salt);
+    NSMutableArray *mix = [ids mutableCopy];
+    NSString *first = [openers.firstObject objectForKey:@"id"];
+    if (first) { [mix removeObject:first]; [mix insertObject:first atIndex:0]; }
+    return mix;
+}
+
 // One round trip finds the music.youtube.com tab and runs the action there.
 // status only reads. start is the one place shuffle is forced on, and only when
 // Glancebar itself is starting playback. The JS stays inside one double-quoted
@@ -5250,6 +5362,15 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     AudioObjectID _volumeWatched;  // device whose volume and mute we listen to
     CFAbsoluteTime _volumeSetAt;   // last change from our own slider, so its echo doesn't rebuild
     BOOL _volumeRebuildPending;
+    NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
+    CFAbsoluteTime _mixLibraryAt;
+    BOOL _mixLibraryLoading, _mixFrozen;       // _mixFrozen: tests set seeds by hand, no background work
+    NSArray<NSDictionary *> *_mixSeeds;        // the four tiles
+    NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
+    NSMutableSet<NSString *> *_mixPreparing;
+    NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
+    NSString *_mixPlayingKey, *_mixStartingKey;
+    dispatch_queue_t _mixQueue;
     NSUInteger _audioSettleGen;
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
     BOOL _networkKnown, _networkOnline;
@@ -5412,6 +5533,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
     _musicProbesEnabled = YES;
     _outputVolume = -1;
+    _mixPrepared = [NSMutableDictionary dictionary];
+    _mixPreparing = [NSMutableSet set];
+    _mixArt = [NSMutableDictionary dictionary];
+    _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
     [self startNetworkMonitor];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(appleMusicChanged:)
                                                           name:@"com.apple.Music.playerInfo" object:nil];
@@ -5525,6 +5650,129 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         self->_volumeRebuildPending = NO;
         if (self->_popover.isShown) [self rebuildContent];
     });
+}
+#pragma mark Seed mixes
+
+// The library is read in the background when the popover first needs tiles, then every 6 h.
+- (void)ensureMixSeeds {
+    if (_mixFrozen || !_musicProbesEnabled || [self musicOffline]) return;
+    BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
+    if (stale && !_mixLibraryLoading) {
+        _mixLibraryLoading = YES;
+        RunAppleScriptTimed(kMixLibraryScript, 90, ^(NSString *output, __unused NSString *errorText, int status) {
+            self->_mixLibraryLoading = NO;
+            NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
+            if (tracks.count < 20) return;   // Music closed, or permission not given yet
+            self->_mixLibrary = tracks;
+            self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
+            [self chooseMixSeeds:NO];
+        });
+        return;
+    }
+    if (_mixLibrary && !_mixSeeds.count) [self chooseMixSeeds:NO];
+}
+// Four seeds a day (the same all day), or a fresh set on New picks. Recent seeds sit out.
+- (void)chooseMixSeeds:(BOOL)fresh {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSInteger day = (NSInteger)floor((NSDate.date.timeIntervalSince1970 + NSTimeZone.localTimeZone.secondsFromGMT) / 86400);
+    NSArray *saved = [ud arrayForKey:@"mixSeeds"];
+    if (!fresh && [ud integerForKey:@"mixSeedsDay"] == day && saved.count) {
+        _mixSeeds = saved;
+    } else {
+        NSInteger picks = [ud integerForKey:@"mixPickCount"] + (fresh ? 1 : 0);
+        [ud setInteger:picks forKey:@"mixPickCount"];
+        NSArray *recent = [ud arrayForKey:@"mixRecentSeeds"] ?: @[];
+        NSArray *seeds = ChooseMixSeeds(_mixLibrary, recent, 4, (uint64_t)day * 7919 + (uint64_t)picks);
+        if (!seeds.count) return;
+        NSMutableArray *keep = [recent mutableCopy];
+        for (NSDictionary *seed in seeds) [keep addObject:seed[@"key"]];
+        while (keep.count > 24) [keep removeObjectAtIndex:0];
+        [ud setObject:keep forKey:@"mixRecentSeeds"];
+        [ud setObject:seeds forKey:@"mixSeeds"];
+        [ud setInteger:day forKey:@"mixSeedsDay"];
+        _mixSeeds = seeds;
+        [_mixPrepared removeAllObjects];
+    }
+    for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed[@"trackID"]]; [self prepareMix:seed then:nil]; }
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)loadMixArt:(NSString *)trackID {
+    if (!trackID.length || _mixArt[trackID]) return;
+    NSString *path = [MixDirectory(@"art") stringByAppendingPathComponent:[trackID stringByAppendingPathExtension:@"jpg"]];
+    NSImage *cached = [NSFileManager.defaultManager fileExistsAtPath:path] ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
+    if (cached) { _mixArt[trackID] = cached; return; }
+    NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
+        "set t to (first track of library playlist 1 whose persistent ID is %@)\n"
+        "set a to raw data of artwork 1 of t\n"
+        "end tell\n"
+        "set fh to open for access (POSIX file %@) with write permission\n"
+        "set eof fh to 0\nwrite a to fh\nclose access fh\nreturn \"ok\"", AppleScriptQuoted(trackID), AppleScriptQuoted(path)];
+    RunAppleScriptTimed(script, 20, ^(__unused NSString *output, __unused NSString *errorText, int status) {
+        NSImage *img = status == 0 ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
+        if (!img) return;
+        self->_mixArt[trackID] = img;
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+// Mixes are built ahead in the background (Claude can take a while), one at a time.
+- (void)prepareMix:(NSDictionary *)seed then:(void (^)(NSArray *ids))done {
+    NSString *key = seed[@"key"];
+    if (_mixPrepared[key]) { if (done) done(_mixPrepared[key]); return; }
+    if ([_mixPreparing containsObject:key] && !done) return;
+    [_mixPreparing addObject:key];
+    NSArray *tracks = _mixLibrary;
+    BOOL claude = [NSUserDefaults.standardUserDefaults objectForKey:@"mixWithClaude"]
+        ? [NSUserDefaults.standardUserDefaults boolForKey:@"mixWithClaude"] : YES;
+    uint64_t salt = (uint64_t)[NSUserDefaults.standardUserDefaults integerForKey:@"mixPickCount"] * 31 + key.hash;
+    dispatch_async(_mixQueue, ^{
+        NSArray *ids = self->_mixPrepared[key] ?: BuildSeedMix(tracks, seed, claude, salt);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self->_mixPreparing removeObject:key];
+            if (ids.count) self->_mixPrepared[key] = ids;
+            if (done) done(ids);
+        });
+    });
+}
+- (IBAction)playSeedMix:(NSButton *)sender {
+    if (sender.tag < 0 || sender.tag >= (NSInteger)_mixSeeds.count) return;
+    NSDictionary *seed = _mixSeeds[sender.tag];
+    NSString *key = seed[@"key"];
+    _mixStartingKey = key;
+    [self rebuildContent];
+    [self prepareMix:seed then:^(NSArray *ids) {
+        if (!ids.count) { self->_mixStartingKey = nil; [self rebuildContent]; return; }
+        NSMutableArray *quoted = [NSMutableArray array];
+        for (NSString *i in ids) [quoted addObject:AppleScriptQuoted(i)];
+        NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
+            "if not (exists user playlist %@) then make new user playlist with properties {name:%@}\n"
+            "set p to user playlist %@\n"
+            "delete every track of p\n"
+            "set lib to library playlist 1\n"
+            "repeat with i in {%@}\n"
+            "try\nduplicate (first track of lib whose persistent ID is (contents of i)) to p\nend try\n"
+            "end repeat\n"
+            "set shuffle enabled to false\n"
+            "play p\n"
+            "end tell\nreturn \"ok\"",
+            AppleScriptQuoted(kMixPlaylistName), AppleScriptQuoted(kMixPlaylistName), AppleScriptQuoted(kMixPlaylistName),
+            [quoted componentsJoinedByString:@", "]];
+        RunAppleScriptTimed(script, 60, ^(__unused NSString *output, __unused NSString *errorText, int status) {
+            self->_mixStartingKey = nil;
+            if (status == 0) {
+                self->_mixPlayingKey = key;
+                // Next time this seed plays, draw a different mix.
+                [self->_mixPrepared removeObjectForKey:key];
+                [self prepareMix:seed then:nil];
+            }
+            // Read the new track and playlist now, so the row and the tile's outline follow.
+            [self runAppleMusicCommand:@"" followUp:YES];
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    }];
+}
+- (IBAction)newMixPicks:(id)sender {
+    if (!_mixLibrary) { [self ensureMixSeeds]; return; }
+    [self chooseMixSeeds:YES];
 }
 - (IBAction)setOutputVolumeFromSlider:(NSSlider *)slider {
     _volumeSetAt = CFAbsoluteTimeGetCurrent();
@@ -6421,7 +6669,79 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     y += kSoundH;
     if (am) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
     y = [self addOutputLineTo:root at:y];
+    if (amTarget && !offline) y = [self addSeedTilesTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
+}
+// Four seeds (a song or an album, cover and name) and New picks. A click plays a long
+// mix built around that seed; the playing seed is outlined.
+- (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
+    [self ensureMixSeeds];
+    if (!_mixSeeds.count) return y;
+    const CGFloat side = 54, capH = 30, top = 6;   // two 10pt lines need ~25pt
+    CGFloat gap = (kW - 2 * kPad - 5 * side) / 4;
+    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
+    line.accessibilityIdentifier = @"popover.mix";
+    BOOL mixPlaying = [_amPlaylist isEqualToString:kMixPlaylistName];
+    NSFont *capFont = [NSFont systemFontOfSize:10];
+    for (NSUInteger i = 0; i < 5; i++) {
+        CGFloat x = kPad + i * (side + gap);
+        BOOL picks = i == 4 || i >= _mixSeeds.count;
+        NSDictionary *seed = picks ? nil : _mixSeeds[i];
+        BOOL playing = !picks && mixPlaying && [seed[@"key"] isEqual:_mixPlayingKey];
+        BOOL starting = !picks && [seed[@"key"] isEqual:_mixStartingKey];
+        NSButton *tile;
+        if (picks) {
+            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
+            tile = [NSButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"arrow.triangle.2.circlepath" accessibilityDescription:nil]
+                                              imageWithSymbolConfiguration:cfg] target:self action:@selector(newMixPicks:)];
+            tile.contentTintColor = NSColor.secondaryLabelColor;
+            tile.imageScaling = NSImageScaleNone;
+            tile.wantsLayer = YES;
+            tile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
+            tile.accessibilityIdentifier = @"popover.mix.newpicks";
+            tile.accessibilityLabel = @"New picks";
+            tile.accessibilityHelp = @"Four new songs and albums to start a mix from";
+        } else {
+            NSImage *cover = _mixArt[seed[@"trackID"]];
+            tile = [NSButton buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
+                                                       imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
+                                      target:self action:@selector(playSeedMix:)];
+            tile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
+            if (!cover) tile.contentTintColor = NSColor.tertiaryLabelColor;
+            tile.tag = (NSInteger)i;
+            tile.wantsLayer = YES;
+            tile.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i];
+            BOOL album = [seed[@"kind"] isEqual:@"album"];
+            tile.accessibilityLabel = [NSString stringWithFormat:@"Play a mix from %@ %@ by %@", album ? @"the album" : @"the song",
+                                       seed[@"title"], seed[@"subtitle"]];
+            tile.accessibilityHelp = [NSString stringWithFormat:@"%@ — %@ · a mix around this %@", seed[@"title"], seed[@"subtitle"],
+                                      album ? @"album" : @"song"];
+            if (!cover) tile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;   // cover still loading
+            if (playing) { tile.layer.borderWidth = 2; tile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
+            if (starting) tile.alphaValue = 0.45;
+        }
+        tile.title = @"";
+        tile.bordered = NO;
+        tile.imagePosition = NSImageOnly;
+        tile.layer.cornerRadius = 4;
+        tile.layer.masksToBounds = YES;
+        tile.frame = NSMakeRect(x, capH, side, side);
+        [line addSubview:tile];
+        NSString *text = picks ? @"New picks" : SeedCaption(seed[@"title"]);
+        CGFloat capW = side + gap - 4;
+        NSTextField *cap = [GBRecoverableTextField wrappingLabelWithString:text];
+        cap.font = capFont;
+        cap.textColor = playing ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+        cap.alignment = NSTextAlignmentCenter;
+        cap.maximumNumberOfLines = 2;
+        cap.cell.truncatesLastVisibleLine = YES;
+        cap.frame = NSMakeRect(x - (gap - 4) / 2, 0, capW, capH - 2);
+        [(GBRecoverableTextField *)cap updateClippedTextHelp];   // full name on hover only when two lines can't hold it
+        cap.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.caption.%lu", (unsigned long)i];
+        [line addSubview:cap];
+    }
+    [root addSubview:line];
+    return y + top + side + capH;
 }
 // Where it will play and how loud, before anything starts: the output device (its symbol and
 // name; click to cycle, right-click for the list), a volume slider, and the level.

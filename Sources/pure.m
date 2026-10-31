@@ -2697,3 +2697,217 @@ NSString *OutputVolumeText(double volume, BOOL muted) {
 }
 
 BOOL OutputVolumeLoud(double volume) { return lround(volume * 100) >= 80; }
+
+#pragma mark - Seed mixes
+
+NSString *GenreFamily(NSString *genre) {
+    NSString *g = genre.lowercaseString ?: @"";
+    for (NSString *k in @[@"electronic", @"dance", @"house", @"techno", @"trance", @"bass", @"drum", @"dubstep", @"garage", @"electronica", @"downtempo", @"ambient"])
+        if ([g containsString:k]) return @"dance";
+    for (NSString *k in @[@"hip-hop", @"hip hop", @"rap", @"r&b", @"soul", @"funk", @"grime", @"trap"])
+        if ([g containsString:k]) return @"rap";
+    for (NSString *k in @[@"alternative", @"rock", @"indie", @"punk", @"metal", @"grunge", @"emo", @"folk", @"singer"])
+        if ([g containsString:k]) return @"alt";
+    if ([g containsString:@"pop"]) return @"pop";
+    return @"other";
+}
+
+// A small deterministic generator so seeds and fallback mixes are testable.
+static uint64_t MixNext(uint64_t *state) {
+    *state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return *state >> 33;
+}
+
+static double MixTrackWeight(NSDictionary *t) {
+    double w = 1 + log1p([t[@"plays"] doubleValue]);
+    if ([t[@"fav"] boolValue]) w *= 2;
+    return w;
+}
+
+NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray<NSString *> *recentKeys,
+                                        NSUInteger count, uint64_t salt) {
+    NSSet *recent = [NSSet setWithArray:recentKeys ?: @[]];
+    NSMutableDictionary<NSString *, NSMutableArray *> *albums = [NSMutableDictionary dictionary];
+    NSMutableArray *songs = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if ([t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        NSString *album = t[@"album"], *artist = t[@"artist"];
+        if (album.length && artist.length) {
+            NSString *k = [NSString stringWithFormat:@"album:%@␟%@", artist.lowercaseString, album.lowercaseString];
+            if (!albums[k]) albums[k] = [NSMutableArray array];
+            [albums[k] addObject:t];
+        }
+        if ([t[@"fav"] boolValue]) [songs addObject:t];
+    }
+    NSMutableArray *pool = [NSMutableArray array];   // candidate seeds with a weight
+    for (NSDictionary *t in songs) {
+        NSString *key = [@"song:" stringByAppendingString:t[@"id"]];
+        if ([recent containsObject:key]) continue;
+        [pool addObject:@{@"key": key, @"kind": @"song", @"title": t[@"title"] ?: @"", @"subtitle": t[@"artist"] ?: @"",
+                          @"trackID": t[@"id"], @"artist": t[@"artist"] ?: @"", @"album": t[@"album"] ?: @"",
+                          @"family": GenreFamily(t[@"genre"]), @"weight": @(MixTrackWeight(t))}];
+    }
+    for (NSString *k in albums) {
+        NSArray *ts = albums[k];
+        if (ts.count < 4 || [recent containsObject:k]) continue;
+        NSDictionary *best = ts.firstObject; double weight = 0;
+        for (NSDictionary *t in ts) { double w = MixTrackWeight(t); weight += w; if (w > MixTrackWeight(best)) best = t; }
+        [pool addObject:@{@"key": k, @"kind": @"album", @"title": best[@"album"], @"subtitle": best[@"artist"],
+                          @"trackID": best[@"id"], @"artist": best[@"artist"], @"album": best[@"album"],
+                          @"family": GenreFamily(best[@"genre"]), @"weight": @(weight / ts.count * 1.5)}];
+    }
+    [pool sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [a[@"key"] compare:b[@"key"]]; }];
+    uint64_t state = salt ^ 0x9E3779B97F4A7C15ULL;
+    NSMutableArray *chosen = [NSMutableArray array];
+    NSMutableSet *families = [NSMutableSet set], *artists = [NSMutableSet set];
+    // Alternate songs and albums; prefer a family and artist not yet shown.
+    for (NSUInteger round = 0; chosen.count < count && pool.count && round < count * 40; round++) {
+        NSString *wantKind = chosen.count % 2 ? @"album" : @"song";
+        double total = 0;
+        NSMutableArray *eligible = [NSMutableArray array];
+        for (NSDictionary *s in pool) {
+            BOOL fresh = ![families containsObject:s[@"family"]] || families.count >= 4;
+            if ([artists containsObject:[s[@"artist"] lowercaseString]]) continue;
+            if (round < count * 20 && (![s[@"kind"] isEqual:wantKind] || !fresh)) continue;
+            [eligible addObject:s]; total += [s[@"weight"] doubleValue];
+        }
+        if (!eligible.count) continue;
+        double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
+        NSDictionary *pick = eligible.lastObject;
+        for (NSDictionary *s in eligible) { r -= [s[@"weight"] doubleValue]; if (r <= 0) { pick = s; break; } }
+        NSMutableDictionary *seed = [pick mutableCopy]; [seed removeObjectForKey:@"weight"];
+        [chosen addObject:seed];
+        [families addObject:pick[@"family"]];
+        [artists addObject:[pick[@"artist"] lowercaseString]];
+        [pool removeObject:pick];
+    }
+    return chosen;
+}
+
+static BOOL MixTrackInSeed(NSDictionary *t, NSDictionary *seed) {
+    if ([seed[@"kind"] isEqual:@"album"])
+        return [[t[@"album"] lowercaseString] isEqual:[seed[@"album"] lowercaseString]] &&
+               [[t[@"artist"] lowercaseString] isEqual:[seed[@"artist"] lowercaseString]];
+    return [t[@"id"] isEqual:seed[@"trackID"]];
+}
+
+NSArray<NSDictionary *> *MixCandidates(NSArray<NSDictionary *> *tracks, NSDictionary *seed,
+                                       NSInteger minIdleDays, NSUInteger limit) {
+    NSString *family = seed[@"family"], *artist = [seed[@"artist"] lowercaseString];
+    NSInteger seedYear = 0;
+    for (NSDictionary *t in tracks) if ([t[@"id"] isEqual:seed[@"trackID"]]) { seedYear = [t[@"year"] integerValue]; break; }
+    NSMutableArray *scored = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if ([t[@"dislike"] boolValue] || MixTrackInSeed(t, seed)) continue;
+        NSInteger idle = [t[@"idleDays"] integerValue];
+        if (idle >= 0 && idle < minIdleDays) continue;
+        double score = 0;
+        if ([[t[@"artist"] lowercaseString] isEqual:artist]) score += 3;
+        NSString *f = GenreFamily(t[@"genre"]);
+        if ([f isEqual:family]) score += 2;
+        else if ([f isEqual:@"other"] || [family isEqual:@"other"]) score += 0.5;
+        NSInteger year = [t[@"year"] integerValue];
+        if (seedYear > 0 && year > 0) score += MAX(0, 1.5 - labs(year - seedYear) / 6.0);
+        score += log1p(MixTrackWeight(t)) * 0.5;
+        if (score < 2) continue;   // a different family with nothing else in common doesn't belong
+        NSMutableDictionary *c = [t mutableCopy]; c[@"score"] = @(score);
+        [scored addObject:c];
+    }
+    [scored sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult r = [b[@"score"] compare:a[@"score"]];
+        return r != NSOrderedSame ? r : [a[@"id"] compare:b[@"id"]];
+    }];
+    return scored.count > limit ? [scored subarrayWithRange:NSMakeRange(0, limit)] : scored;
+}
+
+NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary *> *tracks) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *t in tracks) if (MixTrackInSeed(t, seed) && ![t[@"dislike"] boolValue]) [out addObject:t];
+    if ([seed[@"kind"] isEqual:@"album"]) {
+        // The album's standouts open the mix: favourites and most played, up to four.
+        [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            NSComparisonResult r = [@(MixTrackWeight(b)) compare:@(MixTrackWeight(a))];
+            return r != NSOrderedSame ? r : [a[@"id"] compare:b[@"id"]];
+        }];
+        if (out.count > 4) [out removeObjectsInRange:NSMakeRange(4, out.count - 4)];
+    }
+    return out;
+}
+
+NSArray<NSString *> *RuleMix(NSArray<NSDictionary *> *candidates, NSDictionary *seed,
+                             NSArray<NSDictionary *> *tracks, NSUInteger length, uint64_t salt) {
+    NSMutableArray *ids = [NSMutableArray array];
+    NSMutableArray *openers = [MixSeedTracks(seed, tracks) mutableCopy];
+    NSMutableArray *pool = [candidates mutableCopy];
+    uint64_t state = salt ^ 0xD1B54A32D192ED03ULL;
+    NSString *lastArtist = nil;
+    if (openers.count) { [ids addObject:openers[0][@"id"]]; lastArtist = [openers[0][@"artist"] lowercaseString]; [openers removeObjectAtIndex:0]; }
+    while (ids.count < length && (pool.count || openers.count)) {
+        // An album seed's other standouts are spread through the first half.
+        if (openers.count && ids.count % 3 == 0) {
+            NSDictionary *o = openers.firstObject;
+            [ids addObject:o[@"id"]]; lastArtist = [o[@"artist"] lowercaseString]; [openers removeObjectAtIndex:0];
+            continue;
+        }
+        double total = 0;
+        NSMutableArray *eligible = [NSMutableArray array];
+        for (NSDictionary *c in pool) if (![[c[@"artist"] lowercaseString] isEqual:lastArtist]) { [eligible addObject:c]; total += [c[@"score"] doubleValue]; }
+        if (!eligible.count) {
+            if (!openers.count) break;
+            NSDictionary *o = openers.firstObject;   // nothing else fits here: place the next standout now
+            [ids addObject:o[@"id"]]; lastArtist = [o[@"artist"] lowercaseString]; [openers removeObjectAtIndex:0];
+            continue;
+        }
+        double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
+        NSDictionary *pick = eligible.lastObject;
+        for (NSDictionary *c in eligible) { r -= [c[@"score"] doubleValue]; if (r <= 0) { pick = c; break; } }
+        [ids addObject:pick[@"id"]]; lastArtist = [pick[@"artist"] lowercaseString];
+        [pool removeObject:pick];
+    }
+    return ids;
+}
+
+NSString *MixPrompt(NSDictionary *seed, NSArray<NSDictionary *> *candidates, NSUInteger length) {
+    NSMutableString *p = [NSMutableString string];
+    BOOL album = [seed[@"kind"] isEqual:@"album"];
+    [p appendFormat:@"You are a DJ building a %lu-track listening session from one person's music library.\n", (unsigned long)length];
+    [p appendFormat:@"Seed %@: \"%@\" by %@.\n", album ? @"album" : @"song", album ? seed[@"album"] : seed[@"title"], seed[@"artist"]];
+    [p appendString:@"Pick tracks ONLY from the candidates below and put them in a good listening order: start close to "
+                     "the seed's sound, drift gradually, keep energy coherent, never the same artist twice in a row, "
+                     "at most 3 tracks per artist. Use your knowledge of the artists and songs, not just the genre labels.\n"];
+    if (album) [p appendString:@"Weave in a few of the seed album's own tracks if they are listed.\n"];
+    [p appendFormat:@"Reply with ONLY a JSON array of %lu candidate ids, in order. No other text.\n\nCandidates (id | artist | title | genre | year):\n", (unsigned long)length];
+    for (NSDictionary *c in candidates)
+        [p appendFormat:@"%@ | %@ | %@ | %@ | %@\n", c[@"id"], c[@"artist"] ?: @"", c[@"title"] ?: @"", c[@"genre"] ?: @"",
+            [c[@"year"] integerValue] > 0 ? c[@"year"] : @"?"];
+    return p;
+}
+
+NSArray<NSString *> *ParseMixReply(NSString *reply, NSSet<NSString *> *allowed, NSUInteger maxLength) {
+    NSRange open = [reply rangeOfString:@"["], close = [reply rangeOfString:@"]" options:NSBackwardsSearch];
+    if (open.location == NSNotFound || close.location == NSNotFound || close.location < open.location) return @[];
+    NSData *data = [[reply substringWithRange:NSMakeRange(open.location, close.location - open.location + 1)] dataUsingEncoding:NSUTF8StringEncoding];
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (id item in json) {
+        NSString *id_ = [item isKindOfClass:NSString.class] ? item : [item isKindOfClass:NSNumber.class] ? [item stringValue] : nil;
+        if (!id_ || ![allowed containsObject:id_] || [seen containsObject:id_]) continue;
+        [seen addObject:id_]; [out addObject:id_];
+        if (out.count >= maxLength) break;
+    }
+    return out;
+}
+
+NSString *SeedCaption(NSString *title) {
+    NSString *t = title ?: @"";
+    for (NSString *pattern in @[@"\\s*[\\(\\[][^\\)\\]]*(feat\\.?|ft\\.?|with|remaster|version|edit|mix|live|deluxe|edition)[^\\)\\]]*[\\)\\]]",
+                                @"\\s+-\\s+(single|ep)$", @"\\s+(ep)$"]) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
+        t = [re stringByReplacingMatchesInString:t options:0 range:NSMakeRange(0, t.length) withTemplate:@""];
+    }
+    t = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    return t.length ? t : (title ?: @"");
+}
+
