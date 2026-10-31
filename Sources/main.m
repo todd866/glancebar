@@ -2,6 +2,7 @@
 // with storage, battery, system, and AI summaries plus a deeper details window.
 // Single-file Objective-C/AppKit. Zero dependencies, no sudo. Pure logic in pure.{h,m}.
 #import <Cocoa/Cocoa.h>
+#import <Carbon/Carbon.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
@@ -5444,6 +5445,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,
@@ -7832,6 +7834,29 @@ static BOOL BarItemOnBar(NSStatusItem *item) {
 
 #pragma mark popover
 
+// F3 opens Glancebar: the Mission Control key on Apple keyboards (key code 160) and F3
+// itself, as global hot keys (no Accessibility permission). Opt-in: popoverHotKey.
+static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event, void *client) {
+    (void)next; (void)event;
+    Controller *controller = (__bridge Controller *)client;
+    dispatch_async(dispatch_get_main_queue(), ^{ [controller togglePopover:nil]; });
+    return noErr;
+}
+- (void)registerPopoverHotKeys {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"popoverHotKey"]) return;
+    static BOOL installed;
+    if (installed) return;
+    installed = YES;
+    EventTypeSpec pressed = {kEventClassKeyboard, kEventHotKeyPressed};
+    InstallApplicationEventHandler(&GBPopoverHotKeyPressed, 1, &pressed, (__bridge void *)self, NULL);
+    UInt32 codes[] = {160, kVK_F3};
+    for (UInt32 i = 0; i < 2; i++) {
+        EventHotKeyRef ref = NULL;
+        EventHotKeyID hid = {'GBar', i + 1};
+        OSStatus status = RegisterEventHotKey(codes[i], 0, hid, GetApplicationEventTarget(), 0, &ref);
+        os_log(OS_LOG_DEFAULT, "Glancebar hot key %u: %d", (unsigned)codes[i], (int)status);
+    }
+}
 - (void)togglePopover:(id)sender {
     if (_popover.isShown) { [_popover close]; return; }
     // A transient popover dismisses on the mouse-DOWN of an outside click — and a click on
