@@ -2269,28 +2269,42 @@ int main(void) {
             [lib addObject:T(@"RECENT", @"Played Yesterday", @"Rezident", @"Only For A Moment", @"House", 2021, 50, 1, YES, NO)];
             [lib addObject:T(@"NOPE", @"Disliked", @"Someone", @"X", @"Electronic", 2001, 99, 30, YES, YES)];
             [lib addObject:T(@"DAUG", @"Youth", @"Daughter", @"If You Leave", @"Alternative", 2013, 20, 40, YES, NO)];
+            [lib addObject:T(@"LORDE", @"Royals", @"Lorde", @"Pure Heroine", @"Pop", 2013, 0, -1, YES, NO)];      // favourite, never played here
+            [lib addObject:T(@"NEVER", @"Unknown", @"Nobody", @"Z", @"Pop", 2013, 0, -1, NO, NO)];             // neither
 
             check([GenreFamily(@"Electronic") isEqual:@"dance"] && [GenreFamily(@"Hip-Hop/Rap") isEqual:@"rap"] &&
                   [GenreFamily(@"Indie Rock") isEqual:@"alt"] && [GenreFamily(@"R&B/Soul") isEqual:@"rap"] &&
                   [GenreFamily(@"Pop") isEqual:@"pop"] && [GenreFamily(@"Soundtrack") isEqual:@"other"], @"mix: genre families");
 
             NSArray *seeds = ChooseMixSeeds(lib, @[], 4, 7);
-            NSMutableSet *artists = [NSMutableSet set]; BOOL hasAlbum = NO, hasSong = NO, disliked = NO;
+            NSMutableSet *artists = [NSMutableSet set]; BOOL allSongs = YES, unplayed = NO, disliked = NO;
             for (NSDictionary *sd in seeds) {
                 [artists addObject:sd[@"artist"]];
-                hasAlbum |= [sd[@"kind"] isEqual:@"album"]; hasSong |= [sd[@"kind"] isEqual:@"song"];
+                allSongs &= [sd[@"kind"] isEqual:@"song"];
+                unplayed |= [sd[@"trackID"] isEqual:@"LORDE"] || [sd[@"trackID"] isEqual:@"NEVER"];
                 disliked |= [sd[@"trackID"] isEqual:@"NOPE"];
             }
-            check(seeds.count == 4 && artists.count == 4 && hasAlbum && hasSong && !disliked, @"mix: four seeds, mixed kinds, distinct artists");
+            check(seeds.count == 4 && artists.count == 4 && allSongs && !disliked, @"mix: four song seeds, distinct artists");
+            check(!unplayed, @"mix: seeds come from songs actually played while enough remain");
             check([seeds isEqual:ChooseMixSeeds(lib, @[], 4, 7)], @"mix: seeds are deterministic for a salt");
             NSMutableArray *keys = [NSMutableArray array]; for (NSDictionary *sd in seeds) [keys addObject:sd[@"key"]];
             BOOL repeat = NO;
             for (NSDictionary *sd in ChooseMixSeeds(lib, keys, 4, 7)) repeat |= [keys containsObject:sd[@"key"]];
             check(!repeat, @"mix: recent seeds are not offered again");
 
-            NSDictionary *bonobo = nil;
-            for (NSDictionary *sd in ChooseMixSeeds(lib, @[], 12, 3)) if ([sd[@"key"] hasPrefix:@"album:bonobo"]) bonobo = sd;
-            check(bonobo && [bonobo[@"title"] isEqual:@"Animal Magic"] && [bonobo[@"trackID"] hasPrefix:@"BON"], @"mix: an album seed carries its album and a cover track");
+            NSMutableSet *wide = [NSMutableSet set];
+            for (NSDictionary *sd in ChooseMixSeeds(lib, @[], 12, 3)) [wide addObject:sd[@"trackID"]];
+            check([wide containsObject:@"LORDE"] && ![wide containsObject:@"NEVER"] && wide.count == 7,
+                  @"mix: favourites fill in after played songs run out; never-played non-favourites never");
+            NSString *query = MixArtSearchURL(@"Pete Murray", @"Better Days (Remastered)").absoluteString;
+            check([query hasPrefix:@"https://itunes.apple.com/search?"] && [query containsString:@"Pete%20Murray%20Better%20Days&"] &&
+                  [query containsString:@"entity=song"], @"mix art: search names the artist and the plain title");
+            NSData *reply = [@"{\"results\":[{\"artistName\":\"Someone Else\",\"artworkUrl100\":\"https://a/x/100x100bb.jpg\"},"
+                              "{\"artistName\":\"Pete Murray\",\"artworkUrl100\":\"https://a/y/100x100bb.jpg\"}]}" dataUsingEncoding:NSUTF8StringEncoding];
+            check([MixArtURLFromSearch(reply, @"Pete Murray", 300) isEqual:@"https://a/y/300x300bb.jpg"], @"mix art: prefers the same artist, sized up");
+            check([MixArtURLFromSearch(reply, @"Nobody", 300) isEqual:@"https://a/x/300x300bb.jpg"] &&
+                  MixArtURLFromSearch([@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding], @"X", 300) == nil &&
+                  MixArtURLFromSearch(nil, @"X", 300) == nil, @"mix art: first result otherwise; nothing from an empty reply");
 
             NSDictionary *songSeed = @{@"key": @"song:FRED", @"kind": @"song", @"trackID": @"FRED", @"title": @"Delilah",
                                        @"artist": @"Fred again..", @"album": @"Actual Life 3", @"family": @"dance"};
