@@ -2262,6 +2262,10 @@ int main(void) {
             NSArray *mhz = DVFSTableMHz([NSData dataWithBytes:raw length:sizeof raw]);
             check(mhz.count == 2 && fabs([mhz[0] doubleValue] - 1308) < 0.01 && fabs([mhz[1] doubleValue] - 4464) < 0.01,
                   @"clocks: DVFS table in kHz, zero entries dropped");
+            uint32_t hz[4] = {600000000, 0, 3504000000u, 0};   // M2 stores Hz
+            NSArray *m2 = DVFSTableMHz([NSData dataWithBytes:hz length:sizeof hz]);
+            check(m2.count == 2 && fabs([m2[0] doubleValue] - 600) < 0.01 && fabs([m2[1] doubleValue] - 3504) < 0.01,
+                  @"clocks: an M2 table in Hz reads as MHz");
         }
         {
             NSArray *table = @[@1308, @1608, @1932, @2220];

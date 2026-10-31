@@ -2638,10 +2638,14 @@ BOOL HeatShowing(ThermalLevel chip, double cellC) {
 NSArray<NSNumber *> *DVFSTableMHz(NSData *blob) {
     NSMutableArray *out = [NSMutableArray array];
     const uint8_t *bytes = blob.bytes;
+    double top = 0;
     for (NSUInteger i = 0; i + 8 <= blob.length; i += 8) {
-        uint32_t kHz = (uint32_t)bytes[i] | (uint32_t)bytes[i + 1] << 8 | (uint32_t)bytes[i + 2] << 16 | (uint32_t)bytes[i + 3] << 24;
-        if (kHz) [out addObject:@(kHz / 1000.0)];
+        uint32_t raw = (uint32_t)bytes[i] | (uint32_t)bytes[i + 1] << 8 | (uint32_t)bytes[i + 2] << 16 | (uint32_t)bytes[i + 3] << 24;
+        if (raw) { [out addObject:@(raw)]; top = MAX(top, raw); }
     }
+    // M5 stores kHz (4464000), M2 stores Hz (3504000000). No core clocks past 100 GHz.
+    double perMHz = top > 1e8 ? 1e6 : 1e3;
+    for (NSUInteger i = 0; i < out.count; i++) out[i] = @([out[i] doubleValue] / perMHz);
     return out;
 }
 

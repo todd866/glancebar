@@ -712,7 +712,7 @@ BOOL HeatShowing(ThermalLevel chip, double cellC);
 
 // Core clocks, from IOReport's CPU performance-state residency (no root needed).
 // A DVFS table is the device tree's voltage-states blob: 8-byte entries whose first
-// uint32 is the frequency in kHz. Returns MHz, ascending, zero entries dropped.
+// uint32 is the frequency, in kHz on M5 and in Hz on M2. Returns MHz, zero entries dropped.
 NSArray<NSNumber *> *DVFSTableMHz(NSData *blob);
 // States are named IDLE/OFF/DOWN or V<k>P<m>, k indexing the DVFS table. Returns the
 // residency-weighted MHz while active (0 when never active); *busy is the active share.
