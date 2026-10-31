@@ -298,6 +298,17 @@ truncate/regrow, and privacy-safe deduplication. The IORegistry,
 disk, `top`, `ps`, and AppKit plumbing live in the app shell. CI repeats the sanitizer,
 static-analysis, Universal 2 build, bundle-version, architecture, and signing checks.
 
+## Morning check
+
+A token-free check of Glancebar, Energybar, the worker Macs, iDrive, and the stash reclaim log. It runs at 02:15. The repo does not load the agent; install it from a checkout at `~/Projects/glancebar`:
+
+```bash
+mkdir -p ~/Library/Logs/menubar-morning-check
+cp tools/ops/com.iantodd.menubar-morning-check.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iantodd.menubar-morning-check.plist
+```
+
+`tools/ops/menubar-morning-check.sh` writes `~/Library/Logs/menubar-morning-check/latest.txt`. `--check` lists the probes, `--quick` skips both test suites, and a `YYYY-MM-DD` line in `skip-dates` skips that morning. An all-clear run stays silent; any FAIL or WARN posts one notification.
+
 ## Repository
 
 ```
