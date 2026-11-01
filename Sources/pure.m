@@ -1376,14 +1376,31 @@ NSDictionary<NSString *, NSArray<NSDictionary *> *> *ParseProcessStats(NSString 
 }
 
 NSNumber *ParseSleepDisabled(NSString *pmsetOutput) {
+    BOOL systemHeader = NO, activeHeader = NO, sleepTimer = NO;
     for (NSString *line in [pmsetOutput componentsSeparatedByString:@"\n"]) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([trimmed isEqualToString:@"System-wide power settings:"]) systemHeader = YES;
+        if (systemHeader && [trimmed isEqualToString:@"Currently in use:"]) activeHeader = YES;
         NSMutableArray<NSString *> *parts = [NSMutableArray array];
         for (NSString *s in [line componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet])
             if (s.length) [parts addObject:s];
-        if (parts.count >= 2 && [parts[0] isEqualToString:@"SleepDisabled"])
-            return @(parts[1].integerValue != 0);
+        if (parts.count && [parts[0] isEqualToString:@"SleepDisabled"]) {
+            if (parts.count != 2) return nil;
+            NSScanner *scanner = [NSScanner scannerWithString:parts[1]];
+            long long value;
+            if (![scanner scanLongLong:&value] || !scanner.isAtEnd) return nil;
+            return @(value != 0);
+        }
+        if (activeHeader && parts.count >= 2 && [parts[0] isEqualToString:@"sleep"]) {
+            NSScanner *scanner = [NSScanner scannerWithString:parts[1]];
+            long long value;
+            sleepTimer = [scanner scanLongLong:&value] && scanner.isAtEnd && value >= 0;
+        }
     }
-    return nil;
+    // pmset only prints SleepDisabled when the system preference has been set.
+    // A normal settings report without it means the default (sleep enabled).
+    // Require a recognizable report so errors/truncated output remain unknown.
+    return systemHeader && activeHeader && sleepTimer ? @NO : nil;
 }
 
 NSString *PmsetSudoersRule(NSString *user) {

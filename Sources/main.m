@@ -4885,8 +4885,13 @@ static CGFloat kDetailW = 600;
 
 // Identifies our observation of the status button's effectiveAppearance.
 static void *kBarAppearanceContext = &kBarAppearanceContext;
+static NSString *const kShowPopoverNotification = @"com.iantodd.glancebar.show-popover";
+static NSString *PopoverRequestObject(void) {
+    return [NSString stringWithFormat:@"uid:%u", getuid()];
+}
 
 @interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate>
+@property(nonatomic) BOOL showPopoverOnLaunch;
 @end
 
 @interface Controller ()
@@ -5674,6 +5679,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     int token = 0;
     notify_register_dispatch("com.apple.system.powermanagement.poweradapter", &token,
                              dispatch_get_main_queue(), ^(int __unused t) { [self schedulePowerRefresh]; });
+    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(showPopoverRequested:)
+        name:kShowPopoverNotification object:PopoverRequestObject()
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    if (self.showPopoverOnLaunch) [self showPopoverRequested:nil];
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefresh]; }
@@ -8063,6 +8072,16 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         os_log(OS_LOG_DEFAULT, "Glancebar hot key %u: %d", (unsigned)codes[i], (int)status);
     }
 }
+- (void)showPopoverRequested:(NSNotification *)notification {
+    (void)notification;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self showPopoverRequested:nil]; });
+        return;
+    }
+    // A Touch Bar tap means show, never toggle shut on a repeated request.
+    if (_terminating || !_popover || _popover.isShown) return;
+    [self togglePopover:nil];
+}
 - (void)togglePopover:(id)sender {
     if (_popover.isShown) { [_popover close]; return; }
     // A transient popover dismisses on the mouse-DOWN of an outside click — and a click on
@@ -9961,7 +9980,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         // Flipping blind could turn the setting ON when the user meant OFF.
         NSAlert *alert = [NSAlert new];
         alert.messageText = @"Couldn’t read the current sleep setting";
-        alert.informativeText = @"pmset -g did not answer, so Glancebar can’t tell whether Keep Awake is already on. Try again, or check with `pmset -g | grep SleepDisabled`.";
+        alert.informativeText = @"Glancebar couldn’t read a valid power-settings report from pmset -g, so it can’t tell whether Keep Awake is already on. Try again, or check with `pmset -g`.";
         [alert runModal];
         return;
     }
@@ -12425,10 +12444,12 @@ static void PrintUsage(FILE *stream) {
         "Glancebar %s\n"
         "Usage: Glancebar [--dump [--json] [--strict] [--online]]\n"
         "       Glancebar --sample\n"
+        "       Glancebar --show-popover\n"
         "       Glancebar --version\n"
         "       Glancebar --help\n\n"
         "  --activity-json  Take one read-only app CPU/network snapshot.\n"
         "  --sample   Print one JSON line: CPU, memory, thermal pressure, clocks, temperatures, battery.\n"
+        "  --show-popover  Show the existing popover, launching this app if needed; no Accessibility permission.\n"
         "  --dump     Print a local machine and AI status snapshot.\n"
         "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
         "  --strict   Exit 2 when any sampled source is partial/unavailable.\n"
@@ -12441,7 +12462,7 @@ static void PrintUsage(FILE *stream) {
 // status item under the terminal (or another parent app) and inherit that app's
 // "Allow in the Menu Bar" setting. Relaunch before NSApplication creates any item.
 // CLI modes return above and intentionally remain ordinary direct processes.
-static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched) {
+static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, BOOL showPopover) {
     NSString *expected = NSBundle.mainBundle.bundleIdentifier;
     if (expected.length == 0) {
         fprintf(stderr, "Glancebar: app bundle has no identifier; refusing GUI launch\n");
@@ -12464,7 +12485,9 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched) {
 
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
-    task.arguments = @[bundleURL.path, @"--args", @"--glancebar-launch-services-relaunch"];
+    NSMutableArray *arguments = [NSMutableArray arrayWithArray:@[bundleURL.path, @"--args", @"--glancebar-launch-services-relaunch"]];
+    if (showPopover) [arguments addObject:@"--show-popover"];
+    task.arguments = arguments;
     NSError *error = nil;
     if (![task launchAndReturnError:&error]) {
         fprintf(stderr, "Glancebar: could not relaunch through Launch Services: %s\n",
@@ -12482,11 +12505,12 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO;
+        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO, showPopover = NO;
         const char *onlineEnvironment = getenv("GLANCEBAR_ALLOW_ACCOUNT");
         BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--activity-json") == 0) activityJSON = YES;
+            else if (strcmp(argv[i], "--show-popover") == 0) showPopover = YES;
             else if (strcmp(argv[i], "--sample") == 0) return PrintSampleLine();
             else if (strcmp(argv[i], "--dump") == 0) dump = YES;
             else if (strcmp(argv[i], "--json") == 0) json = YES;
@@ -12497,6 +12521,19 @@ int main(int argc, const char **argv) {
             else if (strcmp(argv[i], "--version") == 0) { printf("Glancebar %s\n", UTF8(GBVersion)); return 0; }
             else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { PrintUsage(stdout); return 0; }
             else { fprintf(stderr, "Glancebar: unknown option '%s'\n", argv[i]); PrintUsage(stderr); return 64; }
+        }
+        if (showPopover && (dump || json || strict || onlineArgument || activityJSON)) {
+            fprintf(stderr, "Glancebar: --show-popover cannot be combined with snapshot options\n");
+            return 64;
+        }
+        if (showPopover) {
+            NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
+            for (NSRunningApplication *owner in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID]) {
+                if (owner.processIdentifier == getpid() || owner.isTerminated) continue;
+                [NSDistributedNotificationCenter.defaultCenter postNotificationName:kShowPopoverNotification
+                    object:PopoverRequestObject() userInfo:nil deliverImmediately:YES];
+                return 0; // Request delivered to the user's session; not a visibility receipt.
+            }
         }
         if (activityJSON) return PrintJSON(GBActivitySurvey()) ? 0 : 70;
         if ((json || strict || onlineArgument) && !dump) {
@@ -12510,10 +12547,11 @@ int main(int argc, const char **argv) {
             } else PrintHumanDump(snapshot);
             return strict && [snapshot[@"status"] isEqualToString:@"partial"] ? 2 : 0;
         }
-        int relaunchResult = RelaunchGUIThroughLaunchServicesIfNeeded(alreadyRelaunched);
+        int relaunchResult = RelaunchGUIThroughLaunchServicesIfNeeded(alreadyRelaunched, showPopover);
         if (relaunchResult >= 0) return relaunchResult;
         NSApplication *app = NSApplication.sharedApplication;
         Controller *controller = [Controller new];
+        controller.showPopoverOnLaunch = showPopover;
         app.delegate = controller;
         [app run];
     }

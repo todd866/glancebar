@@ -46,6 +46,23 @@ static NSDictionary *Fixture(void) {
 @implementation ShownPopover
 - (BOOL)isShown { return YES; }
 @end
+@interface RequestPopover : NSPopover
+@property BOOL requestedVisible;
+@end
+@implementation RequestPopover
+- (BOOL)isShown { return self.requestedVisible; }
+@end
+@interface PopoverRequestController : Controller
+@property NSUInteger showCalls;
+@end
+@implementation PopoverRequestController
+- (void)togglePopover:(id)sender {
+    (void)sender;
+    Check(NSThread.isMainThread, @"popover requests execute on the main thread");
+    self.showCalls++;
+    ((RequestPopover *)[self valueForKey:@"popover"]).requestedVisible = YES;
+}
+@end
 @interface NoNetworkSession : NSObject
 @property NSUInteger requests;
 @end
@@ -95,6 +112,23 @@ static BOOL Render(NSView *view, NSString *path, NSAppearanceName appearance) {
 int main(int argc, const char **argv) { @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    PopoverRequestController *requestController = [PopoverRequestController new];
+    [requestController showPopoverRequested:nil];
+    Check(requestController.showCalls == 0, @"request before popover initialization does nothing");
+    RequestPopover *requestPopover = [RequestPopover new];
+    [requestController setValue:requestPopover forKey:@"popover"];
+    [requestController showPopoverRequested:nil];
+    [requestController showPopoverRequested:nil];
+    Check(requestController.showCalls == 1 && requestPopover.isShown, @"repeated show requests never close the popover");
+    requestPopover.requestedVisible = NO;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ [requestController showPopoverRequested:nil]; });
+    Await(^BOOL { return requestController.showCalls == 2; });
+    [requestController setValue:@YES forKey:@"terminating"];
+    requestPopover.requestedVisible = NO;
+    [requestController showPopoverRequested:nil];
+    Check(requestController.showCalls == 2, @"show request cannot reopen during termination");
+    const char *conflictingArgs[] = {"Glancebar", "--show-popover", "--dump"};
+    Check(GlancebarApplicationMain(3, conflictingArgs) == 64, @"show command rejects snapshot options before any action");
     NSString *home = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"glancebar-activity-ui-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     [NSFileManager.defaultManager createDirectoryAtPath:home withIntermediateDirectories:YES attributes:nil error:NULL];
     setenv("GLANCEBAR_HOME", home.UTF8String, 1);

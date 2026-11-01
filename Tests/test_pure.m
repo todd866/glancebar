@@ -1328,6 +1328,15 @@ int main(void) {
               @"does not match a longer token (SleepDisabledExtra)");
         check([ParseSleepDisabled(@" SleepDisabled 2") isEqual:@YES], @"any nonzero value → YES");
 
+        NSString *pmsetUnset = @"System-wide power settings:\nCurrently in use:\n standby 1\n sleep 1 (sleep prevented by caffeinate, powerd)\n displaysleep 10\n";
+        check([ParseSleepDisabled(pmsetUnset) isEqual:@NO], @"fresh Mac with no SleepDisabled preference defaults to off");
+        check(ParseSleepDisabled(@"System-wide power settings:\nCurrently in use:\n") == nil,
+              @"truncated settings report remains unknown");
+        check(ParseSleepDisabled(@"pmset: failed to read settings") == nil, @"command error remains unknown");
+        check(ParseSleepDisabled([@" SleepDisabled invalid\n" stringByAppendingString:pmsetUnset]) == nil,
+              @"malformed explicit setting must not default to off");
+        check(ParseSleepDisabled(@" SleepDisabled") == nil, @"missing setting value remains unknown");
+
         // --- GUIRequiresLaunchServicesRelaunch ---
         check(!GUIRequiresLaunchServicesRelaunch(@"com.iantodd.glancebar",
                                                  @"com.iantodd.glancebar"),
