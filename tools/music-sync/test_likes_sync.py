@@ -38,6 +38,71 @@ def decode_js(script: str) -> str:
     return base64.b64decode(match.group(1)).decode()
 
 
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def make_jwt(alg: str, exp: int, kid: str = "TESTKEY1") -> str:
+    header = {"alg": alg}
+    if kid:
+        header["kid"] = kid
+    payload = {"exp": exp}
+    parts = [
+        b64url(json.dumps(header, separators=(",", ":")).encode()),
+        b64url(json.dumps(payload, separators=(",", ":")).encode()),
+        b64url(b"signature-bytes"),
+    ]
+    return ".".join(parts)
+
+
+# Public fixture. The ES256 token is the one the bundle snippet carries; the HS256 one is a decoy.
+APPLE_DEV_EXP = 2_000_000_000
+APPLE_DEV_EXP_TEXT = "2033-05-18T03:33:20Z"
+APPLE_DEV_TOKEN = (
+    "eyJhbGciOiJFUzI1NiIsImtpZCI6IlRFU1RLRVkxIn0"
+    ".eyJleHAiOjIwMDAwMDAwMDB9"
+    ".c2lnbmF0dXJlLWJ5dGVz"
+)
+APPLE_HS256_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjIwMDAwMDAwMDB9.c2lnbmF0dXJlLWJ5dGVz"
+APPLE_HOME_HTML = """<!DOCTYPE html>
+<html><head>
+<script src="/assets/vendor-aaa.js"></script>
+<script type="module" crossorigin src="/assets/index~abc123.js"></script>
+</head></html>
+"""
+APPLE_BUNDLE_JS = (
+    "/* apple music web player */\n"
+    'var config = {"developerToken":"' + APPLE_DEV_TOKEN + '"};\n'
+    'var ignored = "' + APPLE_HS256_TOKEN + '";\n'
+)
+VENDOR_JS = 'var vendor = "' + APPLE_HS256_TOKEN + '";\n'
+
+
+def apple_pages(html: str = APPLE_HOME_HTML, bundle: str = APPLE_BUNDLE_JS, vendor: str = VENDOR_JS) -> dict:
+    pages = {
+        "https://music.apple.com/": html,
+        "https://music.apple.com/au/home": html,
+    }
+    for url in likes_sync.apple_bundle_urls(html):
+        pages[url] = vendor if "vendor" in url else bundle
+    return pages
+
+
+def mapped_fetch(pages: dict, seen: list | None = None):
+    urls = seen if seen is not None else []
+
+    def fetch(url: str) -> str:
+        urls.append(url)
+        if url not in pages:
+            raise RuntimeError("unexpected url " + url)
+        body = pages[url]
+        if isinstance(body, Exception):
+            raise body
+        return body
+
+    return fetch, urls
+
+
 class Rng:
     def __init__(self):
         self.calls = []
@@ -124,6 +189,7 @@ class ScriptedOSA:
 def runners_for(osa: ScriptedOSA, sleeps: list | None = None):
     rng = Rng()
     bucket = sleeps if sleeps is not None else []
+    fetch, fetched = mapped_fetch(apple_pages())
     runners = likes_sync.Runners(
         osascript=osa,
         mdls=lambda _path: "",
@@ -132,7 +198,9 @@ def runners_for(osa: ScriptedOSA, sleeps: list | None = None):
         sleep=bucket.append,
         clock=lambda: "2026-11-01T00:00:00Z",
         rng=rng,
+        fetch=fetch,
     )
+    runners.fetched = fetched
     return runners, rng
 
 
@@ -561,9 +629,17 @@ class ArchiveAndLibraryTests(unittest.TestCase):
         self.assertNotIn("JSON.stringify(picked)", probe)
         self.assertNotIn("JSON.stringify(user)", probe)
         self.assertNotIn("JSON.stringify(read)", probe)
+        store = likes_sync.storefront_js()
+        self.assertIn("/v1/me/storefront", store)
+        self.assertIn("media-user-token", store)
+        self.assertIn("Media-User-Token", store)
+        self.assertIn('{method: "GET"}', store)
+        self.assertNotIn("POST", store)
+        self.assertNotIn("PUT", store)
         self.assertIsNone(likes_sync._JWT_RE.search(catalog))
         self.assertIsNone(likes_sync._JWT_RE.search(probe))
         self.assertIsNone(likes_sync._JWT_RE.search(auth))
+        self.assertIsNone(likes_sync._JWT_RE.search(store))
         wrapped = likes_sync.js_wrapper("return \"yes\"")
         self.assertNotIn('"', wrapped)
 
@@ -683,6 +759,18 @@ class ApplyBookkeepingTests(unittest.TestCase):
 
 
 class AccountApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.previous = os.environ.get("MUSIC_SYNC_STATE")
+        os.environ["MUSIC_SYNC_STATE"] = self.tmp.name
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("MUSIC_SYNC_STATE", None)
+        else:
+            os.environ["MUSIC_SYNC_STATE"] = self.previous
+        self.tmp.cleanup()
+
     def test_library_hit_favourites_without_opening_chrome(self):
         osa = ScriptedOSA(
             library=library_text([("P123", "Song - Remastered 2011", "Band", "LP", "false")])
@@ -705,6 +793,7 @@ class AccountApplyTests(unittest.TestCase):
         self.assertFalse(any("make new tab" in script for script in osa.scripts))
         self.assertIn("P123", osa.favorited[0])
         self.assertIn("to true", osa.favorited[0])
+        self.assertEqual(runners.fetched, [])
 
     def test_catalog_artist_mismatch_is_no_match(self):
         osa = ScriptedOSA(songs=[{"id": "999", "title": "Song", "artist": "Someone Else"}])
@@ -730,14 +819,15 @@ class AccountApplyTests(unittest.TestCase):
             songs=[{"id": "999", "title": "Song - Remastered 2011", "artist": "Band - Topic"}]
         )
         runners, _rng = runners_for(osa)
-        outcomes, stopped = silence(
+        _code, stdout, stderr = silence(
             likes_sync.apply_apple,
             [{"videoId": "v", "title": "Song (feat. Pal)", "artist": "Band"}],
             runners,
             None,
             25,
             set(),
-        )[0]
+        )
+        outcomes, stopped = _code
         self.assertFalse(stopped)
         self.assertEqual(outcomes[0]["action"], "catalog-add-love")
         self.assertEqual(outcomes[0]["ids"]["catalogId"], "999")
@@ -748,6 +838,18 @@ class AccountApplyTests(unittest.TestCase):
         self.assertNotIn("removelike", osa.loved[0])
         self.assertEqual(osa.closed, 1)
         self.assertIn("https://music.apple.com", osa.scripts[1])
+        decoded = [
+            decode_js(script)
+            for script in osa.scripts
+            if "javascript" in script and "execute" in script
+        ]
+        self.assertTrue(any(APPLE_DEV_TOKEN in script and "ms-auth-am" in script for script in decoded))
+        self.assertTrue(any(APPLE_DEV_TOKEN in script and "/v1/catalog/" in script for script in decoded))
+        self.assertIn(APPLE_DEV_TOKEN, osa.loved[0])
+        self.assertIn("media-user-token", osa.loved[0])
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+        self.assertTrue(all(url.startswith("https://music.apple.com/") for url in runners.fetched))
 
     def test_youtube_like_and_artist_mismatch(self):
         osa = ScriptedOSA(songs=[{"videoId": "abc_1", "title": "Song", "artist": "Band"}])
@@ -961,7 +1063,7 @@ class CommandTests(unittest.TestCase):
         def boom(*_args, **_kwargs):
             raise AssertionError("dry-run touched an account runner")
 
-        tool_runners = likes_sync.Runners(osascript=boom, mdls=boom, ffprobe=boom, sleep=boom)
+        tool_runners = likes_sync.Runners(osascript=boom, mdls=boom, ffprobe=boom, sleep=boom, fetch=boom)
         args = likes_sync.build_parser().parse_args(["apply", "--side", "am"])
         self.assertEqual(args.limit, 25)
         self.assertFalse(args.apply)
@@ -983,12 +1085,336 @@ class CommandTests(unittest.TestCase):
             silence(
                 likes_sync.main,
                 ["inventory", "--archive", str(Path(self.tmp.name) / "missing.txt")],
-                likes_sync.Runners(osascript=boom),
+                likes_sync.Runners(osascript=boom, fetch=boom),
             )
         self.assertIn("archive not found", str(caught.exception))
 
 
+def chrome_probe(payload, storefront_job=None):
+    """Fake Chrome plus a fixture Apple web bundle. No network."""
+    ticks = {"n": 0}
+
+    def monotonic():
+        ticks["n"] += 1
+        return float(ticks["n"])
+
+    class OSA:
+        def __init__(self):
+            self.closed = 0
+            self.scripts = []
+            self.storefront = ""
+
+        def __call__(self, source):
+            if "make new tab" in source:
+                self.scripts.append(source)
+                return "15,27\n"
+            if "\nclose t\n" in source:
+                self.closed += 1
+                return "closed\n"
+            if "loading of t" in source:
+                return "ready\n"
+            if "javascript" in source and "execute" in source:
+                decoded = decode_js(source)
+                if "ms-probe-am" in decoded:
+                    return json.dumps(payload)
+                if "/v1/me/storefront" in decoded:
+                    if storefront_job is None:
+                        raise AssertionError("storefront was called")
+                    self.storefront = decoded
+                    return "started"
+                if "JSON.stringify(r)" in decoded:
+                    if storefront_job is None:
+                        raise AssertionError("polled without a storefront call")
+                    return json.dumps(storefront_job)
+                if "readyState" in decoded:
+                    return "yes"
+                raise AssertionError(decoded[:240])
+            raise AssertionError(source[:240])
+
+    osa = OSA()
+    fetch, fetched = mapped_fetch(apple_pages())
+    runners = likes_sync.Runners(
+        osascript=osa,
+        sleep=lambda _seconds: None,
+        monotonic=monotonic,
+        fetch=fetch,
+    )
+    runners.fetched = fetched
+    return osa, runners
+
+
+class DeveloperTokenTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.previous = os.environ.get("MUSIC_SYNC_STATE")
+        os.environ["MUSIC_SYNC_STATE"] = self.tmp.name
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("MUSIC_SYNC_STATE", None)
+        else:
+            os.environ["MUSIC_SYNC_STATE"] = self.previous
+        self.tmp.cleanup()
+
+    def test_fixture_bundle_snippet_is_es256(self):
+        self.assertEqual(APPLE_DEV_TOKEN, make_jwt("ES256", APPLE_DEV_EXP))
+        self.assertTrue(APPLE_DEV_TOKEN.startswith("eyJhbGciOiJFUzI1NiIs"))
+        info = likes_sync.extract_developer_token(APPLE_BUNDLE_JS, now=1_700_000_000)
+        self.assertEqual(info["token"], APPLE_DEV_TOKEN)
+        self.assertEqual(info["exp"], APPLE_DEV_EXP)
+        self.assertIsNone(likes_sync.describe_developer_jwt(APPLE_HS256_TOKEN))
+        self.assertIsNone(likes_sync.describe_developer_jwt("eyJhbGciOiJub25lIn0.eyJleHAiOjF9.c2ln"))
+        self.assertIn('{"developerToken":"' + APPLE_DEV_TOKEN + '"}', APPLE_BUNDLE_JS)
+
+    def test_latest_unexpired_es256_wins(self):
+        earlier = make_jwt("ES256", 1_800_000_000, kid="A")
+        later = make_jwt("ES256", 2_100_000_000, kid="B")
+        script = 'var a="' + earlier + '";var b="' + later + '";var c="' + APPLE_HS256_TOKEN + '";'
+        info = likes_sync.extract_developer_token(script, now=1_700_000_000)
+        self.assertEqual(info["token"], later)
+        self.assertEqual(info["exp"], 2_100_000_000)
+        self.assertIsNone(likes_sync.extract_developer_token('var t="' + earlier + '";', now=1_800_000_000))
+
+    def test_bundle_urls_prefer_index_tilde_and_stay_on_apple(self):
+        html = """
+        <script src="https://evil.example/assets/index~nope.js"></script>
+        <script src="/assets/vendor-aaa.js"></script>
+        <link rel="modulepreload" href="/assets/index-zzz.js">
+        <script type="module" src="/assets/index~abc123.js"></script>
+        """
+        self.assertEqual(
+            likes_sync.apple_bundle_urls(html),
+            [
+                "https://music.apple.com/assets/index~nope.js",
+                "https://music.apple.com/assets/index~abc123.js",
+                "https://music.apple.com/assets/index-zzz.js",
+                "https://music.apple.com/assets/vendor-aaa.js",
+            ],
+        )
+
+    def test_cache_skips_fetch_until_the_claim_expires(self):
+        fetch, seen = mapped_fetch(apple_pages())
+        runners = likes_sync.Runners(fetch=fetch)
+        now = 1_700_000_000
+        first = likes_sync.load_developer_token(runners, now=now)
+        self.assertEqual(first["token"], APPLE_DEV_TOKEN)
+        self.assertEqual(first["exp"], APPLE_DEV_EXP)
+        self.assertEqual(
+            seen,
+            [
+                "https://music.apple.com/",
+                "https://music.apple.com/assets/index~abc123.js",
+            ],
+        )
+        path = Path(self.tmp.name) / likes_sync.DEVELOPER_CACHE
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved, {"token": APPLE_DEV_TOKEN, "exp": APPLE_DEV_EXP})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        seen.clear()
+        second = likes_sync.load_developer_token(runners, now=now)
+        self.assertEqual(second, first)
+        self.assertEqual(seen, [])
+
+        expired = make_jwt("ES256", 100)
+        path.write_text(json.dumps({"token": expired, "exp": 9_999_999_999}), encoding="utf-8")
+        refreshed = likes_sync.load_developer_token(runners, now=now)
+        self.assertEqual(refreshed["token"], APPLE_DEV_TOKEN)
+        self.assertEqual(
+            seen,
+            [
+                "https://music.apple.com/",
+                "https://music.apple.com/assets/index~abc123.js",
+            ],
+        )
+
+    def test_index_tilde_beats_an_inline_jwt_and_other_bundles(self):
+        decoy = make_jwt("ES256", 1_900_000_000, kid="INLINE")
+        other = make_jwt("ES256", 1_950_000_000, kid="OTHER")
+        html = (
+            "<!DOCTYPE html><html><head>"
+            '<link rel="modulepreload" href="/assets/index-legacy.js">'
+            '<script>var inline = "' + decoy + '";</script>'
+            '<script type="module" src="/assets/index~abc123.js"></script>'
+            '<script src="/assets/other.js"></script>'
+            "</head></html>"
+        )
+        pages = {
+            "https://music.apple.com/": html,
+            "https://music.apple.com/au/home": html,
+            "https://music.apple.com/assets/index-legacy.js": 'var t="' + APPLE_HS256_TOKEN + '";',
+            "https://music.apple.com/assets/index~abc123.js": APPLE_BUNDLE_JS,
+            "https://music.apple.com/assets/other.js": 'var t="' + other + '";',
+        }
+        fetch, seen = mapped_fetch(pages)
+        info = likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertEqual(info["token"], APPLE_DEV_TOKEN)
+        self.assertEqual(
+            seen,
+            [
+                "https://music.apple.com/",
+                "https://music.apple.com/assets/index~abc123.js",
+            ],
+        )
+        self.assertNotIn(decoy, json.dumps(info))
+
+    def test_falls_back_to_asset_scripts_and_ignores_other_hosts(self):
+        html = """<!DOCTYPE html><html><head>
+<script src="https://evil.example/assets/sneaky.js"></script>
+<script src="/static/app.js"></script>
+<script src="/assets/vendor.js"></script>
+<script type="module" src="/assets/web-player.js"></script>
+</head></html>"""
+        pages = {
+            "https://music.apple.com/": html,
+            "https://music.apple.com/au/home": html,
+            "https://music.apple.com/assets/vendor.js": VENDOR_JS,
+            "https://music.apple.com/assets/web-player.js": APPLE_BUNDLE_JS,
+        }
+        fetch, seen = mapped_fetch(pages)
+        info = likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertEqual(info["token"], APPLE_DEV_TOKEN)
+        self.assertEqual(
+            seen,
+            [
+                "https://music.apple.com/",
+                "https://music.apple.com/assets/vendor.js",
+                "https://music.apple.com/assets/web-player.js",
+            ],
+        )
+        self.assertFalse(any("evil.example" in url for url in seen))
+
+    def test_au_home_is_used_when_the_root_page_has_no_bundle(self):
+        pages = {
+            "https://music.apple.com/": "<html><head></head></html>",
+            "https://music.apple.com/au/home": APPLE_HOME_HTML,
+        }
+        for url in likes_sync.apple_bundle_urls(APPLE_HOME_HTML):
+            pages[url] = VENDOR_JS if "vendor" in url else APPLE_BUNDLE_JS
+        fetch, seen = mapped_fetch(pages)
+        info = likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertEqual(info["exp"], APPLE_DEV_EXP)
+        self.assertEqual(seen[0], "https://music.apple.com/")
+        self.assertEqual(seen[1], "https://music.apple.com/au/home")
+        self.assertIn("https://music.apple.com/assets/index~abc123.js", seen)
+
+    def test_next_script_is_tried_when_a_bundle_fetch_fails(self):
+        html = """<!DOCTYPE html><html><head>
+<script src="/assets/vendor.js"></script>
+<script src="/assets/web-player.js"></script>
+</head></html>"""
+        pages = {
+            "https://music.apple.com/": html,
+            "https://music.apple.com/au/home": html,
+            "https://music.apple.com/assets/vendor.js": RuntimeError("Apple Music fetch failed (404) for /assets/vendor.js"),
+            "https://music.apple.com/assets/web-player.js": APPLE_BUNDLE_JS,
+        }
+        fetch, seen = mapped_fetch(pages)
+        info = likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertEqual(info["token"], APPLE_DEV_TOKEN)
+        self.assertIn("https://music.apple.com/assets/web-player.js", seen)
+
+    def test_hs256_and_expired_tokens_are_not_cached(self):
+        html = '<script src="/assets/index~abc123.js"></script>'
+        pages = {
+            "https://music.apple.com/": html,
+            "https://music.apple.com/au/home": "<html></html>",
+            "https://music.apple.com/assets/index~abc123.js": 'var t="' + APPLE_HS256_TOKEN + '";',
+        }
+        fetch, _seen = mapped_fetch(pages)
+        with self.assertRaises(RuntimeError) as caught:
+            likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertIn("not in the web player bundle", str(caught.exception))
+        self.assertNotIn(APPLE_HS256_TOKEN, str(caught.exception))
+        self.assertNotIn("eyJ", str(caught.exception))
+        self.assertFalse((Path(self.tmp.name) / likes_sync.DEVELOPER_CACHE).exists())
+
+        expired = make_jwt("ES256", 50)
+        pages["https://music.apple.com/assets/index~abc123.js"] = 'var t="' + expired + '";'
+        fetch, _seen = mapped_fetch(pages)
+        with self.assertRaises(RuntimeError) as caught:
+            likes_sync.load_developer_token(likes_sync.Runners(fetch=fetch), now=1_700_000_000)
+        self.assertIn("expired", str(caught.exception))
+        self.assertNotIn(expired, str(caught.exception))
+        self.assertFalse((Path(self.tmp.name) / likes_sync.DEVELOPER_CACHE).exists())
+
+    def test_calls_receive_the_developer_token_and_still_read_the_cookie(self):
+        scripts = [
+            likes_sync.catalog_search_js("query", APPLE_DEV_TOKEN),
+            likes_sync.catalog_love_js("123", APPLE_DEV_TOKEN),
+            likes_sync.auth_js(APPLE_DEV_TOKEN),
+            likes_sync.storefront_js(APPLE_DEV_TOKEN),
+        ]
+        for script in scripts:
+            self.assertIn(APPLE_DEV_TOKEN, script)
+            self.assertIn("media-user-token", script)
+            self.assertIn("cookieValue", script)
+            self.assertNotIn("user-secret-token", script)
+        self.assertNotIn(APPLE_DEV_TOKEN, likes_sync.am_probe_js())
+        store = likes_sync.storefront_js(APPLE_DEV_TOKEN)
+        self.assertIn("/v1/me/storefront", store)
+        self.assertIn('{method: "GET"}', store)
+        self.assertNotIn("POST", store)
+        self.assertNotIn("PUT", store)
+
+    def test_default_fetch_uses_a_browser_ua_and_drops_offsite_bodies(self):
+        seen = {}
+
+        class Headers:
+            def get_content_charset(self):
+                return "utf-8"
+
+        class Response:
+            def __init__(self, body: bytes, url: str):
+                self._body = body
+                self._url = url
+                self.headers = Headers()
+
+            def read(self, _limit):
+                return self._body
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def urlopen(request, timeout=0):
+            seen["ua"] = request.get_header("User-agent")
+            seen["timeout"] = timeout
+            return Response(b"<html>ok</html>", "https://music.apple.com/")
+
+        body = likes_sync.default_fetch("https://music.apple.com/", urlopen=urlopen)
+        self.assertEqual(body, "<html>ok</html>")
+        self.assertEqual(seen["ua"], likes_sync.BROWSER_UA)
+        self.assertEqual(seen["timeout"], 20)
+        self.assertNotIn("python-urllib", seen["ua"].lower())
+
+        def redirected(_request, timeout=0):
+            return Response(b"eyJhbGciOiJFUzI1NiIsSECRET", "https://evil.example/steal")
+
+        with self.assertRaises(RuntimeError) as caught:
+            likes_sync.default_fetch("https://music.apple.com/", urlopen=redirected)
+        self.assertIn("redirected", str(caught.exception))
+        self.assertNotIn("SECRET", str(caught.exception))
+        self.assertNotIn("eyJ", str(caught.exception))
+
+
 class ProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.previous = os.environ.get("MUSIC_SYNC_STATE")
+        os.environ["MUSIC_SYNC_STATE"] = self.tmp.name
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("MUSIC_SYNC_STATE", None)
+        else:
+            os.environ["MUSIC_SYNC_STATE"] = self.previous
+        self.tmp.cleanup()
+
     def test_report_masks_tokens_and_says_when_signed_out(self):
         leaked = "eyJhbGciOiJFUzI1NiJ9.payloadbody.signaturepart"
         text = likes_sync.format_am_probe(
@@ -1043,12 +1469,54 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("main-world:", text)
         self.assertNotIn("not in this Chrome profile", text)
 
+    def test_report_names_the_bundle_token_by_exp_and_the_storefront_id(self):
+        text = likes_sync.format_am_probe(
+            {
+                "url": "https://music.apple.com/au/home",
+                "readyState": "complete",
+                "musickit": "absent",
+                "developer": {
+                    "source": "meta config",
+                    "label": "MEDIA_API.token",
+                    "mask": APPLE_DEV_TOKEN,
+                    "length": len(APPLE_DEV_TOKEN),
+                },
+                "user": {
+                    "source": "cookie media-user-token",
+                    "label": "media-user-token",
+                    "mask": "Abcd",
+                    "length": 246,
+                },
+                "cookieNames": ["media-user-token"],
+                "mainWorld": None,
+            },
+            developer={"token": APPLE_DEV_TOKEN, "exp": APPLE_DEV_EXP},
+            storefront="au",
+        )
+        self.assertIn("developer: found (exp " + APPLE_DEV_EXP_TEXT + ")", text)
+        self.assertIn("storefront: au", text)
+        self.assertIn("mask=Abcd", text)
+        self.assertIn("len=246", text)
+        self.assertNotIn(APPLE_DEV_TOKEN, text)
+        self.assertNotIn("eyJh", text)
+        self.assertNotIn("eyJleHAi", text)
+        self.assertNotIn("c2lnbmF0", text)
+        leaked = likes_sync.format_am_probe(
+            {"url": "https://music.apple.com/au/home", "readyState": "complete", "musickit": "absent"},
+            developer_error="bundle " + APPLE_DEV_TOKEN,
+            storefront_error="amp 401 " + APPLE_DEV_TOKEN,
+        )
+        self.assertNotIn(APPLE_DEV_TOKEN, leaked)
+        self.assertNotIn("eyJleHAi", leaked)
+        self.assertIn("developer: missing", leaked)
+        self.assertIn("storefront:", leaked)
+
     def test_probe_command_prints_the_report_and_closes_the_tab(self):
         payload = {
             "url": "https://music.apple.com/au/home",
             "readyState": "complete",
             "musickit": "absent",
-            "developer": {"source": "meta config", "label": "MEDIA_API.token", "mask": "eyJh", "length": 20},
+            "developer": None,
             "user": None,
             "cookieNames": [],
             "storageKeys": [],
@@ -1056,45 +1524,124 @@ class ProbeTests(unittest.TestCase):
             "scriptHints": [],
             "mainWorld": {"attempted": True, "blocked": False, "error": "", "auth": "no"},
         }
+        osa, runners = chrome_probe(payload)
+        code, stdout, stderr = silence(likes_sync.main, ["probe-am"], runners)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("signed-in: no", stdout)
+        self.assertIn("developer: found (exp " + APPLE_DEV_EXP_TEXT + ")", stdout)
+        self.assertIn("main-world: ran auth=no", stdout)
+        self.assertNotIn("storefront:", stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+        self.assertNotIn("eyJh", stdout)
+        self.assertEqual(osa.closed, 1)
+        self.assertEqual(osa.storefront, "")
+        self.assertIn("https://music.apple.com/au/home", osa.scripts[0])
+        self.assertNotIn("--apply", " ".join(osa.scripts))
+        self.assertEqual(
+            runners.fetched,
+            [
+                "https://music.apple.com/",
+                "https://music.apple.com/assets/index~abc123.js",
+            ],
+        )
+
+    def test_probe_command_prints_only_the_storefront_id(self):
+        payload = {
+            "url": "https://music.apple.com/au/home",
+            "readyState": "complete",
+            "musickit": "absent",
+            "developer": None,
+            "user": {
+                "source": "cookie media-user-token",
+                "label": "media-user-token",
+                "mask": "Abcd",
+                "length": 246,
+            },
+            "cookieNames": ["media-user-token"],
+            "storageKeys": [],
+            "metaNames": [],
+            "scriptHints": [],
+            "mainWorld": None,
+        }
+        job = {
+            "done": True,
+            "ok": True,
+            "storefront": "au",
+            "attributes": {"name": "Australia"},
+            "token": APPLE_DEV_TOKEN,
+            "data": [{"id": "au", "attributes": {"name": "Australia"}}],
+        }
+        osa, runners = chrome_probe(payload, storefront_job=job)
+        code, stdout, stderr = silence(likes_sync.main, ["probe-am"], runners)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("signed-in: yes", stdout)
+        self.assertIn("cookie media-user-token", stdout)
+        self.assertIn("len=246", stdout)
+        self.assertIn("mask=Abcd", stdout)
+        self.assertIn("developer: found (exp " + APPLE_DEV_EXP_TEXT + ")", stdout)
+        self.assertIn("storefront: au", stdout)
+        self.assertNotIn("Australia", stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+        self.assertNotIn("eyJh", stdout)
+        self.assertNotIn("eyJleHAi", stdout)
+        self.assertIn(APPLE_DEV_TOKEN, osa.storefront)
+        self.assertIn("media-user-token", osa.storefront)
+        self.assertIn("/v1/me/storefront", osa.storefront)
+        self.assertNotIn("user-secret-token", osa.storefront)
+        self.assertEqual(osa.closed, 1)
+        self.assertNotIn("--apply", " ".join(osa.scripts))
+
+    def test_probe_storefront_failure_is_redacted(self):
+        payload = {
+            "url": "https://music.apple.com/au/home",
+            "readyState": "complete",
+            "musickit": "absent",
+            "user": {"source": "cookie media-user-token", "label": "media-user-token", "mask": "Abcd", "length": 246},
+        }
+        job = {"done": True, "ok": False, "error": "amp 401 " + APPLE_DEV_TOKEN}
+        osa, runners = chrome_probe(payload, storefront_job=job)
+        code, stdout, stderr = silence(likes_sync.main, ["probe-am"], runners)
+        self.assertEqual(code, 1, stdout)
+        self.assertIn("storefront:", stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+        self.assertNotIn("eyJleHAi", stdout)
+        self.assertEqual(osa.closed, 1)
+
+    def test_probe_still_reports_the_page_when_the_bundle_fetch_fails(self):
+        payload = {
+            "url": "https://music.apple.com/au/home",
+            "readyState": "complete",
+            "musickit": "absent",
+            "user": {"source": "cookie media-user-token", "label": "media-user-token", "mask": "Abcd", "length": 20},
+            "mainWorld": None,
+        }
+
+        def fetch(_url):
+            raise RuntimeError("Apple Music fetch failed (404) for / " + APPLE_DEV_TOKEN)
+
         ticks = {"n": 0}
 
         def monotonic():
             ticks["n"] += 1
             return float(ticks["n"])
 
-        class OSA:
-            def __init__(self):
-                self.closed = 0
-
-            def __call__(self, source):
-                if "make new tab" in source:
-                    self.scripts = getattr(self, "scripts", [])
-                    self.scripts.append(source)
-                    return "15,27\n"
-                if "\nclose t\n" in source:
-                    self.closed += 1
-                    return "closed\n"
-                if "loading of t" in source:
-                    return "ready\n"
-                if "javascript" in source and "execute" in source:
-                    decoded = decode_js(source)
-                    if "ms-probe-am" in decoded:
-                        return json.dumps(payload)
-                    if "readyState" in decoded:
-                        return "yes"
-                    raise AssertionError(decoded[:240])
-                raise AssertionError(source[:240])
-
-        osa = OSA()
-        runners = likes_sync.Runners(osascript=osa, sleep=lambda _seconds: None, monotonic=monotonic)
+        osa, runners = chrome_probe(payload)
+        runners.fetch = fetch
+        runners.monotonic = monotonic
         code, stdout, stderr = silence(likes_sync.main, ["probe-am"], runners)
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("signed-in: no", stdout)
-        self.assertIn("mask=eyJh", stdout)
-        self.assertIn("main-world: ran auth=no", stdout)
+        self.assertEqual(code, 1, stdout)
+        self.assertIn("developer: missing", stdout)
+        self.assertIn("signed-in: yes", stdout)
+        self.assertIn("mask=Abcd", stdout)
+        self.assertNotIn("storefront:", stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+        self.assertNotIn("eyJleHAi", stdout)
         self.assertEqual(osa.closed, 1)
-        self.assertIn("https://music.apple.com/au/home", osa.scripts[0])
-        self.assertNotIn("--apply", " ".join(osa.scripts))
+        self.assertEqual(osa.storefront, "")
 
     def test_chrome_timeout_names_automation(self):
         text = likes_sync.explain_osascript_failure(

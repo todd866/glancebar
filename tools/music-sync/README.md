@@ -23,6 +23,7 @@ Override the paths with `MUSIC_SYNC_ARCHIVE` and `MUSIC_SYNC_YT_DIR` if you need
 - `inventory.json` — `{yt, am_fav}`
 - `plan.json` — `yt_only` (favourite these in Apple Music), `am_only` (like these on YouTube Music), `matched`
 - `applied.jsonl` — one line per attempt: `{at, side, key, action, result, ids}`
+- `apple-developer-token.json` — the public web-player developer token and its `exp` claim. Refreshed when that claim has passed.
 
 Names are matched lower-case, with `(feat. …)`, remaster suffixes, `(Official …)`, ` - Topic`, and punctuation removed. Anything still unmatched is paired when `difflib` scores the `artist title` string at 0.9 or above. Each track is used once.
 
@@ -34,7 +35,7 @@ Chrome has to be the Default profile, signed in to Google and to Apple Music at 
 
 Apple events run page JavaScript in an isolated world. `MusicKit`, `ytcfg`, and `ytmusic-app.networkManager` belong to the page and are not visible there. The DOM, `localStorage`, and cookies are shared.
 
-Apple Music calls read the developer token from the page config (a meta tag or inline script) and the user token from the `media-user-token` cookie or a matching storage key. They then `fetch` `https://amp-api.music.apple.com/v1/…` with `Authorization: Bearer` and `Media-User-Token`. If those tokens are not in the DOM or storage, the script injects into the page's own world and asks MusicKit; if Content-Security-Policy or Trusted Types block that, the run says so. Token values are never printed. `probe-am` only reads the page. It reports which tokens were found, masked to the first four characters, and says when this Chrome profile is not signed in to Apple Music.
+The Apple Music developer token is a public ES256 JWT baked into the web player's JavaScript bundle. The tool fetches `https://music.apple.com/` (then `/au/home` if that page has no bundle) with a normal browser User-Agent, finds `/assets/index~*.js` or `index-*.js`, and otherwise scans every `<script src>` under `/assets/`. It reads the JWT from that bundle, caches it with its `exp` claim, and sends it as `Authorization: Bearer`. The user token stays in the browser: the script reads `media-user-token` from the cookie (or a matching storage key) and sends `Media-User-Token`. Reports show the first four characters of the user token. If the user token is missing, the script injects into the page's own world and asks MusicKit; if Content-Security-Policy or Trusted Types block that, the run says so. `probe-am` is read-only. It reports `developer: found (exp …)` and, when the user token is present, calls `GET /v1/me/storefront` and prints only the storefront id. It also says when this Chrome profile is not signed in to Apple Music.
 
 YouTube Music reads `INNERTUBE_API_KEY` and `INNERTUBE_CONTEXT` from inline scripts (or from `ytcfg` when that global is visible) and `SAPISID` from the cookie.
 

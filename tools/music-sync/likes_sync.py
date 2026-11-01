@@ -19,6 +19,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 FUZZY_MIN = 0.9
@@ -27,6 +30,33 @@ PAUSE_MIN = 2.0
 PAUSE_MAX = 4.0
 STOREFRONT = "au"
 SONG_SEARCH_PARAMS = "EgWKAQIIAWoKEAkQBRAKEAMQBA=="
+APPLE_ORIGIN = "https://music.apple.com"
+APPLE_PAGES = (
+    "https://music.apple.com/",
+    "https://music.apple.com/au/home",
+)
+DEVELOPER_CACHE = "apple-developer-token.json"
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+# The web player bundle is a few megabytes. Stop before a runaway response.
+_FETCH_BYTES = 20_000_000
+_BUNDLE_FETCH_LIMIT = 30
+_STOREFRONT_RE = re.compile(r"^[A-Za-z0-9]{2,8}$")
+_INDEX_BUNDLE_RE = re.compile(
+    r"/assets/index(?:~|-)[A-Za-z0-9._-]+\.js(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_SCRIPT_SRC_RE = re.compile(
+    r"<script\b[^>]*?\bsrc\s*=\s*([\"'])(.*?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+# Bounded so a minified bundle cannot glue unrelated text into one match.
+_JWT_CANDIDATE_RE = re.compile(
+    r"eyJ[A-Za-z0-9_-]{8,2000}\.[A-Za-z0-9_-]{8,2000}\.[A-Za-z0-9_-]{8,2000}"
+)
 
 US = "\x1f"
 RS = "\x1e"
@@ -167,7 +197,10 @@ def _chrome_script(body: str, seconds: int = 30) -> str:
 
 
 class Runners:
-    """Side effects. Tests pass fakes; the defaults shell out to osascript, mdls, and ffprobe."""
+    """Side effects. Tests pass fakes; the defaults shell out to osascript, mdls, and ffprobe.
+
+    fetch GETs public Apple Music pages. It does not send the user token.
+    """
 
     def __init__(
         self,
@@ -179,6 +212,7 @@ class Runners:
         clock=None,
         rng=None,
         monotonic=None,
+        fetch=None,
     ):
         self.osascript = osascript or default_osascript
         self.mdls = mdls or default_mdls
@@ -188,6 +222,7 @@ class Runners:
         self.clock = clock or now_iso
         self.rng = rng or random.Random()
         self.monotonic = monotonic or time.monotonic
+        self.fetch = fetch or default_fetch
 
 
 def now_iso() -> str:
@@ -261,6 +296,41 @@ def default_ffprobe(path: str) -> str:
     if proc.returncode != 0:
         return ""
     return proc.stdout or ""
+
+
+def default_fetch(url: str, urlopen=None) -> str:
+    """GET a public Apple Music URL. The body is a page or script, not a user secret."""
+    opener = urlopen or urllib.request.urlopen
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/javascript,*/*;q=0.8",
+            "Accept-Language": "en-AU,en;q=0.9",
+        },
+        method="GET",
+    )
+    try:
+        with opener(request, timeout=20) as response:
+            final = urllib.parse.urlsplit(response.geturl())
+            if (final.hostname or "") != "music.apple.com":
+                raise RuntimeError("Apple Music fetch redirected away from music.apple.com")
+            raw = response.read(_FETCH_BYTES + 1)
+            if len(raw) > _FETCH_BYTES:
+                raise RuntimeError("Apple Music response was larger than expected")
+            headers = getattr(response, "headers", None)
+            charset = "utf-8"
+            if headers is not None and hasattr(headers, "get_content_charset"):
+                charset = headers.get_content_charset() or "utf-8"
+            return raw.decode(charset, errors="replace")
+    except RuntimeError:
+        raise
+    except urllib.error.HTTPError as exc:
+        path = urllib.parse.urlsplit(url).path or "/"
+        raise RuntimeError(f"Apple Music fetch failed ({exc.code}) for {path}") from None
+    except urllib.error.URLError as exc:
+        reason = redact_secrets(str(getattr(exc, "reason", exc)))[:160]
+        raise RuntimeError(f"Apple Music fetch failed: {reason}") from None
 
 
 def collapse_spaced_dots(text: str) -> str:
@@ -789,6 +859,210 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _b64url_json(segment: str) -> dict | None:
+    if not segment or not re.fullmatch(r"[A-Za-z0-9_-]+", segment):
+        return None
+    try:
+        padded = segment + "=" * (-len(segment) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def describe_developer_jwt(token: str) -> dict | None:
+    """Public ES256 developer JWT. Returns {token, exp} or None. Does not check the signature."""
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return None
+    header = _b64url_json(parts[0])
+    payload = _b64url_json(parts[1])
+    if not header or not payload or header.get("alg") != "ES256":
+        return None
+    exp = payload.get("exp")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    exp_i = int(exp)
+    if exp_i <= 0:
+        return None
+    return {"token": token, "exp": exp_i}
+
+
+def scan_developer_token(script: str, now: float) -> tuple[dict | None, bool]:
+    """Latest unexpired ES256 JWT in a bundle. The bool is true when every match was expired."""
+    best: dict | None = None
+    expired = False
+    for match in _JWT_CANDIDATE_RE.finditer(script or ""):
+        info = describe_developer_jwt(match.group(0))
+        if not info:
+            continue
+        if info["exp"] <= now:
+            expired = True
+            continue
+        if best is None or info["exp"] > best["exp"]:
+            best = info
+    return best, expired
+
+
+def extract_developer_token(script: str, now: float | None = None) -> dict | None:
+    current = time.time() if now is None else now
+    found, _expired = scan_developer_token(script, current)
+    return found
+
+
+def music_asset_url(raw: str) -> str | None:
+    """An https://music.apple.com/assets/*.js URL, or None when the host is somewhere else."""
+    text = (raw or "").strip().replace("&amp;", "&")
+    if not text or text.startswith(("data:", "javascript:")):
+        return None
+    if text.startswith("//"):
+        text = "https:" + text
+    elif text.startswith("/"):
+        text = APPLE_ORIGIN + text
+    elif text.startswith("http://"):
+        text = "https://" + text[len("http://") :]
+    elif not text.startswith("https://"):
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    if (parsed.hostname or "") != "music.apple.com":
+        return None
+    path = parsed.path or ""
+    if not path.endswith(".js") or "/assets/" not in path or ".." in path.split("/"):
+        return None
+    return urllib.parse.urlunsplit(("https", "music.apple.com", path, parsed.query, ""))
+
+
+def apple_bundle_urls(html: str) -> list[str]:
+    """Main index bundle first (index~ then index-), then every other /assets script src."""
+    text = html or ""
+    tilde: list[str] = []
+    dash: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str, bucket: list[str]) -> None:
+        url = music_asset_url(raw)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        bucket.append(url)
+
+    for match in _INDEX_BUNDLE_RE.finditer(text):
+        path = match.group(0)
+        low = path.lower()
+        if "/assets/index~" in low:
+            add(path, tilde)
+        elif "/assets/index-" in low:
+            add(path, dash)
+    extras: list[str] = []
+    for match in _SCRIPT_SRC_RE.finditer(text):
+        raw = match.group(2).strip()
+        url = music_asset_url(raw)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        extras.append(url)
+    return (tilde + dash + extras)[:_BUNDLE_FETCH_LIMIT]
+
+
+def developer_cache_path() -> Path:
+    return state_dir() / DEVELOPER_CACHE
+
+
+def read_developer_cache(now: float) -> dict | None:
+    path = developer_cache_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("token"), str):
+        return None
+    info = describe_developer_jwt(data["token"])
+    if not info or info["exp"] <= now:
+        return None
+    return info
+
+
+def write_developer_cache(info: dict) -> None:
+    path = developer_cache_path()
+    write_json(path, {"token": info["token"], "exp": info["exp"]})
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _fetch_text(runners: Runners, url: str) -> str:
+    try:
+        body = runners.fetch(url)
+    except RuntimeError as exc:
+        raise RuntimeError(redact_secrets(str(exc))[:200]) from None
+    except OSError as exc:
+        raise RuntimeError(redact_secrets(str(exc))[:200]) from None
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body or "")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text
+
+
+def load_developer_token(runners: Runners, now: float | None = None) -> dict:
+    """Public developer token from the state cache, refreshed from the web bundle when expired.
+
+    The token is not a user secret. The return value still must not be printed.
+    """
+    current = time.time() if now is None else now
+    cached = read_developer_cache(current)
+    if cached:
+        return cached
+    last_error = "Apple Music page did not link an /assets/ bundle"
+    saw_expired = False
+    scanned = False
+    for page in APPLE_PAGES:
+        try:
+            html = _fetch_text(runners, page)
+        except RuntimeError as exc:
+            last_error = str(exc)
+            continue
+        urls = apple_bundle_urls(html)
+        if not urls:
+            continue
+        for url in urls:
+            try:
+                bundle = _fetch_text(runners, url)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                continue
+            scanned = True
+            info, expired = scan_developer_token(bundle, current)
+            saw_expired = saw_expired or expired
+            if not info:
+                continue
+            write_developer_cache(info)
+            return info
+    if saw_expired:
+        last_error = "Apple Music developer token in the web player bundle is expired"
+    elif scanned:
+        last_error = "Apple Music developer token was not in the web player bundle"
+    raise RuntimeError(last_error)
+
+
+def format_exp(exp: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(exp)))
+
+
+def storefront_id(job: dict) -> str:
+    """The storefront id from a probe job. Anything else in the response is dropped."""
+    if not isinstance(job, dict) or not job.get("ok"):
+        return ""
+    value = job.get("storefront")
+    if not isinstance(value, str) or not _STOREFRONT_RE.fullmatch(value):
+        return ""
+    return value
+
+
 def load_applied_ok(path: Path) -> set[tuple[str, str]]:
     """Keys with any ok line. Errors stay eligible; a later success is enough to skip."""
     found: set[tuple[str, str]] = set()
@@ -1024,9 +1298,13 @@ POLL_JS = """(function(){
 READY_STATE_JS = '(function(){return document.readyState==="complete"?"yes":"no";})()'
 
 
-def _apple_token_js() -> str:
-    """Read Apple Music tokens from DOM and storage. Never returns them to Python."""
-    return r"""
+def _apple_token_js(developer_token: str = "") -> str:
+    """Read the user token from the cookie. The developer token is passed in and never returned.
+
+    An empty developer token falls back to a DOM scan. The page no longer embeds that JWT.
+    """
+    binding = "  var suppliedDeveloper = " + json.dumps(developer_token or "") + ";\n"
+    return binding + r"""
   function mask4(value) {
     var text = String(value || "");
     if (text.length < 8) return text ? "****" : "";
@@ -1200,13 +1478,18 @@ def _apple_token_js() -> str:
     return {value: "", source: "", label: ""};
   }
   function readAmTokens() {
-    var dev = window.__amDev || null;
-    if (!dev || !dev.value) {
-      if (!(window.__amDevMiss && document.readyState === "complete")) {
-        var picked = findDeveloper();
-        dev = picked.best;
-        if (dev && dev.value) window.__amDev = dev;
-        else if (document.readyState === "complete") window.__amDevMiss = 1;
+    var dev = null;
+    if (suppliedDeveloper) {
+      dev = {value: suppliedDeveloper, source: "apple music bundle", label: "developerToken", score: 100};
+    } else {
+      dev = window.__amDev || null;
+      if (!dev || !dev.value) {
+        if (!(window.__amDevMiss && document.readyState === "complete")) {
+          var picked = findDeveloper();
+          dev = picked.best;
+          if (dev && dev.value) window.__amDev = dev;
+          else if (document.readyState === "complete") window.__amDevMiss = 1;
+        }
       }
     }
     if (!dev) dev = {value: "", source: "", label: "", score: 0};
@@ -1358,10 +1641,10 @@ def _apple_fetch_js() -> str:
 """
 
 
-def auth_js() -> str:
+def auth_js(developer_token: str = "") -> str:
     return (
         "(function(){ /* ms-auth-am */\n"
-        + _apple_token_js()
+        + _apple_token_js(developer_token)
         + r"""
   try {
     var read = readAmTokens();
@@ -1435,14 +1718,49 @@ def am_probe_js() -> str:
     )
 
 
-def catalog_search_js(term: str) -> str:
+def storefront_js(developer_token: str = "") -> str:
+    """GET /v1/me/storefront. The result that comes back to Python is the id only."""
+    return (
+        "(function(){\n"
+        "  window.__ms = {done:false};\n"
+        + _apple_token_js(developer_token)
+        + _apple_fetch_js()
+        + r"""
+  try {
+    var read = readAmTokens();
+    if (!read.developer || !read.developer.value || !read.user || !read.user.value) {
+      window.__ms = {done:true, ok:false, error: "apple tokens missing"};
+      return "started";
+    }
+    ampFetch("/v1/me/storefront", {method: "GET"}).then(function(res) {
+      var rows = res && res.data;
+      if (rows && !rows.length && rows.id) rows = [rows];
+      var id = "";
+      if (rows && rows.length) id = String(rows[0].id || "");
+      if (!/^[A-Za-z0-9]{2,8}$/.test(id)) {
+        window.__ms = {done:true, ok:false, error: "storefront id"};
+        return;
+      }
+      window.__ms = {done:true, ok:true, storefront: id};
+    }, function(err) {
+      window.__ms = {done:true, ok:false, error: publicError(err)};
+    });
+  } catch (e) {
+    window.__ms = {done:true, ok:false, error: publicError(e)};
+  }
+  return "started";
+})()"""
+    )
+
+
+def catalog_search_js(term: str, developer_token: str = "") -> str:
     search_path = json.dumps("/v1/catalog/" + STOREFRONT + "/search")
     return (
         "(function(){\n"
         "  window.__ms = {done:false};\n"
         "  var term = " + json.dumps(term) + ";\n"
         "  var searchPath = " + search_path + ";\n"
-        + _apple_token_js()
+        + _apple_token_js(developer_token)
         + _apple_fetch_js()
         + r"""
   function songsFromCatalog(res) {
@@ -1494,13 +1812,13 @@ def catalog_search_js(term: str) -> str:
     )
 
 
-def catalog_love_js(song_id: str) -> str:
+def catalog_love_js(song_id: str, developer_token: str = "") -> str:
     # value 1 is love. There is no dislike and no library delete.
     return (
         "(function(){\n"
         "  window.__ms = {done:false};\n"
         "  var id = " + json.dumps(song_id) + ";\n"
-        + _apple_token_js()
+        + _apple_token_js(developer_token)
         + _apple_fetch_js()
         + r"""
   function startMainWorldLove() {
@@ -1856,8 +2174,9 @@ def parse_js_json(raw: str) -> dict | None:
 class ChromeSession:
     """One background tab. close() runs from the caller's finally, including on failure."""
 
-    def __init__(self, runners: Runners):
+    def __init__(self, runners: Runners, developer_token: str = ""):
         self.runners = runners
+        self.developer_token = developer_token or ""
         self.wid = ""
         self.tid = ""
 
@@ -1926,7 +2245,7 @@ class ChromeSession:
         while True:
             raw = ""
             try:
-                raw = js_scalar(self.exec_js(auth_js()))
+                raw = js_scalar(self.exec_js(auth_js(self.developer_token)))
             except SystemExit:
                 raise
             except Exception as exc:
@@ -1977,7 +2296,14 @@ def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tupl
     def ensure_session() -> ChromeSession:
         nonlocal session
         if session is None:
-            session = ChromeSession(runners)
+            # The developer JWT is not in the DOM. Load the public bundle token, then
+            # let the page cookie supply the user token.
+            token = ""
+            try:
+                token = load_developer_token(runners)["token"]
+            except RuntimeError as exc:
+                print("Apple Music developer token: " + redact_secrets(str(exc))[:200], file=sys.stderr)
+            session = ChromeSession(runners, developer_token=token)
             session.open("https://music.apple.com/au/home")
             session.wait_loaded()
             # Tokens are read after load. A missing user token fails immediately.
@@ -2081,7 +2407,7 @@ def _job_error(data: dict, fallback: str) -> str:
 
 
 def ChromeSession_catalog_search_songs(self, term: str) -> list[dict]:
-    self.exec_js(catalog_search_js(term))
+    self.exec_js(catalog_search_js(term, self.developer_token))
     data = self.poll_job()
     if not data.get("ok"):
         raise RuntimeError(_job_error(data, "catalog search failed"))
@@ -2089,7 +2415,7 @@ def ChromeSession_catalog_search_songs(self, term: str) -> list[dict]:
 
 
 def ChromeSession_add_and_love(self, song_id: str) -> None:
-    self.exec_js(catalog_love_js(song_id))
+    self.exec_js(catalog_love_js(song_id, self.developer_token))
     data = self.poll_job()
     if not data.get("ok"):
         raise RuntimeError(_job_error(data, "catalog love failed"))
@@ -2249,7 +2575,22 @@ def _token_phrase(kind: str, item) -> str:
     return " ".join(bits)
 
 
-def format_am_probe(data: dict) -> str:
+def _developer_line(data: dict, developer: dict | None, developer_error: str) -> str:
+    exp = developer.get("exp") if isinstance(developer, dict) else None
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        return "developer: found (exp " + format_exp(int(exp)) + ")"
+    if developer_error:
+        return "developer: missing (" + _safe_label(developer_error, 160) + ")"
+    return _token_phrase("developer", data.get("developer"))
+
+
+def format_am_probe(
+    data: dict,
+    developer: dict | None = None,
+    developer_error: str = "",
+    storefront: str = "",
+    storefront_error: str = "",
+) -> str:
     """Masked Apple Music token report. Token values never appear here."""
     if not isinstance(data, dict):
         return "probe: empty"
@@ -2257,7 +2598,7 @@ def format_am_probe(data: dict) -> str:
         "url: " + _safe_label(data.get("url") or "", 160),
         "readyState: " + _safe_label(data.get("readyState") or "", 40),
         "musickit: " + _safe_label(data.get("musickit") or "absent", 20),
-        _token_phrase("developer", data.get("developer")),
+        _developer_line(data, developer, developer_error),
         _token_phrase("user", data.get("user")),
     ]
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
@@ -2266,6 +2607,10 @@ def format_am_probe(data: dict) -> str:
     main_yes = bool(main and not main.get("blocked") and main.get("auth") == "yes")
     signed = user_found or main_yes
     lines.append("signed-in: " + ("yes" if signed else "no"))
+    if storefront and _STOREFRONT_RE.fullmatch(storefront):
+        lines.append("storefront: " + storefront)
+    elif storefront_error:
+        lines.append("storefront: " + _safe_label(storefront_error, 160))
     cookies = _safe_names(data.get("cookieNames"))
     storage = _safe_names(data.get("storageKeys"))
     metas = _safe_names(data.get("metaNames"))
@@ -2307,9 +2652,26 @@ def format_am_probe(data: dict) -> str:
     return redact_secrets("\n".join(lines))
 
 
+def _user_mask(data: dict) -> str:
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    mask = user.get("mask") if isinstance(user, dict) else ""
+    return str(mask or "")
+
+
 def cmd_probe_am(_args, runners: Runners) -> int:
-    """Print which Apple Music tokens the isolated world can see. Values stay masked."""
-    session = ChromeSession(runners)
+    """Read-only Apple Music check. Token values stay masked; the storefront line is the id."""
+    developer = None
+    developer_error = ""
+    try:
+        developer = load_developer_token(runners)
+    except RuntimeError as exc:
+        developer_error = redact_secrets(str(exc))[:200]
+    session = ChromeSession(runners, developer_token=(developer or {}).get("token") or "")
+    raw = ""
+    data = None
+    storefront = ""
+    storefront_error = ""
+    attempted_storefront = False
     try:
         session.open("https://music.apple.com/au/home")
         session.wait_loaded()
@@ -2319,13 +2681,33 @@ def cmd_probe_am(_args, runners: Runners) -> int:
             if str(exc) != "Apple Music did not finish loading in Chrome.":
                 raise
         raw = session.exec_js(am_probe_js())
+        data = parse_js_json(raw)
+        if isinstance(data, dict) and developer and session.developer_token and _user_mask(data):
+            attempted_storefront = True
+            try:
+                session.exec_js(storefront_js(session.developer_token))
+                job = session.poll_job()
+            except Exception as exc:
+                job = {"ok": False, "error": redact_secrets(str(exc))[:200]}
+            storefront = storefront_id(job)
+            if not storefront:
+                storefront_error = _job_error(job, "storefront failed")
     finally:
         session.close()
-    data = parse_js_json(raw)
     if not isinstance(data, dict):
         print(redact_secrets((raw or "").strip())[:400], file=sys.stderr)
         return 1
-    print(format_am_probe(data))
+    print(
+        format_am_probe(
+            data,
+            developer=developer,
+            developer_error=developer_error,
+            storefront=storefront,
+            storefront_error=storefront_error,
+        )
+    )
+    if developer_error or (attempted_storefront and not storefront):
+        return 1
     return 0
 
 
@@ -2345,7 +2727,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = sub.add_parser(
         "probe-am",
-        help="print which Apple Music tokens the isolated world can see (masked)",
+        help="print masked Apple Music token status and the storefront id",
     )
     probe.set_defaults(func=cmd_probe_am)
 
@@ -2366,7 +2748,7 @@ def main(argv: list[str] | None = None, runners: Runners | None = None) -> int:
     try:
         return args.func(args, runners or Runners())
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        print(redact_secrets(str(exc)), file=sys.stderr)
         return 1
 
 
