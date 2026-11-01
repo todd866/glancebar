@@ -4891,7 +4891,7 @@ static NSString *PopoverRequestObject(void) {
 }
 
 @interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate>
-@property(nonatomic) BOOL showPopoverOnLaunch;
+@property(nonatomic, copy) NSString *showDestinationOnLaunch;
 @end
 
 @interface Controller ()
@@ -5487,6 +5487,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
     NSMutableSet<NSString *> *_remoteInFlight;
     CFAbsoluteTime _remotePolledAt;
+    BOOL _fleetFocusPending;
+    NSMutableSet<NSString *> *_fleetExpandedHosts; // session-only; never writes preferences
     NSUInteger _audioSettleGen;
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
     BOOL _musicOff;                    // defaults musicEnabled = NO: no music polling (worker Macs); nothing else
@@ -5541,7 +5543,12 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // Not behind the pmset queue: an apply waiting on a password dialog would eat the budget.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSNumber *awake = SleepDisabledState();
-        if (awake.boolValue && PmsetRuleInstalled()) RunPmsetViaSudo(@"disablesleep", NO);
+        if (awake.boolValue && PmsetRuleInstalled()) {
+            RunPmsetViaSudo(@"disablesleep", NO);
+            // A relaunch soon after (an update, an agent restarting the app) turns it back on.
+            [NSUserDefaults.standardUserDefaults setDouble:NSDate.date.timeIntervalSince1970
+                                                    forKey:@"keepAwakeClearedAtQuit"];
+        }
         dispatch_semaphore_signal(pmsetDone);
     });
     if (dispatch_semaphore_wait(pmsetDone, dispatch_time(DISPATCH_TIME_NOW,
@@ -5653,6 +5660,17 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // Worker Macs can switch music off entirely: defaults write com.iantodd.glancebar musicEnabled -bool NO
     NSUserDefaults *musicPrefs = NSUserDefaults.standardUserDefaults;
     _musicProbesEnabled = YES;
+    // Keep Awake cleared by a quit comes back on a relaunch within 10 minutes: a restart, not a
+    // deliberate stop (Ian, 1 Nov 2026: a quit to eject a drive let a backup Mac sleep mid-copy).
+    double clearedAt = [musicPrefs doubleForKey:@"keepAwakeClearedAtQuit"];
+    if (clearedAt > 0) {
+        [musicPrefs removeObjectForKey:@"keepAwakeClearedAtQuit"];
+        double ago = NSDate.date.timeIntervalSince1970 - clearedAt;
+        if (ago >= 0 && ago < 600 && _musicProbesEnabled)
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (PmsetRuleInstalled()) RunPmsetViaSudo(@"disablesleep", YES);
+            });
+    }
     // Only music stops: _musicProbesEnabled also gates the charge limit, remote Macs and the network
     // monitor, and folding musicEnabled into it left the M1 charging to 100% (1 Nov 2026).
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
@@ -5682,7 +5700,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(showPopoverRequested:)
         name:kShowPopoverNotification object:PopoverRequestObject()
         suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
-    if (self.showPopoverOnLaunch) [self showPopoverRequested:nil];
+    if (self.showDestinationOnLaunch) [self showPopoverRequested:[NSNotification notificationWithName:kShowPopoverNotification object:PopoverRequestObject() userInfo:@{@"destination": self.showDestinationOnLaunch}]];
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefresh]; }
@@ -6878,7 +6896,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots.
 // At most every 25 s, and only while the popover is open.
 - (void)pollRemoteMachinesIfDue {
-    if (!_musicProbesEnabled || CFAbsoluteTimeGetCurrent() - _remotePolledAt < 25) return;
+    if (!_popover.isShown || !_musicProbesEnabled || CFAbsoluteTimeGetCurrent() - _remotePolledAt < 25) return;
     _remotePolledAt = CFAbsoluteTimeGetCurrent();
     for (NSDictionary *m in [self remoteMachines]) {
         NSString *host = m[@"host"];
@@ -6925,7 +6943,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSString *host = [row.accessibilityIdentifier stringByReplacingOccurrencesOfString:@"popover.row.remote." withString:@""];
     NSString *key = [@"remoteOpen." stringByAppendingString:host];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [ud setBool:![ud boolForKey:key] forKey:key];
+    if (_fleetExpandedHosts) {
+        if ([_fleetExpandedHosts containsObject:host]) [_fleetExpandedHosts removeObject:host];
+        else [_fleetExpandedHosts addObject:host];
+    } else [ud setBool:![ud boolForKey:key] forKey:key];
     [self rebuildContent];
 }
 static NSColor *ReadinessColor(double score) {
@@ -6951,7 +6972,7 @@ static NSColor *ReadinessColor(double score) {
         NSDictionary *ready = fresh ? WorkerReadiness(sample, reading[@"mode"], [reading[@"free"] integerValue], [reading[@"slots"] integerValue]) : nil;
         double score = [ready[@"score"] doubleValue];
         NSColor *color = ready ? ReadinessColor(score) : NSColor.tertiaryLabelColor;
-        BOOL open = [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
+        BOOL open = _fleetExpandedHosts ? [_fleetExpandedHosts containsObject:host] : [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
         NSString *tip = ready ? [NSString stringWithFormat:@"%@ · %@ ready · limited by %@ · click for details", name,
                                  [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)], ready[@"limit"]]
                               : [NSString stringWithFormat:@"%@ · not reachable over ssh (%@)", name, host];
@@ -8072,15 +8093,40 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         os_log(OS_LOG_DEFAULT, "Glancebar hot key %u: %d", (unsigned)codes[i], (int)status);
     }
 }
+- (void)focusFleetRows {
+    NSView *root = _popover.contentViewController.view;
+    NSView *divider = ViewWithAccessibilityIdentifier(root, @"popover.divider.remote");
+    if (divider && _popoverScroll) {
+        _fleetFocusPending = NO;
+        CGFloat y = [divider convertRect:divider.bounds toView:_popoverScroll.documentView].origin.y;
+        CGFloat maximum = MAX(0, NSHeight(_popoverScroll.documentView.bounds) - NSHeight(_popoverScroll.contentView.bounds));
+        [_popoverScroll.contentView scrollToPoint:NSMakePoint(0, MIN(y, maximum))];
+        [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
+    }
+}
 - (void)showPopoverRequested:(NSNotification *)notification {
-    (void)notification;
     if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self showPopoverRequested:nil]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self showPopoverRequested:notification]; });
         return;
     }
+    if (_terminating || !_popover) return;
+    NSString *destination = notification.userInfo[@"destination"] ?: @"popover";
+    if ([destination isEqual:@"battery"]) { [self showBatteryDetails:nil]; return; }
+    if ([destination isEqual:@"ai"]) { [self showDetailsTab:@"ai" sender:nil]; return; }
+    if ([destination isEqual:@"fleet"]) {
+        _fleetFocusPending = YES;
+        _fleetExpandedHosts = [NSMutableSet set];
+        for (NSDictionary *machine in [self remoteMachines]) [_fleetExpandedHosts addObject:machine[@"host"]];
+        [self rebuildContent];
+        if (!_popover.isShown) [self togglePopover:nil];
+        [self pollRemoteMachinesIfDue]; // existing in-flight and 25-second throttle
+        [self focusFleetRows];
+        _fleetFocusPending = _remoteInFlight.count > 0; // one final focus after this bounded poll settles
+        return;
+    }
+    if (![destination isEqual:@"popover"]) return;
     // A Touch Bar tap means show, never toggle shut on a repeated request.
-    if (_terminating || !_popover || _popover.isShown) return;
-    [self togglePopover:nil];
+    if (!_popover.isShown) [self togglePopover:nil];
 }
 - (void)togglePopover:(id)sender {
     if (_popover.isShown) { [_popover close]; return; }
@@ -8194,6 +8240,9 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
 // apart from the mouse-UP that trails a transient dismiss. Fires on every close path —
 // outside click, second icon click, or Escape — which is exactly the set we want to guard.
 - (void)popoverWillClose:(NSNotification *)note {
+    _fleetExpandedHosts = nil;
+    _fleetFocusPending = NO;
+    _popoverPrepared = NO;
     _burnLatch = 0;
     [GBSeedTile closeLarge];
     (void)note;
@@ -9805,6 +9854,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         _popover.contentViewController.view = freshView;
         _popoverScroll = freshScroll;
         [self restoreFocus:focusSnapshot inView:freshView window:popoverWindow];
+    }
+    if (_fleetFocusPending && _popover.isShown && !_remoteInFlight.count) {
+        [self focusFleetRows];
+        _fleetFocusPending = NO; // no later refresh may override manual scrolling
     }
 }
 
@@ -12444,11 +12497,14 @@ static void PrintUsage(FILE *stream) {
         "Glancebar %s\n"
         "Usage: Glancebar [--dump [--json] [--strict] [--online]]\n"
         "       Glancebar --sample\n"
-        "       Glancebar --show-popover\n"
+        "       Glancebar --show-popover | --show-fleet | --show-battery | --show-ai\n"
         "       Glancebar --version\n"
         "       Glancebar --help\n\n"
         "  --activity-json  Take one read-only app CPU/network snapshot.\n"
         "  --sample   Print one JSON line: CPU, memory, thermal pressure, clocks, temperatures, battery.\n"
+        "  --show-fleet    Show and expand configured remote machines for this session.\n"
+        "  --show-ai       Open the existing AI details tab.\n"
+        "  --show-battery  Open the existing Battery details tab.\n"
         "  --show-popover  Show the existing popover, launching this app if needed; no Accessibility permission.\n"
         "  --dump     Print a local machine and AI status snapshot.\n"
         "  --json     Emit stable JSON (schemaVersion 1) instead of text.\n"
@@ -12462,7 +12518,7 @@ static void PrintUsage(FILE *stream) {
 // status item under the terminal (or another parent app) and inherit that app's
 // "Allow in the Menu Bar" setting. Relaunch before NSApplication creates any item.
 // CLI modes return above and intentionally remain ordinary direct processes.
-static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, BOOL showPopover) {
+static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, NSString *showDestination) {
     NSString *expected = NSBundle.mainBundle.bundleIdentifier;
     if (expected.length == 0) {
         fprintf(stderr, "Glancebar: app bundle has no identifier; refusing GUI launch\n");
@@ -12486,7 +12542,7 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, BOOL
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
     NSMutableArray *arguments = [NSMutableArray arrayWithArray:@[bundleURL.path, @"--args", @"--glancebar-launch-services-relaunch"]];
-    if (showPopover) [arguments addObject:@"--show-popover"];
+    if (showDestination) [arguments addObject:[@"--show-" stringByAppendingString:showDestination]];
     task.arguments = arguments;
     NSError *error = nil;
     if (![task launchAndReturnError:&error]) {
@@ -12505,13 +12561,17 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, BOOL
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO, showPopover = NO;
+        BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO, sample = NO;
+        NSString *showDestination = nil;
+        NSUInteger destinationCount = 0;
         const char *onlineEnvironment = getenv("GLANCEBAR_ALLOW_ACCOUNT");
         BOOL allowOnline = onlineEnvironment && strcmp(onlineEnvironment, "1") == 0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--activity-json") == 0) activityJSON = YES;
-            else if (strcmp(argv[i], "--show-popover") == 0) showPopover = YES;
-            else if (strcmp(argv[i], "--sample") == 0) return PrintSampleLine();
+            else if (strcmp(argv[i], "--show-popover") == 0 || strcmp(argv[i], "--show-fleet") == 0 || strcmp(argv[i], "--show-battery") == 0 || strcmp(argv[i], "--show-ai") == 0) {
+                showDestination = [NSString stringWithUTF8String:argv[i] + 7]; destinationCount++;
+            }
+            else if (strcmp(argv[i], "--sample") == 0) sample = YES;
             else if (strcmp(argv[i], "--dump") == 0) dump = YES;
             else if (strcmp(argv[i], "--json") == 0) json = YES;
             else if (strcmp(argv[i], "--strict") == 0) strict = YES;
@@ -12522,19 +12582,20 @@ int main(int argc, const char **argv) {
             else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { PrintUsage(stdout); return 0; }
             else { fprintf(stderr, "Glancebar: unknown option '%s'\n", argv[i]); PrintUsage(stderr); return 64; }
         }
-        if (showPopover && (dump || json || strict || onlineArgument || activityJSON)) {
-            fprintf(stderr, "Glancebar: --show-popover cannot be combined with snapshot options\n");
+        if (destinationCount > 1 || (showDestination && (dump || json || strict || onlineArgument || activityJSON || sample))) {
+            fprintf(stderr, "Glancebar: show destinations cannot be combined with each other or snapshot options\n");
             return 64;
         }
-        if (showPopover) {
+        if (showDestination) {
             NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
             for (NSRunningApplication *owner in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID]) {
                 if (owner.processIdentifier == getpid() || owner.isTerminated) continue;
                 [NSDistributedNotificationCenter.defaultCenter postNotificationName:kShowPopoverNotification
-                    object:PopoverRequestObject() userInfo:nil deliverImmediately:YES];
+                    object:PopoverRequestObject() userInfo:@{@"destination": showDestination} deliverImmediately:YES];
                 return 0; // Request delivered to the user's session; not a visibility receipt.
             }
         }
+        if (sample) return PrintSampleLine();
         if (activityJSON) return PrintJSON(GBActivitySurvey()) ? 0 : 70;
         if ((json || strict || onlineArgument) && !dump) {
             fprintf(stderr, "Glancebar: --json, --strict, and --online require --dump\n");
@@ -12547,11 +12608,11 @@ int main(int argc, const char **argv) {
             } else PrintHumanDump(snapshot);
             return strict && [snapshot[@"status"] isEqualToString:@"partial"] ? 2 : 0;
         }
-        int relaunchResult = RelaunchGUIThroughLaunchServicesIfNeeded(alreadyRelaunched, showPopover);
+        int relaunchResult = RelaunchGUIThroughLaunchServicesIfNeeded(alreadyRelaunched, showDestination);
         if (relaunchResult >= 0) return relaunchResult;
         NSApplication *app = NSApplication.sharedApplication;
         Controller *controller = [Controller new];
-        controller.showPopoverOnLaunch = showPopover;
+        controller.showDestinationOnLaunch = showDestination;
         app.delegate = controller;
         [app run];
     }
