@@ -5644,7 +5644,9 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     else if (!getenv("GLANCEBAR_SKIP_WELCOME"))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
-    _musicProbesEnabled = YES;
+    // Worker Macs can switch music off entirely: defaults write com.iantodd.glancebar musicEnabled -bool NO
+    NSUserDefaults *musicPrefs = NSUserDefaults.standardUserDefaults;
+    _musicProbesEnabled = ![musicPrefs objectForKey:@"musicEnabled"] || [musicPrefs boolForKey:@"musicEnabled"];
     _outputVolume = -1;
     _mixPrepared = [NSMutableDictionary dictionary];
     _mixPreparing = [NSMutableSet set];
@@ -5771,6 +5773,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // The library is read in the background when the popover first needs tiles, then every 6 h.
 - (void)ensureMixSeeds {
     if (_mixFrozen || !_musicProbesEnabled || [self musicOffline]) return;
+    // Scripting Music launches it: read the library only while it is already open (the tiles keep their
+    // saved seeds meanwhile). On a Mac with an empty library this retried and relaunched Music (1 Nov 2026).
+    if (!AppleMusicIsRunning()) return;
     BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
     if (stale && !_mixLibraryLoading) {
         _mixLibraryLoading = YES;
@@ -5823,6 +5828,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSString *path = [MixDirectory(@"art") stringByAppendingPathComponent:[trackID stringByAppendingPathExtension:@"jpg"]];
     NSImage *cached = [NSFileManager.defaultManager fileExistsAtPath:path] ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
     if (cached) { _mixArt[trackID] = cached; return; }
+    BOOL musicOpen = AppleMusicIsRunning();   // asking a closed Music for artwork would launch it
     void (^show)(void) = ^{
         NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
         if (!img) return;
@@ -5848,6 +5854,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         "end tell\n"
         "set fh to open for access (POSIX file %@) with write permission\n"
         "set eof fh to 0\nwrite a to fh\nclose access fh\nreturn \"ok\"", AppleScriptQuoted(trackID), AppleScriptQuoted(path)];
+    if (!musicOpen) { fromCatalogue(); return; }
     RunAppleScriptTimed(script, 20, ^(__unused NSString *output, __unused NSString *errorText, int status) {
         if (status == 0 && [[NSImage alloc] initWithContentsOfFile:path]) show();
         else { [NSFileManager.defaultManager removeItemAtPath:path error:nil]; fromCatalogue(); }
