@@ -5484,6 +5484,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     CFAbsoluteTime _remotePolledAt;
     NSUInteger _audioSettleGen;
     BOOL _musicProbesEnabled;          // app launch only; layout tests must not touch Chrome or audio
+    BOOL _musicOff;                    // defaults musicEnabled = NO: no music polling (worker Macs); nothing else
     BOOL _networkKnown, _networkOnline;
     nw_path_monitor_t _pathMonitor;
     BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _localMode, _localEmpty;
@@ -5646,7 +5647,10 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                        dispatch_get_main_queue(), ^{ [self showWelcomeIfNeeded]; });
     // Worker Macs can switch music off entirely: defaults write com.iantodd.glancebar musicEnabled -bool NO
     NSUserDefaults *musicPrefs = NSUserDefaults.standardUserDefaults;
-    _musicProbesEnabled = ![musicPrefs objectForKey:@"musicEnabled"] || [musicPrefs boolForKey:@"musicEnabled"];
+    _musicProbesEnabled = YES;
+    // Only music stops: _musicProbesEnabled also gates the charge limit, remote Macs and the network
+    // monitor, and folding musicEnabled into it left the M1 charging to 100% (1 Nov 2026).
+    _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
     _outputVolume = -1;
     _mixPrepared = [NSMutableDictionary dictionary];
     _mixPreparing = [NSMutableSet set];
@@ -5772,7 +5776,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 
 // The library is read in the background when the popover first needs tiles, then every 6 h.
 - (void)ensureMixSeeds {
-    if (_mixFrozen || !_musicProbesEnabled || [self musicOffline]) return;
+    if (_mixFrozen || !_musicProbesEnabled || _musicOff || [self musicOffline]) return;
     // Scripting Music launches it: read the library only while it is already open (the tiles keep their
     // saved seeds meanwhile). On a Mac with an empty library this retried and relaunched Music (1 Nov 2026).
     if (!AppleMusicIsRunning()) return;
@@ -8078,7 +8082,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         if(!self->_popover.isShown || self->_terminating)return;
         [self refresh];
-        if(self->_musicProbesEnabled){[self yieldLocalMusicIfIdle];[self refreshMusicSources];}
+        if(self->_musicProbesEnabled && !self->_musicOff){[self yieldLocalMusicIfIdle];[self refreshMusicSources];}
         [self beginSampling];[self startPowerTick];
     });
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
