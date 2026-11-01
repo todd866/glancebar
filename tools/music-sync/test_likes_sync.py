@@ -237,6 +237,241 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(typo["id"], "c")
 
 
+def _yt(video_id: str, artist: str, title: str, **extra) -> dict:
+    row = {"videoId": video_id, "artist": artist, "title": title}
+    row.update(extra)
+    return row
+
+
+def _am(pid: str, artist: str, title: str, album: str = "") -> dict:
+    return {"pid": pid, "artist": artist, "title": title, "album": album}
+
+
+class RealLibraryMatchTests(unittest.TestCase):
+    """Fixtures from likes that the old normaliser left one-sided."""
+
+    def _ids(self, plan):
+        return {row["yt"]["videoId"]: row["am"]["pid"] for row in plan["matched"]}
+
+    def test_channel_upload_uses_the_artist_inside_the_title(self):
+        fixtures = [
+            (
+                "delete",
+                "triple j",
+                "DMA'S - 'Delete' (Splendour In The Grass 2018)",
+                "DMA'S",
+                "Delete",
+            ),
+            (
+                "delete-en",
+                "triple j",
+                "DMA'S – 'Delete'",
+                "DMA'S",
+                "Delete",
+            ),
+            (
+                "delete-em",
+                "triple j",
+                'DMA\'S — "Delete"',
+                "DMA'S",
+                "Delete",
+            ),
+            (
+                "sunshine",
+                "Jungle4eva",
+                "Jungle - Sunshine (Official Video)",
+                "Jungle",
+                "Sunshine",
+            ),
+            (
+                "another",
+                "triple j",
+                "Winston Surfshirt - 'Of Another Kind' Ft. Jerome Farah",
+                "Winston Surfshirt",
+                "Of Another Kind",
+            ),
+            (
+                "another-live",
+                "triple j",
+                "Winston Surfshirt - 'Of Another Kind' Ft. Jerome Farah & Milan Ring (live for Like A Version)",
+                "Winston Surfshirt",
+                "Of Another Kind (feat. Milan Ring & Jerome Farah)",
+            ),
+            ("audio", "Ch", "Artist - Song (Official Audio)", "Artist", "Song"),
+            ("lyric", "Ch", "Artist - Lyric Song (Lyric Video)", "Artist", "Lyric Song"),
+            ("visual", "Ch", "Artist - Visual Song (Visualizer)", "Artist", "Visual Song"),
+            ("hd", "Ch", "Artist - HD Song [HD]", "Artist", "HD Song"),
+            ("liveat", "Ch", "Artist - Live Song (Live at the Enmore)", "Artist", "Live Song"),
+            ("year", "Ch", "Artist - Fest Song (Falls Festival 2019)", "Artist", "Fest Song"),
+            ("topic", "Band - Topic", "Real Artist - Topic Song", "Real Artist", "Topic Song"),
+        ]
+        youtube = [_yt(video_id, artist, title) for video_id, artist, title, _am_artist, _am_title in fixtures]
+        apple = [_am(video_id, am_artist, am_title) for video_id, _artist, _title, am_artist, am_title in fixtures]
+        plan = likes_sync.build_plan(youtube, apple)
+        self.assertEqual(self._ids(plan), {video_id: video_id for video_id, *_rest in fixtures})
+        self.assertTrue(all(row["how"] == "exact" and row["ratio"] == 1.0 for row in plan["matched"]))
+        self.assertEqual(plan["yt_only"], [])
+        self.assertEqual(plan["am_only"], [])
+        self.assertEqual(plan["skip"], [])
+        # A bare year in brackets is not a festival tag.
+        self.assertEqual(
+            likes_sync.normalise("Artist", "Song (2016)"),
+            ("artist", "song 2016"),
+        )
+
+    def test_original_names_stay_when_the_title_split_matches_nothing(self):
+        # The split reads this as artist "We Will Rock You". Nothing in the library
+        # is that song, so the original Queen credit is the match.
+        plan = likes_sync.build_plan(
+            [_yt("q", "Queen", "We Will Rock You - Live Cut")],
+            [
+                _am("decoy", "We Will Rock You", "Different Title"),
+                _am("real", "Queen", "We Will Rock You - Live Cut"),
+            ],
+        )
+        self.assertEqual(self._ids(plan), {"q": "real"})
+        self.assertEqual(plan["matched"][0]["how"], "exact")
+        self.assertEqual([row["pid"] for row in plan["am_only"]], ["decoy"])
+
+    def test_primary_artist_and_featured_title(self):
+        fixtures = [
+            (
+                "rock",
+                "De La Soul, MF DOOM",
+                "Rock Co.Kane Flow (feat. MF DOOM)",
+                "De La Soul",
+                "Rock Co.Kane Flow (feat. MF DOOM)",
+            ),
+            (
+                "stingray",
+                "King Stingray, Roy Kellaway,",
+                "Get Me Out",
+                "King Stingray",
+                "Get Me Out",
+            ),
+            ("fred", "Fred again . .", "glow", "Fred again..", "glow"),
+            ("ex", "Fred again.. x Duskus", "ex song", "Fred again..", "ex song"),
+            ("amp", "King Stingray & Roy Kellaway", "amp song", "King Stingray", "amp song"),
+            ("and", "De La Soul and MF DOOM", "and song", "De La Soul", "and song"),
+            ("comma", "De La Soul, MF DOOM", "comma song", "De La Soul", "comma song"),
+        ]
+        youtube = [_yt(video_id, artist, title) for video_id, artist, title, _a, _t in fixtures]
+        apple = [_am(video_id, am_artist, am_title) for video_id, _a, _t, am_artist, am_title in fixtures]
+        plan = likes_sync.build_plan(youtube, apple)
+        self.assertEqual(self._ids(plan), {video_id: video_id for video_id, *_rest in fixtures})
+        self.assertTrue(all(row["how"] == "exact" and row["ratio"] == 1.0 for row in plan["matched"]))
+        # The featured name only has to come off the title. It does not have to be on both artists.
+        bare = likes_sync.build_plan(
+            [_yt("bare", "De La Soul, MF DOOM", "Rock Co.Kane Flow")],
+            [_am("bare", "De La Soul", "Rock Co.Kane Flow (feat. MF DOOM)")],
+        )
+        self.assertEqual(self._ids(bare), {"bare": "bare"})
+        self.assertEqual(bare["matched"][0]["how"], "exact")
+
+    def test_not_songs_are_skipped_and_not_applied(self):
+        rows = [
+            (_yt("mixes", "Someone", "Lane 8 Summer Mixes"), "mix"),
+            (_yt("mixtape", "Someone", "RJD2 Long Mixtape"), "mixtape"),
+            (_yt("full-mix", "Someone", "Your Face or Your Kneecap (full mixtape)"), "full mixtape"),
+            (_yt("album", "Ninja Tune", "Floating Points - 'Crush' (Full Album)"), "full album"),
+            (_yt("dj", "AlphaClam", "The Avalanches — A Party For Melbourne (DJ Set)"), "dj set"),
+            (_yt("boiler", "Boiler Room", "Fred again.. | Boiler Room: London"), "boiler room"),
+            (_yt("tiny", "NPR Music", "Waxahatchee: Tiny Desk Concert"), "tiny desk"),
+            (_yt("npr", "NPR Music", "Beirut Full Concert | NPR MUSIC FRONT ROW"), "npr music"),
+            (_yt("glasto", "BBC Music", "KNEECAP - Fine Art | Glastonbury 2025"), "glastonbury"),
+            (_yt("liveset", "Someone", "Saturday live set"), "live set"),
+            (_yt("remixed", "The Hood Internet", "75 Songs From 2003 Remixed Into 4 Minutes"), "songs remixed"),
+            (_yt("long", "Band", "A Real Song", duration=13 * 60), "longer than 12 minutes"),
+            (_yt("clock", "Band", "Another Song", duration="0:12:01"), "longer than 12 minutes"),
+            (_am("am-tiny", "Edward Sharpe & The Magnetic Zeros", "40 Day Dream (Live at NPR Music’s Tiny Desk Concert)"), "tiny desk"),
+        ]
+        kept = [
+            _yt("song", "Band", "Since I Left You (Prince Paul Remix)"),
+            _yt("edge", "Band", "Alter Ego (2020 Mix)", duration=likes_sync.LONG_VIDEO_SECONDS),
+            _yt("archive", "The Mixtape Archive", "Kid Koala - Scratchcratchratchatch"),
+        ]
+        plan = likes_sync.build_plan(
+            [row for row, _reason in rows if "videoId" in row] + kept,
+            [row for row, _reason in rows if "pid" in row]
+            + [
+                _am("song", "Band", "Since I Left You (Prince Paul Remix)"),
+                _am("koala", "Kid Koala", "Scratchcratchratchatch"),
+            ],
+        )
+        self.assertEqual(
+            [(row.get("videoId") or row.get("pid"), row["reason"]) for row in plan["skip"]],
+            [((row.get("videoId") or row.get("pid")), reason) for row, reason in rows],
+        )
+        self.assertEqual(self._ids(plan), {"song": "song", "archive": "koala"})
+        skipped_ids = {row.get("videoId") or row.get("pid") for row in plan["skip"]}
+        for bucket in (plan["yt_only"], plan["am_only"]):
+            for row in bucket:
+                self.assertNotIn(row.get("videoId") or row.get("pid"), skipped_ids)
+        for row in plan["matched"]:
+            self.assertNotIn(row["yt"]["videoId"], skipped_ids)
+            self.assertNotIn(row["am"]["pid"], skipped_ids)
+        self.assertEqual([row["videoId"] for row in plan["yt_only"]], ["edge"])
+        self.assertEqual(plan["am_only"], [])
+
+    def test_like_a_version_cover_matches_the_apple_title(self):
+        plan = likes_sync.build_plan(
+            [
+                _yt(
+                    "dash",
+                    "triple j",
+                    "Winston Surfshirt - Kiss Me More (Like A Version)",
+                ),
+                _yt(
+                    "cover",
+                    "triple j",
+                    "Winston Surfshirt cover Doja Cat 'Kiss Me More' for Like A Version Ft. Jerome Farah & Milan Ring",
+                ),
+                _yt(
+                    "yellow",
+                    "triple j",
+                    "King Stingray cover Coldplay 'Yellow' for Like A Version",
+                ),
+                _yt(
+                    "adam",
+                    "triple j",
+                    "Nick Ward covers blink-182 'Adam's Song' Ft. E^ST for Like A Version",
+                ),
+            ],
+            [
+                _am(
+                    "dash",
+                    "Winston Surfshirt",
+                    "Kiss Me More (triple j Like A Version) [feat. Jerome Farah & Milan Ring]",
+                ),
+                _am("yellow", "King Stingray", "Yellow (triple j Like A Version)"),
+                _am("adam", "Nick Ward", "Adam's Song (triple j Like A Version)"),
+                _am("doja", "Doja Cat", "Kiss Me More (feat. SZA)"),
+            ],
+        )
+        # Two uploads of the same cover: one favourite, the other stays one-sided.
+        # The original Doja Cat recording is not that cover.
+        self.assertEqual(plan["matched"][0]["yt"]["videoId"], "dash")
+        self.assertEqual(plan["matched"][0]["am"]["pid"], "dash")
+        self.assertEqual(plan["matched"][0]["how"], "exact")
+        # The cover sentence is the same favourite. One Apple row can only be used once.
+        self.assertEqual(
+            likes_sync.pair_score(
+                {
+                    "artist": "triple j",
+                    "title": "Winston Surfshirt cover Doja Cat 'Kiss Me More' for Like A Version Ft. Jerome Farah & Milan Ring",
+                },
+                {
+                    "artist": "Winston Surfshirt",
+                    "title": "Kiss Me More (triple j Like A Version) [feat. Jerome Farah & Milan Ring]",
+                },
+            ),
+            1.0,
+        )
+        self.assertEqual(self._ids(plan), {"dash": "dash", "yellow": "yellow", "adam": "adam"})
+        self.assertEqual([row["videoId"] for row in plan["yt_only"]], ["cover"])
+        self.assertEqual([row["pid"] for row in plan["am_only"]], ["doja"])
+
+
 class ArchiveAndLibraryTests(unittest.TestCase):
     def test_archive_filenames_mdls_and_ffprobe(self):
         self.assertEqual(likes_sync.parse_archive("youtube AbC_def-123\n\nSoundCloud nope\n"), ["AbC_def-123"])
@@ -659,7 +894,8 @@ class CommandTests(unittest.TestCase):
         code, _stdout, _stderr = silence(likes_sync.main, ["plan"], tool_runners)
         self.assertEqual(code, 0)
         plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(plan.keys()), {"yt_only", "am_only", "matched"})
+        self.assertEqual(set(plan.keys()), {"yt_only", "am_only", "matched", "skip"})
+        self.assertEqual(plan["skip"], [])
 
     def test_ffprobe_tags_win_when_present(self):
         root = Path(self.tmp.name)

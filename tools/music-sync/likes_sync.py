@@ -54,11 +54,58 @@ _REMASTER_PAREN = re.compile(r"(?i)\s*[\(\[][^)\]]*\bremaster(?:ed)?\b[^)\]]*[\)
 _REMASTER_DASH = re.compile(r"(?i)\s+-\s+[^\n]*\bremaster(?:ed)?\b.*$")
 _OFFICIAL_PAREN = re.compile(r"(?i)\s*[\(\[]\s*official\b[^)\]]*[\)\]]")
 _OFFICIAL_DASH = re.compile(r"(?i)\s+-\s+official\b.*$")
+_LYRIC_VISUALIZER = re.compile(r"(?i)\s*[\(\[]\s*(?:lyric\s+video|visuali[sz]er)\s*[\)\]]")
+_HD = re.compile(r"(?i)\s*[\[\(]\s*hd\s*[\]\)]")
+_LIVE_AT = re.compile(r"(?i)\s*[\(\[]\s*live\s+at\b[^)\]]*[\)\]]")
+# Festival tags such as "(Splendour In The Grass 2018)". A bare "(2016)" stays,
+# so a year by itself can still tell two releases apart.
+_YEAR_TAG = re.compile(
+    r"(?i)\s*[\(\[](?=[^)\]]*[\w])[^)\]]*[A-Za-z][^)\]]*\b(?:19|20)\d{2}\b[^)\]]*[\)\]]"
+)
+_LAV = re.compile(r"(?i)\s*[\(\[][^)\]]*\blike\s+a\s+version\b[^)\]]*[\)\]]")
+_LAV_FOR = re.compile(r"(?i)\s+for\s+like\s+a\s+version\b")
 _TOPIC = re.compile(r"(?i)\s+-\s+topic\s*$")
 _FILENAME = re.compile(
     r"^(?P<artist>.+?) - (?P<title>.+) \[(?P<video_id>[A-Za-z0-9_-]+)\]\.m4a$",
     re.IGNORECASE,
 )
+_QUOTES = "\"'“”‘’"
+# Whole right-hand side of a split that is a tag, not a song title.
+_DECORATION_ONLY = re.compile(
+    r"(?:"
+    r"official(?:\s+\w+)*|"
+    r"lyric video|visuali[sz]er|hd|"
+    r"(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?|"
+    r"live(?:\s+at\b.*)?"
+    r")"
+)
+# Joins between credited artists. "&", "and", and "x" need spaces so "R&B" and
+# "band" stay one name. A comma does not.
+_ARTIST_JOIN = re.compile(r"(?i)\s*(?:,|\s&\s|\s\band\b\s|\s\bx\b\s)\s*")
+_COVER_LAV = re.compile(
+    r"(?i)^(?P<artist>.+?)\s+covers?\s+.+?\s+"
+    r"[\"“‘'](?P<title>.+?)[\"”’']"
+    r"(?:\s+(?:featuring|feat\.?|ft\.?)(?!\w).+?)?"
+    r"\s+for\s+like\s+a\s+version\b"
+)
+_PARENS = re.compile(r"[\(\[][^)\]]*[\)\]]")
+# Phrase checks see brackets. "mix"/"mixes" does not, so "(Remix)" and
+# "(2020 Mix)" stay songs. "mixtape" is a separate phrase.
+_SKIP_PHRASES = (
+    ("full mixtape", re.compile(r"(?i)\bfull\s+mixtapes?\b")),
+    ("full album", re.compile(r"(?i)\bfull\s+albums?\b")),
+    ("mixtape", re.compile(r"(?i)\bmix\s*tapes?\b")),
+    ("dj set", re.compile(r"(?i)\bdj\s+sets?\b")),
+    ("mix", re.compile(r"(?i)\bdj\s+mix(?:es)?\b")),
+    ("boiler room", re.compile(r"(?i)\bboiler\s+room\b")),
+    ("tiny desk", re.compile(r"(?i)\btiny\s+desk\b")),
+    ("npr music", re.compile(r"(?i)\bnpr\s+music\b")),
+    ("glastonbury", re.compile(r"(?i)\bglastonbury\b")),
+    ("live set", re.compile(r"(?i)\blive\s+sets?\b")),
+    ("songs remixed", re.compile(r"(?i)\b\d+\s+songs\b.*\bremixed\b")),
+)
+_MIX_WORD = re.compile(r"(?i)(?<![a-z])mix(?:es)?\b")
+LONG_VIDEO_SECONDS = 12 * 60
 
 
 def javascript_events_denied(text: str) -> bool:
@@ -182,8 +229,13 @@ def default_ffprobe(path: str) -> str:
     return proc.stdout or ""
 
 
+def collapse_spaced_dots(text: str) -> str:
+    """'Fred again . .' and 'Fred again..' are the same name."""
+    return re.sub(r"(?:\s*\.){2,}", lambda match: "." * match.group(0).count("."), text or "")
+
+
 def normalise_field(value: str) -> str:
-    text = (value or "").lower().strip()
+    text = collapse_spaced_dots(value or "").replace("\xa0", " ").lower().strip()
     text = (
         text.replace("\u2010", "-")
         .replace("\u2011", "-")
@@ -199,6 +251,12 @@ def normalise_field(value: str) -> str:
         text = _REMASTER_DASH.sub("", text)
         text = _OFFICIAL_PAREN.sub("", text)
         text = _OFFICIAL_DASH.sub("", text)
+        text = _LYRIC_VISUALIZER.sub("", text)
+        text = _HD.sub("", text)
+        text = _LIVE_AT.sub("", text)
+        text = _YEAR_TAG.sub("", text)
+        text = _LAV.sub("", text)
+        text = _LAV_FOR.sub("", text)
         text = _TOPIC.sub("", text)
     text = text.replace("'", "").replace("\u2019", "").replace("\u2018", "")
     text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
@@ -209,10 +267,116 @@ def normalise(artist: str, title: str) -> tuple[str, str]:
     return normalise_field(artist), normalise_field(title)
 
 
-def pair_score(left: dict, right: dict) -> float:
-    """1.0 when the normalised names are the same, else difflib on 'artist title'."""
-    left_artist, left_title = normalise(left.get("artist") or "", left.get("title") or "")
-    right_artist, right_title = normalise(right.get("artist") or "", right.get("title") or "")
+def strip_wrapping_quotes(text: str) -> str:
+    value = (text or "").strip()
+    while len(value) >= 2 and value[0] in _QUOTES and value[-1] in _QUOTES:
+        value = value[1:-1].strip()
+    return value
+
+
+def _decoration_only(text: str) -> bool:
+    cleaned = normalise_field(text)
+    if not cleaned:
+        return True
+    return _DECORATION_ONLY.fullmatch(cleaned) is not None
+
+
+def split_artist_title(title: str) -> tuple[str, str] | None:
+    """First top-level 'Artist - Title' in a video title.
+
+    A hyphen needs spaces, so 'blink-182' stays intact. En and em dashes count
+    with or without spaces. The right-hand side has to still be a title after
+    tags are removed: 'Song - Remastered 2011' is not an artist credit.
+    """
+    text = (title or "").replace("\xa0", " ")
+    depth = 0
+    for index, char in enumerate(text):
+        if char in "([{":
+            depth += 1
+            continue
+        if char in ")]}":
+            depth = max(0, depth - 1)
+            continue
+        if depth != 0 or char not in "-–—":
+            continue
+        if char == "-" and not (
+            index > 0
+            and text[index - 1].isspace()
+            and index + 1 < len(text)
+            and text[index + 1].isspace()
+        ):
+            continue
+        left = text[:index].strip()
+        right = strip_wrapping_quotes(text[index + 1 :].strip())
+        if not left or _decoration_only(right):
+            continue
+        if not normalise_field(left) or not normalise_field(right):
+            continue
+        return left, right
+    return None
+
+
+def parse_lav_cover(title: str) -> tuple[str, str] | None:
+    """'Artist cover Someone \\'Title\\' for Like A Version' -> (Artist, Title)."""
+    text = (title or "").replace("\xa0", " ")
+    if "like a version" not in text.lower():
+        return None
+    match = _COVER_LAV.search(text)
+    if not match:
+        return None
+    artist = match.group("artist").strip()
+    song = match.group("title").strip()
+    if not artist or not song:
+        return None
+    return artist, song
+
+
+def primary_artist(artist: str) -> str:
+    """First credited name. 'De La Soul, MF DOOM' and a trailing comma both yield De La Soul."""
+    text = collapse_spaced_dots(artist or "").strip().strip(",")
+    if not text:
+        return ""
+    parts = [part.strip(" ,") for part in _ARTIST_JOIN.split(text)]
+    parts = [part for part in parts if part]
+    return parts[0] if parts else ""
+
+
+def forms_for(track: dict) -> list[tuple[str, str]]:
+    """Normalised (artist, title) readings. The original pair stays in the list as the fallback."""
+    artist = track.get("artist") or ""
+    title = track.get("title") or ""
+    raws = [(artist, title)]
+    embedded = split_artist_title(title)
+    if embedded is not None:
+        raws.append(embedded)
+    cover = parse_lav_cover(title)
+    if cover is not None:
+        raws.append(cover)
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_artist, raw_title in raws:
+        names = [raw_artist]
+        primary = primary_artist(raw_artist)
+        if primary and primary != raw_artist:
+            names.append(primary)
+        for name in names:
+            form = normalise(name, raw_title)
+            if form[0] and form[1] and form not in seen:
+                seen.add(form)
+                found.append(form)
+    return found
+
+
+def _pair_score_prepared(
+    left_forms: set[tuple[str, str]],
+    right_forms: set[tuple[str, str]],
+    left_norm: tuple[str, str],
+    right_norm: tuple[str, str],
+) -> float:
+    if left_forms and right_forms and left_forms & right_forms:
+        return 1.0
+    left_artist, left_title = left_norm
+    right_artist, right_title = right_norm
     if not left_artist or not left_title or not right_artist or not right_title:
         return 0.0
     if (left_artist, left_title) == (right_artist, right_title):
@@ -222,15 +386,98 @@ def pair_score(left: dict, right: dict) -> float:
     ).ratio()
 
 
-def build_plan(yt: list[dict], am_fav: list[dict]) -> dict:
-    """Pair likes with favourites. Exact normalised names win, then the best fuzzy score >= 0.9.
+def pair_score(left: dict, right: dict) -> float:
+    """1.0 when any reading matches, else difflib on the original 'artist title'."""
+    return _pair_score_prepared(
+        set(forms_for(left)),
+        set(forms_for(right)),
+        normalise(left.get("artist") or "", left.get("title") or ""),
+        normalise(right.get("artist") or "", right.get("title") or ""),
+    )
 
-    Each track is used at most once. Leftovers are what apply will add. Nothing here is a removal.
+
+def _phrase_reason(text: str) -> str | None:
+    for reason, pattern in _SKIP_PHRASES:
+        if pattern.search(text or ""):
+            return reason
+    outside = _PARENS.sub(" ", text or "")
+    if _MIX_WORD.search(outside):
+        return "mix"
+    return None
+
+
+def duration_seconds(raw) -> float | None:
+    """Seconds when a length is known. Numbers are seconds; 'm:ss' and 'h:mm:ss' parse too."""
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, (int, float)):
+        if raw < 0:
+            return None
+        return float(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+    parts = text.split(":")
+    if 2 <= len(parts) <= 3 and all(re.fullmatch(r"\d+(?:\.\d+)?", part) for part in parts):
+        nums = [float(part) for part in parts]
+        if len(nums) == 2:
+            return nums[0] * 60 + nums[1]
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    return None
+
+
+def skip_reason(track: dict) -> str | None:
+    """Why this row is not a song. None means it stays in the match."""
+    title = track.get("title") or ""
+    artist = track.get("artist") or ""
+    title_reason = _phrase_reason(title)
+    if title_reason:
+        return title_reason
+    artist_reason = _phrase_reason(artist)
+    # A channel named "The Mixtape Archive" can still upload one song.
+    if artist_reason and not (artist_reason in {"mix", "mixtape"} and split_artist_title(title)):
+        return artist_reason
+    seconds = duration_seconds(track.get("duration"))
+    if seconds is not None and seconds > LONG_VIDEO_SECONDS:
+        return "longer than 12 minutes"
+    return None
+
+
+def _partition(tracks: list[dict], side: str) -> tuple[list[dict], list[dict]]:
+    kept = []
+    skipped = []
+    for track in tracks:
+        reason = skip_reason(track)
+        if not reason:
+            kept.append(track)
+            continue
+        row = public_yt(track) if side == "yt" else public_am(track)
+        row["side"] = side
+        row["reason"] = reason
+        skipped.append(row)
+    return kept, skipped
+
+
+def build_plan(yt: list[dict], am_fav: list[dict]) -> dict:
+    """Pair likes with favourites. Exact readings win, then the best fuzzy score >= 0.9.
+
+    Readings are the original names, an Artist - Title pulled out of a channel
+    upload, a Like A Version cover, and the primary artist when several names
+    are joined. Mixes, sets, and videos longer than 12 minutes (when a duration
+    is known) go to `skip` and are never applied. Each other track is used once.
     """
+    yt_kept, yt_skip = _partition(yt, "yt")
+    am_kept, am_skip = _partition(am_fav, "am")
+    yt_forms = [set(forms_for(track)) for track in yt_kept]
+    am_forms = [set(forms_for(track)) for track in am_kept]
+    yt_norm = [normalise(track.get("artist") or "", track.get("title") or "") for track in yt_kept]
+    am_norm = [normalise(track.get("artist") or "", track.get("title") or "") for track in am_kept]
     pairs = []
-    for i, youtube in enumerate(yt):
-        for j, apple in enumerate(am_fav):
-            score = pair_score(youtube, apple)
+    for i, left_forms in enumerate(yt_forms):
+        for j, right_forms in enumerate(am_forms):
+            score = _pair_score_prepared(left_forms, right_forms, yt_norm[i], am_norm[j])
             if score >= FUZZY_MIN:
                 pairs.append((score, i, j))
     pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
@@ -244,8 +491,8 @@ def build_plan(yt: list[dict], am_fav: list[dict]) -> dict:
         used_am.add(j)
         matched.append(
             {
-                "yt": public_yt(yt[i]),
-                "am": public_am(am_fav[j]),
+                "yt": public_yt(yt_kept[i]),
+                "am": public_am(am_kept[j]),
                 "how": "exact" if score == 1.0 else "fuzzy",
                 "ratio": round(score, 4),
                 "_i": i,
@@ -255,9 +502,10 @@ def build_plan(yt: list[dict], am_fav: list[dict]) -> dict:
     for row in matched:
         del row["_i"]
     return {
-        "yt_only": [public_yt(yt[i]) for i in range(len(yt)) if i not in used_yt],
-        "am_only": [public_am(am_fav[j]) for j in range(len(am_fav)) if j not in used_am],
+        "yt_only": [public_yt(yt_kept[i]) for i in range(len(yt_kept)) if i not in used_yt],
+        "am_only": [public_am(am_kept[j]) for j in range(len(am_kept)) if j not in used_am],
         "matched": matched,
+        "skip": yt_skip + am_skip,
     }
 
 
@@ -1251,7 +1499,7 @@ def cmd_plan(_args, _runners: Runners) -> int:
     write_json(out, plan)
     print(
         f"plan matched {len(plan['matched'])} yt_only {len(plan['yt_only'])} "
-        f"am_only {len(plan['am_only'])} -> {out}"
+        f"am_only {len(plan['am_only'])} skip {len(plan['skip'])} -> {out}"
     )
     return 0
 
