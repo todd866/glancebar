@@ -77,7 +77,7 @@ class ScriptedOSA:
             return "closed\n"
         if "loading of t" in source:
             return "ready\n"
-        if "execute javascript" in source:
+        if "javascript" in source and "execute" in source:
             if self.fail == "javascript":
                 raise RuntimeError(
                     "Executing JavaScript through AppleScript is turned off. "
@@ -741,7 +741,7 @@ class AccountApplyTests(unittest.TestCase):
         self.assertIn("/like/like", osa.liked[0])
         self.assertIn("abc_1", osa.liked[0])
         self.assertNotIn("removelike", osa.liked[0])
-        self.assertTrue(any("EgWKAQIIAWoKEAkQBRAKEAMQBA==" in decode_js(script) for script in osa.scripts if "execute javascript" in script))
+        self.assertTrue(any("EgWKAQIIAWoKEAkQBRAKEAMQBA==" in decode_js(script) for script in osa.scripts if "javascript" in script))
         self.assertEqual(osa.closed, 1)
 
         mismatch = ScriptedOSA(songs=[{"videoId": "abc_1", "title": "Song", "artist": "Someone Else"}])

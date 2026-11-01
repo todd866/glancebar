@@ -894,13 +894,14 @@ def js_wrapper(source: str) -> str:
 
 
 def _js_call(wid: str, tid: str, source: str) -> str:
-    # Chrome's verb is `execute javascript ... in tab`. Glancebar already uses it on this Mac.
+    # Chrome's verb is `execute <tab> javascript ...`. The `execute javascript ... in <tab>` form is
+    # rejected with "Access not allowed" (-1723) even with Apple Events JavaScript on (1 Nov 2026).
     wrapper = js_wrapper(source)
     return (
         'tell application "Google Chrome"\n'
         f"set w to first window whose id is {wid}\n"
         f"set t to first tab of w whose id is {tid}\n"
-        f'return execute javascript "{wrapper}" in t\n'
+        f'return execute t javascript "{wrapper}"\n'
         "end tell\n"
     )
 
