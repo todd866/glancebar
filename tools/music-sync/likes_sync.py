@@ -36,11 +36,19 @@ JS_DENIED_MESSAGE = (
     "In Google Chrome turn on View > Developer > Allow JavaScript from Apple Events, then run again."
 )
 MUSIC_AUTH_MESSAGE = (
-    "Apple Music in Chrome is not signed in (MusicKit isAuthorized stayed false). "
+    "Apple Music in Chrome is not signed in (no media-user-token in cookies or storage). "
     "Open https://music.apple.com in Chrome's Default profile, sign in, then run again."
 )
+MUSIC_BLOCKED_MESSAGE = (
+    "Apple Music tokens were not in the page DOM or storage, and a main-world script "
+    "was blocked (CSP or Trusted Types). Run probe-am for the masked token report."
+)
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+# Long token-shaped runs. Slashes and hyphens stay so page paths are not eaten.
+_OPAQUE_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_+=]{24,}(?![A-Za-z0-9])")
 YOUTUBE_LOAD_MESSAGE = (
-    "YouTube Music did not finish loading in Chrome. "
+    "YouTube Music did not expose innertube config in this tab "
+    "(no ytcfg and no INNERTUBE_API_KEY in inline scripts). "
     "Open https://music.youtube.com while signed in, then run again."
 )
 
@@ -119,17 +127,43 @@ def javascript_events_denied(text: str) -> bool:
     )
 
 
+def redact_secrets(text: str) -> str:
+    """Mask JWTs and other long token-shaped strings. First four characters only."""
+    def jwt(match: re.Match) -> str:
+        return match.group(0)[:4] + "…"
+
+    cleaned = _JWT_RE.sub(jwt, text or "")
+    return _OPAQUE_RE.sub("…", cleaned)
+
+
 def explain_osascript_failure(text: str) -> str:
     if javascript_events_denied(text):
         return JS_DENIED_MESSAGE
     low = (text or "").lower()
-    if "not authorized to send apple events" in low or "(-1743)" in low:
+    if "not authorized to send apple events" in low or "(-1743)" in low or "(-1712)" in low or "appleevent timed out" in low:
         return (
-            "macOS blocked Apple Events. Allow this terminal to control Music and "
-            "Google Chrome in System Settings > Privacy & Security > Automation, then run again."
+            "macOS blocked Apple Events or Chrome did not answer in time. Allow this "
+            "terminal to control Music and Google Chrome in System Settings > Privacy & "
+            "Security > Automation, then run again."
         )
     cleaned = (text or "").strip()
     return cleaned or "osascript failed"
+
+
+def _chrome_unreachable(text: str) -> bool:
+    low = (text or "").lower()
+    return (
+        javascript_events_denied(text)
+        or "(-1743)" in low
+        or "(-1712)" in low
+        or "not authorized to send apple events" in low
+        or "appleevent timed out" in low
+    )
+
+
+def _chrome_script(body: str, seconds: int = 30) -> str:
+    # Chrome sometimes never replies to Apple Events. Fail instead of waiting out the default.
+    return f"with timeout of {seconds} seconds\n{body}end timeout\n"
 
 
 class Runners:
@@ -846,7 +880,7 @@ def run_apply(
             raise
         except Exception as exc:
             raw = {"action": "write", "result": "error", "ids": {}}
-            detail = f"{exc.__class__.__name__}: {exc}"
+            detail = redact_secrets(f"{exc.__class__.__name__}: {exc}")
             print(f"{side} {key} failed: {detail[:300]}", file=sys.stderr)
         result = str(raw.get("result") or "error")
         if result not in {"ok", "no-match", "error"}:
@@ -897,18 +931,19 @@ def _js_call(wid: str, tid: str, source: str) -> str:
     # Chrome's verb is `execute <tab> javascript ...`. The `execute javascript ... in <tab>` form is
     # rejected with "Access not allowed" (-1723) even with Apple Events JavaScript on (1 Nov 2026).
     wrapper = js_wrapper(source)
-    return (
+    return _chrome_script(
         'tell application "Google Chrome"\n'
         f"set w to first window whose id is {wid}\n"
         f"set t to first tab of w whose id is {tid}\n"
         f'return execute t javascript "{wrapper}"\n'
-        "end tell\n"
+        "end tell\n",
+        60,
     )
 
 
 def open_tab_script(url: str) -> str:
     # Reset the active tab so the new one stays in the background.
-    return (
+    return _chrome_script(
         'tell application "Google Chrome"\n'
         "if (count of windows) is 0 then make new window\n"
         "set w to window 1\n"
@@ -920,122 +955,696 @@ def open_tab_script(url: str) -> str:
         "set active tab index of w to previousTab\n"
         "end try\n"
         'return (wid as text) & "," & (tid as text)\n'
-        "end tell\n"
+        "end tell\n",
+        20,
     )
 
 
 def close_tab_script(wid: str, tid: str) -> str:
-    return (
+    return _chrome_script(
         'tell application "Google Chrome"\n'
         f"set w to first window whose id is {wid}\n"
         f"set t to first tab of w whose id is {tid}\n"
         "close t\n"
         'return "closed"\n'
-        "end tell\n"
+        "end tell\n",
+        20,
     )
 
 
 def loading_script(wid: str, tid: str) -> str:
-    return (
+    return _chrome_script(
         'tell application "Google Chrome"\n'
         f"set w to first window whose id is {wid}\n"
         f"set t to first tab of w whose id is {tid}\n"
         'if loading of t then return "loading"\n'
         'return "ready"\n'
-        "end tell\n"
+        "end tell\n",
+        20,
     )
 
 
-AUTH_JS = """(function(){
-  try {
-    if (!window.MusicKit || !MusicKit.getInstance) return "missing";
-    var mk = MusicKit.getInstance();
-    if (mk && mk.isAuthorized) return "yes";
-    return "no";
-  } catch (e) {
-    return "missing";
-  }
-})()"""
-
+# Apple events run this JavaScript in an isolated world: window.MusicKit is the page's
+# object and is invisible here. The DOM, localStorage, and document.cookie are shared.
 YT_READY_JS = """(function(){
-  if (document.querySelector("ytmusic-app")) return "yes";
-  if (window.ytcfg) return "yes";
+  try {
+    if (window.ytcfg && typeof ytcfg.get === "function" && ytcfg.get("INNERTUBE_API_KEY")) return "yes";
+  } catch (e) {}
+  var scripts = document.scripts || [];
+  for (var i = 0; i < scripts.length; i++) {
+    var text = scripts[i].textContent || "";
+    if (text.indexOf("INNERTUBE_API_KEY") !== -1 && text.indexOf("INNERTUBE_CONTEXT") !== -1) return "yes";
+  }
   return "no";
 })()"""
 
-POLL_JS = "(function(){var r=window.__ms;return r&&r.done?JSON.stringify(r):'';})()"
+# Polls the isolated-world result, or a DOM node filled in by a main-world fallback script.
+POLL_JS = """(function(){
+  var job = window.__msJob;
+  if (job) {
+    var el = document.getElementById(job);
+    if (el) {
+      if (!el.getAttribute("data-ms-started")) {
+        el.remove();
+        window.__msJob = "";
+        return JSON.stringify({done:true, ok:false, error:"main-world script did not run (CSP or Trusted Types)"});
+      }
+      var raw = el.getAttribute("data-ms") || "";
+      if (raw) {
+        el.remove();
+        window.__msJob = "";
+        return raw;
+      }
+    }
+  }
+  var r = window.__ms;
+  return r && r.done ? JSON.stringify(r) : "";
+})()"""
+
+READY_STATE_JS = '(function(){return document.readyState==="complete"?"yes":"no";})()'
+
+
+def _apple_token_js() -> str:
+    """Read Apple Music tokens from DOM and storage. Never returns them to Python."""
+    return r"""
+  function mask4(value) {
+    var text = String(value || "");
+    if (text.length < 8) return text ? "****" : "";
+    return text.slice(0, 4);
+  }
+  function publicError(err) {
+    var msg = String((err && err.message) || err || "error");
+    msg = msg.replace(/[A-Za-z0-9._~+/=-]{16,}/g, "…");
+    return msg.slice(0, 120);
+  }
+  function cookieValue(name) {
+    var items = document.cookie ? document.cookie.split("; ") : [];
+    var prefix = name + "=";
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].indexOf(prefix) === 0) {
+        var raw = items[i].slice(prefix.length);
+        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+      }
+    }
+    return "";
+  }
+  function isJwt(value) {
+    return /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/.test(value || "");
+  }
+  function tryParseJson(text) {
+    var raw = String(text || "").replace(/^\s+/, "");
+    if (!raw || (raw.charAt(0) !== "{" && raw.charAt(0) !== "[")) return null;
+    try {
+      var data = JSON.parse(raw);
+      if (typeof data === "string") {
+        try { return JSON.parse(data); } catch (e) { return null; }
+      }
+      return data;
+    } catch (e2) {
+      return null;
+    }
+  }
+  function walkTokens(node, path, source, found, depth) {
+    if (!node || typeof node !== "object" || depth > 7 || found.length > 20) return;
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length; i++) {
+      if (found.length > 20) return;
+      var key = keys[i];
+      var val = node[key];
+      var next = path ? path + "." + key : key;
+      if (typeof val === "string") {
+        if (isJwt(val) && /token|jwt/i.test(key)) found.push({value: val, source: source, label: next});
+      } else if (val && typeof val === "object") {
+        walkTokens(val, next, source, found, depth + 1);
+      }
+    }
+  }
+  function collectJwts(text, source, found) {
+    if (!text || text.indexOf("eyJ") < 0 || found.length > 20) return;
+    var decoded = text;
+    if (decoded.indexOf("&quot;") !== -1 || decoded.indexOf("&#34;") !== -1) {
+      decoded = decoded.replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&amp;/g, "&");
+    }
+    if (decoded.length <= 400000) {
+      var parsed = tryParseJson(decoded);
+      if (parsed) walkTokens(parsed, "", source, found, 0);
+    }
+    var re = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g;
+    var match;
+    var guard = 0;
+    while ((match = re.exec(decoded)) && guard < 12 && found.length <= 20) {
+      guard++;
+      var prefix = decoded.slice(Math.max(0, match.index - 90), match.index);
+      var label = "";
+      var labeled = prefix.match(/([A-Za-z0-9_$.-]{3,60})\s*['"]?\s*[:=]\s*['"]?\s*$/);
+      if (labeled) label = labeled[1];
+      if (prefix.indexOf("MEDIA_API") !== -1) label = "MEDIA_API." + (label || "token");
+      else if (/developer/i.test(prefix)) label = label ? ("developer." + label) : "developerToken";
+      if (!label) continue;
+      if (!/token|jwt/i.test(label) && label.indexOf("MEDIA_API") === -1) continue;
+      found.push({value: match[0], source: source, label: label});
+    }
+  }
+  function scoreDev(item) {
+    var label = String(item.label || "");
+    var source = String(item.source || "");
+    var low = label.toLowerCase();
+    var score = 0;
+    if (low.indexOf("media_api") !== -1 && low.indexOf("token") !== -1) score += 100;
+    if (low.indexOf("developertoken") !== -1 || low.indexOf("developer.token") !== -1 || low.indexOf("developer_token") !== -1) score += 80;
+    if (/(^|\.)token$/.test(low)) score += 40;
+    else if (low.indexOf("token") !== -1 || low.indexOf("jwt") !== -1) score += 30;
+    if (score > 0 && (source.indexOf("config") !== -1 || source.indexOf("environment") !== -1)) score += 20;
+    if (score > 0 && source.indexOf("meta ") === 0) score += 10;
+    return score;
+  }
+  function findDeveloper() {
+    var found = [];
+    var metas = document.getElementsByTagName("meta");
+    for (var i = 0; i < metas.length; i++) {
+      var name = metas[i].getAttribute("name") || metas[i].getAttribute("property") || "";
+      var content = metas[i].getAttribute("content") || "";
+      if (content.indexOf("eyJ") === -1 && content.indexOf("&quot;eyJ") === -1) continue;
+      collectJwts(content, "meta " + name, found);
+    }
+    var scripts = document.scripts || [];
+    for (var s = 0; s < scripts.length; s++) {
+      var text = scripts[s].textContent || "";
+      if (text.indexOf("eyJ") === -1) continue;
+      if (text.indexOf("token") === -1 && text.indexOf("TOKEN") === -1 && text.indexOf("MEDIA_API") === -1 && text.indexOf("developer") === -1) continue;
+      var hint = scripts[s].id ? ("#" + scripts[s].id) : (scripts[s].getAttribute("type") || "inline");
+      collectJwts(text, "script " + hint, found);
+      if (found.length > 20) break;
+    }
+    var unique = [];
+    for (var n = 0; n < found.length; n++) {
+      var item = found[n];
+      if (!item || !item.value) continue;
+      item.score = scoreDev(item);
+      var prior = -1;
+      for (var j = 0; j < unique.length; j++) {
+        if (unique[j].value === item.value) { prior = j; break; }
+      }
+      if (prior >= 0) {
+        if (item.score > unique[prior].score) unique[prior] = item;
+      } else {
+        unique.push(item);
+      }
+    }
+    unique.sort(function(a, b) { return b.score - a.score; });
+    var best = unique.length && unique[0].score >= 30 ? unique[0] : {value: "", source: "", label: "", score: 0};
+    return {best: best, candidates: unique.slice(0, 8)};
+  }
+  function userFromStorage(raw) {
+    if (!raw) return "";
+    if (raw.charAt(0) === "{") {
+      try {
+        var data = JSON.parse(raw);
+        var nested = data && (data["media-user-token"] || data.mediaUserToken || data["music-user-token"] || data.musicUserToken);
+        if (typeof nested === "string") return nested;
+      } catch (e) {}
+      return "";
+    }
+    return raw;
+  }
+  function findUser() {
+    var names = ["media-user-token", "mediaUserToken", "music-user-token", "musicUserToken"];
+    for (var i = 0; i < names.length; i++) {
+      var value = cookieValue(names[i]);
+      if (value && value.length >= 20) return {value: value, source: "cookie " + names[i], label: names[i]};
+    }
+    var stores = [];
+    try { stores.push(["localStorage", window.localStorage]); } catch (e) {}
+    try { stores.push(["sessionStorage", window.sessionStorage]); } catch (e2) {}
+    for (var s = 0; s < stores.length; s++) {
+      var storeLabel = stores[s][0];
+      var store = stores[s][1];
+      var keys = [];
+      try {
+        for (var k = 0; k < store.length; k++) keys.push(store.key(k) || "");
+      } catch (e3) { continue; }
+      for (var n = 0; n < names.length; n++) {
+        var want = names[n].toLowerCase();
+        for (var j = 0; j < keys.length; j++) {
+          var key = keys[j];
+          if (!key) continue;
+          var low = key.toLowerCase();
+          if (low !== want && low.slice(-want.length) !== want) continue;
+          var raw = "";
+          try { raw = store.getItem(key) || ""; } catch (e4) { raw = ""; }
+          var picked = userFromStorage(raw);
+          if (picked && picked.length >= 20) return {value: picked, source: storeLabel + " " + key, label: key};
+        }
+      }
+    }
+    return {value: "", source: "", label: ""};
+  }
+  function readAmTokens() {
+    var dev = window.__amDev || null;
+    if (!dev || !dev.value) {
+      if (!(window.__amDevMiss && document.readyState === "complete")) {
+        var picked = findDeveloper();
+        dev = picked.best;
+        if (dev && dev.value) window.__amDev = dev;
+        else if (document.readyState === "complete") window.__amDevMiss = 1;
+      }
+    }
+    if (!dev) dev = {value: "", source: "", label: "", score: 0};
+    return {developer: dev, user: findUser()};
+  }
+  function injectInline(code) {
+    var script = document.createElement("script");
+    var assigned = false;
+    var reason = "script was not assigned";
+    try { script.text = code; assigned = true; }
+    catch (e1) { reason = publicError(e1); }
+    if (!assigned) {
+      try { script.textContent = code; assigned = true; }
+      catch (e2) { return {ok: false, error: publicError(e2) || reason}; }
+    }
+    var parent = document.head || document.documentElement;
+    if (!parent) return {ok: false, error: "no document"};
+    try { parent.appendChild(script); }
+    catch (e3) { return {ok: false, error: publicError(e3)}; }
+    try { script.remove(); } catch (e4) {}
+    return {ok: true, error: ""};
+  }
+  function startMainWorld(code) {
+    var id = "msjob" + Math.floor(Math.random() * 1000000000);
+    var holder = document.createElement("div");
+    holder.id = id;
+    holder.setAttribute("hidden", "");
+    document.documentElement.appendChild(holder);
+    var wrapped = "(function(){var el=document.getElementById(" + JSON.stringify(id) + ");if(!el)return;el.setAttribute('data-ms-started','1');" + code + "})()";
+    var injected = injectInline(wrapped);
+    if (!injected.ok || !holder.getAttribute("data-ms-started")) {
+      var why = (injected && injected.error) || "main-world script did not run (CSP or Trusted Types)";
+      try { holder.remove(); } catch (e) {}
+      window.__ms = {done: true, ok: false, error: publicError(why)};
+      return;
+    }
+    var immediate = holder.getAttribute("data-ms") || "";
+    if (immediate) {
+      try { window.__ms = JSON.parse(immediate); }
+      catch (e2) { window.__ms = {done: true, ok: false, error: "main-world result"}; }
+      try { holder.remove(); } catch (e3) {}
+      return;
+    }
+    window.__msJob = id;
+  }
+  function mainWorldAuth() {
+    var el = document.documentElement;
+    el.removeAttribute("data-ms-auth");
+    var code = "(function(){var el=document.documentElement;try{var mk=window.MusicKit&&MusicKit.getInstance&&MusicKit.getInstance();if(mk&&(mk.isAuthorized||mk.musicUserToken))el.setAttribute('data-ms-auth','yes');else if(window.MusicKit)el.setAttribute('data-ms-auth','no');else el.setAttribute('data-ms-auth','missing');}catch(e){el.setAttribute('data-ms-auth','missing');}})()";
+    var injected = injectInline(code);
+    if (!injected.ok) return {attempted: true, blocked: true, error: injected.error || "inject failed", auth: ""};
+    var auth = el.getAttribute("data-ms-auth") || "";
+    el.removeAttribute("data-ms-auth");
+    if (!auth) return {attempted: true, blocked: true, error: "script did not run (CSP or Trusted Types)", auth: ""};
+    return {attempted: true, blocked: false, error: "", auth: auth};
+  }
+  function interestingNames(names) {
+    var out = [];
+    var re = /token|music|media|musickit|amp|itua|config|environment/i;
+    for (var i = 0; i < names.length; i++) {
+      var name = String(names[i] || "");
+      if (!re.test(name)) continue;
+      if (!/^[A-Za-z0-9._:/-]{1,80}$/.test(name)) continue;
+      out.push(name);
+      if (out.length >= 30) break;
+    }
+    return out;
+  }
+  function listCookieNames() {
+    var items = document.cookie ? document.cookie.split("; ") : [];
+    var names = [];
+    for (var i = 0; i < items.length; i++) {
+      var name = (items[i].split("=")[0] || "").replace(/^\s+/, "");
+      if (name) names.push(name);
+    }
+    return interestingNames(names);
+  }
+  function listStorageKeys() {
+    var names = [];
+    var stores = [];
+    try { stores.push(window.localStorage); } catch (e) {}
+    try { stores.push(window.sessionStorage); } catch (e2) {}
+    for (var s = 0; s < stores.length; s++) {
+      try {
+        for (var i = 0; i < stores[s].length; i++) names.push(stores[s].key(i) || "");
+      } catch (e3) {}
+    }
+    return interestingNames(names);
+  }
+  function listMetaNames() {
+    var names = [];
+    var metas = document.getElementsByTagName("meta");
+    for (var i = 0; i < metas.length; i++) {
+      var name = metas[i].getAttribute("name") || metas[i].getAttribute("property") || "";
+      if (name) names.push(name);
+    }
+    return interestingNames(names);
+  }
+  function listScriptHints() {
+    var out = [];
+    var scripts = document.scripts || [];
+    for (var i = 0; i < scripts.length; i++) {
+      var text = scripts[i].textContent || "";
+      if (text.indexOf("eyJ") < 0) continue;
+      if (text.indexOf("token") < 0 && text.indexOf("MEDIA_API") < 0) continue;
+      var id = scripts[i].id || scripts[i].getAttribute("type") || "inline";
+      if (/^[A-Za-z0-9._:/-]{1,80}$/.test(id)) out.push(id);
+      if (out.length >= 15) break;
+    }
+    return out;
+  }
+  function describeToken(item) {
+    if (!item || !item.value) return null;
+    return {
+      source: String(item.source || "").slice(0, 120),
+      label: String(item.label || "").slice(0, 80),
+      mask: mask4(item.value),
+      length: String(item.value).length
+    };
+  }
+"""
+
+
+def _apple_fetch_js() -> str:
+    return r"""
+  function ampFetch(path, options) {
+    var read = readAmTokens();
+    var dev = read.developer && read.developer.value;
+    var user = read.user && read.user.value;
+    if (!dev || !user) return Promise.reject(new Error("apple tokens missing"));
+    var headers = {
+      "Authorization": "Bearer " + dev,
+      "Media-User-Token": user,
+      "Origin": "https://music.apple.com",
+      "Accept": "application/json"
+    };
+    if (options && options.contentType) headers["Content-Type"] = options.contentType;
+    var init = {method: (options && options.method) || "GET", headers: headers, credentials: "include"};
+    if (options && options.body) init.body = options.body;
+    return fetch("https://amp-api.music.apple.com" + path, init).then(function(res) {
+      return res.text().then(function(text) {
+        if (!res.ok) throw new Error("amp " + res.status);
+        if (!text) return {};
+        try { return JSON.parse(text); }
+        catch (e) { throw new Error("amp json"); }
+      });
+    });
+  }
+"""
+
+
+def auth_js() -> str:
+    return (
+        "(function(){ /* ms-auth-am */\n"
+        + _apple_token_js()
+        + r"""
+  try {
+    var read = readAmTokens();
+    if (read.user && read.user.value && read.developer && read.developer.value) return "yes";
+    if (document.readyState !== "complete") return "pending";
+    var main = mainWorldAuth();
+    if (main && main.auth === "yes") return "yes";
+    if (main && main.blocked) return "blocked";
+    return "no";
+  } catch (e) {
+    if (document.readyState === "complete") return "no";
+    return "pending";
+  }
+})()"""
+    )
+
+
+def am_probe_js() -> str:
+    return (
+        "(function(){ /* ms-probe-am */\n"
+        + _apple_token_js()
+        + r"""
+  function pageUrl() {
+    var loc = document.location;
+    if (!loc) return "";
+    return (loc.origin || "") + (loc.pathname || "");
+  }
+  try {
+    var picked = findDeveloper();
+    var user = findUser();
+    var candidates = [];
+    var list = picked.candidates || [];
+    for (var i = 0; i < list.length && i < 8; i++) {
+      var item = list[i];
+      candidates.push({
+        source: String(item.source || "").slice(0, 120),
+        label: String(item.label || "").slice(0, 80),
+        mask: mask4(item.value),
+        length: String(item.value || "").length,
+        score: item.score || 0
+      });
+    }
+    var mainWorld = null;
+    if (!user.value) {
+      if (document.readyState === "complete") mainWorld = mainWorldAuth();
+      else mainWorld = {attempted: false, blocked: false, error: "", auth: ""};
+    }
+    var report = {
+      url: pageUrl(),
+      readyState: document.readyState || "",
+      musickit: (typeof window.MusicKit === "undefined") ? "absent" : "present",
+      developer: describeToken(picked.best),
+      user: describeToken(user),
+      candidates: candidates,
+      cookieNames: listCookieNames(),
+      storageKeys: listStorageKeys(),
+      metaNames: listMetaNames(),
+      scriptHints: listScriptHints(),
+      mainWorld: mainWorld
+    };
+    return JSON.stringify(report);
+  } catch (e) {
+    return JSON.stringify({
+      url: pageUrl(),
+      readyState: document.readyState || "",
+      musickit: (typeof window.MusicKit === "undefined") ? "absent" : "present",
+      error: publicError(e)
+    });
+  }
+})()"""
+    )
 
 
 def catalog_search_js(term: str) -> str:
-    quoted = json.dumps(term)
-    return f"""(function(){{
-  window.__ms = {{done:false}};
-  var term = {quoted};
-  var mk;
-  try {{ mk = MusicKit.getInstance(); }}
-  catch (e) {{ window.__ms = {{done:true, ok:false, error:String(e)}}; return "started"; }}
-  var pending;
-  try {{
-    pending = mk.api.music("/v1/catalog/{STOREFRONT}/search", {{term: term, types: "songs", limit: 5}});
-  }} catch (e2) {{ window.__ms = {{done:true, ok:false, error:String(e2)}}; return "started"; }}
-  pending.then(function(res){{
+    search_path = json.dumps("/v1/catalog/" + STOREFRONT + "/search")
+    return (
+        "(function(){\n"
+        "  window.__ms = {done:false};\n"
+        "  var term = " + json.dumps(term) + ";\n"
+        "  var searchPath = " + search_path + ";\n"
+        + _apple_token_js()
+        + _apple_fetch_js()
+        + r"""
+  function songsFromCatalog(res) {
     var list = [];
-    try {{ list = res.results.songs.data; }} catch (e) {{}}
-    if (!list || !list.length) {{
-      try {{ list = res.data.results.songs.data; }} catch (e2) {{}}
-    }}
+    try { list = res.results.songs.data; } catch (e) {}
+    if (!list || !list.length) {
+      try { list = res.data.results.songs.data; } catch (e2) {}
+    }
     list = list || [];
     var songs = [];
-    for (var i = 0; i < list.length; i++) {{
-      var row = list[i] || {{}};
-      var attrs = row.attributes || {{}};
-      songs.push({{id: String(row.id || ""), title: attrs.name || "", artist: attrs.artistName || "", album: attrs.albumName || ""}});
-    }}
-    window.__ms = {{done:true, ok:true, songs: songs}};
-  }}, function(err){{
-    window.__ms = {{done:true, ok:false, error:String(err && err.message || err)}};
-  }});
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i] || {};
+      var attrs = row.attributes || {};
+      songs.push({id: String(row.id || ""), title: attrs.name || "", artist: attrs.artistName || "", album: attrs.albumName || ""});
+    }
+    return songs;
+  }
+  function startMainWorldSearch() {
+    var code = "try{var mk=window.MusicKit&&MusicKit.getInstance&&MusicKit.getInstance();"
+      + "if(!mk||!mk.api||!mk.api.music){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:'MusicKit missing'}));return;}"
+      + "mk.api.music(" + JSON.stringify(searchPath) + ",{term:" + JSON.stringify(term) + ",types:'songs',limit:5}).then(function(res){"
+      + "var list=[];try{list=res.results.songs.data;}catch(e){}"
+      + "if(!list||!list.length){try{list=res.data.results.songs.data;}catch(e2){}}"
+      + "list=list||[];var songs=[];"
+      + "for(var i=0;i<list.length;i++){var row=list[i]||{};var attrs=row.attributes||{};"
+      + "songs.push({id:String(row.id||''),title:attrs.name||'',artist:attrs.artistName||'',album:attrs.albumName||''});}"
+      + "el.setAttribute('data-ms',JSON.stringify({done:true,ok:true,songs:songs}));"
+      + "},function(err){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:String(err&&err.message||err).slice(0,80)}));});"
+      + "}catch(e){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:String(e&&e.message||e).slice(0,80)}));}";
+    startMainWorld(code);
+  }
+  try {
+    var read = readAmTokens();
+    if (read.developer && read.developer.value && read.user && read.user.value) {
+      var path = searchPath + "?term=" + encodeURIComponent(term) + "&types=songs&limit=5";
+      ampFetch(path, {method: "GET"}).then(function(res) {
+        window.__ms = {done:true, ok:true, songs: songsFromCatalog(res)};
+      }, function(err) {
+        window.__ms = {done:true, ok:false, error: publicError(err)};
+      });
+    } else {
+      startMainWorldSearch();
+    }
+  } catch (e) {
+    window.__ms = {done:true, ok:false, error: publicError(e)};
+  }
   return "started";
-}})()"""
+})()"""
+    )
 
 
 def catalog_love_js(song_id: str) -> str:
-    quoted = json.dumps(song_id)
     # value 1 is love. There is no dislike and no library delete.
-    return f"""(function(){{
-  window.__ms = {{done:false}};
-  var id = {quoted};
-  var mk;
-  try {{ mk = MusicKit.getInstance(); }}
-  catch (e) {{ window.__ms = {{done:true, ok:false, error:String(e)}}; return "started"; }}
-  var libraryPath = "/v1/me/library?ids[songs]=" + encodeURIComponent(id);
-  var ratingPath = "/v1/me/ratings/songs/" + encodeURIComponent(id);
-  var pending;
-  try {{
-    pending = mk.api.music(libraryPath, {{}}, {{fetchOptions: {{method: "POST"}}}});
-  }} catch (e2) {{ window.__ms = {{done:true, ok:false, error:String(e2)}}; return "started"; }}
-  pending.then(function(){{
-    return mk.api.music(ratingPath, {{}}, {{fetchOptions: {{
-      method: "PUT",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{type: "rating", attributes: {{value: 1}}}})
-    }}}});
-  }}).then(function(){{
-    window.__ms = {{done:true, ok:true, id: id}};
-  }}, function(err){{
-    window.__ms = {{done:true, ok:false, error:String(err && err.message || err)}};
-  }});
+    return (
+        "(function(){\n"
+        "  window.__ms = {done:false};\n"
+        "  var id = " + json.dumps(song_id) + ";\n"
+        + _apple_token_js()
+        + _apple_fetch_js()
+        + r"""
+  function startMainWorldLove() {
+    var code = "try{var mk=window.MusicKit&&MusicKit.getInstance&&MusicKit.getInstance();"
+      + "if(!mk||!mk.api||!mk.api.music){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:'MusicKit missing'}));return;}"
+      + "var libraryPath='/v1/me/library?ids[songs]='+encodeURIComponent(" + JSON.stringify(id) + ");"
+      + "var ratingPath='/v1/me/ratings/songs/'+encodeURIComponent(" + JSON.stringify(id) + ");"
+      + "mk.api.music(libraryPath,{},{fetchOptions:{method:'POST'}}).then(function(){"
+      + "return mk.api.music(ratingPath,{},{fetchOptions:{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'rating',attributes:{value: 1}})}});"
+      + "}).then(function(){el.setAttribute('data-ms',JSON.stringify({done:true,ok:true}));},"
+      + "function(err){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:String(err&&err.message||err).slice(0,80)}));});"
+      + "}catch(e){el.setAttribute('data-ms',JSON.stringify({done:true,ok:false,error:String(e&&e.message||e).slice(0,80)}));}";
+    startMainWorld(code);
+  }
+  try {
+    var read = readAmTokens();
+    var libraryPath = "/v1/me/library?ids[songs]=" + encodeURIComponent(id);
+    var ratingPath = "/v1/me/ratings/songs/" + encodeURIComponent(id);
+    if (read.developer && read.developer.value && read.user && read.user.value) {
+      ampFetch(libraryPath, {method: "POST"}).then(function() {
+        return ampFetch(ratingPath, {
+          method: "PUT",
+          contentType: "application/json",
+          body: JSON.stringify({type: "rating", attributes: {value: 1}})
+        });
+      }).then(function() {
+        window.__ms = {done:true, ok:true, id: id};
+      }, function(err) {
+        window.__ms = {done:true, ok:false, error: publicError(err)};
+      });
+    } else {
+      startMainWorldLove();
+    }
+  } catch (e) {
+    window.__ms = {done:true, ok:false, error: publicError(e)};
+  }
   return "started";
-}})()"""
+})()"""
+    )
 
 
 def _youtube_helpers_js() -> str:
-    # Shared by search and like. SAPISIDHASH is the fallback when networkManager is missing.
+    # networkManager and window.ytcfg live on the page world, so they are usually
+    # invisible here. Innertube config is in inline scripts; SAPISID is a cookie.
     return r"""
   function cookieValue(name) {
-    var parts = ("; " + document.cookie).split("; " + name + "=");
-    if (parts.length < 2) return "";
-    return decodeURIComponent(parts.pop().split(";").shift() || "");
+    var items = document.cookie ? document.cookie.split("; ") : [];
+    var prefix = name + "=";
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].indexOf(prefix) === 0) {
+        var raw = items[i].slice(prefix.length);
+        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+      }
+    }
+    return "";
+  }
+  function publicYtError(err) {
+    var msg = String((err && err.message) || err || "error");
+    msg = msg.replace(/[A-Za-z0-9._~+/=-]{16,}/g, "…");
+    return msg.slice(0, 120);
+  }
+  function parseJsonValue(text, start) {
+    var i = start;
+    if (i < 0 || i >= text.length) return null;
+    var first = text.charAt(i);
+    if (first === '"') {
+      var j = i + 1, esc = false;
+      for (; j < text.length; j++) {
+        var c = text.charAt(j);
+        if (esc) { esc = false; continue; }
+        if (c === "\\") { esc = true; continue; }
+        if (c === '"') break;
+      }
+      try { return JSON.parse(text.slice(i, j + 1)); } catch (e) { return null; }
+    }
+    if (first !== "{" && first !== "[") return null;
+    var curly = 0, square = 0, inStr = false, esc2 = false;
+    for (var k = i; k < text.length; k++) {
+      var ch = text.charAt(k);
+      if (inStr) {
+        if (esc2) esc2 = false;
+        else if (ch === "\\") esc2 = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === "{") curly++;
+      else if (ch === "}") curly--;
+      else if (ch === "[") square++;
+      else if (ch === "]") square--;
+      if (k > i && curly === 0 && square === 0) {
+        try { return JSON.parse(text.slice(i, k + 1)); } catch (e2) { return null; }
+      }
+    }
+    return null;
+  }
+  function extractYtField(text, key) {
+    var positions = [];
+    var needles = ['"' + key + '"', '\\"' + key + '\\"'];
+    for (var n = 0; n < needles.length; n++) {
+      var from = 0;
+      var needle = needles[n];
+      while (from < text.length) {
+        var at = text.indexOf(needle, from);
+        if (at < 0) break;
+        positions.push(at + needle.length);
+        from = at + needle.length;
+      }
+      if (positions.length) break;
+    }
+    var last = null;
+    for (var p = 0; p < positions.length; p++) {
+      var i = positions[p];
+      while (i < text.length && (text.charAt(i) === "\\" || text.charAt(i) === '"' || text.charAt(i) === "'")) i++;
+      while (i < text.length && " \t\n\r".indexOf(text.charAt(i)) !== -1) i++;
+      if (text.charAt(i) !== ":" && text.charAt(i) !== ",") continue;
+      i++;
+      while (i < text.length && " \t\n\r".indexOf(text.charAt(i)) !== -1) i++;
+      var parsed = parseJsonValue(text, i);
+      if ((parsed === null || parsed === "") && text.charAt(i) === "\\") {
+        var chunk = text.slice(i, i + 200000).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        parsed = parseJsonValue(chunk, 0);
+      }
+      if (parsed !== null && parsed !== "") last = parsed;
+    }
+    return last;
+  }
+  function ytFromScripts() {
+    if (window.__ytParsed && window.__ytParsed.key && window.__ytParsed.context) return window.__ytParsed;
+    var found = {key: "", context: null};
+    var scripts = document.scripts || [];
+    for (var s = 0; s < scripts.length; s++) {
+      var text = scripts[s].textContent || "";
+      if (text.indexOf("INNERTUBE_API_KEY") === -1 && text.indexOf("INNERTUBE_CONTEXT") === -1) continue;
+      var key = extractYtField(text, "INNERTUBE_API_KEY");
+      if (typeof key === "string" && key) found.key = key;
+      var ctx = extractYtField(text, "INNERTUBE_CONTEXT");
+      if (typeof ctx === "string" && ctx.charAt(0) === "{") {
+        try { ctx = JSON.parse(ctx); } catch (e) { ctx = null; }
+      }
+      if (ctx && typeof ctx === "object") found.context = ctx;
+    }
+    if (found.key && found.context) window.__ytParsed = found;
+    return found;
   }
   function ytValue(key) {
     try {
@@ -1044,8 +1653,14 @@ def _youtube_helpers_js() -> str:
         if (value) return value;
       }
     } catch (e) {}
-    var data = window.ytcfg && ytcfg.data_;
-    return data ? data[key] : null;
+    try {
+      var data = window.ytcfg && ytcfg.data_;
+      if (data && data[key]) return data[key];
+    } catch (e2) {}
+    var parsed = ytFromScripts();
+    if (key === "INNERTUBE_API_KEY") return parsed.key || null;
+    if (key === "INNERTUBE_CONTEXT") return parsed.context || null;
+    return null;
   }
   function sha1Hex(text) {
     return crypto.subtle.digest("SHA-1", new TextEncoder().encode(text)).then(function(buf) {
@@ -1070,7 +1685,7 @@ def _youtube_helpers_js() -> str:
   function innertube(path, payload) {
     var key = ytValue("INNERTUBE_API_KEY");
     var ctx = ytValue("INNERTUBE_CONTEXT");
-    if (!key || !ctx) return Promise.reject(new Error("ytcfg missing"));
+    if (!key || !ctx) return Promise.reject(new Error("innertube config missing from page scripts"));
     return sapisidHeader().then(function(auth) {
       var body = {context: ctx};
       var names = Object.keys(payload || {});
@@ -1091,7 +1706,7 @@ def _youtube_helpers_js() -> str:
       }).then(function(res) {
         return res.text().then(function(text) {
           if (!res.ok) throw new Error("innertube " + res.status);
-          try { return JSON.parse(text); } catch (e) { return {raw: text}; }
+          try { return JSON.parse(text); } catch (e) { throw new Error("innertube json"); }
         });
       });
     });
@@ -1166,7 +1781,7 @@ def yt_search_js(query: str) -> str:
     window.__ms = {{done:true, ok:true, songs: songs || []}};
   }}
   function fail(err) {{
-    window.__ms = {{done:true, ok:false, error:String(err && err.message || err)}};
+    window.__ms = {{done:true, ok:false, error: publicYtError(err)}};
   }}
   var app = document.querySelector("ytmusic-app");
   function fromManager() {{
@@ -1196,7 +1811,7 @@ def yt_like_js(video_id: str) -> str:
   var videoId = {quoted};
   {helpers}
   function ok() {{ window.__ms = {{done:true, ok:true, videoId: videoId}}; }}
-  function fail(err) {{ window.__ms = {{done:true, ok:false, error:String(err && err.message || err)}}; }}
+  function fail(err) {{ window.__ms = {{done:true, ok:false, error: publicYtError(err)}}; }}
   var app = document.querySelector("ytmusic-app");
   var liked = null;
   try {{
@@ -1288,7 +1903,7 @@ class ChromeSession:
             except Exception as exc:
                 # A permission failure will not start working if we keep polling.
                 text = str(exc)
-                if javascript_events_denied(text) or "(-1743)" in text or "not authorized to send apple events" in text.lower():
+                if _chrome_unreachable(text):
                     raise SystemExit(explain_osascript_failure(text)) from exc
                 raw = ""
             if raw == want:
@@ -1305,6 +1920,28 @@ class ChromeSession:
 
     def wait_flag(self, source: str, timeout: float, message: str) -> None:
         self.wait_until(lambda: self.exec_js(source), "yes", timeout, message)
+
+    def wait_am_auth(self, timeout: float = 10.0) -> None:
+        deadline = self.runners.monotonic() + timeout
+        while True:
+            raw = ""
+            try:
+                raw = js_scalar(self.exec_js(auth_js()))
+            except SystemExit:
+                raise
+            except Exception as exc:
+                text = str(exc)
+                if _chrome_unreachable(text):
+                    raise SystemExit(explain_osascript_failure(text)) from exc
+            if raw == "yes":
+                return
+            if raw == "no":
+                raise SystemExit(MUSIC_AUTH_MESSAGE)
+            if raw == "blocked":
+                raise SystemExit(MUSIC_BLOCKED_MESSAGE)
+            if self.runners.monotonic() >= deadline:
+                raise SystemExit(MUSIC_AUTH_MESSAGE)
+            self.runners.sleep(0.4)
 
     def poll_job(self, timeout: float = 15.0) -> dict:
         deadline = self.runners.monotonic() + timeout
@@ -1341,10 +1978,10 @@ def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tupl
         nonlocal session
         if session is None:
             session = ChromeSession(runners)
-            session.open("https://music.apple.com")
+            session.open("https://music.apple.com/au/home")
             session.wait_loaded()
-            # isAuthorized is polled after load, about 10s, not a tight loop inside the page.
-            session.wait_flag(AUTH_JS, 10.0, MUSIC_AUTH_MESSAGE)
+            # Tokens are read after load. A missing user token fails immediately.
+            session.wait_am_auth(10.0)
         return session
 
     def perform(item: dict) -> dict:
@@ -1439,11 +2076,15 @@ def _songs_from(data: dict) -> list[dict]:
     return [song for song in songs if isinstance(song, dict)]
 
 
+def _job_error(data: dict, fallback: str) -> str:
+    return redact_secrets(str(data.get("error") or fallback))
+
+
 def ChromeSession_catalog_search_songs(self, term: str) -> list[dict]:
     self.exec_js(catalog_search_js(term))
     data = self.poll_job()
     if not data.get("ok"):
-        raise RuntimeError(data.get("error") or "catalog search failed")
+        raise RuntimeError(_job_error(data, "catalog search failed"))
     return _songs_from(data)
 
 
@@ -1451,14 +2092,14 @@ def ChromeSession_add_and_love(self, song_id: str) -> None:
     self.exec_js(catalog_love_js(song_id))
     data = self.poll_job()
     if not data.get("ok"):
-        raise RuntimeError(data.get("error") or "catalog love failed")
+        raise RuntimeError(_job_error(data, "catalog love failed"))
 
 
 def ChromeSession_youtube_search(self, query: str) -> list[dict]:
     self.exec_js(yt_search_js(query))
     data = self.poll_job()
     if not data.get("ok"):
-        raise RuntimeError(data.get("error") or "youtube search failed")
+        raise RuntimeError(_job_error(data, "youtube search failed"))
     return _songs_from(data)
 
 
@@ -1466,7 +2107,7 @@ def ChromeSession_youtube_like(self, video_id: str) -> None:
     self.exec_js(yt_like_js(video_id))
     data = self.poll_job()
     if not data.get("ok"):
-        raise RuntimeError(data.get("error") or "youtube like failed")
+        raise RuntimeError(_job_error(data, "youtube like failed"))
 
 
 # Bound after the page scripts so a tab call can see those builders.
@@ -1547,6 +2188,147 @@ def cmd_apply(args, runners: Runners) -> int:
     return 1 if stopped else 0
 
 
+_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
+
+
+def _safe_label(value: str, limit: int = 120) -> str:
+    text = redact_secrets(str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit]
+    return text
+
+
+def _safe_mask(value: str) -> str:
+    text = redact_secrets(str(value or ""))
+    if text == "****":
+        return text
+    if text.endswith("…"):
+        text = text[:-1]
+    if re.fullmatch(r"[A-Za-z0-9_-]{4}", text):
+        return text
+    if len(text) >= 4 and re.fullmatch(r"[A-Za-z0-9_-]{4}", text[:4]):
+        return text[:4]
+    return "****" if text else ""
+
+
+def _safe_names(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    found = []
+    for value in values:
+        text = str(value or "").strip()
+        if not _NAME_RE.fullmatch(text):
+            continue
+        if _JWT_RE.search(text) or _OPAQUE_RE.search(text):
+            continue
+        if text not in found:
+            found.append(text)
+        if len(found) >= 30:
+            break
+    return found
+
+
+def _token_phrase(kind: str, item) -> str:
+    if not isinstance(item, dict) or not item.get("mask"):
+        return f"{kind}: missing"
+    source = _safe_label(item.get("source") or "", 80)
+    label = _safe_label(item.get("label") or "", 60)
+    mask = _safe_mask(item.get("mask") or "")
+    try:
+        length_text = str(int(item.get("length")))
+    except (TypeError, ValueError):
+        length_text = "?"
+    bits = [kind + ":"]
+    if source:
+        bits.append(source)
+    if label:
+        bits.append("label=" + label)
+    bits.append("mask=" + mask)
+    bits.append("len=" + length_text)
+    return " ".join(bits)
+
+
+def format_am_probe(data: dict) -> str:
+    """Masked Apple Music token report. Token values never appear here."""
+    if not isinstance(data, dict):
+        return "probe: empty"
+    lines = [
+        "url: " + _safe_label(data.get("url") or "", 160),
+        "readyState: " + _safe_label(data.get("readyState") or "", 40),
+        "musickit: " + _safe_label(data.get("musickit") or "absent", 20),
+        _token_phrase("developer", data.get("developer")),
+        _token_phrase("user", data.get("user")),
+    ]
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    main = data.get("mainWorld") if isinstance(data.get("mainWorld"), dict) else None
+    user_found = bool(isinstance(user, dict) and user.get("mask"))
+    main_yes = bool(main and not main.get("blocked") and main.get("auth") == "yes")
+    signed = user_found or main_yes
+    lines.append("signed-in: " + ("yes" if signed else "no"))
+    cookies = _safe_names(data.get("cookieNames"))
+    storage = _safe_names(data.get("storageKeys"))
+    metas = _safe_names(data.get("metaNames"))
+    scripts = _safe_names(data.get("scriptHints"))
+    lines.append("cookies: " + (", ".join(cookies) if cookies else "(none)"))
+    lines.append("storage: " + (", ".join(storage) if storage else "(none)"))
+    lines.append("metas: " + (", ".join(metas) if metas else "(none)"))
+    lines.append("scripts: " + (", ".join(scripts) if scripts else "(none)"))
+    candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+    shown = [item for item in candidates if isinstance(item, dict) and item.get("mask")]
+    if shown:
+        lines.append("candidates:")
+        for item in shown[:8]:
+            phrase = _token_phrase("candidate", item)
+            try:
+                phrase += " score=" + str(int(item.get("score")))
+            except (TypeError, ValueError):
+                pass
+            lines.append("  " + phrase)
+    if isinstance(main, dict) and (main.get("attempted") or main.get("blocked") or main.get("auth")):
+        if main.get("blocked"):
+            lines.append("main-world: blocked (" + _safe_label(main.get("error") or "CSP or Trusted Types", 160) + ")")
+        elif main.get("attempted") is False and not main.get("auth"):
+            lines.append("main-world: not run (page not complete)")
+        else:
+            lines.append("main-world: ran auth=" + _safe_label(main.get("auth") or "missing", 20))
+    if data.get("error"):
+        lines.append("error: " + _safe_label(data.get("error"), 200))
+    if not signed:
+        lines.append(
+            "note: Apple Music sign-in is not in this Chrome profile "
+            "(no media-user-token cookie or storage key)."
+        )
+    elif not user_found and main_yes:
+        lines.append(
+            "note: user token is not in cookies or storage; "
+            "account calls go through a main-world MusicKit script."
+        )
+    return redact_secrets("\n".join(lines))
+
+
+def cmd_probe_am(_args, runners: Runners) -> int:
+    """Print which Apple Music tokens the isolated world can see. Values stay masked."""
+    session = ChromeSession(runners)
+    try:
+        session.open("https://music.apple.com/au/home")
+        session.wait_loaded()
+        try:
+            session.wait_flag(READY_STATE_JS, 15.0, "Apple Music did not finish loading in Chrome.")
+        except SystemExit as exc:
+            if str(exc) != "Apple Music did not finish loading in Chrome.":
+                raise
+        raw = session.exec_js(am_probe_js())
+    finally:
+        session.close()
+    data = parse_js_json(raw)
+    if not isinstance(data, dict):
+        print(redact_secrets((raw or "").strip())[:400], file=sys.stderr)
+        return 1
+    print(format_am_probe(data))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Sync YouTube Music likes with Apple Music favourites. Dry-run unless --apply."
@@ -1560,6 +2342,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="write state/plan.json")
     plan.set_defaults(func=cmd_plan)
+
+    probe = sub.add_parser(
+        "probe-am",
+        help="print which Apple Music tokens the isolated world can see (masked)",
+    )
+    probe.set_defaults(func=cmd_probe_am)
 
     apply = sub.add_parser("apply", help="favourite or like one side of the plan")
     apply.add_argument("--side", required=True, choices=("am", "yt"))

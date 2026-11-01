@@ -30,7 +30,13 @@ A write into Apple Music (a library track, or a catalog search hit) is kept only
 
 ## Before a real run
 
-Chrome has to be the Default profile, signed in to Google and to Apple Music at https://music.apple.com (`MusicKit.getInstance().isAuthorized`). In Chrome, turn on **View > Developer > Allow JavaScript from Apple Events**. macOS Automation must allow this terminal to control Music and Google Chrome.
+Chrome has to be the Default profile, signed in to Google and to Apple Music at https://music.apple.com. In Chrome, turn on **View > Developer > Allow JavaScript from Apple Events**. macOS Automation must allow this terminal to control Music and Google Chrome.
+
+Apple events run page JavaScript in an isolated world. `MusicKit`, `ytcfg`, and `ytmusic-app.networkManager` belong to the page and are not visible there. The DOM, `localStorage`, and cookies are shared.
+
+Apple Music calls read the developer token from the page config (a meta tag or inline script) and the user token from the `media-user-token` cookie or a matching storage key. They then `fetch` `https://amp-api.music.apple.com/v1/…` with `Authorization: Bearer` and `Media-User-Token`. If those tokens are not in the DOM or storage, the script injects into the page's own world and asks MusicKit; if Content-Security-Policy or Trusted Types block that, the run says so. Token values are never printed. `probe-am` only reads the page. It reports which tokens were found, masked to the first four characters, and says when this Chrome profile is not signed in to Apple Music.
+
+YouTube Music reads `INNERTUBE_API_KEY` and `INNERTUBE_CONTEXT` from inline scripts (or from `ytcfg` when that global is visible) and `SAPISID` from the cookie.
 
 Catalog search uses the Australia storefront (`/v1/catalog/au/`).
 
@@ -43,6 +49,7 @@ From the repo root:
 ```bash
 python3 tools/music-sync/likes_sync.py inventory
 python3 tools/music-sync/likes_sync.py plan
+python3 tools/music-sync/likes_sync.py probe-am
 python3 tools/music-sync/likes_sync.py apply --side am --limit 25
 python3 tools/music-sync/likes_sync.py apply --side yt --limit 25
 ```

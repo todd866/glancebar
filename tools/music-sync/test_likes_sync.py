@@ -89,7 +89,7 @@ class ScriptedOSA:
     def _js(self, source: str) -> str:
         if "JSON.stringify(r)" in source:
             return self._poll()
-        if "isAuthorized" in source:
+        if "ms-auth-am" in source:
             return "yes"
         if "/like/like" in source:
             self.phase = "like"
@@ -528,6 +528,8 @@ class ArchiveAndLibraryTests(unittest.TestCase):
         love = likes_sync.catalog_love_js("123")
         self.assertIn("/v1/me/library?ids[songs]=", love)
         self.assertIn("/v1/me/ratings/songs/", love)
+        self.assertIn("https://amp-api.music.apple.com", love)
+        self.assertIn("Media-User-Token", love)
         self.assertIn("value: 1", love)
         self.assertNotIn("value: -1", love)
         self.assertNotIn("dislike", love.lower())
@@ -535,10 +537,33 @@ class ArchiveAndLibraryTests(unittest.TestCase):
         self.assertIn("/like/like", like)
         self.assertIn("dQw4w9WgXcQ", like)
         self.assertIn("SAPISID", like)
+        self.assertIn("textContent", like)
         self.assertNotIn("removelike", like)
-        search = likes_sync.yt_search_js("query")
+        search = likes_sync.yt_search_js("a{b}")
         self.assertIn("EgWKAQIIAWoKEAkQBRAKEAMQBA==", search)
-        self.assertIn("/v1/catalog/au/search", likes_sync.catalog_search_js("query"))
+        self.assertIn('"a{b}"', search)
+        self.assertIn("INNERTUBE_CONTEXT", search)
+        self.assertIn("textContent", search)
+        catalog = likes_sync.catalog_search_js("query")
+        self.assertIn("/v1/catalog/au/search", catalog)
+        self.assertIn("https://amp-api.music.apple.com", catalog)
+        self.assertIn("Media-User-Token", catalog)
+        self.assertIn("media-user-token", catalog)
+        self.assertNotIn("JSON.stringify(r)", catalog)
+        self.assertNotIn("ms-auth-am", catalog)
+        auth = likes_sync.auth_js()
+        self.assertIn("ms-auth-am", auth)
+        self.assertIn("media-user-token", auth)
+        self.assertNotIn("amp-api.music.apple.com", auth)
+        probe = likes_sync.am_probe_js()
+        self.assertIn("ms-probe-am", probe)
+        self.assertIn("mask4", probe)
+        self.assertNotIn("JSON.stringify(picked)", probe)
+        self.assertNotIn("JSON.stringify(user)", probe)
+        self.assertNotIn("JSON.stringify(read)", probe)
+        self.assertIsNone(likes_sync._JWT_RE.search(catalog))
+        self.assertIsNone(likes_sync._JWT_RE.search(probe))
+        self.assertIsNone(likes_sync._JWT_RE.search(auth))
         wrapped = likes_sync.js_wrapper("return \"yes\"")
         self.assertNotIn('"', wrapped)
 
@@ -961,6 +986,122 @@ class CommandTests(unittest.TestCase):
                 likes_sync.Runners(osascript=boom),
             )
         self.assertIn("archive not found", str(caught.exception))
+
+
+class ProbeTests(unittest.TestCase):
+    def test_report_masks_tokens_and_says_when_signed_out(self):
+        leaked = "eyJhbGciOiJFUzI1NiJ9.payloadbody.signaturepart"
+        text = likes_sync.format_am_probe(
+            {
+                "url": "https://music.apple.com/au/home?token=" + leaked,
+                "readyState": "complete",
+                "musickit": "absent",
+                "developer": {
+                    "source": "meta web-experience-app/config/environment",
+                    "label": "MEDIA_API.token",
+                    "mask": leaked,
+                    "length": 320,
+                },
+                "user": None,
+                "cookieNames": ["itua", leaked],
+                "storageKeys": [],
+                "metaNames": ["web-experience-app/config/environment"],
+                "scriptHints": ["application/json"],
+                "mainWorld": {"attempted": True, "blocked": True, "error": "script did not run " + leaked},
+            }
+        )
+        self.assertIn("signed-in: no", text)
+        self.assertIn("not in this Chrome profile", text)
+        self.assertIn("musickit: absent", text)
+        self.assertIn("mask=eyJh", text)
+        self.assertIn("main-world: blocked", text)
+        self.assertIn("web-experience-app/config/environment", text)
+        self.assertNotIn(leaked, text)
+        self.assertNotIn("payloadbody", text)
+        self.assertNotIn("signaturepart", text)
+
+    def test_report_signed_in_from_cookie(self):
+        text = likes_sync.format_am_probe(
+            {
+                "url": "https://music.apple.com/au/home",
+                "readyState": "complete",
+                "musickit": "absent",
+                "developer": {
+                    "source": "meta config",
+                    "label": "MEDIA_API.token",
+                    "mask": "eyJh",
+                    "length": 280,
+                },
+                "user": {"source": "cookie media-user-token", "label": "media-user-token", "mask": "Abcd", "length": 180},
+                "cookieNames": ["media-user-token"],
+                "mainWorld": None,
+            }
+        )
+        self.assertIn("signed-in: yes", text)
+        self.assertIn("cookie media-user-token", text)
+        self.assertIn("mask=Abcd", text)
+        self.assertNotIn("main-world:", text)
+        self.assertNotIn("not in this Chrome profile", text)
+
+    def test_probe_command_prints_the_report_and_closes_the_tab(self):
+        payload = {
+            "url": "https://music.apple.com/au/home",
+            "readyState": "complete",
+            "musickit": "absent",
+            "developer": {"source": "meta config", "label": "MEDIA_API.token", "mask": "eyJh", "length": 20},
+            "user": None,
+            "cookieNames": [],
+            "storageKeys": [],
+            "metaNames": [],
+            "scriptHints": [],
+            "mainWorld": {"attempted": True, "blocked": False, "error": "", "auth": "no"},
+        }
+        ticks = {"n": 0}
+
+        def monotonic():
+            ticks["n"] += 1
+            return float(ticks["n"])
+
+        class OSA:
+            def __init__(self):
+                self.closed = 0
+
+            def __call__(self, source):
+                if "make new tab" in source:
+                    self.scripts = getattr(self, "scripts", [])
+                    self.scripts.append(source)
+                    return "15,27\n"
+                if "\nclose t\n" in source:
+                    self.closed += 1
+                    return "closed\n"
+                if "loading of t" in source:
+                    return "ready\n"
+                if "javascript" in source and "execute" in source:
+                    decoded = decode_js(source)
+                    if "ms-probe-am" in decoded:
+                        return json.dumps(payload)
+                    if "readyState" in decoded:
+                        return "yes"
+                    raise AssertionError(decoded[:240])
+                raise AssertionError(source[:240])
+
+        osa = OSA()
+        runners = likes_sync.Runners(osascript=osa, sleep=lambda _seconds: None, monotonic=monotonic)
+        code, stdout, stderr = silence(likes_sync.main, ["probe-am"], runners)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("signed-in: no", stdout)
+        self.assertIn("mask=eyJh", stdout)
+        self.assertIn("main-world: ran auth=no", stdout)
+        self.assertEqual(osa.closed, 1)
+        self.assertIn("https://music.apple.com/au/home", osa.scripts[0])
+        self.assertNotIn("--apply", " ".join(osa.scripts))
+
+    def test_chrome_timeout_names_automation(self):
+        text = likes_sync.explain_osascript_failure(
+            "Google Chrome got an error: AppleEvent timed out. (-1712)"
+        )
+        self.assertIn("Automation", text)
+        self.assertIsNone(likes_sync._JWT_RE.search(text))
 
 
 if __name__ == "__main__":
