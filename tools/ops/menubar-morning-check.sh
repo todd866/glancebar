@@ -39,7 +39,7 @@ print_plan() {
   if (( ! QUICK )); then
     print -r -- "Energybar tests: git -C $e worktree add --detach TMP origin/main; remote-run -- ./tests.sh"
   fi
-  print -r -- "Energybar helper: $MORNING_HOME/.config/energybar/vehicle.json"
+  print -r -- "Energybar helper: $MORNING_HOME/.cache/energybar/vehicle-cloud.json"
   print -r -- "workers: ssh -o BatchMode=yes -o ConnectTimeout=8 HOST for each host in $MORNING_HOME/.config/remote-run/hosts"
   print -r -- "iDrive: newest record in $MORNING_HOME/Library/Application Support/IDriveforMac/SessionLogsNew/LOGXML"
   print -r -- "stash: tail $MORNING_HOME/.local/state/stash/reclaim.log and reclaim.err"
@@ -350,20 +350,27 @@ else:
 }
 
 probe_helper() {
-  # The helper rewrites vehicle.json each 10-minute poll; poll.log stays empty unless it errors.
-  local poll="$MORNING_HOME/.config/energybar/vehicle.json"
-  local mtime now age
+  # The Geely helper rewrites vehicle-cloud.json on every 10-minute poll, misses included
+  # (it keeps the last good reading and adds "error"). ~/.config/energybar/vehicle.json
+  # is Energybar's own settings file, not the helper's output.
+  local poll="$MORNING_HOME/.cache/energybar/vehicle-cloud.json"
+  local mtime now age err
   if [[ ! -e $poll ]]; then
-    note_info "Energybar helper" "vehicle.json absent"
+    note_info "Energybar helper" "vehicle-cloud.json absent"
     return
   fi
   mtime=$(stat -f %m "$poll")
   now=$EPOCHSECONDS
   age=$(( (now - mtime) / 60 ))
+  err=$(/usr/bin/sed -nE 's/.*"error": *"([^"]*)".*/\1/p' "$poll" | head -1)
   if (( now - mtime > 1800 )); then
-    record WARN "Energybar helper" "vehicle.json ${age}m old"
+    record WARN "Energybar helper" "vehicle-cloud.json ${age}m old"
+  elif [[ $err == "signed out" || $err == "not linked" ]]; then
+    record WARN "Energybar helper" "$err (geely_soc.py send-code, then verify)"
+  elif [[ -n $err ]]; then
+    record PASS "Energybar helper" "polled ${age}m ago, last try $err"
   else
-    record PASS "Energybar helper" "vehicle.json ${age}m old"
+    record PASS "Energybar helper" "vehicle-cloud.json ${age}m old"
   fi
 }
 

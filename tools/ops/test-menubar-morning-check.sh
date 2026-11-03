@@ -26,6 +26,7 @@ new_case() {
     "$home/Library/Application Support/IDriveforMac/SessionLogsNew/LOGXML" \
     "$home/Library/Application Support/IDriveforMac/SessionLogsNew/Backup" \
     "$home/.config/energybar" \
+    "$home/.cache/energybar" \
     "$home/.local/state/stash" \
     "$home/.config/remote-run" \
     "$home/Projects/glancebar" \
@@ -128,7 +129,7 @@ EOF
   print -r -- '# remote-run workers' > "$home/.config/remote-run/hosts"
   print -r -- 'm2' >> "$home/.config/remote-run/hosts"
   print -r -- '# m1 disabled' >> "$home/.config/remote-run/hosts"
-  touch "$home/.config/energybar/vehicle.json"
+  print -r -- '{"soc": 80.0}' > "$home/.cache/energybar/vehicle-cloud.json"
   print -r -- '2020-01-01 00:00:00 old reclaim note' > "$home/.local/state/stash/reclaim.log"
   : > "$home/.local/state/stash/reclaim.err"
 
@@ -180,7 +181,7 @@ run_script() {
 trace_has() { grep -q -- "$1" "$CASE_TRACE"; }
 trace_count() { grep -c -- "$1" "$CASE_TRACE" 2>/dev/null || true; }
 
-print "1..8"
+print "1..10"
 
 if [[ ! -f $SCRIPT ]]; then
   not_ok "script exists"
@@ -296,6 +297,26 @@ else
 fi
 
 # --- bad option ---
+# --- the helper's own file decides: a signed-out Geely login warns, a network miss passes ---
+new_case
+print -r -- '{"error": "signed out", "checkedAt": "x"}' > "$CASE_HOME/.cache/energybar/vehicle-cloud.json"
+run_script
+if grep -q '^WARN Energybar helper: signed out' "$(report)/latest.txt"; then
+  ok "helper signed-out warns"
+else
+  not_ok "helper signed-out warns"
+  cat "$(report)/latest.txt" 2>/dev/null >&2
+fi
+new_case
+print -r -- '{"soc": 80.0, "error": "TimeoutError"}' > "$CASE_HOME/.cache/energybar/vehicle-cloud.json"
+run_script
+if grep -q '^PASS Energybar helper: polled 0m ago, last try TimeoutError' "$(report)/latest.txt"; then
+  ok "helper network miss passes"
+else
+  not_ok "helper network miss passes"
+  cat "$(report)/latest.txt" 2>/dev/null >&2
+fi
+
 new_case
 run_script --nope
 if (( CASE_RC == 2 )) && [[ ! -s $CASE_TRACE ]]; then
