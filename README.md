@@ -298,6 +298,10 @@ truncate/regrow, and privacy-safe deduplication. The IORegistry,
 disk, `top`, `ps`, and AppKit plumbing live in the app shell. CI repeats the sanitizer,
 static-analysis, Universal 2 build, bundle-version, architecture, and signing checks.
 
+## Proofs
+
+`proofs/HeatGuard.lean` is a Lean 4 model of the battery heat guard (`HeatGuardStep`) with machine-checked theorems: a disabled guard never enables Low Power, it only disables what it engaged, it only engages from idle at 38 °C with Low Power off, and a user switching Low Power off stands it down. `cd proofs && ~/.elan/bin/lake build` checks them (install Lean with elan; no other dependencies).
+
 ## Morning check
 
 A token-free check of Glancebar, Energybar, the worker Macs, iDrive, and the stash reclaim log. It runs at 02:15. The repo does not load the agent; install it from a checkout at `~/Projects/glancebar`:
