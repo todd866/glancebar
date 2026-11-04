@@ -841,7 +841,7 @@ int main(int argc, const char **argv) {
             [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent() - 600)}} mutableCopy] forKey:@"remote"];
             [c rebuildContent]; root = p.contentViewController.view;
             rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
-            if (![rd.stringValue isEqual:@"away"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
+            if (![rd.stringValue isEqual:@"away 10m"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
                 FindIdentifier(root, @"popover.remote.m2.volume.0")) return Fail(__LINE__);
             [ud removeObjectForKey:@"remoteMachines"]; [ud removeObjectForKey:@"remoteOpen.m2"];
             [c rebuildContent]; root = p.contentViewController.view;

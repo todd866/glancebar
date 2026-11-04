@@ -7022,15 +7022,18 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSString *host = m[@"host"], *name = [m[@"name"] length] ? m[@"name"] : host;
         NSString *stem = [@"popover.remote." stringByAppendingString:host];
         NSDictionary *reading = _remote[host];
-        BOOL fresh = reading && CFAbsoluteTimeGetCurrent() - [reading[@"at"] doubleValue] < 120;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        double age = reading ? now - [reading[@"at"] doubleValue] : 0;
+        BOOL fresh = reading && age < 120;
         NSDictionary *sample = reading[@"sample"];
         NSDictionary *ready = fresh ? WorkerReadiness(sample, reading[@"mode"], [reading[@"free"] integerValue], [reading[@"slots"] integerValue]) : nil;
+        NSString *awayText = RemoteAwayText(reading ? age : 0);
         double score = [ready[@"score"] doubleValue];
         NSColor *color = ready ? ReadinessColor(score) : NSColor.tertiaryLabelColor;
         BOOL open = _fleetExpandedHosts ? [_fleetExpandedHosts containsObject:host] : [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
         NSString *tip = ready ? [NSString stringWithFormat:@"%@ · %@ ready · limited by %@ · click for details", name,
                                  [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)], ready[@"limit"]]
-                              : [NSString stringWithFormat:@"%@ · not reachable over ssh (%@)", name, host];
+                              : [NSString stringWithFormat:@"%@ · %@ · not reachable over ssh (%@)", name, awayText, host];
         ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
         row.target = self;
         row.action = @selector(toggleRemoteMachine:);
@@ -7053,7 +7056,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [row addSubview:g];
         [self instrumentValue:(ready ? [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)] : @"—") color:color
                    identifier:[stem stringByAppendingString:@".value"] in:row];
-        [self instrumentDatum:(ready ? ready[@"limit"] : @"away")
+        [self instrumentDatum:(ready ? ready[@"limit"] : awayText)
                         color:(ready && [ready[@"limit"] isEqual:@"ready"] ? NSColor.secondaryLabelColor : color)
                    identifier:[stem stringByAppendingString:@".datum"] in:row];
         [root addSubview:row];

@@ -2421,6 +2421,14 @@ int main(void) {
             NSMutableDictionary *mem = [calm mutableCopy]; mem[@"memPressure"] = @"High";
             check([WorkerReadiness(mem, @"full", 3, 3)[@"limit"] isEqual:@"low memory"], @"worker: memory pressure");
         }
+        check([RemoteAwayText(0) isEqual:@"away"] && [RemoteAwayText(-5) isEqual:@"away"], @"remote away: never this session");
+        check([RemoteAwayText(119) isEqual:@"away 2m"] && [RemoteAwayText(120) isEqual:@"away 2m"] &&
+              [RemoteAwayText(3599) isEqual:@"away 59m"], @"remote away: minutes");
+        check([RemoteAwayText(3600) isEqual:@"away 1h"] && [RemoteAwayText(5400) isEqual:@"away 1.5h"] &&
+              [RemoteAwayText(35999) isEqual:@"away 10h"] && [RemoteAwayText(36000) isEqual:@"away 10h"] &&
+              [RemoteAwayText(86399) isEqual:@"away 23h"], @"remote away: hours");
+        check([RemoteAwayText(86400) isEqual:@"away 1d"] && [RemoteAwayText(259200) isEqual:@"away 3d"],
+              @"remote away: days");
         // Output volume line.
         check([OutputVolumeText(0.554, NO) isEqual:@"55%"] && [OutputVolumeText(1.2, NO) isEqual:@"100%"],
               @"volume: whole percent, capped");

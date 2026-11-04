@@ -778,6 +778,12 @@ NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary 
 // A tile caption: the title without "(feat. …)", "(… Remastered)", " - Single", " EP" and the like.
 NSString *SeedCaption(NSString *title);
 
+// Fleet row datum when a worker Mac has not answered recently: plain `away` when
+// secondsSinceLastSample is unknown or zero (never this session); `away Nm` under an hour
+// (whole minutes, at least 2m); `away 1.5h` / `away 12h` from an hour to under a day
+// (one decimal below 10 h, then whole hours); `away 3d` from a day up (whole days).
+NSString *RemoteAwayText(double secondsSinceLastSample);
+
 // How ready a worker Mac is for more work, from its `Glancebar --sample` line plus its
 // heavy-slot governor mode ("gentle" while someone else is using it) and free slots.
 // score 0…1 is the worst of the headrooms (CPU, heat, memory, disk, battery, slots, in use);

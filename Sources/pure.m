@@ -3005,6 +3005,25 @@ NSString *SeedCaption(NSString *title) {
     return t.length ? t : (title ?: @"");
 }
 
+NSString *RemoteAwayText(double secondsSinceLastSample) {
+    if (secondsSinceLastSample <= 0) return @"away";
+    if (secondsSinceLastSample < 3600) {
+        int minutes = (int)floor(secondsSinceLastSample / 60.0);
+        if (minutes < 2) minutes = 2;
+        return [NSString stringWithFormat:@"away %dm", minutes];
+    }
+    if (secondsSinceLastSample < 86400) {
+        double hours = secondsSinceLastSample / 3600.0;
+        if (hours < 10) {
+            int tenths = (int)lround(hours * 10);
+            if (tenths % 10 == 0) return [NSString stringWithFormat:@"away %dh", tenths / 10];
+            return [NSString stringWithFormat:@"away %d.%dh", tenths / 10, tenths % 10];
+        }
+        return [NSString stringWithFormat:@"away %dh", (int)floor(hours)];
+    }
+    return [NSString stringWithFormat:@"away %dd", (int)floor(secondsSinceLastSample / 86400.0)];
+}
+
 NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger freeSlots, NSInteger slots) {
     NSMutableArray *factors = [NSMutableArray array];   // @[headroom, label]
     if (sample[@"cpu"]) [factors addObject:@[@(MAX(0, 1 - [sample[@"cpu"] doubleValue] / 100)), @"CPU busy"]];
