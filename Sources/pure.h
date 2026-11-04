@@ -738,7 +738,9 @@ double HeatSpeedFraction(ThermalLevel level, double activeMHz, double maxMHz, do
 // Low Power off while it is engaged, the guard stands down until the battery cools.
 typedef NS_ENUM(NSInteger, HeatGuardState) { HeatGuardIdle = 0, HeatGuardEngaged, HeatGuardStoodDown };
 typedef NS_ENUM(NSInteger, HeatGuardAction) { HeatGuardNothing = 0, HeatGuardEnable, HeatGuardDisable };
-// Returns the action and updates *state. tempC <= 0 (unread) never acts.
+// Returns the action and updates *state. tempC <= 0 (unread) never engages; an
+// engaged guard still releases Low Power when it is switched off or the user turns
+// Low Power off, whatever the reading. Proved in proofs/HeatGuard.lean.
 HeatGuardAction HeatGuardStep(BOOL enabled, double tempC, BOOL lowPowerOn, HeatGuardState *state);
 
 // The output line's level: "55%", "mute", or "—" for a device without a volume control.

@@ -1,0 +1,6 @@
+name = "heat-guard-proofs"
+version = "0.1.0"
+defaultTargets = ["HeatGuard"]
+
+[[lean_lib]]
+name = "HeatGuard"
