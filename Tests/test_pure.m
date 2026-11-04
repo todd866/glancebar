@@ -2403,6 +2403,19 @@ int main(void) {
         // Worker readiness.
         {
             NSDictionary *calm = @{@"cpu": @12, @"thermal": @"nominal", @"memPressure": @"Low", @"diskFreeGB": @200, @"diskTotalGB": @500, @"ac": @YES, @"batt": @80};
+            {   // heavy-slot status: switched-off slots are not slots (the M2 runs limit=1)
+                NSInteger f = -1;
+                NSInteger n = HeavySlotCounts(@"slot 1: free\nslot 2: off (limit 1)\nslot 3: off (limit 1)\n", &f);
+                check(n == 1 && f == 1, @"limit=1 M2 with its slot free: 1 of 1, not 1 of 3");
+                n = HeavySlotCounts(@"slot 1: md3 · pid 4 · 05:21:18 · cargo build\nslot 2: off (limit 1)\nslot 3: off (limit 1)", &f);
+                check(n == 1 && f == 0, @"limit=1 M2 busy: 0 of 1");
+                n = HeavySlotCounts(@"slot 1: free\nslot 2: busy\nslot 3: free", &f);
+                check(n == 3 && f == 2, @"three slots, two free");
+                n = HeavySlotCounts(@"", &f); check(n == 0 && f == 0, @"empty status: no slots");
+                n = HeavySlotCounts(@"zsh:1: command not found: heavy-slot", &f); check(n == 0, @"alien text: no slots");
+                NSDictionary *r1 = WorkerReadiness(calm, @"full", 1, 1);
+                check([r1[@"limit"] isEqual:@"ready"], @"one free of one is ready, not 'slots full'");
+            }
             NSDictionary *r = WorkerReadiness(calm, @"full", 3, 3);
             check([r[@"limit"] isEqual:@"ready"] && [r[@"score"] doubleValue] >= 0.85, @"worker: a calm Mac is ready");
             NSMutableDictionary *busy = [calm mutableCopy]; busy[@"cpu"] = @91;

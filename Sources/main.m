@@ -6976,11 +6976,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                 id sample = json.length ? [NSJSONSerialization JSONObjectWithData:json options:0 error:nil] : nil;
                 if ([sample isKindOfClass:NSDictionary.class]) {
                     NSString *mode = parts.count > 1 ? [parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
-                    NSInteger slots = 0, free = 0;
-                    if (parts.count > 2) for (NSString *l in [parts[2] componentsSeparatedByString:@"\n"]) {
-                        if (![l hasPrefix:@"slot "]) continue;
-                        slots++; if ([l hasSuffix:@": free"]) free++;
-                    }
+                    NSInteger free = 0, slots = parts.count > 2 ? HeavySlotCounts(parts[2], &free) : 0;
                     reading = @{@"sample": sample, @"mode": mode ?: @"", @"free": @(free), @"slots": @(slots), @"at": @(CFAbsoluteTimeGetCurrent())};
                 }
             }

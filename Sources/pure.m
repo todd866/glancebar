@@ -3036,6 +3036,18 @@ static double SampleFactorClamp(double headroom) {
     return MIN(1, MAX(0, headroom));
 }
 
+NSInteger HeavySlotCounts(NSString *status, NSInteger *freeSlots) {
+    NSInteger slots = 0, free = 0;
+    for (NSString *l in [status ?: @"" componentsSeparatedByString:@"\n"]) {
+        if (![l hasPrefix:@"slot "]) continue;
+        if ([l rangeOfString:@": off ("].location != NSNotFound) continue;
+        slots++;
+        if ([l hasSuffix:@": free"]) free++;
+    }
+    if (freeSlots) *freeSlots = free;
+    return slots;
+}
+
 NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger freeSlots, NSInteger slots) {
     NSMutableArray *factors = [NSMutableArray array];   // @[headroom, label]
     NSNumber *cpu = SampleNumber(sample[@"cpu"]);

@@ -797,3 +797,9 @@ NSString *SampleString(id value);
 // limit names that factor ("CPU busy", "hot", …) or "ready" when nothing is below 0.8.
 NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger freeSlots, NSInteger slots);
 
+// Counts the slots in a `heavy-slot status` listing. A slot the governor has switched off
+// ("slot 2: off (limit 1)") is not a slot: the M2 runs limit=1, and counting its two off
+// slots made one free of one read as one free of three ("60% · slots full", 5 Nov 2026).
+// Returns the usable slots; *freeSlots gets the free ones. 0 when the text is empty or alien.
+NSInteger HeavySlotCounts(NSString *status, NSInteger *freeSlots);
+
