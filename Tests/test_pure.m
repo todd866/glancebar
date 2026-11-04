@@ -2241,6 +2241,42 @@ int main(void) {
         ])[@"text"] isEqual:@"Second 90% full"],
               @"without a boot volume the secondary line is judged against the first mount");
 
+        // Local external disks get their own glance row. Disk images, network
+        // mounts, the boot volume and system volumes do not.
+        {
+            NSDictionary *boot = @{@"name": @"Macintosh HD", @"path": @"/", @"boot": @YES,
+                                   @"internal": @YES, @"local": @YES, @"diskImage": @NO,
+                                   @"totalBytes": @1000, @"freeBytes": @400};
+            NSDictionary *archive = @{@"name": @"Archive", @"path": @"/Volumes/Archive", @"boot": @NO,
+                                      @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                      @"totalBytes": @2000000000000LL, @"freeBytes": @500000000000LL};
+            NSDictionary *stick = @{@"name": @"Stick", @"path": @"/Volumes/Stick", @"boot": @NO,
+                                    @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                    @"totalBytes": @1000, @"freeBytes": @100};
+            NSDictionary *image = @{@"name": @"Installer", @"path": @"/Volumes/Installer", @"boot": @NO,
+                                    @"internal": @NO, @"local": @YES, @"diskImage": @YES, @"totalBytes": @1000};
+            NSDictionary *share = @{@"name": @"Share", @"path": @"/Volumes/Share", @"boot": @NO,
+                                    @"internal": @NO, @"local": @NO, @"diskImage": @NO, @"totalBytes": @1000};
+            NSDictionary *data = @{@"name": @"Data", @"path": @"/System/Volumes/Data", @"boot": @NO,
+                                   @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"totalBytes": @1000};
+            NSDictionary *blank = @{@"name": @"", @"path": @"/Volumes/Blank", @"boot": @NO,
+                                    @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"totalBytes": @1000};
+            NSDictionary *empty = @{@"name": @"Empty", @"path": @"/Volumes/Empty", @"boot": @NO,
+                                    @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"totalBytes": @0};
+            NSArray *shown = GlanceExternalVolumes(@[boot, archive, image, share, data, blank, empty, stick]);
+            check(shown.count == 2 && shown[0] == archive && shown[1] == stick,
+                  @"glance storage lists local external disks in mount order");
+            NSMutableArray *malformed = [NSMutableArray arrayWithObject:@"nope"];
+            [malformed addObject:archive];
+            check(GlanceExternalVolumes(nil).count == 0 && GlanceExternalVolumes(@[]).count == 0 &&
+                  GlanceExternalVolumes(malformed).count == 1,
+                  @"a missing or malformed volume list contributes no extra glance row");
+            NSMutableDictionary *unmarked = [archive mutableCopy];
+            [unmarked removeObjectForKey:@"local"];
+            check(GlanceExternalVolumes(@[unmarked]).count == 0,
+                  @"a volume that does not say it is local stays off the glance");
+        }
+
         // Heat: macOS's pressure level decides the colour; the temperature is the number.
         check(ThermalLevelFor(-1) == ThermalUnknown, @"thermal: unread pressure is unknown");
         check(ThermalLevelFor(0) == ThermalNominal, @"thermal: nominal");
@@ -2393,9 +2429,11 @@ int main(void) {
         check(OutputVolumeLoud(0.8) && OutputVolumeLoud(0.795) && !OutputVolumeLoud(0.79) && !OutputVolumeLoud(-1),
               @"volume: loud from the 80% shown");
         // The Heat row: appears once either is warm.
-        check(!HeatShowing(ThermalNominal, 34.5) && !HeatShowing(ThermalUnknown, 0), @"heat: quiet while both cool");
-        check(HeatShowing(ThermalThrottling, 31) && HeatShowing(ThermalNear, 0) && HeatShowing(ThermalNominal, 37.6),
+        check(!HeatShowing(NO, ThermalNominal, 34.5) && !HeatShowing(NO, ThermalUnknown, 0), @"heat: quiet while both cool");
+        check(HeatShowing(NO, ThermalThrottling, 31) && HeatShowing(NO, ThermalNear, 0) && HeatShowing(NO, ThermalNominal, 37.6),
               @"heat: either warm shows the row");
+        check(HeatShowing(YES, ThermalNominal, 30) && HeatShowing(YES, ThermalUnknown, 0),
+              @"heat: speedAlways keeps the row up while cool, even before a reading");
         {
             uint8_t raw[24] = {0x60,0xf5,0x13,0,0x16,0x03,0,0,  0,0,0,0,0,0,0,0,  0x80,0x1d,0x44,0,0x16,0x03,0,0};   // 1308000, 0, 4464000 kHz
             NSArray *mhz = DVFSTableMHz([NSData dataWithBytes:raw length:sizeof raw]);

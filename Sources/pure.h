@@ -624,8 +624,15 @@ NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled);
 BOOL ShouldStartPmset(BOOL inFlight);
 
 // Index of the boot volume (@YES), else 0 when the list is non-empty, else NSNotFound.
-// The menu bar, the popover headline, and Details Overview all use this.
+// The menu bar and the boot storage row use this. Other local external disks get
+// their own rows beneath it.
 NSInteger StorageHeadlineIndex(NSArray<NSNumber *> *bootFlags);
+// Local external disks that earn their own glance row, in the given order.
+// A row needs a name, a positive totalBytes, local YES, and boot/internal/diskImage NO.
+// The boot mount ("/"), anything under /System/Volumes, disk images and network
+// mounts stay off this list. Nil or a non-array yields an empty array.
+// Qualifying dictionaries are returned unchanged.
+NSArray<NSDictionary *> *GlanceExternalVolumes(NSArray<NSDictionary *> *volumes);
 // Another mount that is both fuller than the headline and over this percent used
 // gets a secondary popover line. 85 itself does not qualify.
 extern const int kStorageFullSecondaryPercent;   // 85
@@ -709,7 +716,9 @@ NSString *BatteryHeatText(double tempC);
 
 // The Heat row appears once either is warm: macOS reports thermal pressure, or the cells
 // reach 38 °C. While both are cool it stays away.
-BOOL HeatShowing(ThermalLevel chip, double cellC);
+// The Speed row shows while either is warm, or always when the user asks for it
+// (defaults speedAlways), so a cool Mac still reads its clock and temperatures.
+BOOL HeatShowing(BOOL always, ThermalLevel chip, double cellC);
 
 // Core clocks, from IOReport's CPU performance-state residency (no root needed).
 // A DVFS table is the device tree's voltage-states blob: 8-byte entries whose first

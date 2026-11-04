@@ -53,9 +53,15 @@ static NSDictionary *Fixture(void) {
 - (BOOL)isShown { return self.requestedVisible; }
 @end
 @interface PopoverRequestController : Controller
-@property NSUInteger showCalls;
+@property NSUInteger showCalls, fleetFocusCalls, pollCalls;
+@property(copy) NSString *detailTab;
 @end
 @implementation PopoverRequestController
+- (NSArray *)remoteMachines { return @[@{@"host": @"m5"}, @{@"host": @"m2"}]; }
+- (void)rebuildContent {}
+- (void)focusFleetRows { self.fleetFocusCalls++; }
+- (void)pollRemoteMachinesIfDue { self.pollCalls++; }
+- (void)showDetailsTab:(NSString *)tab sender:(id)sender { (void)sender; self.detailTab = tab; }
 - (void)togglePopover:(id)sender {
     (void)sender;
     Check(NSThread.isMainThread, @"popover requests execute on the main thread");
@@ -129,6 +135,52 @@ int main(int argc, const char **argv) { @autoreleasepool {
     Check(requestController.showCalls == 2, @"show request cannot reopen during termination");
     const char *conflictingArgs[] = {"Glancebar", "--show-popover", "--dump"};
     Check(GlancebarApplicationMain(3, conflictingArgs) == 64, @"show command rejects snapshot options before any action");
+    const char *mixedDestinations[] = {"Glancebar", "--show-fleet", "--show-battery"};
+    Check(GlancebarApplicationMain(3, mixedDestinations) == 64, @"multiple destinations rejected");
+    const char *mixedSample[] = {"Glancebar", "--sample", "--show-fleet"};
+    Check(GlancebarApplicationMain(3, mixedSample) == 64, @"sample cannot bypass destination validation");
+    [requestController setValue:@NO forKey:@"terminating"];
+    NSNotification *fleetRequest = [NSNotification notificationWithName:kShowPopoverNotification object:PopoverRequestObject() userInfo:@{@"destination": @"fleet"}];
+    [requestController showPopoverRequested:fleetRequest];
+    [requestController showPopoverRequested:fleetRequest];
+    Check(requestController.showCalls == 3 && requestController.fleetFocusCalls == 2, @"fleet opens once and repeated requests focus without closing");
+    Check([[requestController valueForKey:@"fleetExpandedHosts"] isEqual:[NSSet setWithArray:@[@"m5", @"m2"]]], @"fleet expands configured machines only");
+    Check(requestController.pollCalls == 2, @"fleet uses existing throttled poller");
+    NSNotification *batteryRequest = [NSNotification notificationWithName:kShowPopoverNotification object:PopoverRequestObject() userInfo:@{@"destination": @"battery"}];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ [requestController showPopoverRequested:batteryRequest]; });
+    Await(^BOOL { return [requestController.detailTab isEqual:@"battery"]; });
+    Check(requestController.showCalls == 3, @"battery routes to actual details handler, not generic popover");
+    NSNotification *aiRequest = [NSNotification notificationWithName:kShowPopoverNotification object:PopoverRequestObject() userInfo:@{@"destination": @"ai"}];
+    [requestController showPopoverRequested:aiRequest];
+    [requestController showPopoverRequested:aiRequest];
+    Check([requestController.detailTab isEqual:@"ai"] && requestController.showCalls == 3, @"AI requests use the existing AI details tab without toggling popover");
+    const char *mixedAI[] = {"Glancebar", "--show-ai", "--dump"};
+    Check(GlancebarApplicationMain(3, mixedAI) == 64, @"AI destination rejects snapshot options");
+    id storedExpansion = [NSUserDefaults.standardUserDefaults objectForKey:@"remoteOpen.m5"];
+    ClickRow *remoteRow = [ClickRow new]; remoteRow.accessibilityIdentifier = @"popover.row.remote.m5";
+    [requestController toggleRemoteMachine:remoteRow];
+    Check(![[requestController valueForKey:@"fleetExpandedHosts"] containsObject:@"m5"], @"fleet row can collapse within session");
+    id afterExpansion = [NSUserDefaults.standardUserDefaults objectForKey:@"remoteOpen.m5"];
+    Check(storedExpansion == afterExpansion || [storedExpansion isEqual:afterExpansion], @"session toggle preserves stored preference");
+    Controller *geometryController = [Controller new];
+    RequestPopover *geometryPopover = [RequestPopover new];
+    geometryPopover.contentViewController = [NSViewController new];
+    [geometryController setValue:geometryPopover forKey:@"popover"];
+    [geometryController setValue:@YES forKey:@"fleetFocusPending"];
+    [geometryController focusFleetRows];
+    Check([[geometryController valueForKey:@"fleetFocusPending"] boolValue], @"focus waits when remote results have not made a scrollable layout");
+    NSScrollView *fleetScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 406, 300)];
+    FlippedView *fleetDocument = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, 406, 900)];
+    NSView *fleetDivider = [[NSView alloc] initWithFrame:NSMakeRect(0, 400, 406, 1)];
+    fleetDivider.accessibilityIdentifier = @"popover.divider.remote";
+    [fleetDocument addSubview:fleetDivider]; fleetScroll.documentView = fleetDocument;
+    geometryPopover.contentViewController.view = fleetScroll;
+    [geometryController setValue:fleetScroll forKey:@"popoverScroll"];
+    [geometryController focusFleetRows];
+    Check(fabs(fleetScroll.contentView.bounds.origin.y - 400) < 1, @"fleet focus reveals actual remote divider after expanded layout arrives");
+    Check(![[geometryController valueForKey:@"fleetFocusPending"] boolValue], @"focus is consumed once so later refreshes preserve manual scrolling");
+    [requestController popoverWillClose:[NSNotification notificationWithName:NSPopoverWillCloseNotification object:requestPopover]];
+    Check([requestController valueForKey:@"fleetExpandedHosts"] == nil, @"fleet expansion expires on close");
     NSString *home = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"glancebar-activity-ui-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     [NSFileManager.defaultManager createDirectoryAtPath:home withIntermediateDirectories:YES attributes:nil error:NULL];
     setenv("GLANCEBAR_HOME", home.UTF8String, 1);

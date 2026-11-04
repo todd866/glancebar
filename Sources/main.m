@@ -6,6 +6,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
+#import <DiskArbitration/DiskArbitration.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
@@ -510,7 +511,7 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
 @interface Volume : NSObject
 @property (copy) NSString *path, *name;
 @property long long total, available, physicalAvailable;
-@property BOOL isInternal;
+@property BOOL isInternal, isLocal, isDiskImage;
 @end
 @implementation Volume
 - (long long)used { return MAX(0LL, self.total - self.available); }
@@ -552,7 +553,40 @@ static Volume *VolumeFromURL(NSURL *url, NSArray *keys) {
     vol.total = total.longLongValue; vol.available = avail;
     vol.physicalAvailable = MIN(physical, avail);
     vol.isInternal = [v[NSURLVolumeIsInternalKey] boolValue] || [vol.path isEqualToString:@"/"];
+    vol.isLocal = [v[NSURLVolumeIsLocalKey] boolValue];
     return vol;
+}
+
+// Disk images report model "Disk Image" (or that protocol). A synthesized APFS
+// volume on one still carries the model, which is how Archive stays off the glance
+// while a USB SSD's volumes stay on it.
+static BOOL BSDNameIsDiskImage(DASessionRef session, const char *bsd) {
+    if (!session || !bsd || !bsd[0]) return NO;
+    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, bsd);
+    if (!disk) return NO;
+    CFDictionaryRef desc = DADiskCopyDescription(disk);
+    BOOL image = NO;
+    if (desc) {
+        CFTypeRef model = CFDictionaryGetValue(desc, kDADiskDescriptionDeviceModelKey);
+        CFTypeRef protocol = CFDictionaryGetValue(desc, kDADiskDescriptionDeviceProtocolKey);
+        if (model && CFGetTypeID(model) == CFStringGetTypeID() &&
+            CFStringCompare((CFStringRef)model, CFSTR("Disk Image"), 0) == kCFCompareEqualTo)
+            image = YES;
+        if (protocol && CFGetTypeID(protocol) == CFStringGetTypeID() &&
+            CFStringCompare((CFStringRef)protocol, CFSTR("Disk Image"), 0) == kCFCompareEqualTo)
+            image = YES;
+        CFRelease(desc);
+    }
+    CFRelease(disk);
+    return image;
+}
+
+static BOOL PathIsDiskImage(DASessionRef session, NSString *path) {
+    struct statfs info;
+    if (!path.length || statfs(path.fileSystemRepresentation, &info) != 0) return NO;
+    const char *from = info.f_mntfromname;
+    const char *base = strrchr(from, '/');
+    return BSDNameIsDiskImage(session, base ? base + 1 : from);
 }
 
 static Volume *RootVolumeFallback(void) {
@@ -570,7 +604,22 @@ static Volume *RootVolumeFallback(void) {
     vol.available = (long long)s.f_bavail * (long long)s.f_bsize;
     vol.physicalAvailable = vol.available;
     vol.isInternal = YES;
+    vol.isLocal = YES;
+    vol.isDiskImage = NO;
     return vol;
+}
+
+static NSDictionary *GlanceRecordForVolume(Volume *volume) {
+    return @{
+        @"name": volume.name ?: @"",
+        @"path": volume.path ?: @"",
+        @"boot": @([volume.path isEqualToString:@"/"]),
+        @"internal": @(volume.isInternal),
+        @"local": @(volume.isLocal),
+        @"diskImage": @(volume.isDiskImage),
+        @"totalBytes": @(volume.total),
+        @"freeBytes": @(volume.available),
+    };
 }
 
 static NSArray<Volume *> *ScanVolumes(void) {
@@ -582,15 +631,18 @@ static NSArray<Volume *> *ScanVolumes(void) {
                                                 options:NSVolumeEnumerationSkipHiddenVolumes];
     NSMutableArray<Volume *> *found = [NSMutableArray array];
     BOOL hasRoot = NO;
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
     for (NSURL *url in urls) {
         id localValue = nil;
         BOOL haveLocal = [url getResourceValue:&localValue forKey:NSURLVolumeIsLocalKey error:nil];
         BOOL isLocal = haveLocal && [localValue isKindOfClass:NSNumber.class] && [localValue boolValue];
         Volume *vol = VolumeFromURL(url, VolumeResourceKeys(isLocal));
         if (!vol) continue;
+        vol.isDiskImage = PathIsDiskImage(session, vol.path);
         if ([vol.path isEqualToString:@"/"]) hasRoot = YES;
         [found addObject:vol];
     }
+    if (session) CFRelease(session);
     if (!hasRoot) {
         Volume *root = RootVolumeFallback();
         if (root) [found addObject:root];
@@ -5571,7 +5623,8 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
-                           @"useCursorAccount": @NO, @"switchToNewOutputs": @YES, @"lowData": @NO}];
+                           @"useCursorAccount": @NO, @"switchToNewOutputs": @YES, @"lowData": @NO,
+                           @"speedAlways": @NO}];
     _bat = ReadBattery();
     [self batteryForecast];
     [self noteEnergyBaseline:NO];
@@ -6953,6 +7006,8 @@ static NSColor *ReadinessColor(double score) {
     return score >= 0.7 ? NSColor.systemGreenColor : score >= 0.4 ? NSColor.systemOrangeColor : NSColor.systemRedColor;
 }
 // One row per Mac: name and chevron, a readiness bar, the score and what limits it.
+static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor);
+
 // Clicking opens that Mac's Storage, Battery, System and Speed rows beneath.
 - (CGFloat)addRemoteMachinesTo:(NSView *)root at:(CGFloat)y {
     NSArray *machines = [self remoteMachines];
@@ -7017,6 +7072,23 @@ static NSColor *ReadinessColor(double score) {
         [rows addObject:@[@"internaldrive", @"Storage", @(used), DiskColor(used), [NSString stringWithFormat:@"%d%%", (int)lround(used * 100)],
                           [NSString stringWithFormat:@"%.0f GB free", free], NSColor.secondaryLabelColor, @"storage"]];
     }
+    NSArray *reported = [s[@"volumes"] isKindOfClass:NSArray.class] ? s[@"volumes"] : nil;
+    NSUInteger volumeIndex = 0;
+    for (NSDictionary *volume in GlanceExternalVolumes(reported)) {
+        id freeValue = volume[@"freeBytes"], totalValue = volume[@"totalBytes"];
+        if (![freeValue isKindOfClass:NSNumber.class] || ![totalValue isKindOfClass:NSNumber.class]) continue;
+        long long cap = [totalValue longLongValue], freeBytes = [freeValue longLongValue];
+        if (cap <= 0) continue;
+        if (freeBytes < 0) freeBytes = 0;
+        if (freeBytes > cap) freeBytes = cap;
+        double used = (double)(cap - freeBytes) / (double)cap;
+        [rows addObject:@[@"externaldrive", volume[@"name"], @(used), DiskColor(used),
+                          [NSString stringWithFormat:@"%d%%", (int)lround(used * 100)],
+                          [NSString stringWithFormat:@"%@ free", CompactByteCount(freeBytes)],
+                          NSColor.secondaryLabelColor,
+                          [NSString stringWithFormat:@"volume.%lu", (unsigned long)volumeIndex]]];
+        volumeIndex++;
+    }
     if (s[@"batt"]) {
         int pct = [s[@"batt"] intValue];
         double watts = [s[@"battW"] doubleValue];
@@ -7034,11 +7106,17 @@ static NSColor *ReadinessColor(double score) {
     double speed = [thermal isEqual:@"nominal"] ? 1 : (top > 0 && mhz > 0 && [s[@"pBusy"] doubleValue] >= 0.5 ? MIN(1, mhz / top) : -1);
     if (speed >= 0) {
         NSColor *sc = [thermal isEqual:@"nominal"] ? NSColor.systemGreenColor : [thermal isEqual:@"moderate"] ? NSColor.systemOrangeColor : NSColor.systemRedColor;
-        NSMutableArray *temps = [NSMutableArray array];
-        if (s[@"chipC"]) [temps addObject:[NSString stringWithFormat:@"%ld°", lround([s[@"chipC"] doubleValue])]];
-        if (s[@"cellsC"]) [temps addObject:[NSString stringWithFormat:@"%ld°", lround([s[@"cellsC"] doubleValue])]];
-        [rows addObject:@[@"gauge.with.dots.needle.67percent", @"Speed", @(speed), sc, [NSString stringWithFormat:@"%d%%", (int)lround(speed * 100)],
-                          [temps componentsJoinedByString:@" · "], NSColor.secondaryLabelColor, @"speed"]];
+        // Same readout as this Mac's Speed row: a chip glyph for the hottest core, a
+        // battery glyph for the cells, each in its own colour.
+        double chipC = [s[@"chipC"] doubleValue], cellsC = [s[@"cellsC"] doubleValue];
+        BatteryHeat cells = BatteryHeatFor(cellsC);
+        NSColor *chipColor = [thermal isEqual:@"nominal"] ? NSColor.secondaryLabelColor : sc;
+        NSColor *cellColor = cells == BatteryHeatHot ? NSColor.systemRedColor
+            : cells == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+        NSString *needle = speed >= 0.9 ? @"gauge.with.dots.needle.100percent"
+            : speed >= 0.6 ? @"gauge.with.dots.needle.67percent" : @"gauge.with.dots.needle.33percent";
+        [rows addObject:@[needle, @"Speed", @(speed), sc, [NSString stringWithFormat:@"%d%%", (int)lround(speed * 100)],
+                          HeatTempsReadout(chipC, chipColor, cellsC, cellColor) ?: @"", NSColor.secondaryLabelColor, @"speed"]];
     }
     for (NSArray *r in rows) {
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
@@ -7052,7 +7130,11 @@ static NSColor *ReadinessColor(double score) {
         g.accessibilityIdentifier = [rs stringByAppendingString:@".gauge"];
         [row addSubview:g];
         [self instrumentValue:r[4] color:r[3] identifier:[rs stringByAppendingString:@".value"] in:row];
-        if ([r[5] length]) [self instrumentDatum:r[5] color:r[6] identifier:[rs stringByAppendingString:@".datum"] in:row];
+        if ([r[5] length]) {
+            NSTextField *datum = [self instrumentDatum:([r[5] isKindOfClass:NSAttributedString.class] ? [r[5] string] : r[5])
+                                                 color:r[6] identifier:[rs stringByAppendingString:@".datum"] in:row];
+            if ([r[5] isKindOfClass:NSAttributedString.class]) datum.attributedStringValue = r[5];
+        }
         [root addSubview:row];
         y += kRowH;
     }
@@ -8919,7 +9001,10 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
 // The Speed instrument: the fast cores' speed against their top clock as the bar and
 // percent, the speed held back shaded red behind the bar, then chip and cell temperatures.
 // It appears once macOS reports thermal pressure or the cells reach 38 °C.
-- (BOOL)heatShowing { return HeatShowing(SystemThermalLevel(_sys), _bat.valid ? _bat.tempC : 0); }
+- (BOOL)heatShowing {
+    return HeatShowing([NSUserDefaults.standardUserDefaults boolForKey:@"speedAlways"],
+                       SystemThermalLevel(_sys), _bat.valid ? _bat.tempC : 0);
+}
 - (NSColor *)heatSpeedColor {
     if (_heatSpeed < 0) return NSColor.tertiaryLabelColor;
     ThermalLevel level = SystemThermalLevel(_sys);
@@ -8958,6 +9043,30 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     if (parts.count) [lines addObject:[parts componentsJoinedByString:@" · "]];
     return lines.count ? [lines componentsJoinedByString:@"\n"] : @"Heat unknown";
 }
+// The temperature readout: each reading carries its own symbol and colour, a chip
+// for the hottest core and a battery for the cells. Nil when neither is known.
+static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor) {
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+    NSMutableAttributedString *temps = [NSMutableAttributedString new];
+    void (^reading)(NSString *, double, NSColor *) = ^(NSString *symbol, double c, NSColor *color) {
+        if (c <= 0) return;
+        if (temps.length) [temps appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:@{NSFontAttributeName: font}]];
+        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:kDatumFont - 2.5 weight:NSFontWeightRegular]
+            configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[color]]];
+        NSImage *glyph = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+        if (glyph) {
+            NSTextAttachment *mark = [NSTextAttachment new];
+            mark.image = glyph;
+            mark.bounds = NSMakeRect(0, (font.capHeight - glyph.size.height) / 2, glyph.size.width, glyph.size.height);
+            [temps appendAttributedString:[NSAttributedString attributedStringWithAttachment:mark]];
+        }
+        [temps appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%ld°", lround(c)]
+            attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: color}]];
+    };
+    reading(@"cpu", chipC, chipColor);
+    reading(@"battery.75", cellsC, cellColor);
+    return temps.length ? temps : nil;
+}
 - (void)addHeatInstrumentTo:(NSView *)row gauge:(NSRect)gaugeFrame value:(NSRect)valueFrame
                       datum:(NSRect)datumFrame stem:(NSString *)stem tip:(NSString *)tip {
     NSColor *speedColor = [self heatSpeedColor];
@@ -8983,26 +9092,9 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         : level == ThermalNear ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
     NSColor *cellColor = cellHeat == BatteryHeatHot ? NSColor.systemRedColor
         : cellHeat == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
-    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-    NSMutableAttributedString *temps = [NSMutableAttributedString new];
-    void (^reading)(NSString *, double, NSColor *) = ^(NSString *symbol, double c, NSColor *color) {
-        if (c <= 0) return;
-        if (temps.length) [temps appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:@{NSFontAttributeName: font}]];
-        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:kDatumFont - 2.5 weight:NSFontWeightRegular]
-            configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[color]]];
-        NSImage *glyph = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
-        if (glyph) {
-            NSTextAttachment *mark = [NSTextAttachment new];
-            mark.image = glyph;
-            mark.bounds = NSMakeRect(0, (font.capHeight - glyph.size.height) / 2, glyph.size.width, glyph.size.height);
-            [temps appendAttributedString:[NSAttributedString attributedStringWithAttachment:mark]];
-        }
-        [temps appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%ld°", lround(c)]
-            attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: color}]];
-    };
-    reading(@"cpu", _sys.tempValid ? _sys.cpuTempC : 0, chipColor);
-    reading(@"battery.75", _bat.valid ? _bat.tempC : 0, cellColor);
-    if (temps.length) {
+    NSAttributedString *temps = HeatTempsReadout(_sys.tempValid ? _sys.cpuTempC : 0, chipColor, _bat.valid ? _bat.tempC : 0, cellColor);
+    if (temps) {
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
         NSTextField *datum = [self text:@"" font:font color:NSColor.secondaryLabelColor at:datumFrame align:NSTextAlignmentLeft];
         datum.attributedStringValue = temps;
         datum.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
@@ -9054,6 +9146,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
                               align:NSTextAlignmentLeft];
     field.accessibilityIdentifier = identifier;
     field.maximumNumberOfLines = 1;
+    field.allowsDefaultTighteningForTruncation = YES;
     [row addSubview:field];
     return field;
 }
@@ -9633,11 +9726,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         y += kRowH;
     }
     Volume *leadVolume = [self primaryVolume];
-    NSMutableArray *fillRows = [NSMutableArray arrayWithCapacity:_vols.count];
-    for (Volume *vol in _vols)
-        [fillRows addObject:@{@"name": vol.name ?: @"", @"fraction": @(vol.fraction),
-                              @"boot": @([vol.path isEqualToString:@"/"])}];
-    NSDictionary *secondaryNotice = StorageSecondaryNotice(fillRows);
+    NSDictionary *secondaryNotice = [self storageSecondaryNotice];
     if (leadVolume) {
         Volume *v = leadVolume;
         ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
@@ -9676,6 +9765,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:row];
         y += kRowH;
     }
+    y = [self addPopoverExternalStorageTo:root at:y];
 
     ClickRow *batteryRow = [self batteryInstrumentRow];
     batteryRow.frame = NSMakeRect(0, y, kW, kRowH);
@@ -9925,6 +10015,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self settingsItem:m title:@"Storage" symbol:@"internaldrive" action:@selector(toggleBarDisk:) on:_barShowDisk];
     [self settingsItem:m title:@"Battery" symbol:@"battery.100" action:@selector(toggleBarBattery:) on:_barShowBattery];
     [self settingsItem:m title:@"System" symbol:@"cpu" action:@selector(toggleBarSystem:) on:_barShowSystem];
+
+    [self addSection:m title:@"Panel"];
+    [self settingsItem:m title:@"Speed row always" symbol:@"gauge.with.dots.needle.67percent"
+                    action:@selector(toggleSpeedAlways:)
+                    on:[ud boolForKey:@"speedAlways"]].accessibilityHelp = @"Keep the Speed row (fast-core clock, chip and cell temperatures) up while the Mac is cool, instead of only under thermal pressure.";
 
     [self addSection:m title:@"Battery"];
     [self settingsItem:m title:@"Current draw" symbol:@"bolt" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
@@ -10231,12 +10326,92 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 - (void)toggleBarSystem:(id)s {
     _barShowSystem = !_barShowSystem; [self saveBarOption:@"barShowSystem" value:_barShowSystem];
 }
+- (void)toggleSpeedAlways:(id)s {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [self saveBarOption:@"speedAlways" value:![ud boolForKey:@"speedAlways"]];
+}
 - (Volume *)primaryVolume {
     NSMutableArray<NSNumber *> *boots = [NSMutableArray arrayWithCapacity:_vols.count];
     for (Volume *v in _vols) [boots addObject:@([v.path isEqualToString:@"/"])];
     NSInteger index = StorageHeadlineIndex(boots);
     if (index < 0 || (NSUInteger)index >= _vols.count) return nil;
     return _vols[(NSUInteger)index];
+}
+
+// Local external disks, in scan order. The boot row stays separate.
+- (NSArray<Volume *> *)externalGlanceVolumes {
+    if (!_vols.count) return @[];
+    NSMutableArray *records = [NSMutableArray arrayWithCapacity:_vols.count];
+    for (Volume *volume in _vols) [records addObject:GlanceRecordForVolume(volume)];
+    NSMutableArray<Volume *> *out = [NSMutableArray array];
+    for (NSDictionary *row in GlanceExternalVolumes(records)) {
+        NSString *path = row[@"path"];
+        for (Volume *volume in _vols) {
+            if ([volume.path isEqualToString:path]) { [out addObject:volume]; break; }
+        }
+    }
+    return out;
+}
+
+// A volume with its own row is not also a "97% full" note on the boot row.
+- (NSDictionary *)storageSecondaryNotice {
+    NSMutableSet<NSString *> *shown = [NSMutableSet set];
+    for (Volume *volume in [self externalGlanceVolumes]) if (volume.path.length) [shown addObject:volume.path];
+    NSMutableArray *fillRows = [NSMutableArray array];
+    for (Volume *volume in _vols) {
+        if ([shown containsObject:volume.path ?: @""]) continue;
+        [fillRows addObject:@{@"name": volume.name ?: @"", @"fraction": @(volume.fraction),
+                              @"boot": @([volume.path isEqualToString:@"/"])}];
+    }
+    return StorageSecondaryNotice(fillRows);
+}
+
+- (CGFloat)addPopoverStorageVolume:(Volume *)volume displayName:(NSString *)displayName
+                              stem:(NSString *)stem rowID:(NSString *)rowID
+                                to:(NSView *)root at:(CGFloat)y {
+    ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+    row.target = self;
+    row.action = @selector(showStorageDetails:);
+    row.accessibilityRole = NSAccessibilityButtonRole;
+    row.accessibilityIdentifier = rowID;
+    NSString *tip = StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable);
+    row.accessibilityHelp = tip;
+    row.accessibilityLabel = tip;
+    [self instrumentSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
+                     tint:DiskColor(volume.fraction)
+               identifier:[stem stringByAppendingString:@".symbol"] in:row];
+    [self instrumentName:displayName identifier:[stem stringByAppendingString:@".name"] in:row];
+    Gauge *gauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    gauge.fraction = volume.fraction;
+    gauge.color = DiskColor(volume.fraction);
+    gauge.metricLabel = [NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"];
+    gauge.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
+    gauge.accessibilityHelp = tip;
+    [row addSubview:gauge];
+    NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)];
+    NSTextField *value = [self instrumentValue:pct color:DiskColor(volume.fraction)
+                                    identifier:[stem stringByAppendingString:@".value"] in:row];
+    value.accessibilityHelp = tip;
+    value.accessibilityLabel = [NSString stringWithFormat:@"%@ percent used", pct];
+    NSTextField *datum = [self instrumentDatum:[NSString stringWithFormat:@"%@ free", CompactByteCount(volume.available)]
+                                        color:NSColor.secondaryLabelColor
+                                   identifier:[stem stringByAppendingString:@".datum"] in:row];
+    datum.accessibilityHelp = tip;
+    [root addSubview:row];
+    return y + kRowH;
+}
+
+- (CGFloat)addPopoverExternalStorageTo:(NSView *)root at:(CGFloat)y {
+    NSUInteger index = 1;
+    for (Volume *volume in [self externalGlanceVolumes]) {
+        NSString *stem = [NSString stringWithFormat:@"popover.storage.%lu", (unsigned long)index];
+        NSString *rowID = [NSString stringWithFormat:@"popover.row.storage.%lu", (unsigned long)index];
+        y = [self addPopoverStorageVolume:volume
+                               displayName:(volume.name.length ? volume.name : @"Disk")
+                                      stem:stem rowID:rowID to:root at:y];
+        index++;
+    }
+    return y;
 }
 
 - (NSString *)batteryStatusText {
@@ -11139,6 +11314,47 @@ static NSColor *HealthColor(double fraction) {
     return y + c.rowH;
 }
 
+- (CGFloat)addOverviewStorageVolume:(Volume *)volume displayName:(NSString *)displayName
+                              stem:(NSString *)stem rowID:(NSString *)rowID
+                                to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSMutableString *tip = [StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable) mutableCopy];
+    if (volume.path.length) [tip appendFormat:@"\n%@", volume.path];
+    NSColor *tint = DiskColor(volume.fraction);
+    NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
+    NSImageView *mark = [self detailSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
+                                      size:c.symbol tint:tint frame:DetailLeadRect(c)
+                                identifier:[stem stringByAppendingString:@".symbol"] in:row];
+    mark.accessibilityHelp = tip;
+    NSTextField *volumeName = [self detailText:displayName
+                                           font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                          color:NSColor.labelColor
+                                          frame:NSMakeRect(c.nameX, (c.rowH - 16) / 2.0, c.nameW, 16)
+                                          align:NSTextAlignmentLeft
+                                     identifier:[stem stringByAppendingString:@".name"] in:row];
+    volumeName.accessibilityHelp = tip;
+    [self detailGauge:DetailGaugeRect(c) fraction:volume.fraction color:tint
+                label:[NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"]
+           identifier:[stem stringByAppendingString:@".gauge"] tip:tip in:row];
+    NSString *pct = [NSString stringWithFormat:@"%d%%", (int)lround(volume.fraction * 100)];
+    [self detailValue:pct color:tint identifier:[stem stringByAppendingString:@".value"] tip:tip in:row cols:c];
+    [self detailDatum:[NSString stringWithFormat:@"%@ free", CompactByteCount(volume.available)]
+                color:NSColor.secondaryLabelColor identifier:[stem stringByAppendingString:@".datum"] tip:tip in:row cols:c];
+    return y + c.rowH;
+}
+
+- (CGFloat)addOverviewExternalStorageTo:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
+    NSUInteger index = 1;
+    for (Volume *volume in [self externalGlanceVolumes]) {
+        NSString *stem = [NSString stringWithFormat:@"details.overview.storage.%lu", (unsigned long)index];
+        NSString *rowID = [NSString stringWithFormat:@"details.overview.row.storage.%lu", (unsigned long)index];
+        y = [self addOverviewStorageVolume:volume
+                                displayName:(volume.name.length ? volume.name : @"Disk")
+                                       stem:stem rowID:rowID to:root y:y cols:c];
+        index++;
+    }
+    return y;
+}
+
 - (NSScrollView *)overviewDetailsView {
     FlippedView *root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, kDetailW, 360)];
     root.accessibilityIdentifier = @"details.overview";
@@ -11152,11 +11368,7 @@ static NSColor *HealthColor(double fraction) {
                                 tip:VolumeScanStatus(_volumesLoading, _volumesUnavailable)
                             problem:(_volumesUnavailable || !_volumesLoading)];
     } else {
-        NSMutableArray *fillRows = [NSMutableArray arrayWithCapacity:_vols.count];
-        for (Volume *vol in _vols)
-            [fillRows addObject:@{@"name": vol.name ?: @"", @"fraction": @(vol.fraction),
-                                  @"boot": @([vol.path isEqualToString:@"/"])}];
-        NSDictionary *secondary = StorageSecondaryNotice(fillRows);
+        NSDictionary *secondary = [self storageSecondaryNotice];
         NSMutableString *tip = [StorageVolumeTooltip(v.name, v.total, v.available, v.purgeable) mutableCopy];
         if ([secondary[@"text"] isKindOfClass:NSString.class])
             [tip appendFormat:@" · %@", secondary[@"text"]];
@@ -11185,6 +11397,7 @@ static NSColor *HealthColor(double fraction) {
                     color:NSColor.secondaryLabelColor identifier:@"details.overview.storage.datum" tip:tip in:row cols:c];
         y += c.rowH;
     }
+    y = [self addOverviewExternalStorageTo:root y:y cols:c];
 
     {
         NSString *tip = [self batteryPopoverTip];
@@ -12473,6 +12686,10 @@ static int PrintSampleLine(void) {
         line[@"diskFreeGB"] = Decimal([volume[NSURLVolumeAvailableCapacityForImportantUsageKey] doubleValue] / 1e9, 1);
         line[@"diskTotalGB"] = Decimal([volume[NSURLVolumeTotalCapacityKey] doubleValue] / 1e9, 1);
     }
+    NSMutableArray *volumeRecords = [NSMutableArray array];
+    for (Volume *mounted in ScanVolumes()) [volumeRecords addObject:GlanceRecordForVolume(mounted)];
+    NSArray *externalVolumes = GlanceExternalVolumes(volumeRecords);
+    if (externalVolumes.count) line[@"volumes"] = externalVolumes;
     if (s.tempValid) line[@"chipC"] = Decimal(s.cpuTempC, 1);
     if (s.clocks.valid) {
         line[@"pMHz"] = @(lround(s.clocks.pMHz)); line[@"pTopMHz"] = @(lround(s.clocks.pMaxMHz));

@@ -642,6 +642,26 @@ int main(int argc, const char **argv) {
             [c setValue:[NSValue valueWithBytes:&mild objCType:@encode(BatteryState)] forKey:@"bat"];
             [c rebuildContent];
             if (FindIdentifier(p.contentViewController.view, @"popover.row.heat")) return Fail(__LINE__);
+            // Speed row always: the same row stays up while cool, 100% green with the temperatures.
+            [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"speedAlways"];
+            [c setValue:@1.0 forKey:@"heatSpeed"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *coolValue = (NSTextField *)FindIdentifier(root, @"popover.heat.value");
+            NSTextField *coolDatum = (NSTextField *)FindIdentifier(root, @"popover.heat.datum");
+            if (!FindIdentifier(root, @"popover.row.heat") || ![coolValue.stringValue isEqual:@"100%"] ||
+                ![coolValue.textColor isEqual:NSColor.systemGreenColor] ||
+                ![HeatDatumText(coolDatum) isEqual:@"[cpu]55° [battery]30°"] ||
+                ((Gauge *)FindIdentifier(root, @"popover.heat.gauge")).lossColor ||
+                !FindIdentifier([c overviewDetailsView].documentView, @"details.overview.row.heat") ||
+                !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-speed-always.png"];
+                if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"speedAlways"];
+            [c setValue:@0.52 forKey:@"heatSpeed"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.heat")) return Fail(__LINE__);
             // The rest of the checks run cool, without the Heat row.
             [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
             [c rebuildContent];
@@ -721,13 +741,72 @@ int main(int argc, const char **argv) {
             [c setValue:nil forKey:@"amPlaylist"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
+        {   // A local external disk is its own instrument. Disk images and network mounts stay in Details.
+            Volume *docs = [Volume new];
+            docs.name = @"Documents"; docs.path = @"/Volumes/Documents";
+            docs.total = 300000000000LL; docs.available = 61500000000LL; docs.physicalAvailable = docs.available;
+            docs.isLocal = YES;
+            Volume *research = [Volume new];
+            research.name = @"Research"; research.path = @"/Volumes/Research";
+            research.total = 700000000000LL; research.available = 170000000000LL; research.physicalAvailable = research.available;
+            research.isLocal = YES;
+            Volume *image = [Volume new];
+            image.name = @"Installer"; image.path = @"/Volumes/Installer";
+            image.total = docs.total; image.available = docs.available; image.physicalAvailable = image.available;
+            image.isLocal = YES; image.isDiskImage = YES;
+            Volume *share = [Volume new];
+            share.name = @"Share"; share.path = @"/Volumes/Share";
+            share.total = docs.total; share.available = docs.available; share.physicalAvailable = share.available;
+            NSMutableArray *withExternal = [volumes mutableCopy];
+            [withExternal addObject:docs]; [withExternal addObject:research];
+            [withExternal addObject:image]; [withExternal addObject:share];
+            [c setValue:withExternal forKey:@"vols"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *extName = (NSTextField *)FindIdentifier(root, @"popover.storage.1.name");
+            NSTextField *extValue = (NSTextField *)FindIdentifier(root, @"popover.storage.1.value");
+            NSTextField *extDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.1.datum");
+            NSTextField *researchName = (NSTextField *)FindIdentifier(root, @"popover.storage.2.name");
+            NSTextField *researchValue = (NSTextField *)FindIdentifier(root, @"popover.storage.2.value");
+            NSTextField *researchDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.2.datum");
+            if (![extName.stringValue isEqual:@"Documents"] || ![extValue.stringValue isEqual:@"80%"] ||
+                ![extDatum.stringValue isEqual:@"61.5 GB free"] ||
+                ![researchName.stringValue isEqual:@"Research"] || ![researchValue.stringValue isEqual:@"76%"] ||
+                ![researchDatum.stringValue isEqual:@"170 GB free"] ||
+                FindIdentifier(root, @"popover.storage.3.name") ||
+                !SameColumn(extName, FindIdentifier(root, @"popover.storage.name")) ||
+                !SameColumn(researchName, extName) ||
+                !SameColumn(FindIdentifier(root, @"popover.storage.1.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                !SameColumn(extValue, FindIdentifier(root, @"popover.storage.value")) ||
+                !SameColumn(extDatum, FindIdentifier(root, @"popover.storage.datum")) ||
+                !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+            NSScrollView *externalOverview = [c overviewDetailsView];
+            NSTextField *overviewName = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.1.name");
+            NSTextField *overviewValue = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.1.value");
+            NSTextField *overviewResearch = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.2.name");
+            if (![overviewName.stringValue isEqual:@"Documents"] || ![overviewValue.stringValue isEqual:@"80%"] ||
+                ![overviewResearch.stringValue isEqual:@"Research"] ||
+                FindIdentifier(externalOverview.documentView, @"details.overview.storage.3.name") ||
+                !SameColumn(overviewName, FindIdentifier(externalOverview.documentView, @"details.overview.storage.name")) ||
+                overviewName.toolTip.length)
+                return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                if (!RenderOffscreen(root, [base stringByAppendingString:@"-external.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                if (!RenderOffscreen(root, [base stringByAppendingString:@"-external-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+            }
+            [c setValue:volumes forKey:@"vols"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
         {   // Other Macs: one readiness row each (name, chevron, bar, score, what limits it); a click opens its four rows.
             NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
             [ud setObject:@[@{@"name": @"M2", @"host": @"m2"}] forKey:@"remoteMachines"];
             [ud setBool:NO forKey:@"remoteOpen.m2"];
             [c setValue:@(CFAbsoluteTimeGetCurrent()) forKey:@"remotePolledAt"];   // no real ssh from the harness
             NSDictionary *sample = @{@"cpu": @91, @"thermal": @"heavy", @"pMHz": @1188, @"pTopMHz": @3504, @"pBusy": @0.8, @"memPressure": @"Low",
-                                     @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES, @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37};
+                                     @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES, @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37,
+                                     @"volumes": @[@{@"name": @"Archive", @"path": @"/Volumes/Archive",
+                                                     @"totalBytes": @2000000000000LL, @"freeBytes": @500000000000LL,
+                                                     @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"boot": @NO}]};
             [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
             [c rebuildContent]; root = p.contentViewController.view;
             NSTextField *rv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.value");
@@ -735,14 +814,24 @@ int main(int argc, const char **argv) {
             NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");
             if (!FindIdentifier(root, @"popover.row.remote.m2") || ![rn.stringValue isEqual:@"M2"] || !FindIdentifier(root, @"popover.remote.m2.chevron") ||
                 ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue isEqual:@"CPU busy"] || ![rd.textColor isEqual:NSColor.systemRedColor] ||
-                FindIdentifier(root, @"popover.remote.m2.storage") || !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
+                FindIdentifier(root, @"popover.remote.m2.storage") || FindIdentifier(root, @"popover.remote.m2.volume.0") ||
+                !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
                 !FitsChildren(root)) return Fail(__LINE__);
             [ud setBool:YES forKey:@"remoteOpen.m2"];
             [c rebuildContent]; root = p.contentViewController.view;
             NSTextField *sv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.value");
             NSTextField *sd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.datum");
             NSTextField *pv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.speed.value");
+            NSTextField *pd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.speed.datum");
+            // The other Mac's Speed datum carries the same chip and battery glyphs as this Mac's.
+            if (![HeatDatumText(pd) isEqual:@"[cpu]76° [battery]37°"] || ![HeatDatumColor(pd, 0) isEqual:NSColor.systemRedColor] ||
+                ![HeatDatumColor(pd, 1) isEqual:NSColor.secondaryLabelColor]) return Fail(__LINE__);
+            NSTextField *ev = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.value");
+            NSTextField *en = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.name");
+            NSTextField *ed = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.datum");
             if (![sv.stringValue isEqual:@"56%"] || ![sd.stringValue isEqual:@"218 GB free"] || ![pv.stringValue isEqual:@"34%"] ||
+                ![en.stringValue isEqual:@"Archive"] || ![ev.stringValue isEqual:@"75%"] || ![ed.stringValue isEqual:@"500 GB free"] ||
+                !SameColumn(en, FindIdentifier(root, @"popover.remote.m2.storage.name")) ||
                 !FindIdentifier(root, @"popover.remote.m2.battery") || !FindIdentifier(root, @"popover.remote.m2.system") ||
                 !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
             if (argc > 1) {
@@ -752,7 +841,8 @@ int main(int argc, const char **argv) {
             [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent() - 600)}} mutableCopy] forKey:@"remote"];
             [c rebuildContent]; root = p.contentViewController.view;
             rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
-            if (![rd.stringValue isEqual:@"away"] || FindIdentifier(root, @"popover.remote.m2.storage")) return Fail(__LINE__);
+            if (![rd.stringValue isEqual:@"away"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
+                FindIdentifier(root, @"popover.remote.m2.volume.0")) return Fail(__LINE__);
             [ud removeObjectForKey:@"remoteMachines"]; [ud removeObjectForKey:@"remoteOpen.m2"];
             [c rebuildContent]; root = p.contentViewController.view;
         }

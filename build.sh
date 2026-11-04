@@ -61,6 +61,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -framework CoreAudio \
     -framework CoreGraphics \
     -framework IOKit \
+    -framework DiskArbitration \
     -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$APP/Contents/MacOS/Glancebar"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"

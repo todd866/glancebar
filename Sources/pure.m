@@ -2124,6 +2124,37 @@ NSString *KeepAwakeTooltip(BOOL sudoersRuleInstalled) {
 
 BOOL ShouldStartPmset(BOOL inFlight) { return !inFlight; }
 
+static BOOL GlanceVolumeFlag(NSDictionary *volume, NSString *key) {
+    id value = volume[key];
+    return [value isKindOfClass:NSNumber.class] && [value boolValue];
+}
+
+NSArray<NSDictionary *> *GlanceExternalVolumes(NSArray<NSDictionary *> *volumes) {
+    if (![volumes isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (id row in volumes) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *volume = row;
+        id pathValue = volume[@"path"];
+        if ([pathValue isKindOfClass:NSString.class]) {
+            NSString *path = pathValue;
+            if ([path isEqualToString:@"/"] || [path isEqualToString:@"/System"] ||
+                [path hasPrefix:@"/System/Volumes"])
+                continue;
+        }
+        if (GlanceVolumeFlag(volume, @"boot") || GlanceVolumeFlag(volume, @"internal") ||
+            GlanceVolumeFlag(volume, @"diskImage"))
+            continue;
+        if (!GlanceVolumeFlag(volume, @"local")) continue;
+        id total = volume[@"totalBytes"];
+        if (![total isKindOfClass:NSNumber.class] || [total longLongValue] <= 0) continue;
+        id name = volume[@"name"];
+        if (![name isKindOfClass:NSString.class] || ![(NSString *)name length]) continue;
+        [out addObject:volume];
+    }
+    return out;
+}
+
 NSInteger StorageHeadlineIndex(NSArray<NSNumber *> *bootFlags) {
     if (![bootFlags isKindOfClass:NSArray.class] || bootFlags.count == 0) return NSNotFound;
     NSInteger first = NSNotFound;
@@ -2648,7 +2679,8 @@ NSString *BatteryHeatText(double tempC) {
     return BatteryHeatFor(tempC) == BatteryHeatNone ? nil : [NSString stringWithFormat:@"%ld °C", lround(tempC)];
 }
 
-BOOL HeatShowing(ThermalLevel chip, double cellC) {
+BOOL HeatShowing(BOOL always, ThermalLevel chip, double cellC) {
+    if (always) return YES;
     return chip == ThermalNear || chip == ThermalThrottling || BatteryHeatFor(cellC) != BatteryHeatNone;
 }
 
