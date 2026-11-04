@@ -809,6 +809,15 @@ int main(int argc, const char **argv) {
                                                      @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"boot": @NO}]};
             [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
             [c rebuildContent]; root = p.contentViewController.view;
+            NSMutableDictionary *badSample = [sample mutableCopy];
+            badSample[@"cpu"] = NSNull.null;
+            badSample[@"chipC"] = @"hot";
+            [c setValue:[@{@"m2": @{@"sample": badSample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.row.remote.m2") || !FindIdentifier(root, @"popover.remote.m2.datum") || !FitsChildren(root))
+                return Fail(__LINE__);
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
             NSTextField *rv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.value");
             NSTextField *rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
             NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");

@@ -2420,6 +2420,17 @@ int main(void) {
             check([WorkerReadiness(calm, @"full", 0, 3)[@"limit"] isEqual:@"slots full"], @"worker: every heavy slot taken");
             NSMutableDictionary *mem = [calm mutableCopy]; mem[@"memPressure"] = @"High";
             check([WorkerReadiness(mem, @"full", 3, 3)[@"limit"] isEqual:@"low memory"], @"worker: memory pressure");
+            NSDictionary *garbled = @{@"cpu": NSNull.null, @"batt": @"n/a", @"diskFreeGB": @(-5), @"diskTotalGB": @500,
+                                      @"thermal": @12, @"memPressure": @"Low", @"ac": @YES};
+            NSDictionary *garbledR = WorkerReadiness(garbled, @"full", 3, 3);
+            check(garbledR[@"limit"] && garbledR[@"score"], @"worker: garbled sample returns a limit and score");
+            double garbledScore = [garbledR[@"score"] doubleValue];
+            check(garbledScore >= 0 && garbledScore <= 1, @"worker: garbled sample score stays in 0…1");
+            NSDictionary *negDisk = @{@"cpu": @12, @"thermal": @"nominal", @"memPressure": @"Low", @"diskFreeGB": @(-5),
+                                      @"diskTotalGB": @500, @"ac": @YES, @"batt": @80};
+            NSDictionary *negR = WorkerReadiness(negDisk, @"full", 3, 3);
+            check([negR[@"limit"] isEqual:@"disk full"] && fabs([negR[@"score"] doubleValue]) < 0.001,
+                  @"worker: negative free disk clamps score to zero");
         }
         check([RemoteAwayText(0) isEqual:@"away"] && [RemoteAwayText(-5) isEqual:@"away"], @"remote away: never this session");
         check([RemoteAwayText(119) isEqual:@"away 2m"] && [RemoteAwayText(120) isEqual:@"away 2m"] &&

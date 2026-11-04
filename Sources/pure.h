@@ -786,6 +786,11 @@ NSString *SeedCaption(NSString *title);
 // (one decimal below 10 h, then whole hours); `away 3d` from a day up (whole days).
 NSString *RemoteAwayText(double secondsSinceLastSample);
 
+// Typed fields from a worker `Glancebar --sample` JSON object. NSNull, wrong types, and
+// containers are treated as missing so fleet code never crashes on a bad line.
+NSNumber *SampleNumber(id value);
+NSString *SampleString(id value);
+
 // How ready a worker Mac is for more work, from its `Glancebar --sample` line plus its
 // heavy-slot governor mode ("gentle" while someone else is using it) and free slots.
 // score 0…1 is the worst of the headrooms (CPU, heat, memory, disk, battery, slots, in use);

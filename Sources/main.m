@@ -7069,8 +7069,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 // The opened drawer: the same four instruments as this Mac's, from the worker's sample.
 - (CGFloat)addRemoteDetailRows:(NSDictionary *)s stem:(NSString *)stem to:(NSView *)root at:(CGFloat)y {
     NSMutableArray *rows = [NSMutableArray array];
-    double total = [s[@"diskTotalGB"] doubleValue], free = [s[@"diskFreeGB"] doubleValue];
-    if (total > 0) {
+    NSNumber *totalN = SampleNumber(s[@"diskTotalGB"]), *freeN = SampleNumber(s[@"diskFreeGB"]);
+    if (totalN && freeN && totalN.doubleValue > 0) {
+        double total = totalN.doubleValue, free = freeN.doubleValue;
         double used = MAX(0, MIN(1, 1 - free / total));
         [rows addObject:@[@"internaldrive", @"Storage", @(used), DiskColor(used), [NSString stringWithFormat:@"%d%%", (int)lround(used * 100)],
                           [NSString stringWithFormat:@"%.0f GB free", free], NSColor.secondaryLabelColor, @"storage"]];
@@ -7092,26 +7093,33 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
                           [NSString stringWithFormat:@"volume.%lu", (unsigned long)volumeIndex]]];
         volumeIndex++;
     }
-    if (s[@"batt"]) {
-        int pct = [s[@"batt"] intValue];
-        double watts = [s[@"battW"] doubleValue];
+    NSNumber *battN = SampleNumber(s[@"batt"]);
+    if (battN) {
+        int pct = battN.intValue;
+        NSNumber *wattsN = SampleNumber(s[@"battW"]);
+        double watts = wattsN ? wattsN.doubleValue : 0;
+        NSNumber *acN = SampleNumber(s[@"ac"]);
         NSString *w = fabs(watts) < 0.3 ? @"0 W" : (FormatSignedWatts(watts) ?: @"");
-        [rows addObject:@[[s[@"ac"] boolValue] ? @"battery.100.bolt" : @"battery.75", @"Battery", @(pct / 100.0), BattBarColor(pct),
+        [rows addObject:@[(acN && acN.boolValue) ? @"battery.100.bolt" : @"battery.75", @"Battery", @(pct / 100.0), BattBarColor(pct),
                           [NSString stringWithFormat:@"%d%%", pct], w,
                           fabs(watts) < 0.3 ? NSColor.secondaryLabelColor : watts > 0 ? NSColor.systemGreenColor : NSColor.systemOrangeColor, @"battery"]];
     }
-    if (s[@"cpu"]) {
-        double cpu = [s[@"cpu"] doubleValue] / 100;
+    NSNumber *cpuN = SampleNumber(s[@"cpu"]);
+    if (cpuN) {
+        double cpu = cpuN.doubleValue / 100;
         [rows addObject:@[@"cpu", @"System", @(cpu), CPUColor(cpu), [NSString stringWithFormat:@"%d%%", (int)lround(cpu * 100)], @"", NSColor.secondaryLabelColor, @"system"]];
     }
-    NSString *thermal = s[@"thermal"];
-    double top = [s[@"pTopMHz"] doubleValue], mhz = [s[@"pMHz"] doubleValue];
-    double speed = [thermal isEqual:@"nominal"] ? 1 : (top > 0 && mhz > 0 && [s[@"pBusy"] doubleValue] >= 0.5 ? MIN(1, mhz / top) : -1);
+    NSString *thermal = SampleString(s[@"thermal"]);
+    NSNumber *topN = SampleNumber(s[@"pTopMHz"]), *mhzN = SampleNumber(s[@"pMHz"]), *busyN = SampleNumber(s[@"pBusy"]);
+    double top = topN.doubleValue, mhz = mhzN.doubleValue;
+    double speed = thermal && [thermal isEqual:@"nominal"] ? 1
+        : (top > 0 && mhz > 0 && busyN && busyN.doubleValue >= 0.5 ? MIN(1, mhz / top) : -1);
     if (speed >= 0) {
         NSColor *sc = [thermal isEqual:@"nominal"] ? NSColor.systemGreenColor : [thermal isEqual:@"moderate"] ? NSColor.systemOrangeColor : NSColor.systemRedColor;
         // Same readout as this Mac's Speed row: a chip glyph for the hottest core, a
         // battery glyph for the cells, each in its own colour.
-        double chipC = [s[@"chipC"] doubleValue], cellsC = [s[@"cellsC"] doubleValue];
+        NSNumber *chipN = SampleNumber(s[@"chipC"]), *cellsN = SampleNumber(s[@"cellsC"]);
+        double chipC = chipN ? chipN.doubleValue : 0, cellsC = cellsN ? cellsN.doubleValue : 0;
         BatteryHeat cells = BatteryHeatFor(cellsC);
         NSColor *chipColor = [thermal isEqual:@"nominal"] ? NSColor.secondaryLabelColor : sc;
         NSColor *cellColor = cells == BatteryHeatHot ? NSColor.systemRedColor
