@@ -779,6 +779,16 @@ NSArray<NSString *> *ParseMixReply(NSString *reply, NSSet<NSString *> *allowed, 
 NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary *> *tracks);
 // A tile caption: the title without "(feat. …)", "(… Remastered)", " - Single", " EP" and the like.
 NSString *SeedCaption(NSString *title);
+// Local m4a files for a seed when Apple Music cannot play it. The seed's own file
+// (artist and title both in the filename) comes first, then other files by that artist,
+// at most 40. Empty when nothing on disk matches — the tile then does nothing.
+NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths);
+// station.json: queue file paths and this week's picks (title, artist, reason, file).
+// nil when the data is missing or not an object. An empty queue is still a station.
+NSDictionary *StationFromJSON(NSData *json);
+// Selector DJ to open on a double-click. The installed app wins; otherwise an executable
+// under the .build directory. nil when neither is there.
+NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot);
 
 // Fleet row datum when a worker Mac has not answered recently: plain `away` when
 // secondsSinceLastSample is unknown or zero (never this session); `away Nm` under an hour

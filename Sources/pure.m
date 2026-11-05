@@ -2994,6 +2994,75 @@ NSArray<NSString *> *ParseMixReply(NSString *reply, NSSet<NSString *> *allowed, 
     return out;
 }
 
+NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths) {
+    if (![seed isKindOfClass:NSDictionary.class] || ![paths isKindOfClass:NSArray.class]) return @[];
+    NSString *rawArtist = [seed[@"artist"] isKindOfClass:NSString.class] ? seed[@"artist"] : @"";
+    NSString *artist = [[rawArtist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    NSString *rawTitle = [seed[@"title"] isKindOfClass:NSString.class] ? seed[@"title"] : @"";
+    NSString *title = [[SeedCaption(rawTitle) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    // A one-letter artist or a tiny title would match half the folder.
+    if (artist.length < 2 || title.length < 3) return @[];
+    NSMutableArray *exact = [NSMutableArray array], *same = [NSMutableArray array];
+    for (id item in paths) {
+        if (![item isKindOfClass:NSString.class]) continue;
+        NSString *base = [(NSString *)item lastPathComponent].lowercaseString;
+        if (!base.length || [base hasPrefix:@"."] || ![base hasSuffix:@".m4a"]) continue;
+        BOOL hasArtist = [base containsString:artist];
+        BOOL hasTitle = [base containsString:title];
+        if (hasArtist && hasTitle) [exact addObject:item];
+        else if (hasArtist) [same addObject:item];
+    }
+    NSComparator byPath = ^NSComparisonResult(NSString *a, NSString *b) { return [a compare:b]; };
+    [exact sortUsingComparator:byPath];
+    [same sortUsingComparator:byPath];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *path in exact) if (out.count < 40) [out addObject:path];
+    for (NSString *path in same) if (out.count < 40) [out addObject:path];
+    return out;
+}
+
+NSDictionary *StationFromJSON(NSData *json) {
+    if (![json isKindOfClass:NSData.class] || !json.length) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if (![obj isKindOfClass:NSDictionary.class]) return nil;
+    NSArray *queue = [obj[@"queue"] isKindOfClass:NSArray.class] ? obj[@"queue"] : @[];
+    NSArray *picksIn = [obj[@"picks"] isKindOfClass:NSArray.class] ? obj[@"picks"] : @[];
+    NSMutableArray *files = [NSMutableArray array];
+    for (id row in queue) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        id file = row[@"file"];
+        if ([file isKindOfClass:NSString.class] && [file length]) [files addObject:file];
+    }
+    NSMutableArray *picks = [NSMutableArray array];
+    for (id row in picksIn) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
+        if (!title.length) continue;
+        NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
+        NSString *reason = [row[@"reason"] isKindOfClass:NSString.class] ? row[@"reason"] : @"";
+        id file = row[@"file"];
+        [picks addObject:@{@"title": title, @"artist": artist, @"reason": reason,
+                           @"file": [file isKindOfClass:NSString.class] ? file : @""}];
+    }
+    return @{@"files": files, @"picks": picks};
+}
+
+NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL dir = NO;
+    if ([appBundle isKindOfClass:NSString.class] && appBundle.length &&
+        [fm fileExistsAtPath:appBundle isDirectory:&dir] && dir)
+        return appBundle;
+    if (![buildRoot isKindOfClass:NSString.class] || !buildRoot.length ||
+        ![fm fileExistsAtPath:buildRoot isDirectory:&dir] || !dir)
+        return nil;
+    for (NSString *rel in @[@"debug/SelectorApp", @"out/Products/Debug/SelectorApp"]) {
+        NSString *path = [buildRoot stringByAppendingPathComponent:rel];
+        if ([fm isExecutableFileAtPath:path]) return path;
+    }
+    return nil;
+}
+
 NSString *SeedCaption(NSString *title) {
     NSString *t = title ?: @"";
     for (NSString *pattern in @[@"\\s*[\\(\\[][^\\)\\]]*(feat\\.?|ft\\.?|with|remaster|version|edit|mix|live|deluxe|edition)[^\\)\\]]*[\\)\\]]",

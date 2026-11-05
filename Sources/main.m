@@ -4293,7 +4293,11 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 // their actual text is clipped; ordinary labels still have no hover popup.
 // A seed tile. Hovering the tile or its caption shows the cover large with the full title and artist:
 // the captions are one line and may clip, and tooltips don't show while a menu-bar app is inactive.
-@interface GBSeedTile : NSButton
+@protocol GBTileHover <NSObject>
+- (void)showLarge;
+- (void)hideLarge;
+@end
+@interface GBSeedTile : NSButton <GBTileHover>
 @property (nonatomic, strong) NSImage *cover;
 @property (nonatomic, copy) NSString *songTitle, *songArtist, *seedKey;
 - (void)showLarge;
@@ -4306,23 +4310,27 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 // both had made it flicker (Ian, 1 Nov 2026: "it should be rock solid").
 static NSPopover *gSeedLarge;
 static NSString *gSeedLargeKey;
-@implementation GBSeedTile
-- (void)showLarge {
-    if (!self.window || (!self.cover && !self.songTitle.length)) return;
-    if (gSeedLarge.shown && [gSeedLargeKey isEqual:self.seedKey]) {   // same song: just move it to this tile
-        [gSeedLarge showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
+    if (!anchor.window || !card) return;
+    if (gSeedLarge.shown && [gSeedLargeKey isEqual:key]) {   // same tile: just move it
+        [gSeedLarge showRelativeToRect:anchor.bounds ofView:anchor preferredEdge:NSRectEdgeMaxY];
         return;
     }
     [GBSeedTile closeLarge];
     NSViewController *vc = [NSViewController new];
-    vc.view = [self largeCard];
+    vc.view = card;
     gSeedLarge = [NSPopover new];
     gSeedLarge.contentViewController = vc;
     gSeedLarge.behavior = NSPopoverBehaviorApplicationDefined;
     gSeedLarge.animates = NO;
-    gSeedLargeKey = [self.seedKey copy];
-    [gSeedLarge showRelativeToRect:self.bounds ofView:self preferredEdge:NSRectEdgeMaxY];
+    gSeedLargeKey = [key copy];
+    [gSeedLarge showRelativeToRect:anchor.bounds ofView:anchor preferredEdge:NSRectEdgeMaxY];
     vc.view.window.ignoresMouseEvents = YES;
+}
+@implementation GBSeedTile
+- (void)showLarge {
+    if (!self.window || (!self.cover && !self.songTitle.length)) return;
+    GBPresentLarge(self, self.seedKey, [self largeCard]);
 }
 // The cover at 220 pt over the full title and artist.
 - (NSView *)largeCard {
@@ -4365,7 +4373,7 @@ static NSString *gSeedLargeKey;
 
 // Clicks pass through to the tile; only the hover is caught, over the tile and both caption lines.
 @interface GBSeedHover : NSView
-@property (nonatomic, weak) GBSeedTile *tile;
+@property (nonatomic, weak) id<GBTileHover> tile;
 @end
 @implementation GBSeedHover
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
@@ -4387,6 +4395,116 @@ static NSString *gSeedLargeKey;
 - (void)mouseEntered:(NSEvent *)event { (void)event; [self.tile showLarge]; }
 - (void)mouseExited:(NSEvent *)event { (void)event; if (!self.pointerInside) [self.tile hideLarge]; }
 @end
+
+// This week's count, drawn on the station tile. The digit is the instrument; "new picks" is the label.
+@interface GBCountBadge : NSView
+@property (nonatomic) NSInteger count;
+@end
+@implementation GBCountBadge
+- (BOOL)isOpaque { return NO; }
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    [[NSColor whiteColor] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(self.bounds, 0.5, 0.5)] fill];
+    NSString *text = [NSString stringWithFormat:@"%ld", (long)self.count];
+    NSFont *font = [NSFont systemFontOfSize:self.count > 9 ? 8 : 9 weight:NSFontWeightBold];
+    NSDictionary *attrs = @{NSFontAttributeName: font,
+                            NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.78 green:0.28 blue:0.02 alpha:1]};
+    NSSize size = [text sizeWithAttributes:attrs];
+    [text drawAtPoint:NSMakePoint((NSWidth(self.bounds) - size.width) / 2.0,
+                                  (NSHeight(self.bounds) - size.height) / 2.0 - 0.5) withAttributes:attrs];
+}
+@end
+
+// Orange station tile. Hover lists this week's picks; a double-click opens Selector.
+@interface GBStationTile : NSButton <GBTileHover>
+@property (nonatomic, copy) NSString *seedKey;
+@property (nonatomic, copy) NSArray<NSDictionary *> *picks;
+- (NSView *)largeCard;
+@end
+@implementation GBStationTile
+- (void)showLarge {
+    if (!self.window) return;
+    GBPresentLarge(self, self.seedKey ?: @"station", [self largeCard]);
+}
+- (void)hideLarge {
+    if ([gSeedLargeKey isEqual:self.seedKey]) [GBSeedTile closeLarge];
+}
+- (void)mouseDown:(NSEvent *)event {
+    if (event.clickCount >= 2) {
+        [self sendAction:@selector(openSelectorDJ:) to:self.target];
+        return;
+    }
+    [super mouseDown:event];
+}
+- (NSView *)largeCard {
+    const CGFloat width = 220, pad = 8;
+    NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
+    NSMutableArray *lines = [NSMutableArray array];
+    [lines addObject:@{@"text": @"triple j", @"secondary": @NO, @"id": @"popover.mix.station.large.title"}];
+    NSUInteger i = 0;
+    for (NSDictionary *pick in self.picks) {
+        if (![pick isKindOfClass:NSDictionary.class] || i >= 8) break;
+        NSString *title = [pick[@"title"] isKindOfClass:NSString.class] ? pick[@"title"] : @"";
+        NSString *reason = [pick[@"reason"] isKindOfClass:NSString.class] ? pick[@"reason"] : @"";
+        if (!title.length) continue;
+        [lines addObject:@{@"text": title, @"secondary": @NO,
+                           @"id": [NSString stringWithFormat:@"popover.mix.station.pick.title.%lu", (unsigned long)i]}];
+        if (reason.length)
+            [lines addObject:@{@"text": reason, @"secondary": @YES,
+                               @"id": [NSString stringWithFormat:@"popover.mix.station.pick.reason.%lu", (unsigned long)i]}];
+        i++;
+    }
+    CGFloat y = pad;
+    for (NSDictionary *line in lines.reverseObjectEnumerator) {
+        BOOL secondary = [line[@"secondary"] boolValue];
+        NSTextField *t = [NSTextField labelWithString:line[@"text"]];
+        t.font = secondary ? [NSFont systemFontOfSize:11] : [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+        t.textColor = secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
+        t.alignment = NSTextAlignmentLeft;
+        t.lineBreakMode = NSLineBreakByTruncatingTail;
+        t.frame = NSMakeRect(pad, y, width, secondary ? 14 : 16);
+        t.accessibilityIdentifier = line[@"id"];
+        [content addSubview:t];
+        y = NSMaxY(t.frame) + (secondary ? 6 : 1);
+    }
+    content.frame = NSMakeRect(0, 0, width + 2 * pad, y + pad);
+    return content;
+}
+@end
+
+static NSImage *StationTileImage(BOOL dimmed) {
+    NSImage *symbol = [NSImage imageWithSystemSymbolName:@"dot.radiowaves.left.and.right" accessibilityDescription:nil];
+    if (!symbol) symbol = [NSImage imageWithSystemSymbolName:@"antenna.radiowaves.left.and.right" accessibilityDescription:nil];
+    symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:22 weight:NSFontWeightSemibold]] ?: symbol;
+    NSImage *image = [NSImage imageWithSize:NSMakeSize(54, 54) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+        if (dimmed) {
+            [[NSColor colorWithWhite:0.5 alpha:0.22] setFill];
+            [path fill];
+        } else {
+            NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedRed:0.95 green:0.33 blue:0.04 alpha:1]
+                                                                  endingColor:[NSColor colorWithCalibratedRed:1.0 green:0.62 blue:0.22 alpha:1]];
+            [gradient drawInBezierPath:path angle:90];
+        }
+        if (symbol) {
+            NSSize size = symbol.size.width > 1 ? symbol.size : NSMakeSize(22, 22);
+            CGFloat side = MIN(26, MAX(size.width, size.height));
+            NSRect box = NSMakeRect((54 - side) / 2.0, (54 - side) / 2.0, side, side);
+            // Mask the symbol with a flat colour. imageWithTintColor: is not on the macOS 13 SDK.
+            NSImage *mark = [NSImage imageWithSize:box.size flipped:NO drawingHandler:^BOOL(NSRect r) {
+                [(dimmed ? NSColor.tertiaryLabelColor : NSColor.whiteColor) setFill];
+                NSRectFill(r);
+                [symbol drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationDestinationIn fraction:1];
+                return YES;
+            }];
+            [mark drawInRect:box fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
+        }
+        return YES;
+    }];
+    image.template = NO;
+    return image;
+}
 
 @interface GBRecoverableTextField : NSTextField
 - (void)updateClippedTextHelp;
@@ -4964,6 +5082,7 @@ static NSString *PopoverRequestObject(void) {
 - (void)audioDevicesChanged;
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
+- (void)ensureMixSeeds;
 @end
 
 // CoreAudio property reads. Output streams are the output scope of kAudioDevicePropertyStreams;
@@ -5535,6 +5654,9 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
     NSMutableSet<NSString *> *_mixLiked;                       // track ids given a 👍 (mix/feedback.jsonl)
     NSString *_mixPlayingKey, *_mixStartingKey;
+    NSArray<NSString *> *_mixLocalPaths;
+    BOOL _stationLoaded, _stationAvailable;
+    NSArray *_stationFiles, *_stationPicks;
     dispatch_queue_t _mixQueue;
     NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
     NSMutableSet<NSString *> *_remoteInFlight;
@@ -5856,10 +5978,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 
 // The library is read in the background when the popover first needs tiles, then every 6 h.
 - (void)ensureMixSeeds {
-    if (_mixFrozen || !_musicProbesEnabled || _musicOff || [self musicOffline]) return;
-    // Scripting Music launches it: read the library only while it is already open (the tiles keep their
-    // saved seeds meanwhile). On a Mac with an empty library this retried and relaunched Music (1 Nov 2026).
-    if (!AppleMusicIsRunning()) return;
+    if (_mixFrozen || _musicOff) return;
+    // Today's tiles stay up when Music is closed, the Mac is offline, or the library read fails.
+    // The read used to be the only place saved seeds were applied, so the row vanished (5 Nov 2026).
+    if (!_mixSeeds.count) {
+        NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:@"mixSeeds"];
+        if ([saved isKindOfClass:NSArray.class] && saved.count) _mixSeeds = saved;
+    }
+    if (!_musicProbesEnabled || [self musicOffline] || !AppleMusicIsRunning()) return;
+    // Scripting Music launches it: read the library only while it is already open. On a Mac with an
+    // empty library this retried and relaunched Music (1 Nov 2026).
     BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
     if (stale && !_mixLibraryLoading) {
         _mixLibraryLoading = YES;
@@ -5963,14 +6091,54 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         });
     });
 }
+- (NSArray<NSString *> *)mixLocalPaths {
+    if (_mixLocalPaths) return _mixLocalPaths;
+    NSMutableArray *paths = [NSMutableArray array];
+    for (NSString *sub in @[@"Music/YouTube Liked", @"Music/Glancebar Radio"]) {
+        NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:sub];
+        NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
+            includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+        for (NSURL *url in urls) if (url.path.length) [paths addObject:url.path];
+    }
+    _mixLocalPaths = LikedMusicAudioFiles(paths);
+    return _mixLocalPaths;
+}
+- (void)playLocalPaths:(NSArray<NSString *> *)paths {
+    if (!_musicProbesEnabled || !paths.count) return;
+    NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
+    for (NSString *path in paths) if (path.length) [urls addObject:[NSURL fileURLWithPath:path]];
+    if (!urls.count) return;
+    _localURLs = urls;
+    [self playLocalIndex:0];
+}
+// The same player the offline Liked folder uses, in the seed's order: its own file, then that artist.
+- (void)playSeedLocally:(NSDictionary *)seed {
+    NSArray *paths = LocalSeedFiles(seed, [self mixLocalPaths]);
+    _mixStartingKey = nil;
+    if (!paths.count) {
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    _mixPlayingKey = seed[@"key"];
+    [self playLocalPaths:paths];
+}
 - (IBAction)playSeedMix:(NSButton *)sender {
     if (sender.tag < 0 || sender.tag >= (NSInteger)_mixSeeds.count) return;
     NSDictionary *seed = _mixSeeds[sender.tag];
     NSString *key = seed[@"key"];
+    if ([self musicOffline] || !AppleMusicIsRunning()) {
+        _mixStartingKey = key;
+        if (_popover.isShown) [self rebuildContent];
+        [self playSeedLocally:seed];
+        return;
+    }
     _mixStartingKey = key;
     [self rebuildContent];
     [self prepareMix:seed then:^(NSArray *ids) {
-        if (!ids.count) { self->_mixStartingKey = nil; [self rebuildContent]; return; }
+        if (!ids.count || [self musicOffline] || !AppleMusicIsRunning()) {
+            [self playSeedLocally:seed];
+            return;
+        }
         NSMutableArray *quoted = [NSMutableArray array];
         for (NSString *i in ids) [quoted addObject:AppleScriptQuoted(i)];
         NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
@@ -6001,8 +6169,51 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     }];
 }
 - (IBAction)newMixPicks:(id)sender {
+    (void)sender;
     if (!_mixLibrary) { [self ensureMixSeeds]; return; }
     [self chooseMixSeeds:YES];
+}
+- (void)ensureStation {
+    if (_mixFrozen || _stationLoaded) return;
+    _stationLoaded = YES;
+    NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/station.json"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    NSDictionary *station = StationFromJSON(data);
+    _stationAvailable = station != nil;
+    _stationFiles = station[@"files"] ?: @[];
+    _stationPicks = station[@"picks"] ?: @[];
+}
+- (IBAction)playStation:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled || !_stationAvailable) return;
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (id file in _stationFiles) {
+        if (![file isKindOfClass:NSString.class] || ![file length]) continue;
+        if ([NSFileManager.defaultManager fileExistsAtPath:file]) [paths addObject:file];
+    }
+    if (!paths.count) return;
+    _mixPlayingKey = @"station:triplej";
+    _mixStartingKey = nil;
+    [self playLocalPaths:paths];
+}
+- (IBAction)openSelectorDJ:(id)sender {
+    (void)sender;
+    if (!_musicProbesEnabled) return;
+    NSString *build = [GBHomeDirectory() stringByAppendingPathComponent:@"Projects/selector/apps/SelectorApp/.build"];
+    NSString *path = SelectorDJPath(@"/Applications/SelectorApp.app", build);
+    if (!path.length) return;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    if ([path.pathExtension isEqualToString:@"app"]) {
+        NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+        config.activates = YES;
+        [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:config completionHandler:nil];
+        return;
+    }
+    NSTask *task = [NSTask new];
+    task.executableURL = url;
+    task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    [task launchAndReturnError:nil];
 }
 - (IBAction)setOutputVolumeFromSlider:(NSSlider *)slider {
     _volumeSetAt = CFAbsoluteTimeGetCurrent();
@@ -6933,7 +7144,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     y += kSoundH;
     if (am) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
     y = [self addOutputLineTo:root at:y];
-    if (amTarget && !offline) y = [self addSeedTilesTo:root at:y];
+    // The tiles stay up when YouTube or the offline player has the transport. Hiding them
+    // unless Apple Music was the target is what made the row disappear (5 Nov 2026).
+    if (!_musicOff) y = [self addSeedTilesTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
 }
 #pragma mark Other Macs
@@ -7148,88 +7361,139 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     return y;
 }
 
-// Four seed songs (cover, title, artist) and New picks. A click plays a long
-// mix built around that seed; the playing seed is outlined.
+// Four seed songs, the triple j station, and a round New picks button. A click plays
+// that seed's mix; the playing tile is outlined. Missing station.json dims the station.
 - (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
+    if (_musicOff) return y;
     [self ensureMixSeeds];
-    if (!_mixSeeds.count) return y;
-    const CGFloat side = 54, capH = 30, top = 6;   // title row + artist row, 14pt each
-    CGFloat gap = (kW - 2 * kPad - 5 * side) / 4;
+    [self ensureStation];
+    const CGFloat side = 54, buttonSide = 22, capH = 30, top = 6, rowH = 14;
+    NSUInteger n = MIN(_mixSeeds.count, 4);
+    NSUInteger gaps = n + 1;   // between the seeds, the station and the button
+    CGFloat gap = (kW - 2 * kPad - (n + 1) * side - buttonSide) / (CGFloat)gaps;
+    if (gap < 2) gap = 2;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
     line.accessibilityIdentifier = @"popover.mix";
     BOOL mixPlaying = [_amPlaylist isEqualToString:kMixPlaylistName];
     NSFont *capFont = [NSFont systemFontOfSize:10];
-    for (NSUInteger i = 0; i < 5; i++) {
-        CGFloat x = kPad + i * (side + gap);
-        BOOL picks = i == 4 || i >= _mixSeeds.count;
-        NSDictionary *seed = picks ? nil : _mixSeeds[i];
-        BOOL playing = !picks && mixPlaying && [seed[@"key"] isEqual:_mixPlayingKey];
-        BOOL starting = !picks && [seed[@"key"] isEqual:_mixStartingKey];
-        NSButton *tile;
-        if (picks) {
-            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
-            tile = [NSButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"arrow.triangle.2.circlepath" accessibilityDescription:nil]
-                                              imageWithSymbolConfiguration:cfg] target:self action:@selector(newMixPicks:)];
-            tile.contentTintColor = NSColor.secondaryLabelColor;
-            tile.imageScaling = NSImageScaleNone;
-            tile.wantsLayer = YES;
-            tile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
-            tile.accessibilityIdentifier = @"popover.mix.newpicks";
-            tile.accessibilityLabel = @"New picks";
-            tile.accessibilityHelp = @"Four new songs and albums to start a mix from";
-        } else {
-            NSImage *cover = _mixArt[seed[@"trackID"]];
-            GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
-                                                       imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
-                                      target:self action:@selector(playSeedMix:)];
-            seedTile.cover = cover;   // hover shows it large, with the full names
-            seedTile.songTitle = SeedCaption(seed[@"title"]);
-            seedTile.songArtist = seed[@"artist"];
-            seedTile.seedKey = seed[@"key"];
-            tile = seedTile;
-            tile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
-            if (!cover) tile.contentTintColor = NSColor.tertiaryLabelColor;
-            tile.tag = (NSInteger)i;
-            tile.wantsLayer = YES;
-            tile.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i];
-            BOOL album = [seed[@"kind"] isEqual:@"album"];
-            tile.accessibilityLabel = [NSString stringWithFormat:@"Play a mix from %@ %@ by %@", album ? @"the album" : @"the song",
-                                       seed[@"title"], seed[@"subtitle"]];
-            tile.accessibilityHelp = [NSString stringWithFormat:@"%@ — %@ · a mix around this %@", seed[@"title"], seed[@"subtitle"],
-                                      album ? @"album" : @"song"];
-            if (!cover) tile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;   // cover still loading
-            if (playing) { tile.layer.borderWidth = 2; tile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
-            if (starting) tile.alphaValue = 0.45;
-        }
-        tile.title = @"";
-        tile.bordered = NO;
-        tile.imagePosition = NSImageOnly;
-        tile.layer.cornerRadius = 4;
-        tile.layer.masksToBounds = YES;
-        tile.frame = NSMakeRect(x, capH, side, side);
-        [line addSubview:tile];
-        // Title over artist, one line each in aligned rows; the title reads first. A clipped one shows in full on hover.
-        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2, rowH = 14;   // the tile's full pitch
-        NSArray *lines = picks ? @[@"New picks"] : @[SeedCaption(seed[@"title"]), seed[@"artist"] ?: @""];
-        for (NSUInteger l = 0; l < lines.count; l++) {
-            NSTextField *cap = [GBRecoverableTextField labelWithString:lines[l]];
+    CGFloat x = kPad;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSDictionary *seed = _mixSeeds[i];
+        BOOL playing = (mixPlaying || _localMode) && [seed[@"key"] isEqual:_mixPlayingKey];
+        BOOL starting = [seed[@"key"] isEqual:_mixStartingKey];
+        NSImage *cover = _mixArt[seed[@"trackID"]];
+        GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
+                                                   imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
+                                  target:self action:@selector(playSeedMix:)];
+        seedTile.cover = cover;
+        seedTile.songTitle = SeedCaption(seed[@"title"]);
+        seedTile.songArtist = seed[@"artist"];
+        seedTile.seedKey = seed[@"key"];
+        seedTile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
+        if (!cover) seedTile.contentTintColor = NSColor.tertiaryLabelColor;
+        seedTile.tag = (NSInteger)i;
+        seedTile.wantsLayer = YES;
+        seedTile.title = @"";
+        seedTile.bordered = NO;
+        seedTile.imagePosition = NSImageOnly;
+        seedTile.layer.cornerRadius = 4;
+        seedTile.layer.masksToBounds = YES;
+        seedTile.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i];
+        BOOL album = [seed[@"kind"] isEqual:@"album"];
+        seedTile.accessibilityLabel = [NSString stringWithFormat:@"Play a mix from %@ %@ by %@", album ? @"the album" : @"the song",
+                                   seed[@"title"], seed[@"subtitle"]];
+        seedTile.accessibilityHelp = [NSString stringWithFormat:@"%@ — %@ · a mix around this %@", seed[@"title"], seed[@"subtitle"],
+                                  album ? @"album" : @"song"];
+        if (!cover) seedTile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
+        if (playing) { seedTile.layer.borderWidth = 2; seedTile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
+        if (starting) seedTile.alphaValue = 0.45;
+        seedTile.frame = NSMakeRect(x, capH, side, side);
+        [line addSubview:seedTile];
+        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
+        NSArray *captions = @[SeedCaption(seed[@"title"]), seed[@"artist"] ?: @""];
+        for (NSUInteger l = 0; l < captions.count; l++) {
+            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.font = capFont;
-            cap.textColor = playing ? NSColor.controlAccentColor : (l || picks ? NSColor.secondaryLabelColor : NSColor.labelColor);
+            cap.textColor = playing ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
-            cap.allowsDefaultTighteningForTruncation = YES;   // squeeze a little before clipping
+            cap.allowsDefaultTighteningForTruncation = YES;
             cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
             [(GBRecoverableTextField *)cap updateClippedTextHelp];
             cap.accessibilityIdentifier = [NSString stringWithFormat:l ? @"popover.mix.artist.%lu" : @"popover.mix.caption.%lu", (unsigned long)i];
             [line addSubview:cap];
         }
-        if ([tile isKindOfClass:GBSeedTile.class]) {
-            GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
-            hover.tile = (GBSeedTile *)tile;
-            hover.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.hover.%lu", (unsigned long)i];
-            [line addSubview:hover];
-        }
+        GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
+        hover.tile = seedTile;
+        hover.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.hover.%lu", (unsigned long)i];
+        [line addSubview:hover];
+        x += side + gap;
     }
+    BOOL stationOn = _stationAvailable;
+    BOOL stationPlaying = [_mixPlayingKey isEqual:@"station:triplej"];
+    GBStationTile *station = [GBStationTile buttonWithImage:StationTileImage(!stationOn) target:self action:@selector(playStation:)];
+    station.seedKey = @"station:triplej";
+    station.picks = _stationPicks ?: @[];
+    station.title = @"";
+    station.bordered = NO;
+    station.imagePosition = NSImageOnly;
+    station.imageScaling = NSImageScaleNone;
+    station.wantsLayer = YES;
+    station.layer.cornerRadius = 4;
+    station.layer.masksToBounds = YES;
+    station.alphaValue = stationOn ? 1 : 0.4;
+    station.accessibilityIdentifier = @"popover.mix.station";
+    NSUInteger pickCount = station.picks.count;
+    station.accessibilityLabel = @"triple j for you";
+    station.accessibilityHelp = stationOn ? @"Play triple j for you" : @"triple j for you is not available";
+    if (stationPlaying) { station.layer.borderWidth = 2; station.layer.borderColor = NSColor.controlAccentColor.CGColor; }
+    station.frame = NSMakeRect(x, capH, side, side);
+    [line addSubview:station];
+    if (stationOn && pickCount > 0) {
+        GBCountBadge *badge = [[GBCountBadge alloc] initWithFrame:NSMakeRect(NSMaxX(station.frame) - 18, NSMaxY(station.frame) - 18, 16, 16)];
+        badge.count = (NSInteger)pickCount;
+        badge.accessibilityIdentifier = @"popover.mix.station.badge";
+        badge.accessibilityLabel = [NSString stringWithFormat:@"%lu new picks", (unsigned long)pickCount];
+        [line addSubview:badge];
+    }
+    {
+        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
+        NSArray *captions = @[@"triple j", @"for you"];
+        for (NSUInteger l = 0; l < captions.count; l++) {
+            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
+            cap.font = capFont;
+            cap.textColor = stationPlaying ? NSColor.controlAccentColor
+                : (l ? NSColor.secondaryLabelColor : (stationOn ? NSColor.labelColor : NSColor.tertiaryLabelColor));
+            cap.alignment = NSTextAlignmentCenter;
+            cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
+            [(GBRecoverableTextField *)cap updateClippedTextHelp];
+            cap.accessibilityIdentifier = l ? @"popover.mix.artist.4" : @"popover.mix.caption.4";
+            [line addSubview:cap];
+        }
+        GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
+        hover.tile = station;
+        hover.accessibilityIdentifier = @"popover.mix.hover.station";
+        [line addSubview:hover];
+    }
+    x += side + gap;
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightSemibold];
+    NSButton *picks = [NSButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"arrow.triangle.2.circlepath" accessibilityDescription:nil]
+                                                imageWithSymbolConfiguration:cfg] target:self action:@selector(newMixPicks:)];
+    picks.title = @"";
+    picks.bordered = NO;
+    picks.imagePosition = NSImageOnly;
+    picks.imageScaling = NSImageScaleNone;
+    picks.contentTintColor = NSColor.secondaryLabelColor;
+    picks.wantsLayer = YES;
+    picks.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
+    picks.layer.cornerRadius = buttonSide / 2.0;
+    picks.layer.masksToBounds = YES;
+    picks.accessibilityIdentifier = @"popover.mix.newpicks";
+    picks.accessibilityLabel = @"New picks";
+    picks.accessibilityHelp = @"Four new songs and albums to start a mix from";
+    picks.frame = NSMakeRect(x, capH + (side - buttonSide) / 2.0, buttonSide, buttonSide);
+    [line addSubview:picks];
     [root addSubview:line];
     return y + top + side + capH;
 }

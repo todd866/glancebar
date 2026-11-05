@@ -2400,6 +2400,48 @@ int main(void) {
               [SeedCaption(@"Youth - Single") isEqual:@"Youth"] && [SeedCaption(@"Animal Magic") isEqual:@"Animal Magic"] &&
               [SeedCaption(@"Lightning Crashes (Live)") isEqual:@"Lightning Crashes"] && [SeedCaption(@"(feat. X)") isEqual:@"(feat. X)"],
               @"mix: captions drop features, versions and release types");
+        {
+            NSDictionary *seed = @{@"title": @"Blurred", @"artist": @"Kiasmos"};
+            NSArray *paths = @[@"/Music/Other - Song [a].m4a",
+                               @"/Music/Kiasmos - Looped [c].m4a",
+                               @"/Music/Kiasmos - Blurred [b].m4a",
+                               @"/Music/note.txt", @"/Music/Kiasmos - Blurred.mp3"];
+            NSArray *got = LocalSeedFiles(seed, paths);
+            check(got.count == 2 && [got[0] isEqual:@"/Music/Kiasmos - Blurred [b].m4a"] &&
+                  [got[1] isEqual:@"/Music/Kiasmos - Looped [c].m4a"],
+                  @"mix: offline play opens the seed's file, then other files by that artist");
+            check(LocalSeedFiles(seed, @[]).count == 0 && LocalSeedFiles(@{@"title": @"Blurred"}, paths).count == 0 &&
+                  LocalSeedFiles(nil, paths).count == 0,
+                  @"mix: no artist match or an empty folder plays nothing");
+            NSData *raw = [@"{\"queue\":[{\"file\":\"/radio/a.m4a\",\"title\":\"A\"},{\"file\":null},{\"title\":\"no file\"}],"
+                            "\"picks\":[{\"title\":\"Kiss from a Rose\",\"artist\":\"Tame Impala\",\"reason\":\"like Tame Impala\",\"file\":\"/radio/a.m4a\"},"
+                            "{\"title\":\"\",\"reason\":\"drop me\"}]}" dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *station = StationFromJSON(raw);
+            check([station[@"files"] isEqual:@[@"/radio/a.m4a"]] && [station[@"picks"] count] == 1 &&
+                  [station[@"picks"][0][@"title"] isEqual:@"Kiss from a Rose"] &&
+                  [station[@"picks"][0][@"reason"] isEqual:@"like Tame Impala"],
+                  @"station: queue keeps local paths; a pick keeps its reason; null files and blank titles drop");
+            check(StationFromJSON(nil) == nil && StationFromJSON([@"[]" dataUsingEncoding:NSUTF8StringEncoding]) == nil &&
+                  StationFromJSON([@"not json" dataUsingEncoding:NSUTF8StringEncoding]) == nil &&
+                  [StationFromJSON([@"{\"queue\":[],\"picks\":[]}" dataUsingEncoding:NSUTF8StringEncoding])[@"files"] isEqual:@[]],
+                  @"station: missing or non-object JSON is absent; an empty queue is still a station");
+            NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+            NSString *build = [root stringByAppendingPathComponent:@"SelectorApp/.build"];
+            NSString *bin = [build stringByAppendingPathComponent:@"debug/SelectorApp"];
+            NSString *app = [root stringByAppendingPathComponent:@"SelectorApp.app"];
+            NSFileManager *fm = NSFileManager.defaultManager;
+            [fm createDirectoryAtPath:bin.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"#!/bin/sh\nexit 0\n" writeToFile:bin atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [fm setAttributes:@{NSFilePosixPermissions: @0755} ofItemAtPath:bin error:nil];
+            NSString *emptyBuild = [root stringByAppendingPathComponent:@"empty/.build"];
+            [fm createDirectoryAtPath:emptyBuild withIntermediateDirectories:YES attributes:nil error:nil];
+            check([SelectorDJPath(nil, build) isEqual:bin], @"station: the debug binary opens when .build exists");
+            check(SelectorDJPath(nil, emptyBuild) == nil && SelectorDJPath(nil, nil) == nil,
+                  @"station: a build tree with no binary, or no tree, opens nothing");
+            [fm createDirectoryAtPath:app withIntermediateDirectories:YES attributes:nil error:nil];
+            check([SelectorDJPath(app, build) isEqual:app], @"station: an installed app wins over the build tree");
+            [fm removeItemAtPath:root error:nil];
+        }
         // Worker readiness.
         {
             NSDictionary *calm = @{@"cpu": @12, @"thermal": @"nominal", @"memPressure": @"Low", @"diskFreeGB": @200, @"diskTotalGB": @500, @"ac": @YES, @"batt": @80};

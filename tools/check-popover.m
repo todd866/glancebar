@@ -406,6 +406,14 @@ int main(int argc, const char **argv) {
                       @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},
                       @{@"key": @"song:D1", @"kind": @"song", @"title": @"So Long, See You Tomorrow Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
               forKey:@"mixSeeds"];
+        [c setValue:@YES forKey:@"stationLoaded"];
+        [c setValue:@YES forKey:@"stationAvailable"];
+        [c setValue:@[@"/tmp/glancebar-station-a.m4a"] forKey:@"stationFiles"];
+        [c setValue:@[
+            @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @"/tmp/glancebar-station-a.m4a"},
+            @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
+            @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
+        ] forKey:@"stationPicks"];
         [c setValue:@"limit80" forKey:@"chargeMode"];
         [c setValue:@YES forKey:@"chargeModeLoaded"];
         NSPopover *p = [NSPopover new];
@@ -699,24 +707,44 @@ int main(int argc, const char **argv) {
             [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
-        {   // Seed tiles: four covers + New picks under the output line; title over artist, one line each, playing seed outlined.
+        {   // Seed tiles, the triple j station, and a round New picks button. Title over artist, one line each.
             NSView *mix = FindIdentifier(root, @"popover.mix");
             NSView *line = FindIdentifier(root, @"popover.sound.line");
             NSTextField *c0 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.0");
             NSTextField *a0 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.0");
             NSTextField *c3 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.3");
             NSTextField *a3 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.3");
+            NSButton *s0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
             NSButton *s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
-            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !FindIdentifier(root, @"popover.mix.newpicks") ||
-                !FindIdentifier(root, @"popover.mix.seed.3") || FindIdentifier(root, @"popover.mix.seed.4") ||
-                FindIdentifier(root, @"popover.mix.artist.4") ||
+            NSButton *s3 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.3");
+            NSButton *station = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+            NSButton *picks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
+            NSTextField *stCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
+            NSTextField *stArt = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.4");
+            NSView *badge = FindIdentifier(root, @"popover.mix.station.badge");
+            CGFloat gapSeeds = NSMinX(s1.frame) - NSMaxX(s0.frame);
+            CGFloat gapStation = NSMinX(station.frame) - NSMaxX(s3.frame);
+            CGFloat gapButton = NSMinX(picks.frame) - NSMaxX(station.frame);
+            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !picks || !station || !s3 ||
+                FindIdentifier(root, @"popover.mix.seed.4") ||
                 ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
                 ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] ||
                 ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
                 c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
-                fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || NSHeight(c0.frame) < ceil(c0.font.ascender - c0.font.descender) ||
+                fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || fabs(NSMinY(a0.frame) - NSMinY(stArt.frame)) > 0.5 ||
+                NSHeight(c0.frame) < ceil(c0.font.ascender - c0.font.descender) ||
                 ![c0.textColor isEqual:NSColor.labelColor] || ![a0.textColor isEqual:NSColor.secondaryLabelColor] ||
-                ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail) return Fail(__LINE__);
+                ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail ||
+                ![picks.accessibilityLabel isEqual:@"New picks"] || picks.action != @selector(newMixPicks:) ||
+                fabs(NSWidth(picks.frame) - 22) > 0.5 || fabs(NSHeight(picks.frame) - 22) > 0.5 ||
+                fabs(picks.layer.cornerRadius - 11) > 0.5 ||
+                fabs(NSWidth(station.frame) - 54) > 0.5 || fabs(NSHeight(station.frame) - 54) > 0.5 ||
+                fabs(NSMidY(picks.frame) - NSMidY(station.frame)) > 0.5 ||
+                fabs(NSMinX(s0.frame) - kPad) > 0.6 || fabs(NSMaxX(picks.frame) - (kW - kPad)) > 0.6 ||
+                fabs(gapSeeds - gapStation) > 0.6 || fabs(gapSeeds - gapButton) > 0.6 || gapSeeds < 2 ||
+                ![stCap.stringValue isEqual:@"triple j"] || ![stArt.stringValue isEqual:@"for you"] ||
+                !badge || ![badge.accessibilityLabel isEqual:@"3 new picks"] || station.alphaValue < 0.95)
+                return Fail(__LINE__);
             {   // A cover tile carries its image for the large hover view.
                 NSImage *art = [NSImage imageWithSize:NSMakeSize(60, 60) flipped:NO drawingHandler:^BOOL(NSRect r) { [NSColor.systemRedColor setFill]; NSRectFill(r); return YES; }];
                 [c setValue:[@{@"A1": art} mutableCopy] forKey:@"mixArt"];
@@ -740,6 +768,78 @@ int main(int argc, const char **argv) {
             if (s1.layer.borderWidth < 1.9 || ![c1.textColor isEqual:NSColor.controlAccentColor]) return Fail(__LINE__);
             [c setValue:nil forKey:@"amPlaylist"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
+            // The row was drawn only while Apple Music was the play target, so a YouTube tab
+            // (or offline playback) removed the tiles even though today's seeds were saved.
+            [c setValue:@YES forKey:@"ytTabOpen"];
+            [c setValue:@NO forKey:@"amLoaded"];
+            [c setValue:@NO forKey:@"localMode"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks"))
+                return Fail(__LINE__);
+            [c setValue:@YES forKey:@"musicProbesEnabled"];
+            [c setValue:@YES forKey:@"networkKnown"];
+            [c setValue:@NO forKey:@"networkOnline"];
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.mix.seed.0")) return Fail(__LINE__);
+            [c setValue:@NO forKey:@"musicProbesEnabled"];
+            [c setValue:@NO forKey:@"networkKnown"];
+            [c setValue:@YES forKey:@"networkOnline"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            {   // Saved seeds show when the library cannot be read (Music closed, or offline).
+                NSArray *liveSeeds = [c valueForKey:@"mixSeeds"];
+                [c setValue:nil forKey:@"mixSeeds"];
+                [c setValue:@NO forKey:@"mixFrozen"];
+                [c setValue:@NO forKey:@"musicOff"];
+                NSMutableDictionary *args = [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain] mutableCopy] ?: [NSMutableDictionary dictionary];
+                args[@"mixSeeds"] = @[@{@"key": @"song:Z", @"kind": @"song", @"title": @"Saved Seed",
+                                        @"subtitle": @"Saved Artist", @"trackID": @"Z", @"artist": @"Saved Artist",
+                                        @"album": @"", @"family": @"other"}];
+                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
+                [c ensureMixSeeds];
+                NSArray *restored = [c valueForKey:@"mixSeeds"];
+                BOOL savedOK = restored.count == 1 && [restored[0][@"title"] isEqual:@"Saved Seed"];
+                [c setValue:@YES forKey:@"mixFrozen"];
+                [c setValue:liveSeeds forKey:@"mixSeeds"];
+                [args removeObjectForKey:@"mixSeeds"];
+                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
+                [c rebuildContent]; root = p.contentViewController.view;
+                if (!savedOK) return Fail(__LINE__);
+            }
+            {   // Missing station.json dims the tile and hides the count. It must not remove the row.
+                [c setValue:@NO forKey:@"stationAvailable"];
+                [c setValue:@[] forKey:@"stationPicks"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSButton *dimmed = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+                GBStationTile *cardTile = (GBStationTile *)dimmed;
+                if (!dimmed || dimmed.alphaValue > 0.5 || FindIdentifier(root, @"popover.mix.station.badge") ||
+                    !FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks") ||
+                    ![cardTile isKindOfClass:GBStationTile.class]) return Fail(__LINE__);
+                [c setValue:@YES forKey:@"stationAvailable"];
+                [c setValue:@[
+                    @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @"/tmp/glancebar-station-a.m4a"},
+                    @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
+                    @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
+                ] forKey:@"stationPicks"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                GBStationTile *stationTile = (GBStationTile *)FindIdentifier(root, @"popover.mix.station");
+                NSView *card = [stationTile largeCard];
+                NSTextField *reason = (NSTextField *)FindIdentifier(card, @"popover.mix.station.pick.reason.0");
+                NSTextField *pickTitle = (NSTextField *)FindIdentifier(card, @"popover.mix.station.pick.title.0");
+                GBSeedHover *hover = (GBSeedHover *)FindIdentifier(root, @"popover.mix.hover.station");
+                if (![stationTile isKindOfClass:GBStationTile.class] || ![reason.stringValue isEqual:@"like Tame Impala"] ||
+                    ![pickTitle.stringValue isEqual:@"Kiss from a Rose"] || hover.tile != stationTile ||
+                    [hover hitTest:NSMakePoint(NSMidX(hover.frame), NSMidY(hover.frame))] ||
+                    !FindIdentifier(root, @"popover.mix.station.badge")) return Fail(__LINE__);
+            }
+            const char *tilesPNG = getenv("GLANCEBAR_TILES_PNG");
+            if (tilesPNG && tilesPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:tilesPNG];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"tiles-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"tiles-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+                [c rebuildContent]; root = p.contentViewController.view;
+            }
         }
         {   // A local external disk is its own instrument. Disk images and network mounts stay in Details.
             Volume *docs = [Volume new];
