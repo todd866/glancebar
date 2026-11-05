@@ -6200,7 +6200,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     (void)sender;
     if (!_musicProbesEnabled) return;
     NSString *build = [GBHomeDirectory() stringByAppendingPathComponent:@"Projects/selector/apps/SelectorApp/.build"];
-    NSString *path = SelectorDJPath(@"/Applications/SelectorApp.app", build);
+    NSString *path = SelectorDJPath(@"/Applications/Selector.app", build);
     if (!path.length) return;
     NSURL *url = [NSURL fileURLWithPath:path];
     if ([path.pathExtension isEqualToString:@"app"]) {
