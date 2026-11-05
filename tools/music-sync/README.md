@@ -53,9 +53,13 @@ python3 tools/music-sync/likes_sync.py plan
 python3 tools/music-sync/likes_sync.py probe-am
 python3 tools/music-sync/likes_sync.py apply --side am --limit 25
 python3 tools/music-sync/likes_sync.py apply --side yt --limit 25
+python3 tools/music-sync/likes_sync.py love --artist "Band" --title "Song"
+python3 tools/music-sync/likes_sync.py love --artist "Band" --title "Song" --apply
 ```
 
 Read `plan.json` and the dry-run lines. A real write is the same `apply` with `--apply`. The default limit is 25 tracks a run, with a 2–4 second pause between writes.
+
+`love` favourites one song. A library hit sets favorited. Otherwise it searches the catalog, adds the song, and loves it, with the same artist-match guard as `apply`. It prints one JSON line `{"result","id"}` and exits 0 on ok, 3 on no-match, 1 on error. Without `--apply` it prints `{"result":"dry-run","id":""}` and does not open Music. An attempt is appended to `applied.jsonl`. The nightly sync then carries a new Apple Music favourite to YouTube Music.
 
 `--side am` favourites `yt_only` in Apple Music: if the song is already in the library it sets favorited; otherwise it searches the catalog, adds the song, and loves it. `--side yt` searches YouTube Music for each `am_only` favourite and likes the video.
 

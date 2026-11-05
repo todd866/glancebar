@@ -2277,6 +2277,64 @@ def _search_term(artist: str, title: str) -> str:
     return f"{artist or ''} {title or ''}".strip()[:240]
 
 
+def open_apple_session(runners: Runners) -> ChromeSession:
+    # The developer JWT is not in the DOM. Load the public bundle token, then
+    # let the page cookie supply the user token.
+    token = ""
+    try:
+        token = load_developer_token(runners)["token"]
+    except RuntimeError as exc:
+        print("Apple Music developer token: " + redact_secrets(str(exc))[:200], file=sys.stderr)
+    session = ChromeSession(runners, developer_token=token)
+    try:
+        session.open("https://music.apple.com/au/home")
+        session.wait_loaded()
+        # Tokens are read after load. A missing user token fails immediately.
+        session.wait_am_auth(10.0)
+    except BaseException:
+        session.close()
+        raise
+    return session
+
+
+def favourite_apple_track(
+    artist: str,
+    title: str,
+    runners: Runners,
+    library: list,
+    session_box: dict,
+) -> dict:
+    """Library hit, else catalog search with the same artist guard, then add and love.
+
+    A catalog search stores its Chrome tab on `session_box["session"]` before the
+    search, so the caller can close the tab when the search raises.
+    """
+    if not has_names(artist, title):
+        return {"action": "catalog-search", "result": "no-match", "ids": {}}
+    library_hit = pick_hit(artist, title, library)
+    if library_hit and library_hit.get("pid"):
+        runners.osascript(favorite_script(library_hit["pid"]))
+        return {
+            "action": "set-favorited",
+            "result": "ok",
+            "ids": {"pid": library_hit["pid"]},
+        }
+    session = session_box.get("session")
+    if session is None:
+        session = open_apple_session(runners)
+        session_box["session"] = session
+    songs = session.catalog_search_songs(_search_term(artist, title))
+    chosen = pick_hit(artist, title, songs)
+    if not chosen or not chosen.get("id"):
+        return {"action": "catalog-search", "result": "no-match", "ids": {}}
+    session.add_and_love(chosen["id"])
+    return {
+        "action": "catalog-add-love",
+        "result": "ok",
+        "ids": {"catalogId": chosen["id"]},
+    }
+
+
 def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tuple[list[dict], bool]:
     # Nothing queued: don't open Music. The read is the slow part, and it can launch the app.
     if not pending_items(items, "am", applied_ok, limit):
@@ -2291,50 +2349,16 @@ def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tupl
             dry_run=False,
         )
     library = collect_library(runners)
-    session: ChromeSession | None = None
-
-    def ensure_session() -> ChromeSession:
-        nonlocal session
-        if session is None:
-            # The developer JWT is not in the DOM. Load the public bundle token, then
-            # let the page cookie supply the user token.
-            token = ""
-            try:
-                token = load_developer_token(runners)["token"]
-            except RuntimeError as exc:
-                print("Apple Music developer token: " + redact_secrets(str(exc))[:200], file=sys.stderr)
-            session = ChromeSession(runners, developer_token=token)
-            session.open("https://music.apple.com/au/home")
-            session.wait_loaded()
-            # Tokens are read after load. A missing user token fails immediately.
-            session.wait_am_auth(10.0)
-        return session
+    session_box: dict = {"session": None}
 
     def perform(item: dict) -> dict:
         video_id = item.get("videoId") or ""
         artist = item.get("artist") or ""
         title = item.get("title") or ""
-        ids = {"videoId": video_id}
-        if not has_names(artist, title):
-            return {"action": "catalog-search", "result": "no-match", "ids": ids}
-        library_hit = pick_hit(artist, title, library)
-        if library_hit and library_hit.get("pid"):
-            runners.osascript(favorite_script(library_hit["pid"]))
-            return {
-                "action": "set-favorited",
-                "result": "ok",
-                "ids": {"videoId": video_id, "pid": library_hit["pid"]},
-            }
-        songs = ensure_session().catalog_search_songs(_search_term(artist, title))
-        chosen = pick_hit(artist, title, songs)
-        if not chosen or not chosen.get("id"):
-            return {"action": "catalog-search", "result": "no-match", "ids": ids}
-        ensure_session().add_and_love(chosen["id"])
-        return {
-            "action": "catalog-add-love",
-            "result": "ok",
-            "ids": {"videoId": video_id, "catalogId": chosen["id"]},
-        }
+        raw = favourite_apple_track(artist, title, runners, library, session_box)
+        ids = dict(raw.get("ids") or {})
+        ids["videoId"] = video_id
+        return {"action": raw.get("action"), "result": raw.get("result"), "ids": ids}
 
     try:
         return run_apply(
@@ -2348,6 +2372,7 @@ def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tupl
             dry_run=False,
         )
     finally:
+        session = session_box.get("session")
         if session:
             session.close()
 
@@ -2512,6 +2537,76 @@ def cmd_apply(args, runners: Runners) -> int:
     else:
         _outcomes, stopped = apply_youtube(items, runners, record, args.limit, applied_ok)
     return 1 if stopped else 0
+
+
+def _love_key(artist: str, title: str) -> str:
+    artist_name, title_name = normalise(artist, title)
+    return f"{artist_name}|{title_name}"
+
+
+def _print_love(result: str, song_id: str) -> None:
+    print(json.dumps({"result": result, "id": song_id}, ensure_ascii=False))
+
+
+def cmd_love(args, runners: Runners) -> int:
+    """Favourite one song in Apple Music and add it to the library when it is not there.
+
+    Dry-run unless --apply. Prints one JSON line. Exit 0 ok, 3 no-match, 1 error.
+    """
+    artist = args.artist or ""
+    title = args.title or ""
+    if not args.apply:
+        _print_love("dry-run", "")
+        return 0
+
+    applied_path = state_dir() / "applied.jsonl"
+
+    def record(action: str, result: str, ids: dict) -> None:
+        append_applied(
+            applied_path,
+            {
+                "at": runners.clock(),
+                "side": "am",
+                "key": _love_key(artist, title),
+                "action": action,
+                "result": result,
+                "ids": ids if isinstance(ids, dict) else {},
+            },
+        )
+
+    if not has_names(artist, title):
+        record("catalog-search", "no-match", {})
+        _print_love("no-match", "")
+        return 3
+
+    session_box: dict = {"session": None}
+    try:
+        library = collect_library(runners)
+        raw = favourite_apple_track(artist, title, runners, library, session_box)
+    except (SystemExit, Exception) as exc:
+        print(redact_secrets(str(exc))[:300], file=sys.stderr)
+        record("write", "error", {})
+        _print_love("error", "")
+        return 1
+    finally:
+        session = session_box.get("session")
+        if session:
+            session.close()
+
+    result = str(raw.get("result") or "error")
+    if result not in {"ok", "no-match", "error"}:
+        result = "error"
+    ids = raw.get("ids") if isinstance(raw.get("ids"), dict) else {}
+    record(str(raw.get("action") or "write"), result, ids)
+    song_id = ""
+    if result == "ok":
+        song_id = str(ids.get("pid") or ids.get("catalogId") or "")
+    _print_love(result, song_id)
+    if result == "ok":
+        return 0
+    if result == "no-match":
+        return 3
+    return 1
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
@@ -2740,6 +2835,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="perform account writes; without this flag, print the dry run",
     )
     apply.set_defaults(func=cmd_apply)
+
+    love = sub.add_parser(
+        "love",
+        help="favourite one song in Apple Music and add it to the library",
+    )
+    love.add_argument("--artist", required=True)
+    love.add_argument("--title", required=True)
+    love.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the account write; without this flag, print a dry run",
+    )
+    love.set_defaults(func=cmd_love)
     return parser
 
 

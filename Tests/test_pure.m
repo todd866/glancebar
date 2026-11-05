@@ -2441,6 +2441,50 @@ int main(void) {
             [fm createDirectoryAtPath:app withIntermediateDirectories:YES attributes:nil error:nil];
             check([SelectorDJPath(app, build) isEqual:app], @"station: an installed app wins over the build tree");
             [fm removeItemAtPath:root error:nil];
+            NSData *byPath = [@"{\"queue\":[{\"path\":\"/radio/p.m4a\",\"track_key\":\"radiohead|the national anthem\",\"title\":\"The National Anthem\",\"artist\":\"Radiohead\"}],\"picks\":[]}"
+                              dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *pathStation = StationFromJSON(byPath);
+            check([pathStation[@"files"] isEqual:@[@"/radio/p.m4a"]] &&
+                  [pathStation[@"tracks"][0][@"key"] isEqual:@"radiohead|the national anthem"] &&
+                  [station[@"tracks"][0][@"file"] isEqual:@"/radio/a.m4a"] &&
+                  [station[@"tracks"][0][@"title"] isEqual:@"A"],
+                  @"station: path and file both name a queue file; a row keeps its title");
+            check([SelectorTrackKey(@"Jamie xx", @"I Don't Know") isEqual:@"jamie xx|i don t know"] &&
+                  [SelectorTrackKey(@"Jamie\u00A0xx", @"I Don't Know") isEqual:@"jamie xx|i don t know"] &&
+                  [SelectorTrackKey(@"Fred again..", @"Danielle (smile on my face)") isEqual:@"fred again|danielle smile on my face"] &&
+                  [SelectorTrackKey(@"Skrillex & Boys Noize", @"Fine Day Anthem") isEqual:@"skrillex boys noize|fine day anthem"] &&
+                  SelectorTrackKey(@"", @"Only") == nil && SelectorTrackKey(@"Only", @"") == nil,
+                  @"track key: selector normalise, apostrophe becomes a space");
+            NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
+            NSString *up = SelectorFeedbackLine(@"Tame Impala", @"Kiss from a Rose", @"local", epoch);
+            NSString *apple = SelectorFeedbackLine(@"LIVE", @"Lightning Crashes", @"apple", epoch);
+            check([up isEqual:@"{\"artist\":\"Tame Impala\",\"at\":\"1970-01-01T00:00:00Z\",\"event\":\"like\",\"title\":\"Kiss from a Rose\",\"track_key\":\"tame impala|kiss from a rose\"}"] &&
+                  ![apple containsString:@"\"source\""] && [apple containsString:@"\"event\":\"like\""] &&
+                  SelectorFeedbackLine(@"", @"", @"local", epoch) == nil,
+                  @"feedback: a thumbs-up line names the track key, source and UTC time");
+            NSArray *rows = @[@{@"file": @"/radio/a.m4a", @"artist": @"Tame Impala", @"title": @"Kiss from a Rose",
+                                @"key": @"tame impala|kiss from a rose"}];
+            NSDictionary *fromStation = LocalTrackIdentity(rows, @"/radio/a.m4a", @"Other", @"Tags",
+                                                           @"Tame Impala - Kiss from a Rose [9vKAi3bwWPM].m4a");
+            NSDictionary *fromTags = LocalTrackIdentity(@[], @"/music/Whatever.m4a", @"ODESZA", @"Memories That You Call", @"Whatever.m4a");
+            NSDictionary *fromName = LocalTrackIdentity(nil, @"/music/Tame Impala - Kiss from a Rose [9vKAi3bwWPM].m4a",
+                                                        @"", @"", @"Tame Impala - Kiss from a Rose [9vKAi3bwWPM].m4a");
+            check([fromStation[@"trackKey"] isEqual:@"tame impala|kiss from a rose"] &&
+                  [fromStation[@"artist"] isEqual:@"Tame Impala"] &&
+                  [fromStation[@"trackID"] isEqual:@"9vKAi3bwWPM"] &&
+                  [fromTags[@"trackKey"] isEqual:@"odesza|memories that you call"] &&
+                  [fromName[@"title"] isEqual:@"Kiss from a Rose"] &&
+                  LocalTrackIdentity(nil, @"/music/nope.m4a", @"", @"", @"nope.m4a") == nil,
+                  @"local track: station.json, then tags, then Artist - Title [id].m4a");
+            NSString *hearts = HeartCacheAdding(nil, @"tame impala|kiss from a rose");
+            NSString *again = HeartCacheAdding(hearts, @"tame impala|kiss from a rose");
+            NSString *junk = HeartCacheAdding(@"not json", @"a|b");
+            check(HeartCacheContains(hearts, @"tame impala|kiss from a rose") &&
+                  !HeartCacheContains(hearts, @"fred again|delilah") &&
+                  HeartCacheKeys(again).count == 1 &&
+                  HeartCacheContains(junk, @"a|b") && !HeartCacheContains(nil, @"a|b") &&
+                  [HeartCacheKeys(HeartCacheAdding(hearts, @"")) isEqual:HeartCacheKeys(hearts)],
+                  @"hearts: a key stays filled, a blank key is not stored, junk JSON still accepts a new key");
         }
         // Worker readiness.
         {

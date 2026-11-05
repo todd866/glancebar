@@ -1651,5 +1651,122 @@ class ProbeTests(unittest.TestCase):
         self.assertIsNone(likes_sync._JWT_RE.search(text))
 
 
+class LoveCommandTests(unittest.TestCase):
+    """`love` favourites one song. Fakes only: no network and no osascript."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.previous = os.environ.get("MUSIC_SYNC_STATE")
+        os.environ["MUSIC_SYNC_STATE"] = self.tmp.name
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("MUSIC_SYNC_STATE", None)
+        else:
+            os.environ["MUSIC_SYNC_STATE"] = self.previous
+        self.tmp.cleanup()
+
+    def _applied(self) -> list[dict]:
+        path = Path(self.tmp.name) / "applied.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def _run(self, osa: ScriptedOSA, argv: list[str]):
+        runners, _rng = runners_for(osa)
+        code, stdout, stderr = silence(likes_sync.main, argv, runners)
+        return code, stdout, stderr, osa
+
+    def test_dry_run_does_not_touch_music(self):
+        osa = ScriptedOSA(library=library_text([("P123", "Song", "Band", "LP", "false")]))
+        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "dry-run", "id": ""})
+        self.assertEqual(osa.scripts, [])
+        self.assertEqual(self._applied(), [])
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+        self.assertNotIn(APPLE_DEV_TOKEN, stderr)
+
+    def test_library_hit_favourites_and_logs(self):
+        osa = ScriptedOSA(library=library_text([("P123", "Song - Remastered 2011", "Band", "LP", "false")]))
+        code, stdout, stderr, osa = self._run(
+            osa, ["love", "--artist", "Band - Topic", "--title", "Song (feat. Pal)", "--apply"]
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "ok", "id": "P123"})
+        self.assertEqual(len(osa.favorited), 1)
+        self.assertIn("P123", osa.favorited[0])
+        self.assertIn("to true", osa.favorited[0])
+        self.assertEqual(osa.loved, [])
+        self.assertEqual(osa.closed, 0)
+        self.assertFalse(any("make new tab" in script for script in osa.scripts))
+        logged = self._applied()
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged[0]["side"], "am")
+        self.assertEqual(logged[0]["action"], "set-favorited")
+        self.assertEqual(logged[0]["result"], "ok")
+        self.assertEqual(logged[0]["ids"]["pid"], "P123")
+        self.assertEqual(logged[0]["at"], "2026-11-01T00:00:00Z")
+        self.assertTrue(logged[0]["key"])
+
+    def test_catalog_match_adds_and_loves(self):
+        osa = ScriptedOSA(
+            library="",
+            songs=[{"id": "999", "title": "Song - Remastered 2011", "artist": "Band - Topic"}],
+        )
+        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song (feat. Pal)", "--apply"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "ok", "id": "999"})
+        self.assertEqual(osa.favorited, [])
+        self.assertEqual(len(osa.loved), 1)
+        self.assertIn("/v1/me/library?ids[songs]=", osa.loved[0])
+        self.assertIn("999", osa.loved[0])
+        self.assertIn("value: 1", osa.loved[0])
+        self.assertEqual(osa.closed, 1)
+        logged = self._applied()
+        self.assertEqual(logged[0]["action"], "catalog-add-love")
+        self.assertEqual(logged[0]["result"], "ok")
+        self.assertEqual(logged[0]["ids"]["catalogId"], "999")
+        self.assertNotIn(APPLE_DEV_TOKEN, stdout)
+
+    def test_wrong_artist_is_no_match(self):
+        osa = ScriptedOSA(
+            library=library_text([("P123", "Song", "Someone Else", "LP", "false")]),
+            songs=[{"id": "999", "title": "Song", "artist": "Someone Else"}],
+        )
+        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song", "--apply"])
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "no-match", "id": ""})
+        self.assertEqual(osa.favorited, [])
+        self.assertEqual(osa.loved, [])
+        self.assertEqual(osa.closed, 1)
+        logged = self._applied()
+        self.assertEqual(logged[0]["result"], "no-match")
+        self.assertEqual(logged[0]["action"], "catalog-search")
+
+    def test_blank_names_do_not_open_music(self):
+        osa = ScriptedOSA(library=library_text([("P123", "Song", "Band", "LP", "true")]))
+        code, stdout, _stderr, osa = self._run(osa, ["love", "--artist", " ", "--title", "", "--apply"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(stdout), {"result": "no-match", "id": ""})
+        self.assertEqual(osa.scripts, [])
+        self.assertEqual(self._applied()[0]["result"], "no-match")
+
+    def test_library_read_error_exits_1(self):
+        def boom(source: str) -> str:
+            raise RuntimeError("osascript failed: Music not running")
+
+        runners, _rng = runners_for(ScriptedOSA())
+        runners.osascript = boom
+        code, stdout, stderr = silence(
+            likes_sync.main, ["love", "--artist", "Band", "--title", "Song", "--apply"], runners
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout), {"result": "error", "id": ""})
+        self.assertIn("Music not running", stderr)
+        logged = self._applied()
+        self.assertEqual(logged[0]["result"], "error")
+
+
 if __name__ == "__main__":
     unittest.main()

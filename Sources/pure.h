@@ -761,6 +761,19 @@ NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray
 NSURL *MixArtSearchURL(NSString *artist, NSString *title);
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at);
 NSSet<NSString *> *MixLikedIDs(NSString *jsonl);
+// Selector identity: normalise(artist) + "|" + normalise(title). Letters, digits and
+// underscores stay; everything else becomes a space. "Jamie xx" / "I Don't Know"
+// → "jamie xx|i don t know". Empty when either side normalises to nothing.
+NSString *SelectorTrackKey(NSString *artist, NSString *title);
+// One thumbs-up line for ~/.local/state/selector/feedback.jsonl. nil without a track key.
+NSString *SelectorFeedbackLine(NSString *artist, NSString *title, NSString *source, NSDate *at);
+// Station row (file or path, plus artist and title) wins, then file tags, then
+// "Artist - Title [id].ext". nil when the track still has no artist and title.
+NSDictionary *LocalTrackIdentity(NSArray *stationRows, NSString *path, NSString *tagArtist, NSString *tagTitle, NSString *filename);
+// hearts.json is {"tracks":[track_key, ...]}. Adding a blank key leaves the cache unchanged.
+NSString *HeartCacheAdding(NSString *json, NSString *key);
+BOOL HeartCacheContains(NSString *json, NSString *key);
+NSArray<NSString *> *HeartCacheKeys(NSString *json);
 NSString *MixArtURLFromSearch(NSData *json, NSString *artist, NSUInteger px);
 // Tracks that suit the seed, best first: same artist, same family, near years, favourites
 // and plays; nothing disliked or played in the last minIdleDays (the seed's own tracks excepted).
@@ -783,8 +796,9 @@ NSString *SeedCaption(NSString *title);
 // (artist and title both in the filename) comes first, then other files by that artist,
 // at most 40. Empty when nothing on disk matches — the tile then does nothing.
 NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths);
-// station.json: queue file paths and this week's picks (title, artist, reason, file).
-// nil when the data is missing or not an object. An empty queue is still a station.
+// station.json: queue file paths (file or path) and this week's picks (title, artist, reason, file).
+// tracks keeps each queue file with its artist, title and identity key. nil when the data is
+// missing or not an object. An empty queue is still a station.
 NSDictionary *StationFromJSON(NSData *json);
 // Selector DJ to open on a double-click. The installed app wins; otherwise an executable
 // under the .build directory. nil when neither is there.

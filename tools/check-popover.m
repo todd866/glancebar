@@ -144,6 +144,7 @@ static BOOL ActionableMenuImages(NSMenu *menu) {
     }
     return YES;
 }
+static BOOL gStationRender = NO;
 static BOOL RenderOffscreen(NSView *view, NSString *path, NSAppearanceName appearance) {
     if (!view || view.bounds.size.width < 1 || view.bounds.size.height < 1 || !path.length) return NO;
     // A detail document does not paint its own window background. On a clear bitmap that
@@ -1167,7 +1168,8 @@ int main(int argc, const char **argv) {
             NSView *playingOut = FindIdentifier(root, @"popover.sound");
             if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
                 ![playingOut.accessibilityHelp containsString:@"click for"] ||
-                ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"])
+                ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"] ||
+                FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "idle") == 0) {
             [c setValue:@NO forKey:@"ytTabOpen"];
@@ -1246,6 +1248,78 @@ int main(int argc, const char **argv) {
             [c setValue:@NO forKey:@"amLoaded"];
             [c setValue:@NO forKey:@"playbackKnown"];
             [c setValue:@NO forKey:@"playbackPlaying"];
+        } else if (musicState && strcmp(musicState, "station") == 0) {
+            id oldDevices = [c valueForKey:@"audioDevices"];
+            id oldUID = [c valueForKey:@"defaultOutputUID"];
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@NO forKey:@"amLoaded"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Kiss from a Rose" forKey:@"localTitle"];
+            [c setValue:@"Tame Impala" forKey:@"localArtist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@243 forKey:@"trackDuration"];
+            [c setValue:@0 forKey:@"localIndex"];
+            [c setValue:@[[NSURL fileURLWithPath:@"/tmp/glancebar-station-a.m4a"]] forKey:@"localURLs"];
+            [c setValue:@[@{@"file": @"/tmp/glancebar-station-a.m4a", @"artist": @"Tame Impala",
+                            @"title": @"Kiss from a Rose", @"key": @"tame impala|kiss from a rose"}] forKey:@"stationTracks"];
+            [c setValue:@[
+                @{@"uid": @"speakers", @"name": @"MacBook Air Speakers",
+                  @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2, @"dataSource": @""}
+            ] forKey:@"audioDevices"];
+            [c setValue:@"speakers" forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            NSButton *thumb = (NSButton *)FindIdentifier(root, @"popover.music.thumbsup");
+            NSView *title = FindIdentifier(root, @"popover.music.title");
+            if (!SoundRow(root, @"Kiss from a Rose", @"Tame Impala · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+                ![heart isKindOfClass:NSButton.class] || ![thumb isKindOfClass:NSButton.class] ||
+                ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
+                ![thumb.accessibilityLabel isEqual:@"Thumbs-up: mixes should play more like this"] ||
+                fabs(NSWidth(heart.frame) - 22) > 0.5 || fabs(NSHeight(heart.frame) - 22) > 0.5 ||
+                fabs(NSWidth(thumb.frame) - 22) > 0.5 || fabs(NSHeight(thumb.frame) - 22) > 0.5 ||
+                NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame))
+                return Fail(__LINE__);
+            [c setValue:[NSMutableSet setWithObject:@"tame impala|kiss from a rose"] forKey:@"heartedKeys"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            if (![heart.accessibilityLabel isEqual:@"Remove from Favourites"]) return Fail(__LINE__);
+            [c setValue:[NSMutableSet set] forKey:@"heartedKeys"];
+            [c setValue:@"song:SEED" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
+                return Fail(__LINE__);
+            [c setValue:@"" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+                return Fail(__LINE__);
+            [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (argc > 1) {
+                gStationRender = YES;
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(root, [NSString stringWithUTF8String:argv[1]], look)) return Fail(__LINE__);
+            }
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:nil forKey:@"mixPlayingKey"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
+            [c setValue:nil forKey:@"localTitle"];
+            [c setValue:nil forKey:@"localArtist"];
+            [c setValue:nil forKey:@"localURLs"];
+            [c setValue:nil forKey:@"stationTracks"];
+            [c setValue:nil forKey:@"heartedKeys"];
+            [c setValue:oldDevices forKey:@"audioDevices"];
+            [c setValue:oldUID forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
         }
         if (!ActionableMenuImages([c moreMenu])) return Fail(__LINE__);
         // Toolbar tabs, built but not ordered front. Every tab keeps its identifier and a symbol.
@@ -1751,7 +1825,7 @@ int main(int argc, const char **argv) {
             }
         }
         [c setValue:nil forKey:@"detailsWindow"];
-        if (argc > 1) {
+        if (argc > 1 && !gStationRender) {
             root.appearance = [NSAppearance appearanceNamed:(argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)];
             NSBitmapImageRep *rep = [root bitmapImageRepForCachingDisplayInRect:root.bounds];
             [root cacheDisplayInRect:root.bounds toBitmapImageRep:rep];

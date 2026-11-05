@@ -5656,7 +5656,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSString *_mixPlayingKey, *_mixStartingKey;
     NSArray<NSString *> *_mixLocalPaths;
     BOOL _stationLoaded, _stationAvailable;
-    NSArray *_stationFiles, *_stationPicks;
+    NSArray *_stationFiles, *_stationPicks, *_stationTracks;
     dispatch_queue_t _mixQueue;
     NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
     NSMutableSet<NSString *> *_remoteInFlight;
@@ -5668,9 +5668,11 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     BOOL _musicOff;                    // defaults musicEnabled = NO: no music polling (worker Macs); nothing else
     BOOL _networkKnown, _networkOnline;
     nw_path_monitor_t _pathMonitor;
-    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _localMode, _localEmpty;
+    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _localMode, _localEmpty, _localTagsReady, _localLoveInFlight;
     BOOL _ytJSDenied, _ytStartPending, _ytStatusInFlight, _offlineTracksEntering;
-    NSString *_localTitle, *_localArtist, *_ytTitle, *_ytArtist, *_musicNote;
+    NSString *_localTitle, *_localArtist, *_ytTitle, *_ytArtist, *_musicNote, *_localHeartError;
+    NSUInteger _localHeartEpoch;
+    NSMutableSet<NSString *> *_heartedKeys;
     AVQueuePlayer *_localPlayer;
     NSArray<NSURL *> *_localURLs;
     NSArray<AVPlayerItem *> *_localObservedItems;
@@ -6182,6 +6184,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _stationAvailable = station != nil;
     _stationFiles = station[@"files"] ?: @[];
     _stationPicks = station[@"picks"] ?: @[];
+    _stationTracks = station[@"tracks"] ?: @[];
 }
 - (IBAction)playStation:(id)sender {
     (void)sender;
@@ -6304,6 +6307,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSDictionary *parsed = ParseLikedTrackFilename(url.lastPathComponent);
     _localTitle = parsed[@"title"] ?: @"";
     _localArtist = parsed[@"artist"] ?: @"";
+    _localTagsReady = NO;
+    _localHeartError = nil;
+    _localHeartEpoch++;
     NSUInteger gen = ++_musicGen;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
     [asset loadValuesAsynchronouslyForKeys:@[@"commonMetadata"] completionHandler:^{
@@ -6316,6 +6322,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             if (gen != self->_musicGen || !self->_localMode) return;
             if (title.length) self->_localTitle = title;
             if (artist.length) self->_localArtist = artist;
+            self->_localTagsReady = title.length && artist.length;
             [self publishNowPlaying];
             if (self->_popover.isShown) [self rebuildContent];
         });
@@ -6379,6 +6386,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)startOfflinePlayback {
     if (!_musicProbesEnabled) return;
+    // The liked-folder shuffle is not a station or a seed mix, so its row has no heart.
+    _mixPlayingKey = nil;
     [self disableRemoteCommands];
     NSArray<NSString *> *paths = [self offlineTrackPaths];
     if (!paths.count) {
@@ -6846,8 +6855,141 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     RunAppleScript(@"tell application \"Music\"\ntry\nreveal current track\nend try\nactivate\nend tell",
                    ^(NSString *o, NSString *e, int st) { (void)o; (void)e; (void)st; });
 }
+- (NSDictionary *)currentLocalIdentity {
+    if (!_localMode || _localIndex < 0 || _localIndex >= (NSInteger)_localURLs.count) return nil;
+    NSString *path = _localURLs[_localIndex].path;
+    if (!path.length) return nil;
+    return LocalTrackIdentity(_stationTracks, path, _localTagsReady ? _localArtist : @"",
+                              _localTagsReady ? _localTitle : @"", path.lastPathComponent);
+}
+- (NSMutableSet<NSString *> *)heartedKeys {
+    if (!_heartedKeys) {
+        _heartedKeys = [NSMutableSet set];
+        if (_musicProbesEnabled) {
+            NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/hearts.json"];
+            NSString *json = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            [_heartedKeys addObjectsFromArray:HeartCacheKeys(json)];
+        }
+    }
+    return _heartedKeys;
+}
+- (void)rememberHeart:(NSString *)key {
+    if (!key.length) return;
+    [[self heartedKeys] addObject:key];
+    if (!_musicProbesEnabled) return;
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"hearts.json"];
+    NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *next = HeartCacheAdding(existing, key);
+    if (![next writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+    [_heartedKeys setSet:[NSSet setWithArray:HeartCacheKeys(next)]];
+}
+- (void)noteLocalHeartError:(NSString *)reason {
+    NSString *text = [[reason ?: @"" stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
+                      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (text.length > 160) text = [text substringToIndex:160];
+    _localHeartError = text.length ? text : @"Couldn't add to Apple Music";
+    NSUInteger epoch = ++_localHeartEpoch;
+    if (_popover.isShown) [self rebuildContent];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (epoch != self->_localHeartEpoch) return;
+        self->_localHeartError = nil;
+        if (self->_popover.isShown) [self rebuildContent];
+    });
+}
+static NSString *LikesSyncScript(void) {
+    return [GBHomeDirectory() stringByAppendingPathComponent:@"Projects/glancebar/tools/music-sync/likes_sync.py"];
+}
+static NSString *Python3Path(void) {
+    for (NSString *path in @[@"/opt/homebrew/bin/python3", @"/usr/local/bin/python3", @"/usr/bin/python3"])
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:path]) return path;
+    return @"/usr/bin/python3";
+}
+static NSDictionary *LoveResultJSON(NSString *stdoutText) {
+    NSString *last = nil;
+    for (NSString *line in [stdoutText componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet])
+        if (line.length) last = line;
+    NSData *data = [last dataUsingEncoding:NSUTF8StringEncoding];
+    id obj = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+}
+- (void)loveCurrentLocalTrack {
+    if (!_musicProbesEnabled || _localLoveInFlight) return;
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *artist = ident[@"artist"] ?: @"";
+    NSString *title = ident[@"title"] ?: @"";
+    NSString *key = ident[@"trackKey"] ?: @"";
+    if (!artist.length || !title.length || !key.length) {
+        [self noteLocalHeartError:@"No artist and title"];
+        return;
+    }
+    if ([[self heartedKeys] containsObject:key]) return;
+    NSString *script = LikesSyncScript();
+    if (![NSFileManager.defaultManager fileExistsAtPath:script]) {
+        [self noteLocalHeartError:@"Likes sync is not installed"];
+        return;
+    }
+    _localLoveInFlight = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:Python3Path()];
+        task.arguments = @[script, @"love", @"--artist", artist, @"--title", title, @"--apply"];
+        NSPipe *out = [NSPipe pipe], *errPipe = [NSPipe pipe];
+        task.standardOutput = out;
+        task.standardError = errPipe;
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        if (![task launchAndReturnError:NULL]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_localLoveInFlight = NO;
+                [self noteLocalHeartError:@"Couldn't add to Apple Music"];
+            });
+            return;
+        }
+        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:120];
+        NSData *outData = [out.fileHandleForReading readDataToEndOfFile];
+        NSData *errData = [errPipe.fileHandleForReading readDataToEndOfFile];
+        [task waitUntilExit];
+        [watchdog disarm];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_localLoveInFlight = NO;
+            NSString *stdoutText = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
+            NSString *stderrText = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding];
+            NSDictionary *payload = LoveResultJSON(stdoutText);
+            NSString *result = [payload[@"result"] isKindOfClass:NSString.class] ? payload[@"result"] : @"";
+            int status = task.terminationReason == NSTaskTerminationReasonExit ? task.terminationStatus : 1;
+            if (status == 0 && [result isEqual:@"ok"]) {
+                [self rememberHeart:key];
+                self->_localHeartError = nil;
+                self->_localHeartEpoch++;
+                if (self->_popover.isShown) [self rebuildContent];
+                return;
+            }
+            NSString *why = status == 3 || [result isEqual:@"no-match"] ? @"No Apple Music match" : stderrText;
+            [self noteLocalHeartError:why];
+        });
+    });
+}
+- (void)appendSelectorFeedbackForArtist:(NSString *)artist title:(NSString *)title source:(NSString *)source {
+    if (!_musicProbesEnabled) return;
+    NSString *line = SelectorFeedbackLine(artist, title, source, NSDate.date);
+    if (!line.length) return;
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"feedback.jsonl"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:path])
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
 - (IBAction)musicFavorite:(id)sender {
     (void)sender;
+    if (_localMode && _mixPlayingKey.length) {
+        [self loveCurrentLocalTrack];
+        return;
+    }
     if (!_amLoaded) return;
     _amFavorited = !_amFavorited;   // answer the click now; the read-back confirms it
     if (_popover.isShown) [self rebuildContent];
@@ -6863,10 +7005,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (IBAction)musicThumbsUp:(id)sender {
     (void)sender;
-    if (!_amLoaded || !_amTrackID.length) return;
-    BOOL liked = ![[self mixLiked] containsObject:_amTrackID];
-    if (liked) [_mixLiked addObject:_amTrackID]; else [_mixLiked removeObject:_amTrackID];
-    NSString *line = MixFeedbackLine(_amTrackID, _amTitle, _amArtist, liked, NSDate.date);
+    BOOL local = _localMode && _mixPlayingKey.length;
+    if (!local && (!_amLoaded || !_amTrackID.length)) return;
+    NSDictionary *ident = local ? [self currentLocalIdentity] : nil;
+    NSString *thumbID = local ? ([ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"]) : _amTrackID;
+    if (!thumbID.length) return;
+    BOOL liked = ![[self mixLiked] containsObject:thumbID];
+    if (liked) [_mixLiked addObject:thumbID]; else [_mixLiked removeObject:thumbID];
+    NSString *title = local ? (ident[@"title"] ?: _localTitle) : _amTitle;
+    NSString *artist = local ? (ident[@"artist"] ?: _localArtist) : _amArtist;
+    NSString *line = MixFeedbackLine(thumbID, title, artist, liked, NSDate.date);
     NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -6874,10 +7022,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
     for (NSUInteger i = 0; i < _mixLibrary.count; i++)   // the next seed draw counts it straight away
-        if ([_mixLibrary[i][@"id"] isEqual:_amTrackID]) {
+        if ([_mixLibrary[i][@"id"] isEqual:thumbID]) {
             NSMutableArray *lib = [_mixLibrary mutableCopy]; NSMutableDictionary *t = [lib[i] mutableCopy];
             t[@"thumb"] = @(liked); lib[i] = t; _mixLibrary = lib; break;
         }
+    // A thumbs-up is the curator signal. Taking it back does not un-heart the track.
+    if (liked) {
+        [self appendSelectorFeedbackForArtist:artist title:title source:local ? @"local" : @"apple"];
+        NSString *heartKey = local ? ident[@"trackKey"] : SelectorTrackKey(_amArtist, _amTitle);
+        BOOL hearted = local ? (heartKey.length && [[self heartedKeys] containsObject:heartKey]) : _amFavorited;
+        if (!hearted) {
+            if (local) [self loveCurrentLocalTrack];
+            else {
+                _amFavorited = YES;
+                [self runAppleMusicCommand:@"try\nduplicate current track to source 1\nend try\n"
+                                            "try\nset favorited of current track to true\nend try"
+                                  followUp:NO];
+            }
+        }
+    }
     if (_popover.isShown) [self rebuildContent];
 }
 - (IBAction)musicShuffle:(id)sender {
@@ -7090,15 +7253,36 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [row addSubview:art];
         textX = NSMaxX(art.frame) + 8;
     }
-    if (am) {
-        NSButton *heart = [self transportButton:_amFavorited ? @"heart.fill" : @"heart" pointSize:15 side:22
+    // The same ♥ and 👍 as Apple Music, on a local station or seed-mix queue.
+    BOOL localQueue = _localMode && _mixPlayingKey.length;
+    if (am || localQueue) {
+        BOOL hearted = NO;
+        NSString *heartError = nil;
+        NSString *thumbID = nil;
+        if (am) {
+            hearted = _amFavorited;
+            thumbID = _amTrackID;
+        } else {
+            NSDictionary *ident = [self currentLocalIdentity];
+            NSString *key = ident[@"trackKey"];
+            hearted = key.length && [[self heartedKeys] containsObject:key];
+            heartError = _localHeartError;
+            thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : key;
+        }
+        NSButton *heart = [self transportButton:hearted ? @"heart.fill" : @"heart" pointSize:15 side:22
                                          action:@selector(musicFavorite:) identifier:@"popover.music.favorite"
-                                          label:_amFavorited ? @"Remove from Favourites" : @"Add to Favourites"];
+                                          label:hearted ? @"Remove from Favourites" : @"Add to Favourites"];
         heart.frame = NSOffsetRect(heart.frame, textRight - 22, 0);
-        heart.contentTintColor = _amFavorited ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
+        if (heartError.length) {
+            heart.contentTintColor = NSColor.systemRedColor;
+            heart.toolTip = heartError;
+            heart.accessibilityHelp = heartError;
+        } else {
+            heart.contentTintColor = hearted ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
+        }
         [row addSubview:heart];
         // 👍 tells the curator "I like this", apart from ♥ (which keeps it in the library).
-        BOOL liked = _amTrackID.length && [[self mixLiked] containsObject:_amTrackID];
+        BOOL liked = thumbID.length && [[self mixLiked] containsObject:thumbID];
         NSButton *thumb = [self transportButton:liked ? @"hand.thumbsup.fill" : @"hand.thumbsup" pointSize:14 side:22
                                          action:@selector(musicThumbsUp:) identifier:@"popover.music.thumbsup"
                                           label:liked ? @"Remove thumbs-up" : @"Thumbs-up: mixes should play more like this"];

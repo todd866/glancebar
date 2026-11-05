@@ -2826,6 +2826,114 @@ NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray
 
 // 👍 feedback for the curator, one JSON object per line in mix/feedback.jsonl; the last line for a
 // track wins, so un-liking is just another line.
+static NSString *SelectorNormaliseField(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || !value.length) return @"";
+    NSString *text = [[value stringByReplacingOccurrencesOfString:@"\u00A0" withString:@" "] lowercaseString];
+    static NSCharacterSet *drop;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *keep = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
+        [keep addCharactersInString:@"_"];
+        drop = [keep invertedSet];
+    });
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSString *part in [text componentsSeparatedByCharactersInSet:drop])
+        if (part.length) [parts addObject:part];
+    return [parts componentsJoinedByString:@" "];
+}
+
+NSString *SelectorTrackKey(NSString *artist, NSString *title) {
+    NSString *a = SelectorNormaliseField(artist), *t = SelectorNormaliseField(title);
+    if (!a.length || !t.length) return nil;
+    return [NSString stringWithFormat:@"%@|%@", a, t];
+}
+
+NSString *SelectorFeedbackLine(NSString *artist, NSString *title, NSString *source, NSDate *at) {
+    NSString *key = SelectorTrackKey(artist, title);
+    if (!key.length) return nil;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
+    (void)source;   // Selector's feedback contract (docs/contracts.md) has no source on a like; it would fail validation.
+    NSDictionary *line = @{@"artist": artist ?: @"", @"at": [fmt stringFromDate:at ?: NSDate.date], @"event": @"like",
+                           @"title": title ?: @"", @"track_key": key};
+    NSData *data = [NSJSONSerialization dataWithJSONObject:line options:NSJSONWritingSortedKeys error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
+
+static BOOL SelectorSamePath(NSString *a, NSString *b) {
+    if (![a isKindOfClass:NSString.class] || ![b isKindOfClass:NSString.class] || !a.length || !b.length) return NO;
+    if ([a isEqual:b]) return YES;
+    return [a.stringByStandardizingPath isEqual:b.stringByStandardizingPath];
+}
+
+static NSString *SelectorRowFile(NSDictionary *row) {
+    NSString *file = [row[@"file"] isKindOfClass:NSString.class] ? row[@"file"] : @"";
+    if (!file.length && [row[@"path"] isKindOfClass:NSString.class]) file = row[@"path"];
+    return file ?: @"";
+}
+
+static NSString *SelectorRowKey(NSDictionary *row) {
+    NSString *key = [row[@"track_key"] isKindOfClass:NSString.class] ? row[@"track_key"] : @"";
+    if (!key.length && [row[@"key"] isKindOfClass:NSString.class]) key = row[@"key"];
+    return [key containsString:@"|"] ? key : @"";
+}
+
+NSDictionary *LocalTrackIdentity(NSArray *stationRows, NSString *path, NSString *tagArtist, NSString *tagTitle, NSString *filename) {
+    NSString *artist = nil, *title = nil, *key = nil;
+    for (id item in stationRows) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *row = item;
+        if (!SelectorSamePath(SelectorRowFile(row), path)) continue;
+        NSString *rowArtist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
+        NSString *rowTitle = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
+        if (!rowArtist.length || !rowTitle.length) continue;
+        artist = rowArtist;
+        title = rowTitle;
+        key = SelectorRowKey(row);
+        break;
+    }
+    if (!artist.length && [tagArtist isKindOfClass:NSString.class] && tagArtist.length &&
+        [tagTitle isKindOfClass:NSString.class] && tagTitle.length) {
+        artist = tagArtist;
+        title = tagTitle;
+    }
+    NSDictionary *parsed = ParseLikedTrackFilename(filename);
+    if (![parsed[@"trackID"] length]) parsed = ParseLikedTrackFilename(path);
+    if (!artist.length) {
+        NSString *fileArtist = parsed[@"artist"] ?: @"";
+        NSString *fileTitle = parsed[@"title"] ?: @"";
+        if (fileArtist.length && fileTitle.length) { artist = fileArtist; title = fileTitle; }
+    }
+    if (!artist.length || !title.length) return nil;
+    if (!key.length) key = SelectorTrackKey(artist, title);
+    if (!key.length) return nil;
+    return @{@"artist": artist, @"title": title, @"trackKey": key, @"trackID": parsed[@"trackID"] ?: @""};
+}
+
+NSArray<NSString *> *HeartCacheKeys(NSString *json) {
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    id obj = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSArray *tracks = [obj isKindOfClass:NSDictionary.class] ? obj[@"tracks"] : nil;
+    if (![tracks isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id item in tracks) if ([item isKindOfClass:NSString.class] && [item length]) [out addObject:item];
+    return out;
+}
+
+NSString *HeartCacheAdding(NSString *json, NSString *key) {
+    NSMutableArray *tracks = [HeartCacheKeys(json) mutableCopy];
+    if (key.length && ![tracks containsObject:key]) [tracks addObject:key];
+    [tracks sortUsingSelector:@selector(compare:)];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"tracks": tracks} options:NSJSONWritingSortedKeys error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
+
+BOOL HeartCacheContains(NSString *json, NSString *key) {
+    return key.length && [HeartCacheKeys(json) containsObject:key];
+}
+
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at) {
     NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
     NSDictionary *o = @{@"at": [f stringFromDate:at ?: NSDate.date], @"trackID": trackID ?: @"", @"title": title ?: @"",
@@ -3028,23 +3136,30 @@ NSDictionary *StationFromJSON(NSData *json) {
     NSArray *queue = [obj[@"queue"] isKindOfClass:NSArray.class] ? obj[@"queue"] : @[];
     NSArray *picksIn = [obj[@"picks"] isKindOfClass:NSArray.class] ? obj[@"picks"] : @[];
     NSMutableArray *files = [NSMutableArray array];
-    for (id row in queue) {
-        if (![row isKindOfClass:NSDictionary.class]) continue;
-        id file = row[@"file"];
-        if ([file isKindOfClass:NSString.class] && [file length]) [files addObject:file];
+    NSMutableArray *tracks = [NSMutableArray array];
+    for (id item in queue) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *row = item;
+        NSString *file = SelectorRowFile(row);
+        if (!file.length) continue;
+        [files addObject:file];
+        [tracks addObject:@{@"file": file,
+                            @"artist": [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"",
+                            @"title": [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"",
+                            @"key": SelectorRowKey(row)}];
     }
     NSMutableArray *picks = [NSMutableArray array];
-    for (id row in picksIn) {
-        if (![row isKindOfClass:NSDictionary.class]) continue;
+    for (id item in picksIn) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *row = item;
         NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
         if (!title.length) continue;
         NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
         NSString *reason = [row[@"reason"] isKindOfClass:NSString.class] ? row[@"reason"] : @"";
-        id file = row[@"file"];
-        [picks addObject:@{@"title": title, @"artist": artist, @"reason": reason,
-                           @"file": [file isKindOfClass:NSString.class] ? file : @""}];
+        NSString *file = SelectorRowFile(row);
+        [picks addObject:@{@"title": title, @"artist": artist, @"reason": reason, @"file": file ?: @""}];
     }
-    return @{@"files": files, @"picks": picks};
+    return @{@"files": files, @"picks": picks, @"tracks": tracks};
 }
 
 NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot) {
