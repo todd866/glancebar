@@ -1958,6 +1958,39 @@ double MusicBlendSeconds(double remainingSec, double fullSec, double minSec) {
     return remainingSec;
 }
 
+int MusicVolumeCents(double volume) {
+    if (!isfinite(volume) || volume <= 0) return 0;
+    long rounded = llround(volume * 100.0);
+    if (rounded < 0) return 0;
+    if (rounded > 100) return 100;
+    return (int)rounded;
+}
+
+BOOL MusicBlendCutOwesNext(int phase, BOOL skipSent) {
+    (void)phase;
+    return !skipSent;
+}
+
+BOOL VolumeScriptShouldApply(uint64_t applyGeneration, uint64_t latestGeneration) {
+    return applyGeneration == latestGeneration;
+}
+
+static int ClampMusicVolume(int volume) {
+    if (volume < 0) return 0;
+    if (volume > 100) return 100;
+    return volume;
+}
+
+BOOL MusicRestoredVolumeMatches(BOOL readOK, int readVolume, int original) {
+    if (!readOK) return NO;
+    return ClampMusicVolume(readVolume) == ClampMusicVolume(original);
+}
+
+BOOL YouTubeRestoredVolumeMatches(BOOL readOK, double readVolume, double original) {
+    if (!readOK || !isfinite(readVolume) || !isfinite(original)) return NO;
+    return MusicVolumeCents(readVolume) == MusicVolumeCents(original);
+}
+
 static NSString *FormatClockPart(double seconds, BOOL withHours) {
     int whole = (int)seconds;
     int h = whole / 3600;

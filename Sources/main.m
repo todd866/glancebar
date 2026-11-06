@@ -21,6 +21,7 @@
 #import <libproc.h>
 #import <mach/mach.h>
 #import <signal.h>
+#import <stdatomic.h>
 #import <sys/mount.h>
 #import <sys/sysctl.h>
 #import <os/log.h>
@@ -972,14 +973,25 @@ static NSString *AppGroupForPid(pid_t pid) {
 // disarm right after waitUntilExit, so a reaped child's recycled pid is never signalled.
 @interface GBWatchdog : NSObject
 - (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds;
+// hardKill SIGKILLs at the deadline. Quit uses it so a restore cannot outlive that
+// second; the usual path SIGTERMs at the deadline and SIGKILLs one second later.
+- (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds hardKill:(BOOL)hardKill;
 - (void)disarm;
 @end
 @implementation GBWatchdog { pid_t _pid; BOOL _disarmed; }
 - (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds {
+    return [self initWithPid:pid seconds:seconds hardKill:NO];
+}
+- (instancetype)initWithPid:(pid_t)pid seconds:(int64_t)seconds hardKill:(BOOL)hardKill {
     if (!(self = [super init])) return nil;
     _pid = pid;
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC), q, ^{
+    int64_t deadline = seconds > 0 ? seconds : 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, deadline * NSEC_PER_SEC), q, ^{
+        if (hardKill) {
+            [self signal:SIGKILL];
+            return;
+        }
         [self signal:SIGTERM];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), q, ^{ [self signal:SIGKILL]; });
     });
@@ -5361,35 +5373,131 @@ static NSImage *AppleMusicThumbnail(NSString *path, CGFloat side) {
     [small addRepresentation:rep];
     return small;
 }
+static const int kVolumeScriptSec = 10;
+// Quit waits this long for each dipped target, then SIGKILLs the script. The
+// process is leaving; a longer wait would hang termination.
+static const int kBlendQuitRestoreSec = 1;
+
+// Music and Chrome each get one serial queue. Dip ticks and the restore used to
+// share the concurrent global queue, so a stale dip osascript could finish after
+// the restore and leave the volume down. Generation is the second gate: a script
+// already queued with an older stamp does not start once a restore has published
+// a newer one. The load/store is atomic because the check runs on the volume queue
+// and the bump runs on the main thread.
+static _Atomic uint64_t gMusicVolumeGeneration;
+static _Atomic uint64_t gChromeVolumeGeneration;
+
+static dispatch_queue_t BlendVolumeQueue(const char *label) {
+    dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+    return dispatch_queue_create(label, attr);
+}
+static dispatch_queue_t MusicVolumeQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = BlendVolumeQueue("com.iantodd.glancebar.music-volume"); });
+    return queue;
+}
+static dispatch_queue_t ChromeVolumeQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = BlendVolumeQueue("com.iantodd.glancebar.chrome-volume"); });
+    return queue;
+}
+static uint64_t CurrentVolumeGeneration(_Atomic uint64_t *slot) {
+    return atomic_load_explicit(slot, memory_order_acquire);
+}
+static uint64_t BumpVolumeGeneration(_Atomic uint64_t *slot) {
+    return atomic_fetch_add_explicit(slot, 1, memory_order_acq_rel) + 1;
+}
+
+// Blocks the calling thread. hardKill SIGKILLs at `seconds` (quit). Otherwise the
+// watchdog SIGTERMs then, and SIGKILLs a second later, matching the old helper.
+static int RunAppleScriptBlocking(NSString *source, int seconds, BOOL hardKill,
+                                 NSString **outOutput, NSString **outError) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+    task.arguments = @[@"-e", source ?: @""];
+    NSPipe *out = [NSPipe pipe], *err = [NSPipe pipe];
+    task.standardOutput = out;
+    task.standardError = err;
+    if (![task launchAndReturnError:NULL]) {
+        if (outOutput) *outOutput = @"";
+        if (outError) *outError = @"osascript failed to launch";
+        return 1;
+    }
+    // osascript has no deadline. A hung Chrome, or a permission dialog nobody answers,
+    // would block this queue forever; terminate at the deadline and force-kill a second later.
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:seconds hardKill:hardKill];
+    NSString *output = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+    NSString *errorText = [[NSString alloc] initWithData:[err.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+    [task waitUntilExit];
+    [watchdog disarm];
+    int status = task.terminationStatus;
+    if (task.terminationReason != NSTaskTerminationReasonExit) {
+        if (!errorText.length) errorText = @"osascript timed out";
+        if (status == 0) status = 1;
+    }
+    if (outOutput) *outOutput = output;
+    if (outError) *outError = errorText;
+    return status;
+}
 static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status));
 static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
-    RunAppleScriptTimed(source, 10, done);
+    RunAppleScriptTimed(source, kVolumeScriptSec, done);
 }
 static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSTask *task = [NSTask new];
-        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
-        task.arguments = @[@"-e", source ?: @""];
-        NSPipe *out = [NSPipe pipe], *err = [NSPipe pipe];
-        task.standardOutput = out;
-        task.standardError = err;
-        if (![task launchAndReturnError:NULL]) {
-            dispatch_async(dispatch_get_main_queue(), ^{ done(@"", @"osascript failed to launch", 1); });
+        NSString *output = nil, *errorText = nil;
+        int status = RunAppleScriptBlocking(source, seconds, NO, &output, &errorText);
+        if (!done) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ done(output ?: @"", errorText ?: @"", status); });
+    });
+}
+
+// Volume sets for one target, in order, and only if `generation` is still latest.
+// `readScript` (the final restore) is run once afterwards; a mismatch writes
+// `setScript` one more time. A dropped apply still calls `done` — the caller's
+// busy flag has to clear — with dropped YES so it is not treated as a failed set.
+// `setOK` nil means status == 0. Callbacks are on the main queue. Not called on `queue`.
+static void RunGeneratedVolumeScript(dispatch_queue_t queue, _Atomic uint64_t *latest, uint64_t generation,
+                                    NSString *setScript, NSString *readScript,
+                                    BOOL (^setOK)(NSString *output, NSString *errorText, int status),
+                                    BOOL (^matchesRead)(NSString *output, NSString *errorText, int status),
+                                    void (^done)(BOOL ok, BOOL dropped)) {
+    dispatch_async(queue, ^{
+        if (!VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(NO, YES); });
             return;
         }
-        // osascript has no deadline. A hung Chrome, or a permission dialog nobody answers,
-        // would block this queue forever; terminate at the deadline and force-kill a second later.
-        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:seconds];
-        NSString *output = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
-        NSString *errorText = [[NSString alloc] initWithData:[err.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
-        [task waitUntilExit];
-        [watchdog disarm];
-        int status = task.terminationStatus;
-        if (task.terminationReason != NSTaskTerminationReasonExit) {
-            if (!errorText.length) errorText = @"osascript timed out";
-            if (status == 0) status = 1;
+        NSString *output = nil, *errorText = nil;
+        int status = RunAppleScriptBlocking(setScript, kVolumeScriptSec, NO, &output, &errorText);
+        BOOL ok = setOK ? setOK(output, errorText, status) : status == 0;
+        if (readScript.length && matchesRead &&
+            VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
+            NSString *readOut = nil, *readErr = nil;
+            int readStatus = RunAppleScriptBlocking(readScript, kVolumeScriptSec, NO, &readOut, &readErr);
+            if (!matchesRead(readOut, readErr, readStatus) &&
+                VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
+                output = nil;
+                errorText = nil;
+                status = RunAppleScriptBlocking(setScript, kVolumeScriptSec, NO, &output, &errorText);
+                ok = setOK ? setOK(output, errorText, status) : status == 0;
+            }
         }
-        dispatch_async(dispatch_get_main_queue(), ^{ done(output, errorText, status); });
+        dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(ok, NO); });
+    });
+}
+
+// Quit's restore. Bumps the generation so a dip still queued on `queue` does not
+// start, waits until that queue is idle, then sets the volume. Call from the main
+// thread only: dispatch_sync onto `queue` deadlocks if `queue` is already this thread.
+static void RestoreBlendedVolumeSync(dispatch_queue_t queue, _Atomic uint64_t *generation, NSString *script) {
+    if (!script.length) return;
+    uint64_t stamp = BumpVolumeGeneration(generation);
+    dispatch_sync(queue, ^{
+        if (!VolumeScriptShouldApply(stamp, CurrentVolumeGeneration(generation))) return;
+        (void)RunAppleScriptBlocking(script, kBlendQuitRestoreSec, YES, NULL, NULL);
     });
 }
 #pragma mark - Seed mixes (Apple Music)
@@ -5641,13 +5749,6 @@ static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *do
     if (u > 1) u = 1;
     return rising ? u : (1.0 - u);
 }
-static int MusicVolumeCents(double volume) {
-    if (!isfinite(volume) || volume <= 0) return 0;
-    long rounded = llround(volume * 100.0);
-    if (rounded < 0) return 0;
-    if (rounded > 100) return 100;
-    return (int)rounded;
-}
 
 @implementation Controller {
     MeteredMonitor *_meteredMonitor;
@@ -5813,13 +5914,15 @@ static int MusicVolumeCents(double volume) {
     double _localBlendStarted, _localBlendDuration;
     // Music.app and the YouTube tab have one output, so a blend dips it, skips,
     // then brings the same number back. Known means we still owe that restore.
-    BOOL _amBlendActive, _amBlendBusy, _amBlendVolumeKnown;
+    // SkipSent is set when next goes out and stays set while the restore runs:
+    // the phase is Idle for that whole script, and Idle is not "not skipped".
+    BOOL _amBlendActive, _amBlendBusy, _amBlendVolumeKnown, _amBlendSkipSent;
     int _amBlendOriginal, _amBlendApplied, _amBlendPhase;
     NSUInteger _amBlendToken;
     NSTimer *_amBlendTimer;
     double _amBlendPhaseStarted;
     void (^_amBlendStopThen)(void);
-    BOOL _ytBlendActive, _ytBlendBusy, _ytBlendVolumeKnown;
+    BOOL _ytBlendActive, _ytBlendBusy, _ytBlendVolumeKnown, _ytBlendSkipSent;
     int _ytBlendPhase;
     double _ytBlendOriginal, _ytBlendApplied, _ytBlendPhaseStarted;
     NSUInteger _ytBlendToken;
@@ -6797,7 +6900,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _localPlayer = nil;
 }
 // Quit doesn't spin the main run loop, so a dip's timer will not get to restore
-// Music or the YouTube tab. Fire that restore now; both apps outlive us.
+// Music or the YouTube tab. Each restore runs on that target's volume queue and
+// this method waits for it (at most a second once the queue is free). Both apps
+// outlive us. The local player is in-process; assigning its volume is enough.
 - (void)silenceMusicBlendsForQuit {
     [_musicNextArmTimer invalidate];
     _musicNextArmTimer = nil;
@@ -6814,6 +6919,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _ytBlendToken++;
     _amBlendActive = NO;
     _ytBlendActive = NO;
+    // A late blend callback must not skip or start another restore after this.
+    _amBlendStopThen = nil;
+    _ytBlendStopThen = nil;
     if (_localOutgoing) {
         [_localOutgoing pause];
         _localOutgoing = nil;
@@ -6822,17 +6930,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_amBlendVolumeKnown) {
         int volume = _amBlendOriginal;
         _amBlendVolumeKnown = NO;
-        RunAppleScript([NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume],
-                       ^(NSString *output, NSString *errorText, int status) {
-            (void)output; (void)errorText; (void)status;
-        });
+        NSString *script = [NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume];
+        RestoreBlendedVolumeSync(MusicVolumeQueue(), &gMusicVolumeGeneration, script);
     }
     if (_ytBlendVolumeKnown) {
-        NSString *action = YouTubeVolumeAction(_ytBlendOriginal);
+        NSString *script = YouTubeControlScript(YouTubeVolumeAction(_ytBlendOriginal));
         _ytBlendVolumeKnown = NO;
-        RunAppleScript(YouTubeControlScript(action), ^(NSString *output, NSString *errorText, int status) {
-            (void)output; (void)errorText; (void)status;
-        });
+        RestoreBlendedVolumeSync(ChromeVolumeQueue(), &gChromeVolumeGeneration, script);
     }
 }
 // The queue advances by itself and never updates the index, so Next would jump
@@ -7733,21 +7837,25 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 // A press during a blend lands on the track that blend was already entering.
 // Local index moved when the fade started, so finishing it is the cut. A service
-// dip that has not skipped yet still owes that one skip, at the original volume.
+// dip that has not sent next yet still owes that one skip, at the original volume.
+// The skip flag, not the phase: finish-stop clears the phase to Idle before the
+// restore script returns, and a press during that restore must not send next again.
 - (void)finishRunningBlendAsCut {
     BOOL local = _localBlendTimer != nil || _localOutgoing != nil;
     if (local) [self finishLocalBlend];
     if ([self appleMusicBlendBusy]) {
-        BOOL skipped = _amBlendPhase == MusicDipSkip || _amBlendPhase == MusicDipUp;
+        BOOL owesNext = MusicBlendCutOwesNext(_amBlendPhase, _amBlendSkipSent);
+        __weak __typeof(self) weakSelf = self;
         [self requestAppleMusicBlendStopThen:^{
-            if (!local && !skipped) [self performMusicNextCutNow];
+            if (!local && owesNext) [weakSelf performMusicNextCutNow];
         }];
         return;
     }
     if ([self youTubeBlendBusy]) {
-        BOOL skipped = _ytBlendPhase == MusicDipSkip || _ytBlendPhase == MusicDipUp;
+        BOOL owesNext = MusicBlendCutOwesNext(_ytBlendPhase, _ytBlendSkipSent);
+        __weak __typeof(self) weakSelf = self;
         [self requestYouTubeBlendStopThen:^{
-            if (!local && !skipped) [self performMusicNextCutNow];
+            if (!local && owesNext) [weakSelf performMusicNextCutNow];
         }];
     }
 }
@@ -7771,19 +7879,34 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [_amBlendTimer invalidate];
     _amBlendTimer = nil;
 }
-- (void)applyAppleMusicVolume:(int)volume done:(void (^)(BOOL ok))done {
+// verify publishes a new volume generation and, after the set, reads Music once.
+// A dip passes verify NO and keeps the current generation, so a restore that
+// bumps can drop it before the script starts.
+- (void)applyAppleMusicVolume:(int)volume verify:(BOOL)verify done:(void (^)(BOOL ok, BOOL dropped))done {
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
+    uint64_t generation = verify ? BumpVolumeGeneration(&gMusicVolumeGeneration)
+                                : CurrentVolumeGeneration(&gMusicVolumeGeneration);
     NSString *script = [NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume];
-    RunAppleScript(script, ^(NSString *output, NSString *errorText, int status) {
-        (void)output; (void)errorText;
-        if (done) done(status == 0);
-    });
+    NSString *readScript = verify ? @"tell application \"Music\" to sound volume" : nil;
+    BOOL (^matches)(NSString *, NSString *, int) = nil;
+    if (verify) {
+        matches = ^BOOL(NSString *output, NSString *errorText, int status) {
+            (void)errorText;
+            int actual = 0;
+            BOOL readOK = status == 0 && MusicSoundVolume(output, &actual);
+            return MusicRestoredVolumeMatches(readOK, actual, volume);
+        };
+    }
+    RunGeneratedVolumeScript(MusicVolumeQueue(), &gMusicVolumeGeneration, generation, script, readScript,
+                            nil, matches, done);
 }
-// One restore, then whatever the interrupt was waiting to do. A failed set does not
-// try again: the caller already decided this is the last word on the volume.
+// One restore, then whatever the interrupt was waiting to do. The phase goes Idle
+// here, before the script returns; _amBlendSkipSent is left alone so a press during
+// the restore still knows next already went out. The restore itself re-reads once
+// and writes the original again if that read differs.
 - (void)finishAppleMusicBlendStop {
-    if (_amBlendBusy) return;
+    if (_terminating || _amBlendBusy) return;
     [self stopAppleBlendTimer];
     _amBlendActive = NO;
     int original = _amBlendOriginal;
@@ -7798,7 +7921,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     _amBlendBusy = YES;
     NSUInteger token = _amBlendToken;
-    [self applyAppleMusicVolume:original done:^(BOOL __unused ok) {
+    [self applyAppleMusicVolume:original verify:YES done:^(BOOL __unused ok, BOOL __unused dropped) {
         if (token != self->_amBlendToken) {
             self->_amBlendBusy = NO;
             [self finishAppleMusicBlendStop];
@@ -7823,11 +7946,13 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _amBlendActive = NO;
     _amBlendVolumeKnown = NO;
     _amBlendPhase = MusicDipIdle;
+    _amBlendSkipSent = NO;
     _amBlendStopThen = nil;
 }
 - (void)appleMusicBlendFireNext {
     if (!_amBlendActive || _amBlendBusy) return;
     _amBlendPhase = MusicDipSkip;
+    _amBlendSkipSent = YES;
     _amBlendBusy = YES;
     NSUInteger token = _amBlendToken;
     [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES done:^(BOOL ok) {
@@ -7837,6 +7962,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             return;
         }
         if (!ok) {
+            // The command did not land. This restore's own cut, and a press that
+            // replaces it, still owe one next.
+            self->_amBlendSkipSent = NO;
             self->_amBlendActive = NO;
             __weak __typeof(self) weakSelf = self;
             self->_amBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
@@ -7873,17 +8001,18 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _amBlendApplied = target;
     NSUInteger token = _amBlendToken;
     _amBlendBusy = YES;
-    [self applyAppleMusicVolume:target done:^(BOOL ok) {
+    [self applyAppleMusicVolume:target verify:NO done:^(BOOL ok, BOOL dropped) {
         self->_amBlendBusy = NO;
         if (token != self->_amBlendToken || !self->_amBlendActive) {
             [self finishAppleMusicBlendStop];
             return;
         }
+        if (dropped) return;
         if (!ok) {
-            BOOL skipped = self->_amBlendPhase == MusicDipSkip || self->_amBlendPhase == MusicDipUp;
+            BOOL owesNext = MusicBlendCutOwesNext(self->_amBlendPhase, self->_amBlendSkipSent);
             self->_amBlendActive = NO;
             __weak __typeof(self) weakSelf = self;
-            self->_amBlendStopThen = ^{ if (!skipped) [weakSelf performMusicNextCutNow]; };
+            self->_amBlendStopThen = ^{ if (owesNext) [weakSelf performMusicNextCutNow]; };
             [self finishAppleMusicBlendStop];
             return;
         }
@@ -7892,6 +8021,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 - (void)beginAppleMusicBlend {
     if (_amBlendActive || _amBlendBusy) { [self finishRunningBlendAsCut]; return; }
+    _amBlendSkipSent = NO;
     _amBlendActive = YES;
     _amBlendPhase = MusicDipDown;
     _amBlendVolumeKnown = NO;
@@ -7930,14 +8060,34 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [_ytBlendTimer invalidate];
     _ytBlendTimer = nil;
 }
-- (void)applyYouTubeVolume:(double)volume done:(void (^)(BOOL ok))done {
-    RunAppleScript(YouTubeControlScript(YouTubeVolumeAction(volume)), ^(NSString *output, NSString *errorText, int status) {
+// Same generation rule as Music. A JavaScript denial is a failed set: the page
+// did not take the volume. verify re-reads the video volume in cents.
+- (void)applyYouTubeVolume:(double)volume verify:(BOOL)verify done:(void (^)(BOOL ok, BOOL dropped))done {
+    if (!isfinite(volume) || volume < 0) volume = 0;
+    if (volume > 1) volume = 1;
+    uint64_t generation = verify ? BumpVolumeGeneration(&gChromeVolumeGeneration)
+                                : CurrentVolumeGeneration(&gChromeVolumeGeneration);
+    NSString *script = YouTubeControlScript(YouTubeVolumeAction(volume));
+    NSString *readScript = verify ? YouTubeControlScript(@"volget") : nil;
+    BOOL (^setOK)(NSString *, NSString *, int) = ^BOOL(NSString *output, NSString *errorText, int status) {
         NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        if (done) done(status == 0 && [parsed[@"denied"] isEqual:@""]);
-    });
+        return status == 0 && [parsed[@"denied"] isEqual:@""];
+    };
+    BOOL (^matches)(NSString *, NSString *, int) = nil;
+    if (verify) {
+        matches = ^BOOL(NSString *output, NSString *errorText, int status) {
+            NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+            NSNumber *n = [parsed[@"volume"] isKindOfClass:NSNumber.class] ? parsed[@"volume"] : nil;
+            BOOL readOK = status == 0 && [parsed[@"denied"] isEqual:@""] && n != nil;
+            return YouTubeRestoredVolumeMatches(readOK, n ? n.doubleValue : 0, volume);
+        };
+    }
+    RunGeneratedVolumeScript(ChromeVolumeQueue(), &gChromeVolumeGeneration, generation, script, readScript,
+                            setOK, matches, done);
 }
+// Idle here is "not dipping", not "next was not sent". _ytBlendSkipSent stays.
 - (void)finishYouTubeBlendStop {
-    if (_ytBlendBusy) return;
+    if (_terminating || _ytBlendBusy) return;
     [self stopYouTubeBlendTimer];
     _ytBlendActive = NO;
     double original = _ytBlendOriginal;
@@ -7952,7 +8102,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     _ytBlendBusy = YES;
     NSUInteger token = _ytBlendToken;
-    [self applyYouTubeVolume:original done:^(BOOL __unused ok) {
+    [self applyYouTubeVolume:original verify:YES done:^(BOOL __unused ok, BOOL __unused dropped) {
         if (token != self->_ytBlendToken) {
             self->_ytBlendBusy = NO;
             [self finishYouTubeBlendStop];
@@ -7977,11 +8127,13 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _ytBlendActive = NO;
     _ytBlendVolumeKnown = NO;
     _ytBlendPhase = MusicDipIdle;
+    _ytBlendSkipSent = NO;
     _ytBlendStopThen = nil;
 }
 - (void)youTubeBlendFireNext {
     if (!_ytBlendActive || _ytBlendBusy) return;
     _ytBlendPhase = MusicDipSkip;
+    _ytBlendSkipSent = YES;
     _ytBlendBusy = YES;
     NSUInteger token = _ytBlendToken;
     NSUInteger generation = ++_musicGen;
@@ -8007,6 +8159,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         // A status line means the click ran. unanswered is the timeout / no-tab case,
         // where the skip still has to happen or the dip just sits at volume 0.
         if (unanswered) {
+            // No tab, or the script timed out: the click did not run.
+            self->_ytBlendSkipSent = NO;
             self->_ytBlendActive = NO;
             __weak __typeof(self) weakSelf = self;
             self->_ytBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
@@ -8042,17 +8196,18 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _ytBlendApplied = target;
     NSUInteger token = _ytBlendToken;
     _ytBlendBusy = YES;
-    [self applyYouTubeVolume:target done:^(BOOL ok) {
+    [self applyYouTubeVolume:target verify:NO done:^(BOOL ok, BOOL dropped) {
         self->_ytBlendBusy = NO;
         if (token != self->_ytBlendToken || !self->_ytBlendActive) {
             [self finishYouTubeBlendStop];
             return;
         }
+        if (dropped) return;
         if (!ok) {
-            BOOL skipped = self->_ytBlendPhase == MusicDipSkip || self->_ytBlendPhase == MusicDipUp;
+            BOOL owesNext = MusicBlendCutOwesNext(self->_ytBlendPhase, self->_ytBlendSkipSent);
             self->_ytBlendActive = NO;
             __weak __typeof(self) weakSelf = self;
-            self->_ytBlendStopThen = ^{ if (!skipped) [weakSelf performMusicNextCutNow]; };
+            self->_ytBlendStopThen = ^{ if (owesNext) [weakSelf performMusicNextCutNow]; };
             [self finishYouTubeBlendStop];
             return;
         }
@@ -8062,6 +8217,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (void)beginYouTubeBlend {
     if (_ytJSDenied || !ChromeIsRunning()) { [self performMusicNextCutNow]; return; }
     if (_ytBlendActive || _ytBlendBusy) { [self finishRunningBlendAsCut]; return; }
+    _ytBlendSkipSent = NO;
     _ytBlendActive = YES;
     _ytBlendPhase = MusicDipDown;
     _ytBlendVolumeKnown = NO;

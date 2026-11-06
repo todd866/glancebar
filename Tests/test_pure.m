@@ -2672,6 +2672,33 @@ int main(void) {
               @"blend: an unknown remaining time keeps the full fade");
         check(MusicBlendSeconds(1, 6, 10) == 6, @"blend: a minimum above the full fade cannot lengthen it");
         {
+            // Finish-stop clears the phase to Idle before restore returns. A press then
+            // must follow skipSent, or a blend that already skipped sends a second next.
+            BOOL quiet = YES, owes = YES;
+            for (int phase = 0; phase <= 3; phase++) {
+                if (MusicBlendCutOwesNext(phase, YES)) quiet = NO;
+                if (!MusicBlendCutOwesNext(phase, NO)) owes = NO;
+            }
+            check(quiet, @"blend: once next was sent, Idle during restore does not send another");
+            check(owes, @"blend: a dip that has not sent next still owes one");
+        }
+        check(VolumeScriptShouldApply(0, 0), @"volume: the first generation may write");
+        check(VolumeScriptShouldApply(4, 4), @"volume: the generation the restore just published may write");
+        check(!VolumeScriptShouldApply(3, 4), @"volume: a dip stamped before the restore does not write");
+        check(!VolumeScriptShouldApply(5, 4), @"volume: a stamp ahead of the latest generation does not write");
+        check(MusicRestoredVolumeMatches(YES, 40, 40), @"volume: a matching Music read needs no second write");
+        check(!MusicRestoredVolumeMatches(YES, 12, 40), @"volume: a dipped Music read is written again");
+        check(!MusicRestoredVolumeMatches(NO, 40, 40), @"volume: an unreadable Music read is written again");
+        check(MusicRestoredVolumeMatches(YES, 120, 100) && MusicRestoredVolumeMatches(YES, -3, 0),
+              @"volume: Music reads clamp into 0..100 before the compare");
+        check(YouTubeRestoredVolumeMatches(YES, 0.8, 0.8), @"volume: a matching YouTube read needs no second write");
+        check(YouTubeRestoredVolumeMatches(YES, 0.804, 0.80), @"volume: YouTube compares in whole cents");
+        check(!YouTubeRestoredVolumeMatches(YES, 0.81, 0.80), @"volume: a cent apart is a different YouTube volume");
+        check(!YouTubeRestoredVolumeMatches(NO, 0.8, 0.8), @"volume: an unreadable YouTube read is written again");
+        check(!YouTubeRestoredVolumeMatches(YES, NAN, 0.8), @"volume: a non-finite YouTube read does not match");
+        check(MusicVolumeCents(0.804) == 80 && MusicVolumeCents(NAN) == 0 && MusicVolumeCents(2) == 100 &&
+              MusicVolumeCents(-1) == 0, @"volume: cents clamp into 0..100");
+        {
             NSString *us = YouTubeStatusSeparator;
             NSDictionary *loud = ParseYouTubeStatus([@[@"yes", @"playing", @"T", @"A", @"", @"1", @"2", @"0.8"]
                                                      componentsJoinedByString:us], @"");

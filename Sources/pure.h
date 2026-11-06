@@ -606,6 +606,27 @@ extern const double kMusicBlendFullSec;   // 6
 extern const double kMusicBlendMinSec;    // 1
 double MusicBlendSeconds(double remainingSec, double fullSec, double minSec);
 
+// Video volume as an integer percent. Non-finite or below zero is 0; above 1 is 100.
+int MusicVolumeCents(double volume);
+
+// A cut during a service blend owes `next` only when this blend has not sent one.
+// `phase` is Idle (0), Down (1), Skip (2) or Up (3). Finish-stop writes Idle before
+// the restore script returns, so Idle used to look like "not skipped" and a press
+// during the restore sent a second next. skipSent, set when next is sent, is the
+// only input that counts; phase does not change the answer.
+BOOL MusicBlendCutOwesNext(int phase, BOOL skipSent);
+
+// A volume script runs only while the generation it captured is still the latest.
+// The restore (and quit) publish a new generation; a dip stamped earlier must not
+// write after that, even if its osascript was already queued.
+BOOL VolumeScriptShouldApply(uint64_t applyGeneration, uint64_t latestGeneration);
+
+// After the restore script, one read-back. NO means write the original once more:
+// the read failed, or it is not the volume just requested. Music is an integer
+// 0..100 (values outside that clamp). YouTube is 0..1, compared in whole cents.
+BOOL MusicRestoredVolumeMatches(BOOL readOK, int readVolume, int original);
+BOOL YouTubeRestoredVolumeMatches(BOOL readOK, double readVolume, double original);
+
 // The offline player is in the way: online, local mode, and not actually playing.
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing);
 // lastOpen <= 0 means Glancebar has not opened a tab. Otherwise at most one open per 60s.
