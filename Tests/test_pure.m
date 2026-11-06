@@ -2599,6 +2599,90 @@ int main(void) {
                   @"guard: unticking undoes its own Low Power");
         }
 
+        // Next: a tap inside the window cuts, the timer is the blend.
+        check(kMusicNextTapWindowSec == 0.25 && kMusicBlendFullSec == 6 && kMusicBlendMinSec == 1,
+              @"next: the tap window is a quarter-second and the local fade is 6s (min 1s)");
+        {
+            double arm = 0;
+            check(ClassifyMusicNext(&arm, 1000, 0.25, NO, NO) == MusicNextTapWait && arm == 1000,
+                  @"next: the first press waits");
+            check(ClassifyMusicNext(&arm, 1000.25, 0.25, NO, NO) == MusicNextTapCut && arm == 0,
+                  @"next: a press on the window edge cuts and clears the arm");
+            check(ClassifyMusicNext(&arm, 1000, 0.25, NO, NO) == MusicNextTapWait && arm == 1000,
+                  @"next: after a cut the next press waits again");
+            check(ClassifyMusicNext(&arm, 1000.26, 0.25, NO, NO) == MusicNextTapWait && arm == 1000.26,
+                  @"next: a press past the window is a new single tap");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 1000.1, 0.25, NO, YES) == MusicNextTapCut && arm == 0,
+                  @"next: a press during a blend cuts, even inside the old window");
+            arm = 0;
+            check(ClassifyMusicNext(&arm, 50, 0.25, NO, YES) == MusicNextTapCut && arm == 0,
+                  @"next: a blend with no arm still cuts and does not arm");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 1000.25, 0.25, YES, NO) == MusicNextTapBlend && arm == 0,
+                  @"next: the timer at the window is a blend");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 1000.21, 0.25, YES, NO) == MusicNextTapBlend && arm == 0,
+                  @"next: a timer 40ms early still blends");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 1000.16, 0.25, YES, NO) == MusicNextTapNone && arm == 1000,
+                  @"next: a timer 90ms early keeps the arm");
+            arm = 0;
+            check(ClassifyMusicNext(&arm, 1000, 0.25, YES, NO) == MusicNextTapNone,
+                  @"next: a timer with no arm does nothing");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 1000.25, 0.25, YES, YES) == MusicNextTapNone && arm == 0,
+                  @"next: a timer during a blend does not start another");
+            check(ClassifyMusicNext(NULL, 1000, 0.25, NO, YES) == MusicNextTapCut,
+                  @"next: a blend press cuts with nowhere to store the arm");
+            check(ClassifyMusicNext(NULL, 1000, 0.25, NO, NO) == MusicNextTapNone,
+                  @"next: a first press with nowhere to store the arm does not pretend to wait");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, NAN, 0.25, NO, NO) == MusicNextTapNone && arm == 1000,
+                  @"next: a non-finite press does not move the arm");
+            arm = 1000;
+            check(ClassifyMusicNext(&arm, 999, 0.25, NO, NO) == MusicNextTapWait && arm == 999,
+                  @"next: a clock that jumps backwards re-arms");
+            arm = 0;
+            check(ClassifyMusicNext(&arm, 10, 0, NO, NO) == MusicNextTapWait, @"next: a zero window still arms");
+            check(ClassifyMusicNext(&arm, 10, 0, NO, NO) == MusicNextTapCut && arm == 0,
+                  @"next: a zero window cuts a second press at the same instant");
+        }
+        {
+            MusicBlendGain start = MusicBlendGainAt(0), mid = MusicBlendGainAt(0.5), end = MusicBlendGainAt(1);
+            check(start.outgoing == 1 && start.incoming == 0, @"blend: equal-power starts on the outgoing track");
+            check(end.outgoing == 0 && end.incoming == 1, @"blend: equal-power ends on the incoming track");
+            check(fabs(mid.outgoing - mid.incoming) < 1e-12 &&
+                  fabs(mid.outgoing * mid.outgoing + mid.incoming * mid.incoming - 1) < 1e-12,
+                  @"blend: the midpoint is equal power");
+            MusicBlendGain early = MusicBlendGainAt(-1), late = MusicBlendGainAt(2), bad = MusicBlendGainAt(NAN);
+            check(early.outgoing == 1 && early.incoming == 0 && late.outgoing == 0 && late.incoming == 1 &&
+                  bad.outgoing == 1 && bad.incoming == 0, @"blend: t outside 0..1 clamps to the ends");
+        }
+        check(MusicBlendSeconds(10, 6, 1) == 6 && MusicBlendSeconds(6, 6, 1) == 6,
+              @"blend: a track with 6s or more left fades for the full 6s");
+        check(fabs(MusicBlendSeconds(3.2, 6, 1) - 3.2) < 1e-12, @"blend: under 6s left, the fade matches what's left");
+        check(MusicBlendSeconds(0.4, 6, 1) == 1 && MusicBlendSeconds(0, 6, 1) == 1,
+              @"blend: less than a second left still fades for the 1s minimum");
+        check(MusicBlendSeconds(NAN, 6, 1) == 6 && MusicBlendSeconds(-2, 6, 1) == 6,
+              @"blend: an unknown remaining time keeps the full fade");
+        check(MusicBlendSeconds(1, 6, 10) == 6, @"blend: a minimum above the full fade cannot lengthen it");
+        {
+            NSString *us = YouTubeStatusSeparator;
+            NSDictionary *loud = ParseYouTubeStatus([@[@"yes", @"playing", @"T", @"A", @"", @"1", @"2", @"0.8"]
+                                                     componentsJoinedByString:us], @"");
+            check(fabs([loud[@"volume"] doubleValue] - 0.8) < 1e-12, @"music: status can carry the video volume");
+            NSDictionary *hot = ParseYouTubeStatus([@[@"yes", @"playing", @"T", @"A", @"", @"1", @"2", @"1.5"]
+                                                    componentsJoinedByString:us], @"");
+            check([hot[@"volume"] doubleValue] == 1, @"music: video volume above 1 clamps");
+            NSDictionary *noVol = ParseYouTubeStatus([@[@"yes", @"playing", @"T", @"A", @"", @"1", @"2"]
+                                                      componentsJoinedByString:us], @"");
+            check(noVol[@"volume"] == nil, @"music: a status line without volume leaves it absent");
+            NSDictionary *denied = ParseYouTubeStatus(@"", @"Access not allowed (-1723)");
+            check(denied[@"volume"] == nil && [denied[@"denied"] isEqual:@"javascript"],
+                  @"music: a JavaScript denial has no volume");
+        }
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
         return failures ? 1 : 0;

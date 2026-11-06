@@ -1,4 +1,5 @@
 #import "pure.h"
+#import <math.h>
 #import <limits.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -1865,20 +1866,95 @@ NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText) {
     NSInteger count = ParsePlaylistCount(YouTubeStatusField(fields, 4));
     NSNumber *elapsed = YouTubeStatusNumber(fields, 5);
     NSNumber *duration = YouTubeStatusNumber(fields, 6);
+    NSNumber *volume = YouTubeStatusNumber(fields, 7);
     // JavaScript is refused only after a music tab was found and execute javascript ran.
     // Automation is refused before any tab can be seen. Either way the page told us nothing.
     if ([denied isEqual:@"automation"]) {
         tab = NO; playing = [NSNull null]; title = @""; artist = @""; count = 0;
-        elapsed = nil; duration = nil;
+        elapsed = nil; duration = nil; volume = nil;
     } else if ([denied isEqual:@"javascript"]) {
         tab = YES; playing = [NSNull null]; title = @""; artist = @""; count = 0;
-        elapsed = nil; duration = nil;
+        elapsed = nil; duration = nil; volume = nil;
     }
     NSMutableDictionary *status = [@{@"tab": @(tab), @"playing": playing, @"title": title,
                                      @"artist": artist, @"count": @(count), @"denied": denied} mutableCopy];
     if (elapsed) status[@"elapsed"] = elapsed;
     if (duration) status[@"duration"] = duration;
+    if (volume) {
+        double level = volume.doubleValue;
+        if (level < 0) level = 0;
+        if (level > 1) level = 1;
+        status[@"volume"] = @(level);
+    }
     return status;
+}
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+const double kMusicNextTapWindowSec = 0.25;
+const double kMusicNextTimerSlopSec = 0.05;
+const double kMusicBlendFullSec = 6.0;
+const double kMusicBlendMinSec = 1.0;
+
+static double MusicNextWindow(double windowSec) {
+    if (!isfinite(windowSec) || windowSec < 0) return kMusicNextTapWindowSec;
+    return windowSec;
+}
+
+MusicNextTap ClassifyMusicNext(double *armedAt, double now, double windowSec,
+                               BOOL timerFired, BOOL blending) {
+    double armed = (armedAt && isfinite(*armedAt) && *armedAt > 0) ? *armedAt : 0;
+    // A fade is already running: this press cuts it. The window timer must not
+    // start a second fade on top, so a late fire is ignored once the arm is cleared.
+    if (blending && !timerFired) {
+        if (armedAt) *armedAt = 0;
+        return MusicNextTapCut;
+    }
+    if (timerFired) {
+        if (!(armed > 0) || !isfinite(now)) return MusicNextTapNone;
+        double window = MusicNextWindow(windowSec);
+        // 1e-4 covers the rounding of (armed+window) - now against the slop.
+        if ((armed + window) - now > kMusicNextTimerSlopSec + 1e-4) return MusicNextTapNone;
+        if (armedAt) *armedAt = 0;
+        if (blending) return MusicNextTapNone;
+        return MusicNextTapBlend;
+    }
+    if (!isfinite(now)) return MusicNextTapNone;
+    double window = MusicNextWindow(windowSec);
+    // Inside the window, including the exact edge. A timestamp that went backwards
+    // is a new first press, not a double tap.
+    if (armed > 0 && now >= armed && now - armed <= window) {
+        if (armedAt) *armedAt = 0;
+        return MusicNextTapCut;
+    }
+    if (!armedAt) return MusicNextTapNone;
+    *armedAt = now;
+    return MusicNextTapWait;
+}
+
+MusicBlendGain MusicBlendGainAt(double t) {
+    MusicBlendGain g = {1, 0};
+    if (!isfinite(t) || t <= 0) return g;
+    if (t >= 1) {
+        g.outgoing = 0;
+        g.incoming = 1;
+        return g;
+    }
+    g.outgoing = cos(t * (M_PI / 2.0));
+    g.incoming = sin(t * (M_PI / 2.0));
+    return g;
+}
+
+double MusicBlendSeconds(double remainingSec, double fullSec, double minSec) {
+    if (!isfinite(fullSec) || fullSec < 0) fullSec = kMusicBlendFullSec;
+    if (!isfinite(minSec) || minSec < 0) minSec = kMusicBlendMinSec;
+    if (minSec > fullSec) minSec = fullSec;
+    if (!isfinite(remainingSec) || remainingSec < 0) return fullSec;
+    if (remainingSec >= fullSec) return fullSec;
+    if (remainingSec < minSec) return minSec;
+    return remainingSec;
 }
 
 static NSString *FormatClockPart(double seconds, BOOL withHours) {

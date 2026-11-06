@@ -92,6 +92,10 @@ static CGFloat WrappedHeight(NSTextField *field) {
                                                     options:NSStringDrawingUsesLineFragmentOrigin
                                                  attributes:@{NSFontAttributeName: field.font}]);
 }
+// The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
+static BOOL IntendedControlTip(NSView *view) {
+    return [view.accessibilityIdentifier isEqual:@"popover.music.next"] && [view.toolTip isEqual:kMusicNextTip];
+}
 static BOOL RecoveryTip(NSView *view) {
     if (![view isKindOfClass:NSTextField.class]) return NO;
     NSTextField *field = (NSTextField *)view;
@@ -102,7 +106,7 @@ static BOOL RecoveryTip(NSView *view) {
         field.attributedStringValue.size.width + 4 > NSWidth(field.bounds);
 }
 static NSView *WordyTip(NSView *view) {
-    if (view.toolTip.length && !RecoveryTip(view)) return view;
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
 }
@@ -203,7 +207,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
-    if (view.toolTip.length && !RecoveryTip(view)) {
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
     }

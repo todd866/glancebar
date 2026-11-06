@@ -544,11 +544,13 @@ BOOL ChromeAutomationDenied(NSString *errorText);
 // ASCII unit separator (character 31). Status fields use it because song titles contain '|'.
 extern NSString *const YouTubeStatusSeparator;
 // One AppleScript round trip. Fields, in order: tab ("yes"/"no"), state ("playing"/"paused"/
-// other), title, artist, playlist-count text, elapsed seconds, duration seconds.
-// Keys: tab (BOOL), playing (YES/NO or NSNull when the page did not say), title, artist,
-// count (0 when it is not a count), denied (@"javascript", @"automation", or @"").
-// elapsed and duration are NSNumbers when the script sent a finite number, and absent
-// otherwise (empty, missing, or not finite). Nil inputs are an empty result, not a crash.
+// other), title, artist, playlist-count text, elapsed seconds, duration seconds, and
+// (optional) the page's video volume, 0..1. Keys: tab (BOOL), playing (YES/NO or NSNull
+// when the page did not say), title, artist, count (0 when it is not a count), denied
+// (@"javascript", @"automation", or @""). elapsed, duration and volume are NSNumbers
+// when the script sent a finite number, and absent otherwise (empty, missing, or not
+// finite). Volume is clamped into [0, 1]. A denial has no volume: the page said nothing.
+// Nil inputs are an empty result, not a crash.
 NSDictionary *ParseYouTubeStatus(NSString *output, NSString *errorText);
 // "0:00 / 3:43", or "1:02:03 / 1:10:00" once the duration reaches an hour.
 // Nil when duration is <= 0 or not finite, or elapsed is not finite.
@@ -567,6 +569,42 @@ NSDictionary *ParseAppleMusicStatus(NSString *output);
 NSString *AppleScriptQuoted(NSString *text);
 // One side of FormatTrackTime ("1:23", or "0:01:23" once the track reaches an hour); nil like it.
 NSString *FormatTrackClock(double seconds, double duration);
+
+// --- Music Next: one tap blends, two taps cut ---
+// A press arms `armedAt`. A second press within the window is a cut and clears the arm.
+// The timer firing after the window, with the arm still set, is the blend. A press while
+// a blend is already running is a cut (the caller ends that fade; it does not stack
+// another). armedAt <= 0 means no press is waiting. now/armedAt share one clock.
+// A timer that is a few milliseconds early still counts: NSTimer is not exact.
+typedef NS_ENUM(NSInteger, MusicNextTap) {
+    MusicNextTapNone = 0,   // timer with no arm, or a timer that is still too early
+    MusicNextTapWait,       // first press; caller starts the window timer
+    MusicNextTapBlend,      // the window elapsed with no second press
+    MusicNextTapCut,        // second press inside the window, or a press during a blend
+};
+extern const double kMusicNextTapWindowSec;   // 0.25
+extern const double kMusicNextTimerSlopSec;   // 0.05 — early timer fires still blend
+// timerFired YES is the window timer, not a press. blending YES is a fade already
+// in progress. NULL armedAt cannot remember a first press (Wait becomes None) but a
+// press during a blend is still a cut. A non-finite now does not arm.
+MusicNextTap ClassifyMusicNext(double *armedAt, double now, double windowSec,
+                               BOOL timerFired, BOOL blending);
+
+// Equal-power crossfade. t is clamped to 0..1. outgoing = cos(t*pi/2), incoming = sin.
+// t non-finite or <= 0 is the start (out 1, in 0); t >= 1 is the end (out 0, in 1).
+typedef struct {
+    double outgoing;
+    double incoming;
+} MusicBlendGain;
+MusicBlendGain MusicBlendGainAt(double t);
+
+// Local crossfade length. fullSec is the normal blend (6). A known remaining time
+// shorter than that shortens the fade, but never under minSec (1): a track about to
+// end still overlaps briefly. Unknown remaining (non-finite or negative) keeps fullSec.
+// minSec above fullSec is treated as fullSec.
+extern const double kMusicBlendFullSec;   // 6
+extern const double kMusicBlendMinSec;    // 1
+double MusicBlendSeconds(double remainingSec, double fullSec, double minSec);
 
 // The offline player is in the way: online, local mode, and not actually playing.
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing);

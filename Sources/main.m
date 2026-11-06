@@ -24,6 +24,7 @@
 #import <sys/mount.h>
 #import <sys/sysctl.h>
 #import <os/log.h>
+#import <math.h>
 #import <Security/Security.h>
 #import <sqlite3.h>
 #import "pure.h"
@@ -5489,15 +5490,53 @@ static NSArray<NSString *> *BuildSeedMix(NSArray<NSDictionary *> *tracks, NSDict
     return mix;
 }
 
+// "vol0.40" .. "vol1.00". Digits and one dot only, so the token can sit inside the
+// single-quoted action in YouTubeControlScript without breaking the JS string.
+static BOOL YouTubeVolumeSetAction(NSString *action) {
+    if (![action hasPrefix:@"vol"] || action.length < 5 || action.length > 7) return NO;
+    NSString *num = [action substringFromIndex:3];
+    NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
+    if ([num rangeOfCharacterFromSet:[ok invertedSet]].location != NSNotFound) return NO;
+    NSArray *parts = [num componentsSeparatedByString:@"."];
+    return parts.count == 2 && [parts[0] length] >= 1 && [parts[1] length] == 2;
+}
+// Locale-independent. snprintf %f follows LC_NUMERIC and would emit "vol0,40".
+static NSString *YouTubeVolumeAction(double volume) {
+    int cents = 0;
+    if (isfinite(volume) && volume > 0) {
+        long rounded = llround(volume * 100.0);
+        if (rounded > 100) rounded = 100;
+        if (rounded > 0) cents = (int)rounded;
+    }
+    return [NSString stringWithFormat:@"vol%d.%02d", cents / 100, cents % 100];
+}
+// Music's `sound volume` is an integer 0..100. Nil / prose is not a volume.
+static BOOL MusicSoundVolume(NSString *output, int *outVolume) {
+    if (![output isKindOfClass:NSString.class] || !outVolume) return NO;
+    NSString *s = [output stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!s.length) return NO;
+    NSScanner *scanner = [NSScanner scannerWithString:s];
+    scanner.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    int value = 0;
+    if (![scanner scanInt:&value] || !scanner.isAtEnd) return NO;
+    if (value < 0) value = 0;
+    if (value > 100) value = 100;
+    *outVolume = value;
+    return YES;
+}
+
 // One round trip finds the music.youtube.com tab and runs the action there.
 // status only reads. start is the one place shuffle is forced on, and only when
-// Glancebar itself is starting playback. The JS stays inside one double-quoted
-// AppleScript string, so it cannot contain a double quote; fields come back
-// separated by ASCII 31 (YouTubeStatusSeparator) because titles contain '|'.
-// Fields: tab, state, title, artist, playlist count, elapsed seconds, duration seconds.
+// Glancebar itself is starting playback. volget reads <video>.volume; vol0.40 sets it.
+// The JS stays inside one double-quoted AppleScript string, so it cannot contain a
+// double quote; fields come back separated by ASCII 31 (YouTubeStatusSeparator)
+// because titles contain '|'.
+// Fields: tab, state, title, artist, playlist count, elapsed seconds, duration seconds, volume.
 static NSString *YouTubeControlScript(NSString *action) {
     if (![action isEqual:@"start"] && ![action isEqual:@"playpause"] &&
-        ![action isEqual:@"next"] && ![action isEqual:@"previous"])
+        ![action isEqual:@"next"] && ![action isEqual:@"previous"] &&
+        ![action isEqual:@"status"] && ![action isEqual:@"volget"] &&
+        !YouTubeVolumeSetAction(action))
         action = @"status";
     NSString *js = [NSString stringWithFormat:
         @"(function(){var action='%@';"
@@ -5513,6 +5552,9 @@ static NSString *YouTubeControlScript(NSString *action) {
         "var nx=bar&&bar.querySelector('.next-button');if(nx)nx.click();"
         "}else if(action==='previous'){"
         "var pv=bar&&bar.querySelector('.previous-button');if(pv)pv.click();"
+        "}else if(action.substring(0,3)==='vol'&&action!=='volget'){"
+        "var vset=document.querySelector('video');"
+        "if(vset){var nv=parseFloat(action.substring(3));if(isFinite(nv)){if(nv<0)nv=0;if(nv>1)nv=1;vset.volume=nv;}}"
         "}else if(action==='start'){"
         "var buttons=document.querySelectorAll('button,[role=button],[role=switch]');"
         "var shuffle=null;"
@@ -5537,7 +5579,8 @@ static NSString *YouTubeControlScript(NSString *action) {
         "function num(v){return (typeof v==='number'&&isFinite(v))?(''+v):'';}"
         "var elapsed=video?num(video.currentTime):'';"
         "var duration=video?num(video.duration):'';"
-        "return 'yes'+us+playing+us+title+us+artist+us+countText+us+elapsed+us+duration;})()",
+        "var vol=video?num(video.volume):'';"
+        "return 'yes'+us+playing+us+title+us+artist+us+countText+us+elapsed+us+duration+us+vol;})()",
         action];
     return [NSString stringWithFormat:
         @"tell application \"Google Chrome\"\n"
@@ -5553,6 +5596,32 @@ static NSString *YouTubeControlScript(NSString *action) {
 static NSString *const kYouTubeJSNote = @"Enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events to control playback";
 static NSString *const kYouTubeAutomationNote = @"Allow Glancebar to control Chrome: System Settings ▸ Privacy & Security ▸ Automation";
 static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing offline music";
+static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap cuts";
+
+// A service blend dips one player: down, skip, up. Idle is "no dip".
+enum {
+    MusicDipIdle = 0,
+    MusicDipDown,
+    MusicDipSkip,
+    MusicDipUp,
+};
+
+// 1 at the original level, 0 at the bottom. *done once dipSec has elapsed.
+static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *done) {
+    BOOL finished = !(dipSec > 0) || !(elapsed < dipSec);
+    if (done) *done = finished;
+    double u = finished || !(dipSec > 0) ? 1.0 : elapsed / dipSec;
+    if (u < 0) u = 0;
+    if (u > 1) u = 1;
+    return rising ? u : (1.0 - u);
+}
+static int MusicVolumeCents(double volume) {
+    if (!isfinite(volume) || volume <= 0) return 0;
+    long rounded = llround(volume * 100.0);
+    if (rounded < 0) return 0;
+    if (rounded > 100) return 100;
+    return (int)rounded;
+}
 
 @implementation Controller {
     MeteredMonitor *_meteredMonitor;
@@ -5708,6 +5777,28 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     NSImage *_amArt;
     NSTimer *_amProbeTimer;
     NSUInteger _amGen;
+    // First Next press waits out the double-tap window. 0 means nothing is armed.
+    double _musicNextArmedAt;
+    NSTimer *_musicNextArmTimer;
+    // Local crossfade: the player that was current keeps sounding while the next
+    // queue starts at volume 0. Only the timer writes those two volumes.
+    AVQueuePlayer *_localOutgoing;
+    NSTimer *_localBlendTimer;
+    double _localBlendStarted, _localBlendDuration;
+    // Music.app and the YouTube tab have one output, so a blend dips it, skips,
+    // then brings the same number back. Known means we still owe that restore.
+    BOOL _amBlendActive, _amBlendBusy, _amBlendVolumeKnown;
+    int _amBlendOriginal, _amBlendApplied, _amBlendPhase;
+    NSUInteger _amBlendToken;
+    NSTimer *_amBlendTimer;
+    double _amBlendPhaseStarted;
+    void (^_amBlendStopThen)(void);
+    BOOL _ytBlendActive, _ytBlendBusy, _ytBlendVolumeKnown;
+    int _ytBlendPhase;
+    double _ytBlendOriginal, _ytBlendApplied, _ytBlendPhaseStarted;
+    NSUInteger _ytBlendToken;
+    NSTimer *_ytBlendTimer;
+    void (^_ytBlendStopThen)(void);
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -5725,6 +5816,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
     // the main thread for longer than the shared budget.
     _terminating = YES;
     [self stopAudioRouting];
+    [self silenceMusicBlendsForQuit];
     [self cancelStorage];
     [_meteredMonitor stop];
     dispatch_semaphore_t pmsetDone = dispatch_semaphore_create(0);
@@ -6349,12 +6441,108 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         });
     }];
 }
-- (void)tearDownLocalPlayer {
+- (void)detachLocalObservers {
     for (AVPlayerItem *item in _localObservedItems)
         [NSNotificationCenter.defaultCenter removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:item];
     _localObservedItems = nil;
+}
+- (void)attachLocalObservers:(NSArray<AVPlayerItem *> *)items {
+    [self detachLocalObservers];
+    _localObservedItems = items;
+    for (AVPlayerItem *item in items)
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(localItemEnded:)
+                                                   name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+}
+- (NSArray<AVPlayerItem *> *)localItemsFromIndex:(NSInteger)index {
+    NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
+    for (NSInteger i = index; i < (NSInteger)_localURLs.count; i++)
+        [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
+    return items;
+}
+- (NSInteger)wrappedLocalIndex:(NSInteger)index {
+    NSInteger n = (NSInteger)_localURLs.count;
+    if (n <= 0) return 0;
+    if (index < 0) return n - 1;
+    if (index >= n) return 0;
+    return index;
+}
+// The outgoing queue still holds every later track. Left alone it would start the
+// one after this song once the item ends, under a fade that no longer observes it.
+- (void)keepOnlyCurrentItemOn:(AVQueuePlayer *)player {
+    if (!player) return;
+    AVPlayerItem *current = player.currentItem;
+    for (AVPlayerItem *item in [player.items copy])
+        if (item != current) [player removeItem:item];
+}
+- (double)secondsRemainingInPlayer:(AVPlayer *)player {
+    AVPlayerItem *item = player.currentItem;
+    if (!item) return NAN;
+    CMTime now = player.currentTime;
+    CMTime length = item.duration;
+    if (!CMTIME_IS_NUMERIC(now) || !CMTIME_IS_NUMERIC(length)) return NAN;
+    double elapsed = CMTimeGetSeconds(now);
+    double duration = CMTimeGetSeconds(length);
+    if (!isfinite(elapsed) || !isfinite(duration)) return NAN;
+    return duration - elapsed;
+}
+- (void)finishLocalBlend {
+    [_localBlendTimer invalidate];
+    _localBlendTimer = nil;
+    // The incoming player is the one the UI already shows. Full volume, then the
+    // outgoing player can go: a fade abandoned at the bottom would stay quiet.
+    if (_localPlayer) _localPlayer.volume = 1;
+    if (_localOutgoing) {
+        [_localOutgoing pause];
+        _localOutgoing = nil;
+    }
+}
+- (void)tearDownLocalPlayer {
+    [_localBlendTimer invalidate];
+    _localBlendTimer = nil;
+    [self detachLocalObservers];
+    if (_localOutgoing) {
+        [_localOutgoing pause];
+        _localOutgoing = nil;
+    }
     [_localPlayer pause];
     _localPlayer = nil;
+}
+// Quit doesn't spin the main run loop, so a dip's timer will not get to restore
+// Music or the YouTube tab. Fire that restore now; both apps outlive us.
+- (void)silenceMusicBlendsForQuit {
+    [_musicNextArmTimer invalidate];
+    _musicNextArmTimer = nil;
+    _musicNextArmedAt = 0;
+    [_localBlendTimer invalidate];
+    _localBlendTimer = nil;
+    [_amBlendTimer invalidate];
+    _amBlendTimer = nil;
+    [_ytBlendTimer invalidate];
+    _ytBlendTimer = nil;
+    _amBlendToken++;
+    _ytBlendToken++;
+    _amBlendActive = NO;
+    _ytBlendActive = NO;
+    if (_localOutgoing) {
+        [_localOutgoing pause];
+        _localOutgoing = nil;
+    }
+    if (_localPlayer) _localPlayer.volume = 1;
+    if (_amBlendVolumeKnown) {
+        int volume = _amBlendOriginal;
+        _amBlendVolumeKnown = NO;
+        RunAppleScript([NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume],
+                       ^(NSString *output, NSString *errorText, int status) {
+            (void)output; (void)errorText; (void)status;
+        });
+    }
+    if (_ytBlendVolumeKnown) {
+        NSString *action = YouTubeVolumeAction(_ytBlendOriginal);
+        _ytBlendVolumeKnown = NO;
+        RunAppleScript(YouTubeControlScript(action), ^(NSString *output, NSString *errorText, int status) {
+            (void)output; (void)errorText; (void)status;
+        });
+    }
 }
 // The queue advances by itself and never updates the index, so Next would jump
 // backwards and the label would stay on the finished song. At the end, wrap the
@@ -6384,17 +6572,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)playLocalIndex:(NSInteger)index {
     if (!_localURLs.count) return;
-    if (index < 0) index = (NSInteger)_localURLs.count - 1;
-    if (index >= (NSInteger)_localURLs.count) index = 0;
+    index = [self wrappedLocalIndex:index];
     _localIndex = index;
-    NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
-    for (NSInteger i = index; i < (NSInteger)_localURLs.count; i++)
-        [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
+    NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
     [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
-    _localObservedItems = items;
-    for (AVPlayerItem *item in items)
-        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(localItemEnded:) name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    _localPlayer.volume = 1;
+    [self attachLocalObservers:items];
     _localMode = YES;
     _localEmpty = NO;
     _playbackKnown = YES;
@@ -6403,6 +6587,53 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self enableRemoteCommands];
     [_localPlayer play];
     [self publishNowPlaying];
+    if (_popover.isShown) [self rebuildContent];
+}
+- (void)localBlendTick:(NSTimer *)timer {
+    (void)timer;
+    if (!_localBlendTimer) return;
+    if (!_localOutgoing || !_localPlayer) { [self finishLocalBlend]; return; }
+    double duration = _localBlendDuration > 0 ? _localBlendDuration : kMusicBlendFullSec;
+    double t = (CFAbsoluteTimeGetCurrent() - _localBlendStarted) / duration;
+    if (!(t < 1)) { [self finishLocalBlend]; return; }
+    MusicBlendGain gain = MusicBlendGainAt(t);
+    _localOutgoing.volume = (float)gain.outgoing;
+    _localPlayer.volume = (float)gain.incoming;
+}
+// Keeps the current player. The new queue is built the same way as playLocalIndex:,
+// at volume 0, and the row switches to it immediately.
+- (void)beginLocalBlend {
+    if (!_localURLs.count || !_localPlayer) {
+        [self playLocalIndex:_localIndex + 1];
+        return;
+    }
+    NSInteger index = [self wrappedLocalIndex:_localIndex + 1];
+    double remaining = [self secondsRemainingInPlayer:_localPlayer];
+    AVQueuePlayer *outgoing = _localPlayer;
+    [self detachLocalObservers];
+    [self keepOnlyCurrentItemOn:outgoing];
+    outgoing.volume = 1;
+    _localOutgoing = outgoing;
+    NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
+    AVQueuePlayer *incoming = [AVQueuePlayer queuePlayerWithItems:items];
+    incoming.volume = 0;
+    _localPlayer = incoming;
+    [self attachLocalObservers:items];
+    _localIndex = index;
+    _localMode = YES;
+    _localEmpty = NO;
+    _playbackKnown = YES;
+    _playbackPlaying = YES;
+    [self applyLocalItemURL:_localURLs[index]];
+    [self enableRemoteCommands];
+    [_localPlayer play];
+    [self publishNowPlaying];
+    _localBlendDuration = MusicBlendSeconds(remaining, kMusicBlendFullSec, kMusicBlendMinSec);
+    _localBlendStarted = CFAbsoluteTimeGetCurrent();
+    [_localBlendTimer invalidate];
+    _localBlendTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 target:self
+                                             selector:@selector(localBlendTick:) userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:_localBlendTimer forMode:NSRunLoopCommonModes];
     if (_popover.isShown) [self rebuildContent];
 }
 - (void)startOfflinePlayback {
@@ -6429,6 +6660,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)toggleLocalPlayback {
     if (!_localPlayer) { [self startOfflinePlayback]; return; }
+    // Pause finishes the fade first, so the incoming track is the one that pauses
+    // and the outgoing player is not left audible underneath.
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
     if (_localPlayer.rate > 0) {
         [_localPlayer pause];
         _playbackPlaying = NO;
@@ -6674,12 +6908,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     (void)event; [self musicPrevious:nil]; return 0;
 }
 - (void)sendYouTubeCommand:(NSString *)action key:(UInt32)key {
-    if (!_musicProbesEnabled) return;
+    [self sendYouTubeCommand:action key:key done:nil];
+}
+- (void)sendYouTubeCommand:(NSString *)action key:(UInt32)key done:(void (^)(BOOL ok))done {
+    if (!_musicProbesEnabled) { if (done) done(NO); return; }
     if (!ChromeIsRunning()) {
         _ytTabOpen = NO;
         _playbackKnown = NO;
         [self stopYouTubeProbeTimer];
         if (_popover.isShown) [self rebuildContent];
+        if (done) done(NO);
         return;
     }
     NSUInteger generation = ++_musicGen;
@@ -6688,19 +6926,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_ytJSDenied) {
         PostSystemMediaKey(key);
         [self runYouTubeStatusAfter:0.3 generation:generation];
+        if (done) done(YES);
         return;
     }
     RunAppleScript(YouTubeControlScript(action), ^(NSString *output, NSString *errorText, int status) {
-        if (generation != self->_musicGen) return;
+        if (generation != self->_musicGen) { if (done) done(NO); return; }
         NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
         BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
-        if ([parsed[@"denied"] isEqual:@"javascript"]) {
+        BOOL denied = [parsed[@"denied"] isEqual:@"javascript"];
+        if (denied) {
             [self applyYouTubeStatus:parsed updateTransport:NO];
             PostSystemMediaKey(key);
         } else if (!unanswered) {
             [self applyYouTubeStatus:parsed updateTransport:NO];
         }
         [self runYouTubeStatusAfter:0.3 generation:generation];
+        if (done) done(!denied && !unanswered);
     });
 }
 // --- Apple Music ---
@@ -6755,12 +6996,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // A tell block launches Music, so every probe checks it is running first. Commands that
 // change the track read back once more: Music answers before the new track has loaded.
 - (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp {
-    if (!_musicProbesEnabled) return;
-    if (!AppleMusicIsRunning()) { [self clearAppleMusic]; return; }
+    [self runAppleMusicCommand:command followUp:followUp done:nil];
+}
+- (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp done:(void (^)(BOOL ok))done {
+    if (!_musicProbesEnabled) { if (done) done(NO); return; }
+    if (!AppleMusicIsRunning()) { [self clearAppleMusic]; if (done) done(NO); return; }
     NSUInteger generation = ++_amGen;
     _amStatusInFlight = YES;
     RunAppleScript(AppleMusicScript(command), ^(NSString *output, NSString *errorText, int status) {
-        if (generation != self->_amGen) return;
+        if (generation != self->_amGen) { if (done) done(NO); return; }
         self->_amStatusInFlight = NO;
         if (status != 0 || command.length)
             GBLog("apple music: command=%{public}@ status=%d out=%{public}@ err=%{public}@", command, status,
@@ -6768,14 +7012,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         if (ChromeAutomationDenied(errorText)) {
             self->_musicNote = kAppleMusicAutomationNote;
             if (self->_popover.isShown) [self rebuildContent];
+            if (done) done(NO);
             return;
         }
-        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) return;   // timeout: keep what we had
+        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) { if (done) done(NO); return; }   // timeout: keep what we had
         [self applyAppleMusicStatus:ParseAppleMusicStatus(output)];
         if (followUp)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (generation == self->_amGen) [self runAppleMusicCommand:@"" followUp:NO];
             });
+        if (done) done(YES);
     });
 }
 - (void)applyAppleMusicStatus:(NSDictionary *)status {
@@ -7011,6 +7257,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         [self loveCurrentLocalTrack];
         return;
     }
+    if (_amLoaded && [self appleMusicBlendBusy]) {
+        [self requestAppleMusicBlendStopThen:^{ [self musicFavorite:nil]; }];
+        return;
+    }
     if (!_amLoaded) return;
     _amFavorited = !_amFavorited;   // answer the click now; the read-back confirms it
     if (_popover.isShown) [self rebuildContent];
@@ -7027,6 +7277,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (IBAction)musicThumbsUp:(id)sender {
     (void)sender;
     BOOL local = _localMode && _mixPlayingKey.length;
+    if (!local && [self appleMusicBlendBusy]) {
+        [self requestAppleMusicBlendStopThen:^{ [self musicThumbsUp:nil]; }];
+        return;
+    }
     if (!local && (!_amLoaded || !_amTrackID.length)) return;
     NSDictionary *ident = local ? [self currentLocalIdentity] : nil;
     NSString *thumbID = local ? ([ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"]) : _amTrackID;
@@ -7067,6 +7321,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (IBAction)musicShuffle:(id)sender {
     (void)sender;
     if (!_amLoaded) return;
+    if ([self appleMusicBlendBusy]) {
+        [self requestAppleMusicBlendStopThen:^{ [self musicShuffle:nil]; }];
+        return;
+    }
     _amShuffle = !_amShuffle;
     if (_popover.isShown) [self rebuildContent];
     [self runAppleMusicCommand:[NSString stringWithFormat:@"set shuffle enabled to %@", _amShuffle ? @"true" : @"false"]
@@ -7074,6 +7332,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 - (IBAction)musicSeek:(id)sender {
     if (!_amLoaded || ![sender isKindOfClass:NSSlider.class]) return;
+    if ([self appleMusicBlendBusy]) {
+        [self requestAppleMusicBlendStopThen:^{ [self musicSeek:sender]; }];
+        return;
+    }
     double seconds = ((NSSlider *)sender).doubleValue;
     if (!isfinite(seconds) || seconds < 0) return;
     _trackElapsed = seconds;
@@ -7087,12 +7349,23 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
           _networkKnown, _networkOnline, _amStartPending);
     if (_localMode) { [self toggleLocalPlayback]; return; }
     if (_amLoaded) {
+        if ([self appleMusicBlendBusy]) {
+            [self requestAppleMusicBlendStopThen:^{ [self musicPlay:nil]; }];
+            return;
+        }
         _playbackPlaying = !_playbackPlaying;
         if (_popover.isShown) [self rebuildContent];
         [self runAppleMusicCommand:@"playpause\ndelay 0.3" followUp:YES];
         return;
     }
-    if (_ytTabOpen) { [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY]; return; }
+    if (_ytTabOpen) {
+        if ([self youTubeBlendBusy]) {
+            [self requestYouTubeBlendStopThen:^{ [self musicPlay:nil]; }];
+            return;
+        }
+        [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY];
+        return;
+    }
     if (_networkKnown && !_networkOnline) { [self startOfflinePlayback]; return; }
     [self startAppleMusicPlayback];
 }
@@ -7100,6 +7373,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     (void)sender;
     if (!_musicProbesEnabled) return;
     if (_localMode) {
+        // Previous decides from the track the row already shows. Snap the fade
+        // first so the outgoing player is not still sounding under that seek.
+        if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
         double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
         if (seconds > 3) {
             // The clock ticks from its last sample; restart it with the seek, not 15s later.
@@ -7113,15 +7389,438 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         [self playLocalIndex:_localIndex - 1];
         return;
     }
-    if (_amLoaded) { [self runAppleMusicCommand:@"back track\ndelay 0.3" followUp:YES]; return; }
-    if (_ytTabOpen) [self sendYouTubeCommand:@"previous" key:NX_KEYTYPE_PREVIOUS];
+    if (_amLoaded) {
+        if ([self appleMusicBlendBusy]) {
+            [self requestAppleMusicBlendStopThen:^{ [self musicPrevious:nil]; }];
+            return;
+        }
+        [self runAppleMusicCommand:@"back track\ndelay 0.3" followUp:YES];
+        return;
+    }
+    if (_ytTabOpen) {
+        if ([self youTubeBlendBusy]) {
+            [self requestYouTubeBlendStopThen:^{ [self musicPrevious:nil]; }];
+            return;
+        }
+        [self sendYouTubeCommand:@"previous" key:NX_KEYTYPE_PREVIOUS];
+    }
+}
+- (void)invalidateMusicNextArmTimer {
+    [_musicNextArmTimer invalidate];
+    _musicNextArmTimer = nil;
+}
+- (BOOL)musicBlendRunning {
+    return _localBlendTimer != nil || _localOutgoing != nil || _amBlendActive || _ytBlendActive;
+}
+- (void)performMusicNextCutNow {
+    if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
+    if (_amLoaded) { [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES]; return; }
+    if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
+}
+// A press during a blend lands on the track that blend was already entering.
+// Local index moved when the fade started, so finishing it is the cut. A service
+// dip that has not skipped yet still owes that one skip, at the original volume.
+- (void)finishRunningBlendAsCut {
+    BOOL local = _localBlendTimer != nil || _localOutgoing != nil;
+    if (local) [self finishLocalBlend];
+    if ([self appleMusicBlendBusy]) {
+        BOOL skipped = _amBlendPhase == MusicDipSkip || _amBlendPhase == MusicDipUp;
+        [self requestAppleMusicBlendStopThen:^{
+            if (!local && !skipped) [self performMusicNextCutNow];
+        }];
+        return;
+    }
+    if ([self youTubeBlendBusy]) {
+        BOOL skipped = _ytBlendPhase == MusicDipSkip || _ytBlendPhase == MusicDipUp;
+        [self requestYouTubeBlendStopThen:^{
+            if (!local && !skipped) [self performMusicNextCutNow];
+        }];
+    }
+}
+- (void)performMusicNextBlend {
+    if (_localMode) {
+        if (_localBlendTimer || _localOutgoing) { [self finishLocalBlend]; return; }
+        [self beginLocalBlend];
+        return;
+    }
+    if (_amLoaded) { [self beginAppleMusicBlend]; return; }
+    if (_ytTabOpen) {
+        if (_ytJSDenied) { [self performMusicNextCutNow]; return; }
+        [self beginYouTubeBlend];
+    }
+}
+- (BOOL)appleMusicBlendBusy {
+    return _amBlendActive || _amBlendBusy || _amBlendVolumeKnown || _amBlendStopThen != nil;
+}
+- (void)stopAppleBlendTimer {
+    [_amBlendTimer invalidate];
+    _amBlendTimer = nil;
+}
+- (void)applyAppleMusicVolume:(int)volume done:(void (^)(BOOL ok))done {
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    NSString *script = [NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume];
+    RunAppleScript(script, ^(NSString *output, NSString *errorText, int status) {
+        (void)output; (void)errorText;
+        if (done) done(status == 0);
+    });
+}
+// One restore, then whatever the interrupt was waiting to do. A failed set does not
+// try again: the caller already decided this is the last word on the volume.
+- (void)finishAppleMusicBlendStop {
+    if (_amBlendBusy) return;
+    [self stopAppleBlendTimer];
+    _amBlendActive = NO;
+    int original = _amBlendOriginal;
+    BOOL known = _amBlendVolumeKnown;
+    _amBlendVolumeKnown = NO;
+    _amBlendPhase = MusicDipIdle;
+    if (!known) {
+        void (^go)(void) = _amBlendStopThen;
+        _amBlendStopThen = nil;
+        if (go) go();
+        return;
+    }
+    _amBlendBusy = YES;
+    NSUInteger token = _amBlendToken;
+    [self applyAppleMusicVolume:original done:^(BOOL __unused ok) {
+        if (token != self->_amBlendToken) {
+            self->_amBlendBusy = NO;
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        self->_amBlendBusy = NO;
+        void (^go)(void) = self->_amBlendStopThen;
+        self->_amBlendStopThen = nil;
+        if (go) go();
+    }];
+}
+- (void)requestAppleMusicBlendStopThen:(void (^)(void))then {
+    if (![self appleMusicBlendBusy]) { if (then) then(); return; }
+    _amBlendStopThen = then;
+    _amBlendActive = NO;
+    _amBlendToken++;
+    [self stopAppleBlendTimer];
+    if (!_amBlendBusy) [self finishAppleMusicBlendStop];
+}
+- (void)finishAppleMusicBlend {
+    [self stopAppleBlendTimer];
+    _amBlendActive = NO;
+    _amBlendVolumeKnown = NO;
+    _amBlendPhase = MusicDipIdle;
+    _amBlendStopThen = nil;
+}
+- (void)appleMusicBlendFireNext {
+    if (!_amBlendActive || _amBlendBusy) return;
+    _amBlendPhase = MusicDipSkip;
+    _amBlendBusy = YES;
+    NSUInteger token = _amBlendToken;
+    [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES done:^(BOOL ok) {
+        self->_amBlendBusy = NO;
+        if (token != self->_amBlendToken || !self->_amBlendActive) {
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        if (!ok) {
+            self->_amBlendActive = NO;
+            __weak __typeof(self) weakSelf = self;
+            self->_amBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        self->_amBlendPhase = MusicDipUp;
+        self->_amBlendApplied = 0;
+        self->_amBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
+        [self appleMusicBlendTick:nil];
+    }];
+}
+- (void)appleMusicBlendTick:(NSTimer *)timer {
+    (void)timer;
+    if (!_amBlendActive || _amBlendBusy) return;
+    if (_amBlendPhase != MusicDipDown && _amBlendPhase != MusicDipUp) return;
+    BOOL up = _amBlendPhase == MusicDipUp;
+    if (_amBlendOriginal == 0) {
+        if (up) [self finishAppleMusicBlend];
+        else [self appleMusicBlendFireNext];
+        return;
+    }
+    const double dip = 1.5;
+    BOOL phaseDone = NO;
+    double level = MusicDipLevel(CFAbsoluteTimeGetCurrent() - _amBlendPhaseStarted, dip, up, &phaseDone);
+    int target = (int)llround((double)_amBlendOriginal * level);
+    if (phaseDone) target = up ? _amBlendOriginal : 0;
+    if (target == _amBlendApplied) {
+        if (!phaseDone) return;
+        if (up) [self finishAppleMusicBlend];
+        else [self appleMusicBlendFireNext];
+        return;
+    }
+    _amBlendApplied = target;
+    NSUInteger token = _amBlendToken;
+    _amBlendBusy = YES;
+    [self applyAppleMusicVolume:target done:^(BOOL ok) {
+        self->_amBlendBusy = NO;
+        if (token != self->_amBlendToken || !self->_amBlendActive) {
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        if (!ok) {
+            BOOL skipped = self->_amBlendPhase == MusicDipSkip || self->_amBlendPhase == MusicDipUp;
+            self->_amBlendActive = NO;
+            __weak __typeof(self) weakSelf = self;
+            self->_amBlendStopThen = ^{ if (!skipped) [weakSelf performMusicNextCutNow]; };
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        [self appleMusicBlendTick:nil];
+    }];
+}
+- (void)beginAppleMusicBlend {
+    if (_amBlendActive || _amBlendBusy) { [self finishRunningBlendAsCut]; return; }
+    _amBlendActive = YES;
+    _amBlendPhase = MusicDipDown;
+    _amBlendVolumeKnown = NO;
+    _amBlendToken++;
+    NSUInteger token = _amBlendToken;
+    _amBlendBusy = YES;
+    RunAppleScript(@"tell application \"Music\" to sound volume", ^(NSString *output, NSString *errorText, int status) {
+        (void)errorText;
+        self->_amBlendBusy = NO;
+        if (token != self->_amBlendToken || !self->_amBlendActive) {
+            [self finishAppleMusicBlendStop];
+            return;
+        }
+        int volume = 0;
+        if (status != 0 || !MusicSoundVolume(output, &volume)) {
+            self->_amBlendActive = NO;
+            [self performMusicNextCutNow];
+            return;
+        }
+        self->_amBlendOriginal = volume;
+        self->_amBlendApplied = volume;
+        self->_amBlendVolumeKnown = YES;
+        self->_amBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
+        [self stopAppleBlendTimer];
+        self->_amBlendTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 target:self
+                                                    selector:@selector(appleMusicBlendTick:)
+                                                    userInfo:nil repeats:YES];
+        [NSRunLoop.mainRunLoop addTimer:self->_amBlendTimer forMode:NSRunLoopCommonModes];
+        [self appleMusicBlendTick:nil];
+    });
+}
+- (BOOL)youTubeBlendBusy {
+    return _ytBlendActive || _ytBlendBusy || _ytBlendVolumeKnown || _ytBlendStopThen != nil;
+}
+- (void)stopYouTubeBlendTimer {
+    [_ytBlendTimer invalidate];
+    _ytBlendTimer = nil;
+}
+- (void)applyYouTubeVolume:(double)volume done:(void (^)(BOOL ok))done {
+    RunAppleScript(YouTubeControlScript(YouTubeVolumeAction(volume)), ^(NSString *output, NSString *errorText, int status) {
+        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+        if (done) done(status == 0 && [parsed[@"denied"] isEqual:@""]);
+    });
+}
+- (void)finishYouTubeBlendStop {
+    if (_ytBlendBusy) return;
+    [self stopYouTubeBlendTimer];
+    _ytBlendActive = NO;
+    double original = _ytBlendOriginal;
+    BOOL known = _ytBlendVolumeKnown;
+    _ytBlendVolumeKnown = NO;
+    _ytBlendPhase = MusicDipIdle;
+    if (!known) {
+        void (^go)(void) = _ytBlendStopThen;
+        _ytBlendStopThen = nil;
+        if (go) go();
+        return;
+    }
+    _ytBlendBusy = YES;
+    NSUInteger token = _ytBlendToken;
+    [self applyYouTubeVolume:original done:^(BOOL __unused ok) {
+        if (token != self->_ytBlendToken) {
+            self->_ytBlendBusy = NO;
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        self->_ytBlendBusy = NO;
+        void (^go)(void) = self->_ytBlendStopThen;
+        self->_ytBlendStopThen = nil;
+        if (go) go();
+    }];
+}
+- (void)requestYouTubeBlendStopThen:(void (^)(void))then {
+    if (![self youTubeBlendBusy]) { if (then) then(); return; }
+    _ytBlendStopThen = then;
+    _ytBlendActive = NO;
+    _ytBlendToken++;
+    [self stopYouTubeBlendTimer];
+    if (!_ytBlendBusy) [self finishYouTubeBlendStop];
+}
+- (void)finishYouTubeBlend {
+    [self stopYouTubeBlendTimer];
+    _ytBlendActive = NO;
+    _ytBlendVolumeKnown = NO;
+    _ytBlendPhase = MusicDipIdle;
+    _ytBlendStopThen = nil;
+}
+- (void)youTubeBlendFireNext {
+    if (!_ytBlendActive || _ytBlendBusy) return;
+    _ytBlendPhase = MusicDipSkip;
+    _ytBlendBusy = YES;
+    NSUInteger token = _ytBlendToken;
+    NSUInteger generation = ++_musicGen;
+    RunAppleScript(YouTubeControlScript(@"next"), ^(NSString *output, NSString *errorText, int status) {
+        self->_ytBlendBusy = NO;
+        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+        BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
+        if ([parsed[@"denied"] isEqual:@"javascript"]) {
+            [self applyYouTubeStatus:parsed updateTransport:NO];
+            PostSystemMediaKey(NX_KEYTYPE_NEXT);
+            self->_ytBlendActive = NO;
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        if (generation == self->_musicGen && !unanswered)
+            [self applyYouTubeStatus:parsed updateTransport:NO];
+        if (generation == self->_musicGen)
+            [self runYouTubeStatusAfter:0.3 generation:generation];
+        // A status line means the click ran. unanswered is the timeout / no-tab case,
+        // where the skip still has to happen or the dip just sits at volume 0.
+        if (unanswered) {
+            self->_ytBlendActive = NO;
+            __weak __typeof(self) weakSelf = self;
+            self->_ytBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        self->_ytBlendPhase = MusicDipUp;
+        self->_ytBlendApplied = 0;
+        self->_ytBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
+        [self youTubeBlendTick:nil];
+    });
+}
+- (void)youTubeBlendTick:(NSTimer *)timer {
+    (void)timer;
+    if (!_ytBlendActive || _ytBlendBusy) return;
+    if (_ytBlendPhase != MusicDipDown && _ytBlendPhase != MusicDipUp) return;
+    BOOL up = _ytBlendPhase == MusicDipUp;
+    if (!(_ytBlendOriginal > 0)) {
+        if (up) [self finishYouTubeBlend];
+        else [self youTubeBlendFireNext];
+        return;
+    }
+    const double dip = 1.2;
+    BOOL phaseDone = NO;
+    double level = MusicDipLevel(CFAbsoluteTimeGetCurrent() - _ytBlendPhaseStarted, dip, up, &phaseDone);
+    double target = phaseDone ? (up ? _ytBlendOriginal : 0) : _ytBlendOriginal * level;
+    if (MusicVolumeCents(target) == MusicVolumeCents(_ytBlendApplied)) {
+        if (!phaseDone) return;
+        if (up) [self finishYouTubeBlend];
+        else [self youTubeBlendFireNext];
+        return;
+    }
+    _ytBlendApplied = target;
+    NSUInteger token = _ytBlendToken;
+    _ytBlendBusy = YES;
+    [self applyYouTubeVolume:target done:^(BOOL ok) {
+        self->_ytBlendBusy = NO;
+        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        if (!ok) {
+            BOOL skipped = self->_ytBlendPhase == MusicDipSkip || self->_ytBlendPhase == MusicDipUp;
+            self->_ytBlendActive = NO;
+            __weak __typeof(self) weakSelf = self;
+            self->_ytBlendStopThen = ^{ if (!skipped) [weakSelf performMusicNextCutNow]; };
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        [self youTubeBlendTick:nil];
+    }];
+}
+- (void)beginYouTubeBlend {
+    if (_ytJSDenied || !ChromeIsRunning()) { [self performMusicNextCutNow]; return; }
+    if (_ytBlendActive || _ytBlendBusy) { [self finishRunningBlendAsCut]; return; }
+    _ytBlendActive = YES;
+    _ytBlendPhase = MusicDipDown;
+    _ytBlendVolumeKnown = NO;
+    _ytBlendToken++;
+    NSUInteger token = _ytBlendToken;
+    _ytBlendBusy = YES;
+    RunAppleScript(YouTubeControlScript(@"volget"), ^(NSString *output, NSString *errorText, int status) {
+        self->_ytBlendBusy = NO;
+        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
+            [self finishYouTubeBlendStop];
+            return;
+        }
+        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
+        if (![parsed[@"denied"] isEqual:@""]) {
+            [self applyYouTubeStatus:parsed updateTransport:NO];
+            self->_ytBlendActive = NO;
+            [self performMusicNextCutNow];
+            return;
+        }
+        if (status != 0 && ![parsed[@"tab"] boolValue]) {
+            self->_ytBlendActive = NO;
+            [self performMusicNextCutNow];
+            return;
+        }
+        NSNumber *volume = [parsed[@"volume"] isKindOfClass:NSNumber.class] ? parsed[@"volume"] : nil;
+        double original = volume ? volume.doubleValue : 1;
+        if (!isfinite(original) || original < 0) original = 1;
+        if (original > 1) original = 1;
+        self->_ytBlendOriginal = original;
+        self->_ytBlendApplied = original;
+        self->_ytBlendVolumeKnown = YES;
+        self->_ytBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
+        [self stopYouTubeBlendTimer];
+        self->_ytBlendTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 target:self
+                                                    selector:@selector(youTubeBlendTick:)
+                                                    userInfo:nil repeats:YES];
+        [NSRunLoop.mainRunLoop addTimer:self->_ytBlendTimer forMode:NSRunLoopCommonModes];
+        [self youTubeBlendTick:nil];
+    });
 }
 - (IBAction)musicNext:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
-    if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
-    if (_amLoaded) { [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES]; return; }
-    if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
+    BOOL blending = [self musicBlendRunning];
+    MusicNextTap tap = ClassifyMusicNext(&_musicNextArmedAt, CFAbsoluteTimeGetCurrent(),
+                                        kMusicNextTapWindowSec, NO, blending);
+    if (tap == MusicNextTapCut) {
+        [self invalidateMusicNextArmTimer];
+        if (blending) [self finishRunningBlendAsCut];
+        else [self performMusicNextCutNow];
+        return;
+    }
+    if (tap != MusicNextTapWait) return;
+    [self invalidateMusicNextArmTimer];
+    _musicNextArmTimer = [NSTimer scheduledTimerWithTimeInterval:kMusicNextTapWindowSec target:self
+                                                       selector:@selector(musicNextArmFired:)
+                                                       userInfo:nil repeats:NO];
+}
+- (void)musicNextArmFired:(NSTimer *)timer {
+    (void)timer;
+    _musicNextArmTimer = nil;
+    if (!_musicProbesEnabled) { _musicNextArmedAt = 0; return; }
+    double now = CFAbsoluteTimeGetCurrent();
+    MusicNextTap tap = ClassifyMusicNext(&_musicNextArmedAt, now, kMusicNextTapWindowSec,
+                                        YES, [self musicBlendRunning]);
+    if (tap == MusicNextTapBlend) { [self performMusicNextBlend]; return; }
+    // Fired before the window (the pure check keeps the arm). One more wait.
+    if (tap == MusicNextTapNone && _musicNextArmedAt > 0) {
+        double remain = (_musicNextArmedAt + kMusicNextTapWindowSec) - CFAbsoluteTimeGetCurrent();
+        if (remain < 0.01) remain = 0.01;
+        _musicNextArmTimer = [NSTimer scheduledTimerWithTimeInterval:remain target:self
+                                                           selector:@selector(musicNextArmFired:)
+                                                           userInfo:nil repeats:NO];
+    }
 }
 - (NSButton *)transportButton:(NSString *)symbol pointSize:(CGFloat)pointSize side:(CGFloat)side
                          action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
@@ -7235,7 +7934,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [row addSubview:play];
     x = NSMaxX(play.frame) + 2;
     NSButton *next = [self transportButton:@"forward.end.fill" pointSize:18 side:22
-                                    action:@selector(musicNext:) identifier:@"popover.music.next" label:@"Next track"];
+                                    action:@selector(musicNext:) identifier:@"popover.music.next" label:kMusicNextTip];
+    next.accessibilityHelp = kMusicNextTip;
+    next.toolTip = kMusicNextTip;
     next.frame = NSOffsetRect(next.frame, x, 0);
     next.enabled = loaded;
     if (!loaded) next.contentTintColor = NSColor.tertiaryLabelColor;
