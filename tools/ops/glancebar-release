@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Build/publish on signing Mac; fetch only source-matching Developer ID releases."""
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, tempfile
+P=pathlib.Path
+INPUTS=('Sources','Tests','Resources','tools','build.sh','tests.sh','Info.plist','Glancebar.entitlements')
+REQUIREMENT='=identifier "com.iantodd.glancebar" and anchor apple generic and certificate leaf[subject.OU] = "U87MQBZKJ5"'
+def run(*args,**kw): return subprocess.run(args,check=True,**kw)
+def digest(root, names):
+    entries={}
+    for name in names:
+        p=root/name
+        for f in sorted(p.rglob('*')) if p.is_dir() else [p]:
+            if f.is_file(): entries[str(f.relative_to(root))]=hashlib.sha256(f.read_bytes()).hexdigest()
+    return hashlib.sha256(json.dumps(entries,sort_keys=True).encode()).hexdigest()
+def verify(app): run('codesign','--verify','--deep','--strict','-R',REQUIREMENT,str(app))
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('action',choices=['publish','fetch']); ap.add_argument('repo',type=P); ap.add_argument('output',nargs='?',type=P); a=ap.parse_args()
+    repo=a.repo.resolve(); source=digest(repo,INPUTS)
+    releases=P.home()/'.local/state/glancebar-releases'; releases.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.stage-',dir=releases) as tmp:
+        stage=P(tmp)
+        if a.action=='publish':
+            src=stage/'source'; src.mkdir()
+            for name in INPUTS:
+                p=repo/name
+                if p.is_dir(): shutil.copytree(p,src/name)
+                else: shutil.copy2(p,src/name)
+            if digest(src,INPUTS)!=source: raise RuntimeError('Source changed during snapshot')
+            env=os.environ.copy(); env['GLANCEBAR_CODESIGN_IDENTITY']='Developer ID Application: Ian Todd (U87MQBZKJ5)'; env['GLANCEBAR_TIMESTAMP']='1'; env['HEAVY_SLOT_LABEL']='glancebar-release'
+            run(str(P.home()/'.local/bin/heavy-slot'),'--','./build.sh',cwd=src,env=env)
+            app=src/'build/Glancebar.app'; verify(app)
+            release=stage/'release'; release.mkdir(); shutil.copytree(app,release/'Glancebar.app')
+            (release/'manifest.json').write_text(json.dumps({'source':source,'bundle':digest(release,('Glancebar.app',))},indent=2)+'\n')
+            dest=releases/source
+            if not dest.exists(): release.rename(dest)
+            print(dest)
+        else:
+            if a.output is None: ap.error('fetch requires output app path')
+            run('rsync','-a',f'm5:.local/state/glancebar-releases/{source}/',str(stage)+'/')
+            manifest=json.loads((stage/'manifest.json').read_text())
+            if manifest['source']!=source or manifest['bundle']!=digest(stage,('Glancebar.app',)): raise RuntimeError('Release manifest mismatch')
+            verify(stage/'Glancebar.app')
+            if digest(repo,INPUTS)!=source: raise RuntimeError('Local source changed during fetch')
+            if a.output.exists(): raise RuntimeError('Output must be a fresh staging path')
+            shutil.copytree(stage/'Glancebar.app',a.output)
+if __name__=='__main__': main()

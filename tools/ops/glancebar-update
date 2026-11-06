@@ -1,0 +1,38 @@
+#!/bin/bash
+# glancebar-update — keep this Mac's Glancebar on origin/main. Run by the LaunchAgent
+# local.glancebar-update every 15 minutes. Skips a checkout with local changes or off main;
+# fetches source-matching, tested Developer ID releases from M5.
+set -uo pipefail
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin
+repo="$HOME/Projects/glancebar"; log="$HOME/.local/state/glancebar-update/log"
+mkdir -p "$(dirname "$log")"
+say() { echo "$(date '+%F %T') $*" >> "$log"; }
+cd "$repo" || { say "no checkout"; exit 0; }
+[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { say "skip: not on main"; exit 0; }
+[ -z "$(git status --porcelain)" ] || { say "skip: local changes"; exit 0; }
+git fetch -q origin main || { say "fetch failed"; exit 0; }
+installed="$(cat "$HOME/.local/state/glancebar-update/installed" 2>/dev/null)"
+target="$(git rev-parse origin/main)"
+[ "$installed" = "$target" ] && exit 0
+git merge -q --ff-only origin/main || { say "fast-forward failed"; exit 0; }
+# Signed releases are built and tested on M5 with glancebar-release publish.
+# Match every build/test input, so a stale release cannot regress local fixes.
+stage="$(mktemp -d "$HOME/.local/state/glancebar-update/stage.XXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+if ! "$HOME/.local/bin/glancebar-release" fetch "$repo" "$stage/Glancebar.app" > "$HOME/.local/state/glancebar-update/build.log" 2>&1; then
+  say "matching signed release unavailable; keeping current app"; exit 0
+fi
+app="/Applications/Glancebar.app"
+backup="$HOME/.local/state/glancebar-update/previous-$(date +%Y%m%d-%H%M%S).app"
+pkill -u "$(id -u)" -x Glancebar || true
+if [ -d "$app" ]; then
+  mv "$app" "$backup" || { say "backup failed; leaving existing app"; exit 1; }
+fi
+if ! mv "$stage/Glancebar.app" "$app"; then
+  [ ! -d "$backup" ] || mv "$backup" "$app"
+  open -g "$app"
+  say "install failed; restored previous app"; exit 1
+fi
+open -g "$app"
+echo "$target" > "$HOME/.local/state/glancebar-update/installed"
+say "installed $(git log --oneline -1)"
