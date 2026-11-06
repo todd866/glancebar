@@ -8,5 +8,11 @@
 
 void GBFineVolumeStart(void);
 
+// While a routed app is playing (audio_route.h), the volume keys turn that app's speaker,
+// not the system default the rest of the Mac is held on. The provider returns that device,
+// or kAudioObjectUnknown for the default output.
+#import <CoreAudio/CoreAudio.h>
+void GBFineVolumeSetTargetProvider(AudioObjectID (^provider)(void));
+
 // The HUD's content, exposed so a headless render can check it (tools/fine-volume-sheet.m).
 NSView *GBFineVolumeHUDContent(double volume, BOOL muted);

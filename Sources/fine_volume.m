@@ -152,6 +152,11 @@ static void ShowHUD(double volume, BOOL muted) {
 
 static CFMachPortRef gTap;
 static GBVolumeStepState gState;
+static AudioObjectID (^gTargetProvider)(void);
+
+void GBFineVolumeSetTargetProvider(AudioObjectID (^provider)(void)) {
+    gTargetProvider = [provider copy];
+}
 
 static CGEventRef TapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef cg, void *info) {
     (void)proxy; (void)info;
@@ -166,7 +171,8 @@ static CGEventRef TapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRe
     if (key != NX_KEYTYPE_SOUND_UP && key != NX_KEYTYPE_SOUND_DOWN) return cg;   // mute etc. untouched
     NSEventModifierFlags mods = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
     if ((mods & NSEventModifierFlagOption) && (mods & NSEventModifierFlagShift)) return cg;  // system quarter steps
-    AudioObjectID dev = DefaultOutput();
+    AudioObjectID dev = gTargetProvider ? gTargetProvider() : kAudioObjectUnknown;
+    if (!dev) dev = DefaultOutput();
     double volume = 0;
     if (!ReadVolume(dev, &volume)) return cg;                                     // macOS handles it
     BOOL down = ((e.data1 & 0xFF00) >> 8) == 0xA;

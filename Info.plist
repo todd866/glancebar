@@ -20,6 +20,8 @@
 	<string>13.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Glancebar plays one app's audio (Music) only on the speaker you choose, and keeps every other sound on the Mac.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Glancebar plays, pauses and skips music in Music or YouTube Music.</string>
 </dict>
