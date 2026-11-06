@@ -2513,7 +2513,9 @@ int main(void) {
             r = WorkerReadiness(calm, @"gentle", 2, 2);
             check([r[@"limit"] isEqual:@"in use"] && [r[@"score"] doubleValue] < 0.35, @"worker: someone at the screen means in use");
             NSMutableDictionary *full = [calm mutableCopy]; full[@"diskFreeGB"] = @10;
-            check([WorkerReadiness(full, @"full", 3, 3)[@"limit"] isEqual:@"disk full"], @"worker: little disk left");
+            NSMutableDictionary *roomy = [calm mutableCopy]; roomy[@"diskFreeGB"] = @48; roomy[@"diskTotalGB"] = @494;
+            check([WorkerReadiness(roomy, @"full", 3, 3)[@"limit"] isEqual:@"ready"], @"worker: 48 GB free is not a disk limit");
+            check([WorkerReadiness(full, @"full", 3, 3)[@"limit"] isEqual:@"disk low"], @"worker: little disk left");
             NSMutableDictionary *flat = [calm mutableCopy]; flat[@"ac"] = @NO; flat[@"batt"] = @15;
             check([WorkerReadiness(flat, @"full", 3, 3)[@"limit"] isEqual:@"low battery"], @"worker: on a low battery");
             check([WorkerReadiness(calm, @"full", 0, 3)[@"limit"] isEqual:@"slots full"], @"worker: every heavy slot taken");
@@ -2528,7 +2530,7 @@ int main(void) {
             NSDictionary *negDisk = @{@"cpu": @12, @"thermal": @"nominal", @"memPressure": @"Low", @"diskFreeGB": @(-5),
                                       @"diskTotalGB": @500, @"ac": @YES, @"batt": @80};
             NSDictionary *negR = WorkerReadiness(negDisk, @"full", 3, 3);
-            check([negR[@"limit"] isEqual:@"disk full"] && fabs([negR[@"score"] doubleValue]) < 0.001,
+            check([negR[@"limit"] isEqual:@"disk low"] && fabs([negR[@"score"] doubleValue]) < 0.001,
                   @"worker: negative free disk clamps score to zero");
         }
         check([RemoteAwayText(0) isEqual:@"away"] && [RemoteAwayText(-5) isEqual:@"away"], @"remote away: never this session");

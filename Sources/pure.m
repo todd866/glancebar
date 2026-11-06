@@ -3324,8 +3324,10 @@ NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger fr
     if ([mem isEqual:@"High"]) [factors addObject:@[@0.2, @"low memory"]];
     else if ([mem isEqual:@"Medium"]) [factors addObject:@[@0.55, @"low memory"]];
     NSNumber *freeN = SampleNumber(sample[@"diskFreeGB"]), *totalN = SampleNumber(sample[@"diskTotalGB"]);
+    // Absolute space, not a share: a job needs gigabytes, and 48 GB free on a 512 GB disk is plenty.
+    // Limits from 40 GB down; under 10 GB it is the main limit.
     if (freeN && totalN && totalN.doubleValue > 0)
-        [factors addObject:@[@(SampleFactorClamp(freeN.doubleValue / totalN.doubleValue / 0.15)), @"disk full"]];
+        [factors addObject:@[@(SampleFactorClamp(freeN.doubleValue / 50)), @"disk low"]];
     NSNumber *batt = SampleNumber(sample[@"batt"]), *ac = SampleNumber(sample[@"ac"]);
     if (batt && !(ac ? ac.boolValue : NO))
         [factors addObject:@[@(SampleFactorClamp(MIN(1, batt.doubleValue / 50))), @"low battery"]];

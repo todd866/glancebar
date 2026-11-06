@@ -8172,9 +8172,23 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [row addSubview:g];
         [self instrumentValue:(ready ? [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)] : @"—") color:color
                    identifier:[stem stringByAppendingString:@".value"] in:row];
-        [self instrumentDatum:(ready ? ready[@"limit"] : awayText)
+        NSTextField *datum = [self instrumentDatum:(ready ? ready[@"limit"] : awayText)
                         color:(ready && [ready[@"limit"] isEqual:@"ready"] ? NSColor.secondaryLabelColor : color)
                    identifier:[stem stringByAppendingString:@".datum"] in:row];
+        // Chip temperature leads the datum: it is what Ian watches on the workers. The limit
+        // follows only when something is limiting; "ready" adds nothing next to a green gauge.
+        NSNumber *chipN = fresh ? SampleNumber(sample[@"chipC"]) : nil;
+        if (ready && chipN.doubleValue > 0) {
+            NSString *thermal = SampleString(sample[@"thermal"]);
+            double chipC = chipN.doubleValue;
+            NSColor *chipColor = (thermal && ![thermal isEqual:@"nominal"]) ? NSColor.systemOrangeColor
+                : chipC >= 95 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+            NSMutableAttributedString *text = [HeatTempsReadout(chipC, chipColor, 0, nil) mutableCopy];
+            if (text && ![ready[@"limit"] isEqual:@"ready"])
+                [text appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:ready[@"limit"]]
+                    attributes:@{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: color}]];
+            if (text) datum.attributedStringValue = text;
+        }
         [root addSubview:row];
         y += kRowH;
         if (!open || !fresh) continue;

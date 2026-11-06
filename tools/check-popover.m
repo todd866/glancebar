@@ -966,7 +966,7 @@ int main(int argc, const char **argv) {
             NSTextField *rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
             NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");
             if (!FindIdentifier(root, @"popover.row.remote.m2") || ![rn.stringValue isEqual:@"M2"] || !FindIdentifier(root, @"popover.remote.m2.chevron") ||
-                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue isEqual:@"CPU busy"] || ![rd.textColor isEqual:NSColor.systemRedColor] ||
+                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue hasSuffix:@"CPU busy"] || ([rd.stringValue containsString:@"°"] ? ![[rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:rd.stringValue.length - 1 effectiveRange:NULL] isEqual:NSColor.systemRedColor] : ![rd.textColor isEqual:NSColor.systemRedColor]) ||
                 FindIdentifier(root, @"popover.remote.m2.storage") || FindIdentifier(root, @"popover.remote.m2.volume.0") ||
                 !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
                 !FitsChildren(root)) return Fail(__LINE__);
