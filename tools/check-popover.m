@@ -94,7 +94,12 @@ static CGFloat WrappedHeight(NSTextField *field) {
 }
 // The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
 static BOOL IntendedControlTip(NSView *view) {
-    return [view.accessibilityIdentifier isEqual:@"popover.music.next"] && [view.toolTip isEqual:kMusicNextTip];
+    if (![view.accessibilityIdentifier isEqual:@"popover.music.next"]) return NO;
+    NSString *tip = view.toolTip ?: @"";
+    if ([tip isEqual:kMusicNextTip]) return YES;
+    // Deck mode keeps this gesture tip and appends the upcoming title.
+    NSString *prefix = [kMusicNextTip stringByAppendingString:@" — "];
+    return [tip hasPrefix:prefix] && tip.length > prefix.length;
 }
 static BOOL RecoveryTip(NSView *view) {
     if (![view isKindOfClass:NSTextField.class]) return NO;

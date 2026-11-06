@@ -1,6 +1,7 @@
 #import "pure.h"
 #import <math.h>
 #import <limits.h>
+#import <string.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
@@ -3236,6 +3237,69 @@ NSDictionary *StationFromJSON(NSData *json) {
         [picks addObject:@{@"title": title, @"artist": artist, @"reason": reason, @"file": file ?: @""}];
     }
     return @{@"files": files, @"picks": picks, @"tracks": tracks};
+}
+
+static void DeckCopyField(char *dst, size_t cap, id value) {
+    if (!dst || cap == 0) return;
+    dst[0] = '\0';
+    if (![value isKindOfClass:NSString.class]) return;
+    const char *utf = [(NSString *)value UTF8String];
+    if (!utf) return;
+    size_t n = strlen(utf);
+    if (n >= cap) n = cap - 1;
+    if (n) memcpy(dst, utf, n);
+    dst[n] = '\0';
+}
+
+static double DeckJSONNumber(id value) {
+    if (![value isKindOfClass:NSNumber.class]) return NAN;
+    double number = [(NSNumber *)value doubleValue];
+    return isfinite(number) ? number : NAN;
+}
+
+GBDeckNow DeckNowFromJSON(NSData *json) {
+    GBDeckNow out;
+    memset(&out, 0, sizeof(out));
+    out.position = NAN;
+    out.duration = NAN;
+    out.bpm = NAN;
+    if (![json isKindOfClass:NSData.class] || json.length == 0) return out;
+    id obj = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if (![obj isKindOfClass:NSDictionary.class]) return out;
+    out.valid = YES;
+    id okValue = obj[@"ok"];
+    if (okValue) out.ok = [okValue isKindOfClass:NSNumber.class] && [okValue boolValue];
+    else out.ok = YES;
+
+    NSString *state = [obj[@"state"] isKindOfClass:NSString.class] ? [obj[@"state"] lowercaseString] : @"";
+    state = [state stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    DeckCopyField(out.state, sizeof(out.state), state);
+    out.playing = [state isEqual:@"playing"];
+    out.paused = [state isEqual:@"paused"];
+    out.stopped = [state isEqual:@"stopped"];
+
+    NSDictionary *track = [obj[@"track"] isKindOfClass:NSDictionary.class] ? obj[@"track"] : nil;
+    NSDictionary *next = [obj[@"next"] isKindOfClass:NSDictionary.class] ? obj[@"next"] : nil;
+    DeckCopyField(out.title, sizeof(out.title), track[@"title"]);
+    DeckCopyField(out.artist, sizeof(out.artist), track[@"artist"]);
+    DeckCopyField(out.path, sizeof(out.path), track[@"path"]);
+    DeckCopyField(out.nextTitle, sizeof(out.nextTitle), next[@"title"]);
+
+    double position = DeckJSONNumber(obj[@"position_s"]);
+    if (isfinite(position) && position < 0) position = 0;
+    out.position = isfinite(position) ? position : NAN;
+    double left = DeckJSONNumber(obj[@"track_left_s"]);
+    if (isfinite(position) && isfinite(left) && left >= 0) out.duration = position + left;
+    else {
+        double listed = DeckJSONNumber(track[@"duration_s"]);
+        if (!isfinite(listed)) listed = DeckJSONNumber(obj[@"duration_s"]);
+        out.duration = (isfinite(listed) && listed > 0) ? listed : NAN;
+    }
+    double effective = DeckJSONNumber(obj[@"effective_bpm"]);
+    double trackBPM = DeckJSONNumber(track[@"bpm"]);
+    if (isfinite(effective) && effective > 0) out.bpm = effective;
+    else if (isfinite(trackBPM) && trackBPM > 0) out.bpm = trackBPM;
+    return out;
 }
 
 NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot) {

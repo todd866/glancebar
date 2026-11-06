@@ -1,5 +1,7 @@
 // Unit tests for Glancebar's pure functions (Sources/pure.m). Run via ./tests.sh.
 #import <Foundation/Foundation.h>
+#import <math.h>
+#import <string.h>
 #import "pure.h"
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -2683,6 +2685,53 @@ int main(void) {
             NSDictionary *denied = ParseYouTubeStatus(@"", @"Access not allowed (-1723)");
             check(denied[@"volume"] == nil && [denied[@"denied"] isEqual:@"javascript"],
                   @"music: a JavaScript denial has no volume");
+        }
+
+        {
+            NSData *playing = [@"{\"state\":\"playing\",\"index\":13,\"position_s\":12.5,\"track_left_s\":100,"
+                                "\"effective_bpm\":126.4,\"next\":{\"title\":\"Next Song\",\"artist\":\"Someone\","
+                                "\"path\":\"/n.m4a\",\"bpm\":120,\"key\":\"8A\"},\"track\":{\"artist\":\"Tame Impala\","
+                                "\"title\":\"Let It Happen\",\"path\":\"/music/let.m4a\",\"bpm\":117.5,\"key\":\"6A\"}}"
+                               dataUsingEncoding:NSUTF8StringEncoding];
+            GBDeckNow now = DeckNowFromJSON(playing);
+            check(now.valid && now.ok && now.playing && !now.paused && !now.stopped &&
+                  strcmp(now.state, "playing") == 0 &&
+                  strcmp(now.title, "Let It Happen") == 0 &&
+                  strcmp(now.artist, "Tame Impala") == 0 &&
+                  strcmp(now.path, "/music/let.m4a") == 0 &&
+                  strcmp(now.nextTitle, "Next Song") == 0 &&
+                  fabs(now.position - 12.5) < 1e-9 && fabs(now.duration - 112.5) < 1e-9 &&
+                  fabs(now.bpm - 126.4) < 1e-9,
+                  @"deck: now.json gives state, title, artist, path, position, bpm and the next title");
+            NSData *paused = [@"{\"state\":\"Paused\",\"position_s\":3,\"track\":{\"title\":\"Only\","
+                               "\"artist\":\"Nine Inch Nails\",\"path\":\"/t.m4a\",\"bpm\":118},\"next\":null}"
+                              dataUsingEncoding:NSUTF8StringEncoding];
+            GBDeckNow hold = DeckNowFromJSON(paused);
+            check(hold.valid && hold.ok && hold.paused && !hold.playing && hold.nextTitle[0] == '\0' &&
+                  strcmp(hold.title, "Only") == 0 && strcmp(hold.path, "/t.m4a") == 0 &&
+                  fabs(hold.position - 3) < 1e-9 && fabs(hold.bpm - 118) < 1e-9 && isnan(hold.duration),
+                  @"deck: a paused deck uses track bpm; null next has no title; duration stays unknown");
+            NSData *listed = [@"{\"state\":\"playing\",\"position_s\":1,\"track\":{\"title\":\"A\",\"artist\":\"B\","
+                               "\"path\":\"/a.m4a\",\"bpm\":100,\"duration_s\":200}}"
+                              dataUsingEncoding:NSUTF8StringEncoding];
+            GBDeckNow fromList = DeckNowFromJSON(listed);
+            check(fabs(fromList.duration - 200) < 1e-9 && fabs(fromList.bpm - 100) < 1e-9,
+                  @"deck: duration_s is the length when the deck sends no time left");
+            GBDeckNow command = DeckNowFromJSON([@"{\"ok\":true,\"state\":\"paused\"}" dataUsingEncoding:NSUTF8StringEncoding]);
+            GBDeckNow rejected = DeckNowFromJSON([@"{\"ok\":false,\"error\":\"missing set\"}" dataUsingEncoding:NSUTF8StringEncoding]);
+            GBDeckNow stopped = DeckNowFromJSON([@"{\"state\":\"stopped\",\"position_s\":0,\"effective_bpm\":0}"
+                                                 dataUsingEncoding:NSUTF8StringEncoding]);
+            check(command.valid && command.ok && command.paused && command.title[0] == '\0' &&
+                  rejected.valid && !rejected.ok && !rejected.playing && rejected.state[0] == '\0' &&
+                  stopped.valid && stopped.stopped && !stopped.playing && isnan(stopped.bpm) &&
+                  fabs(stopped.position - 0) < 1e-9,
+                  @"deck: a status reply can be only ok and state; a refusal is not ok; 0 bpm is absent");
+            GBDeckNow missing = DeckNowFromJSON(nil);
+            GBDeckNow array = DeckNowFromJSON([@"[]" dataUsingEncoding:NSUTF8StringEncoding]);
+            GBDeckNow junk = DeckNowFromJSON([@"not json" dataUsingEncoding:NSUTF8StringEncoding]);
+            check(!missing.valid && !array.valid && !junk.valid && isnan(missing.position) &&
+                  isnan(missing.bpm) && missing.title[0] == '\0' && !missing.playing,
+                  @"deck: missing or non-object JSON is not a deck state");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

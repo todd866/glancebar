@@ -842,6 +842,29 @@ NSDictionary *StationFromJSON(NSData *json);
 // under the .build directory. nil when neither is there.
 NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot);
 
+// now.json, or a deck status/command reply (the status command returns now.json).
+// Strings are empty when absent. position, duration and bpm are NAN when absent.
+// duration is position_s + track_left_s when both are numbers; otherwise duration_s
+// on the track or the object. bpm prefers effective_bpm when it is above 0, else
+// track.bpm. ok is the reply's ok flag, or YES when that key is absent (now.json).
+// A non-object or unreadable payload leaves valid NO.
+typedef struct {
+    BOOL valid;
+    BOOL ok;
+    BOOL playing;
+    BOOL paused;
+    BOOL stopped;
+    double position;
+    double duration;
+    double bpm;
+    char state[32];
+    char title[512];
+    char artist[512];
+    char path[1024];
+    char nextTitle[512];
+} GBDeckNow;
+GBDeckNow DeckNowFromJSON(NSData *json);
+
 // Fleet row datum when a worker Mac has not answered recently: plain `away` when
 // secondsSinceLastSample is unknown or zero (never this session); `away Nm` under an hour
 // (whole minutes, at least 2m); `away 1.5h` / `away 12h` from an hour to under a day
