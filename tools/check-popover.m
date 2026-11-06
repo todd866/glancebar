@@ -470,6 +470,12 @@ int main(int argc, const char **argv) {
                         @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2,
                         @"dataSource": @""}] forKey:@"audioDevices"];
         [c setValue:@"bose" forKey:@"defaultOutputUID"];
+        // This binary keeps NSUserDefaults under its own name. A failure inside the M2
+        // block used to return before removing remoteMachines, so the next run grew an
+        // extra fleet gauge (popover.remote.<host>.gauge).
+        NSUserDefaults *fixtureDefaults = NSUserDefaults.standardUserDefaults;
+        [fixtureDefaults removeObjectForKey:@"remoteMachines"];
+        [fixtureDefaults removeObjectForKey:@"remoteOpen.m2"];
         [c rebuildContent];
         NSView *root = p.contentViewController.view;
         printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
