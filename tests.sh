@@ -57,6 +57,9 @@ fi
 "$CC" "${TEST_FLAGS[@]}" Sources/volume_step.m Tests/test_volume_step.m -framework Foundation -o "$WORK_DIR/glancebar_volume_step_tests"
 "$WORK_DIR/glancebar_volume_step_tests"
 
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/audio_route_plan.m Tests/test_audio_route.m -framework Foundation -o "$WORK_DIR/glancebar_audio_route_tests"
+"$WORK_DIR/glancebar_audio_route_tests"
+
 # Stateful filesystem/incremental-reader coverage. The harness imports the private app
 # shell so it exercises the production AIReader without publishing a test-only API.
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_ai_reader.m \
