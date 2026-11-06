@@ -5277,7 +5277,9 @@ static void SetRowNameW(CGFloat width) {
     if (width > maxW) width = maxW;
     gRowNameW = width;
 }
-static CGFloat RowGaugeX(void) { return kAINameX + RowNameW() + 6; }
+// At the short name column the gauge stays on kGaugeX. A wider volume name
+// pushes it right by the same amount the column grew.
+static CGFloat RowGaugeX(void) { return kGaugeX + (RowNameW() - kAINameW); }
 static CGFloat RowGaugeW(void) {
     CGFloat width = kValueX - 4 - RowGaugeX();
     return width >= kMinGaugeW ? width : kGaugeW;
