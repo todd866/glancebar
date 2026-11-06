@@ -8,6 +8,7 @@
 #import <IOKit/IOKitLib.h>
 #import <DiskArbitration/DiskArbitration.h>
 #import <IOKit/hidsystem/ev_keymap.h>
+#import "fine_volume.h"
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <notify.h>
@@ -5743,6 +5744,7 @@ static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing off
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
+    dispatch_async(dispatch_get_main_queue(), ^{ GBFineVolumeStart(); });
     [ud registerDefaults:@{@"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,

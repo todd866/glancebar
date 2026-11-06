@@ -55,10 +55,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -isysroot "$SDKROOT" \
     -mmacosx-version-min=13.0 \
     "${ARCH_FLAGS[@]}" \
-    Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/main.m \
+    Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/main.m \
     -framework Cocoa -framework Carbon \
     -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio \
+    -framework CoreAudio -framework AudioToolbox \
     -framework CoreGraphics \
     -framework IOKit \
     -framework DiskArbitration \
