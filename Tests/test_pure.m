@@ -2543,6 +2543,49 @@ int main(void) {
               [RemoteAwayText(86399) isEqual:@"away 23h"], @"remote away: hours");
         check([RemoteAwayText(86400) isEqual:@"away 1d"] && [RemoteAwayText(259200) isEqual:@"away 3d"],
               @"remote away: days");
+        {
+            NSString *same = @"{\"state\":\"ok\",\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                              "\"origin\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"behind\":0,\"detail\":\"current\"}";
+            check(FleetSyncDrift(nil, @"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == nil &&
+                  FleetSyncDrift(@"", @"abc") == nil &&
+                  FleetSyncDrift(@"not json", @"abc") == nil &&
+                  FleetSyncDrift(@"[]", @"abc") == nil &&
+                  FleetSyncDrift(same, @"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == nil &&
+                  FleetSyncDrift(same, @"") == nil &&
+                  FleetSyncDrift(same, @"aaaaaaaa") == nil,
+                  @"fleet: in sync, or no status, shows nothing");
+            NSDictionary *behind = FleetSyncDrift(@"{\"state\":\"ok\",\"installed\":\"aaa\",\"origin\":\"bbb\",\"behind\":3,"
+                                                   "\"detail\":\"3 commits behind origin/main\"}", @"bbb");
+            check([behind[@"word"] isEqual:@"3 behind"] && [behind[@"detail"] isEqual:@"3 commits behind origin/main"],
+                  @"fleet: a behind count is the short word when the run was ok");
+            NSDictionary *one = FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":1,\"installed\":\"aaa\",\"origin\":\"bbb\"}", @"bbb");
+            check([one[@"word"] isEqual:@"1 behind"] && [one[@"detail"] isEqual:@"1 behind"],
+                  @"fleet: one commit, and a missing detail falls back to the word");
+            NSDictionary *release = FleetSyncDrift(@"{\"state\":\"no-release\",\"behind\":3,\"installed\":\"aaa\","
+                                                    "\"origin\":\"bbb\",\"detail\":\"matching signed release unavailable\"}", @"bbb");
+            check([release[@"word"] isEqual:@"no release"] &&
+                  [release[@"detail"] isEqual:@"matching signed release unavailable · 3 behind"],
+                  @"fleet: no release stays the word; the count stays in the detail");
+            NSDictionary *edits = FleetSyncDrift(@"{\"state\":\"local-changes\",\"behind\":0,\"installed\":\"aaa\","
+                                                  "\"origin\":\"aaa\",\"detail\":\"tracked edits\"}", @"aaa");
+            NSDictionary *branch = FleetSyncDrift(@"{\"state\":\"not-main\",\"behind\":-1,\"detail\":\"not on main\"}", @"");
+            NSDictionary *fetch = FleetSyncDrift(@"{\"state\":\"fetch-failed\",\"behind\":-1,\"detail\":\"git fetch failed\"}", @"");
+            NSDictionary *install = FleetSyncDrift(@"{\"state\":\"install-failed\",\"behind\":2,\"detail\":\"install failed\"}", @"");
+            check([edits[@"word"] isEqual:@"local edits"] && [edits[@"detail"] isEqual:@"tracked edits"] &&
+                  [branch[@"word"] isEqual:@"not main"] && [fetch[@"word"] isEqual:@"fetch failed"] &&
+                  [install[@"word"] isEqual:@"install failed"] &&
+                  [install[@"detail"] isEqual:@"install failed · 2 behind"],
+                  @"fleet: a run that is not ok names that state");
+            NSDictionary *differs = FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":0,\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                                                    "\"origin\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+                                                   @"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            check([differs[@"word"] isEqual:@"differs"] && [differs[@"detail"] containsString:@"bbbbbbb"],
+                  @"fleet: same origin count, different commit from this Mac");
+            check(FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":-1,\"installed\":\"abcdefg\",\"origin\":\"abcdefg\"}", @"abcdefg") == nil,
+                  @"fleet: an unknown count still matches when the commits do");
+            check(FleetSyncDrift(@"{\"state\":\"weird\",\"behind\":0,\"installed\":\"abcdefg\",\"origin\":\"abcdefg\"}", @"abcdefg") == nil,
+                  @"fleet: an unknown state with nothing else wrong stays quiet");
+        }
         // Output volume line.
         check([OutputVolumeText(0.554, NO) isEqual:@"55%"] && [OutputVolumeText(1.2, NO) isEqual:@"100%"],
               @"volume: whole percent, capped");

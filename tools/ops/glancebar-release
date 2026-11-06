@@ -1,46 +1,168 @@
 #!/usr/bin/env python3
-"""Build/publish on signing Mac; fetch only source-matching Developer ID releases."""
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, tempfile
-P=pathlib.Path
-INPUTS=('Sources','Tests','Resources','tools','build.sh','tests.sh','Info.plist','Glancebar.entitlements')
-REQUIREMENT='=identifier "com.iantodd.glancebar" and anchor apple generic and certificate leaf[subject.OU] = "U87MQBZKJ5"'
-def run(*args,**kw): return subprocess.run(args,check=True,**kw)
-def digest(root, names):
-    entries={}
-    for name in names:
-        p=root/name
-        for f in sorted(p.rglob('*')) if p.is_dir() else [p]:
-            if f.is_file(): entries[str(f.relative_to(root))]=hashlib.sha256(f.read_bytes()).hexdigest()
-    return hashlib.sha256(json.dumps(entries,sort_keys=True).encode()).hexdigest()
-def verify(app): run('codesign','--verify','--deep','--strict','-R',REQUIREMENT,str(app))
-def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('action',choices=['publish','fetch']); ap.add_argument('repo',type=P); ap.add_argument('output',nargs='?',type=P); a=ap.parse_args()
-    repo=a.repo.resolve(); source=digest(repo,INPUTS)
-    releases=P.home()/'.local/state/glancebar-releases'; releases.mkdir(parents=True,exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.stage-',dir=releases) as tmp:
-        stage=P(tmp)
-        if a.action=='publish':
-            src=stage/'source'; src.mkdir()
-            for name in INPUTS:
-                p=repo/name
-                if p.is_dir(): shutil.copytree(p,src/name)
-                else: shutil.copy2(p,src/name)
-            if digest(src,INPUTS)!=source: raise RuntimeError('Source changed during snapshot')
-            env=os.environ.copy(); env['GLANCEBAR_CODESIGN_IDENTITY']='Developer ID Application: Ian Todd (U87MQBZKJ5)'; env['GLANCEBAR_TIMESTAMP']='1'; env['HEAVY_SLOT_LABEL']='glancebar-release'
-            run(str(P.home()/'.local/bin/heavy-slot'),'--','./build.sh',cwd=src,env=env)
-            app=src/'build/Glancebar.app'; verify(app)
-            release=stage/'release'; release.mkdir(); shutil.copytree(app,release/'Glancebar.app')
-            (release/'manifest.json').write_text(json.dumps({'source':source,'bundle':digest(release,('Glancebar.app',))},indent=2)+'\n')
-            dest=releases/source
-            if not dest.exists(): release.rename(dest)
+"""Publish a Developer ID release on the signing Mac; fetch it on a worker.
+
+The source digest hashes the working-tree bytes of git-tracked files under
+INPUTS, in publish and fetch alike, so an untracked or ignored file cannot
+change it. publish refuses tracked edits, and refuses unless HEAD is
+origin/main (--allow-unpushed overrides only that). The build is
+tools/build-remote.sh from the source snapshot; exit 75 or no reachable
+worker falls back to heavy-slot -- ./build.sh.
+"""
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
+
+P = pathlib.Path
+INPUTS = ('Sources', 'Tests', 'Resources', 'tools', 'build.sh', 'tests.sh',
+          'Info.plist', 'Glancebar.entitlements')
+REQUIREMENT = ('=identifier "com.iantodd.glancebar" and anchor apple generic '
+               'and certificate leaf[subject.OU] = "U87MQBZKJ5"')
+CODESIGN = 'Developer ID Application: Ian Todd (U87MQBZKJ5)'
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def git(repo, *args, check=True):
+    return subprocess.run(['git', '-C', str(repo), *args], check=check,
+                          capture_output=True, text=True)
+
+
+def tracked_paths(repo):
+    out = git(repo, 'ls-files', '-z', '--', *INPUTS)
+    return [p for p in out.stdout.split('\0') if p]
+
+
+def hash_paths(root, paths):
+    entries = {}
+    root = P(root)
+    for rel in paths:
+        f = root / rel
+        data = f.read_bytes() if f.is_file() else b''
+        entries[rel] = hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+
+
+def source_digest(repo):
+    repo = P(repo)
+    return hash_paths(repo, tracked_paths(repo))
+
+
+def bundle_digest(root):
+    """Every file in the app bundle. Same encoding the manifest has always used."""
+    entries = {}
+    root = P(root)
+    app = root / 'Glancebar.app'
+    if app.exists():
+        for f in sorted(app.rglob('*')):
+            if f.is_file():
+                entries[str(f.relative_to(root))] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+
+
+def copy_tracked(repo, src, paths):
+    for rel in paths:
+        src_file = P(repo) / rel
+        if not src_file.is_file():
+            continue
+        dest = P(src) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dest)
+
+
+def require_publishable(repo, allow_unpushed):
+    dirty = git(repo, 'status', '--porcelain', '--untracked-files=no').stdout.strip()
+    if dirty:
+        die('publish refused: tracked files are modified\n' + dirty)
+    head = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    origin = git(repo, 'rev-parse', 'origin/main', check=False)
+    if origin.returncode != 0:
+        die('publish refused: origin/main is not available')
+    om = origin.stdout.strip()
+    if head != om:
+        why = f'publish refused: HEAD {head} != origin/main {om}'
+        if not allow_unpushed:
+            die(why)
+        print(why + '; continuing (--allow-unpushed)', file=sys.stderr)
+
+
+def verify(app):
+    subprocess.run(['codesign', '--verify', '--deep', '--strict', '-R', REQUIREMENT, str(app)],
+                   check=True)
+
+
+def build_snapshot(src, env):
+    remote = P(src) / 'tools' / 'build-remote.sh'
+    if not remote.is_file():
+        die(f'publish failed: missing {remote}')
+    proc = subprocess.run([str(remote)], cwd=src, env=env, capture_output=True, text=True)
+    text = (proc.stdout or '') + (proc.stderr or '')
+    if proc.returncode != 0:
+        unreachable = proc.returncode in (75, 4) or 'no worker reachable' in text
+        if not unreachable:
+            sys.stderr.write(text)
+            die(f'publish failed: build-remote exited {proc.returncode}')
+        print('build-remote unavailable; building locally', file=sys.stderr)
+        heavy = P.home() / '.local' / 'bin' / 'heavy-slot'
+        subprocess.run([str(heavy), '--', './build.sh'], cwd=src, env=env, check=True)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument('action', choices=['publish', 'fetch', 'digest'])
+    ap.add_argument('repo', type=P)
+    ap.add_argument('output', nargs='?', type=P)
+    ap.add_argument('--allow-unpushed', action='store_true')
+    a = ap.parse_args(argv)
+    repo = a.repo.resolve()
+    if a.action == 'digest':
+        print(source_digest(repo))
+        return
+    releases = P.home() / '.local' / 'state' / 'glancebar-releases'
+    releases.mkdir(parents=True, exist_ok=True)
+    if a.action == 'publish':
+        require_publishable(repo, a.allow_unpushed)
+    paths = tracked_paths(repo)
+    source = hash_paths(repo, paths)
+    with tempfile.TemporaryDirectory(prefix='.stage-', dir=releases) as tmp:
+        stage = P(tmp)
+        if a.action == 'publish':
+            src = stage / 'source'
+            src.mkdir()
+            copy_tracked(repo, src, paths)
+            if hash_paths(src, paths) != source:
+                die('Source changed during snapshot')
+            env = os.environ.copy()
+            env['GLANCEBAR_CODESIGN_IDENTITY'] = CODESIGN
+            env['GLANCEBAR_TIMESTAMP'] = '1'
+            env['HEAVY_SLOT_LABEL'] = 'glancebar-release'
+            build_snapshot(src, env)
+            app = src / 'build' / 'Glancebar.app'
+            verify(app)
+            release = stage / 'release'
+            release.mkdir()
+            shutil.copytree(app, release / 'Glancebar.app')
+            (release / 'manifest.json').write_text(
+                json.dumps({'source': source, 'bundle': bundle_digest(release)}, indent=2) + '\n')
+            dest = releases / source
+            if not dest.exists():
+                release.rename(dest)
             print(dest)
         else:
-            if a.output is None: ap.error('fetch requires output app path')
-            run('rsync','-a',f'm5:.local/state/glancebar-releases/{source}/',str(stage)+'/')
-            manifest=json.loads((stage/'manifest.json').read_text())
-            if manifest['source']!=source or manifest['bundle']!=digest(stage,('Glancebar.app',)): raise RuntimeError('Release manifest mismatch')
-            verify(stage/'Glancebar.app')
-            if digest(repo,INPUTS)!=source: raise RuntimeError('Local source changed during fetch')
-            if a.output.exists(): raise RuntimeError('Output must be a fresh staging path')
-            shutil.copytree(stage/'Glancebar.app',a.output)
-if __name__=='__main__': main()
+            if a.output is None:
+                ap.error('fetch requires output app path')
+            store = os.environ.get('GLANCEBAR_RELEASE_STORE', 'm5:.local/state/glancebar-releases')
+            subprocess.run(['rsync', '-a', f'{store}/{source}/', str(stage) + '/'], check=True)
+            manifest = json.loads((stage / 'manifest.json').read_text())
+            if manifest.get('source') != source or manifest.get('bundle') != bundle_digest(stage):
+                die('Release manifest mismatch')
+            verify(stage / 'Glancebar.app')
+            if hash_paths(repo, tracked_paths(repo)) != source:
+                die('Local source changed during fetch')
+            if a.output.exists():
+                die('Output must be a fresh staging path')
+            shutil.copytree(stage / 'Glancebar.app', a.output)
+
+
+if __name__ == '__main__':
+    main()

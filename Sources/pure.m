@@ -3440,3 +3440,55 @@ NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger fr
     return @{@"score": @(score), @"limit": limit};
 }
 
+static NSString *FleetTrim(id value) {
+    if (![value isKindOfClass:NSString.class]) return @"";
+    return [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+static NSString *FleetShortSHA(NSString *sha) {
+    return sha.length > 7 ? [sha substringToIndex:7] : (sha ?: @"");
+}
+
+// A 7-character prefix is the same commit as the full sha `git rev-parse` writes.
+static BOOL FleetSHAEqual(NSString *a, NSString *b) {
+    if (!a.length || !b.length) return NO;
+    if ([a isEqualToString:b]) return YES;
+    return a.length >= 7 && b.length >= 7 && ([a hasPrefix:b] || [b hasPrefix:a]);
+}
+
+static NSString *FleetStateWord(NSString *state) {
+    if ([state isEqual:@"no-release"]) return @"no release";
+    if ([state isEqual:@"local-changes"]) return @"local edits";
+    if ([state isEqual:@"not-main"]) return @"not main";
+    if ([state isEqual:@"fetch-failed"]) return @"fetch failed";
+    if ([state isEqual:@"install-failed"]) return @"install failed";
+    return nil;
+}
+
+NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA) {
+    NSString *text = FleetTrim(statusJSON);
+    if (!text.length) return nil;
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    id obj = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![obj isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *status = obj;
+    NSString *state = FleetTrim(status[@"state"]);
+    NSString *installed = FleetTrim(status[@"installed"]);
+    NSString *detail = FleetTrim(status[@"detail"]);
+    NSString *local = FleetTrim(localSHA);
+    NSInteger behind = -1;
+    if ([status[@"behind"] isKindOfClass:NSNumber.class]) behind = [status[@"behind"] integerValue];
+    NSString *word = state.length && ![state isEqual:@"ok"] ? FleetStateWord(state) : nil;
+    if (!word.length && behind > 0) word = [NSString stringWithFormat:@"%ld behind", (long)behind];
+    if (!word.length && installed.length && local.length && !FleetSHAEqual(installed, local)) word = @"differs";
+    if (!word.length) return nil;
+    if (!detail.length) {
+        if ([word isEqual:@"differs"])
+            detail = [NSString stringWithFormat:@"installed %@ · this Mac %@", FleetShortSHA(installed), FleetShortSHA(local)];
+        else detail = word;
+    }
+    if (behind > 0 && [detail rangeOfString:@"behind"].location == NSNotFound)
+        detail = [NSString stringWithFormat:@"%@ · %ld behind", detail, (long)behind];
+    return @{@"word": word, @"detail": detail};
+}
+

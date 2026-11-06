@@ -909,3 +909,14 @@ NSDictionary *WorkerReadiness(NSDictionary *sample, NSString *mode, NSInteger fr
 // Returns the usable slots; *freeSlots gets the free ones. 0 when the text is empty or alien.
 NSInteger HeavySlotCounts(NSString *status, NSInteger *freeSlots);
 
+// Worker Glancebar sync, from the text of ~/.local/state/glancebar-update/status.json
+// (the fourth segment of the fleet ssh sample). localSHA is this Mac's installed
+// commit, or its checkout HEAD when that file is empty. Nil when the row should
+// look as it does without a status file: missing or unreadable JSON, state "ok"
+// with behind 0, and the same commit as this Mac when both shas are known
+// (a short sha matches a full one). Otherwise @{@"word", @"detail"}: the word is
+// the orange datum ("3 behind", "no release", "local edits", "not main",
+// "fetch failed", "install failed", "differs") and the detail is one tooltip line.
+// A state other than ok wins over the behind count; the count is then kept in the detail.
+NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA);
+

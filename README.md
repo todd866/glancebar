@@ -118,6 +118,10 @@ locally with `./build.sh`. Do not remove quarantine from an app obtained from so
 else unless you have independently verified it. Maintainers can follow
 [`docs/RELEASING.md`](docs/RELEASING.md) to create a signed, notarized candidate.
 
+## Shipping and fleet sync
+
+Ship from the M5 with `tools/ops/glancebar-deploy`. It refuses tracked edits or any branch other than `main`, pushes `origin/main`, then `glancebar-release publish` builds and tests on a worker (`tools/build-remote.sh`) and Developer ID-signs here. The release is keyed by a digest of the git-tracked inputs, so an untracked or ignored file cannot block a match; if no worker is reachable the build falls back to `heavy-slot -- ./build.sh`. Deploy installs that app into `/Applications` (the previous one goes to the Trash) and records the commit. Each Mac runs `tools/ops/glancebar-update` every 15 minutes: it fast-forwards `main`, moves aside only an untracked file that would be overwritten, and installs the matching signed release, leaving a single copy in `/Applications`. The run writes `~/.local/state/glancebar-update/status.json`. On the M5 the worker row keeps its temperature and, when that Mac is behind or not current, adds one orange datum (`3 behind`, `no release`, `local edits`) with the detail in the row help.
+
 Launch at Login can be enabled during first run or from ⋯ › Settings. You can
 also manage it in **System Settings → General → Login Items**.
 

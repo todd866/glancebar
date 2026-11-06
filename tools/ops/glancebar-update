@@ -1,38 +1,243 @@
 #!/bin/bash
 # glancebar-update — keep this Mac's Glancebar on origin/main. Run by the LaunchAgent
-# local.glancebar-update every 15 minutes. Skips a checkout with local changes or off main;
-# fetches source-matching, tested Developer ID releases from M5.
+# local.glancebar-update every 15 minutes. Skips a checkout with tracked edits or off
+# main. Untracked files do not skip; ones that would block the fast-forward are moved
+# aside and the fast-forward is tried once more. Installs the source-matching Developer
+# ID release, and leaves a single copy in /Applications.
 set -uo pipefail
-export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin
-repo="$HOME/Projects/glancebar"; log="$HOME/.local/state/glancebar-update/log"
-mkdir -p "$(dirname "$log")"
-say() { echo "$(date '+%F %T') $*" >> "$log"; }
-cd "$repo" || { say "no checkout"; exit 0; }
-[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { say "skip: not on main"; exit 0; }
-[ -z "$(git status --porcelain)" ] || { say "skip: local changes"; exit 0; }
-git fetch -q origin main || { say "fetch failed"; exit 0; }
-installed="$(cat "$HOME/.local/state/glancebar-update/installed" 2>/dev/null)"
-target="$(git rev-parse origin/main)"
-[ "$installed" = "$target" ] && exit 0
-git merge -q --ff-only origin/main || { say "fast-forward failed"; exit 0; }
-# Signed releases are built and tested on M5 with glancebar-release publish.
-# Match every build/test input, so a stale release cannot regress local fixes.
-stage="$(mktemp -d "$HOME/.local/state/glancebar-update/stage.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
-if ! "$HOME/.local/bin/glancebar-release" fetch "$repo" "$stage/Glancebar.app" > "$HOME/.local/state/glancebar-update/build.log" 2>&1; then
-  say "matching signed release unavailable; keeping current app"; exit 0
+export PATH="${GLANCEBAR_PATH_PREFIX:+$GLANCEBAR_PATH_PREFIX:}/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin"
+
+repo=${GLANCEBAR_REPO:-$HOME/Projects/glancebar}
+state_dir=${GLANCEBAR_STATE_DIR:-$HOME/.local/state/glancebar-update}
+app=${GLANCEBAR_APP:-/Applications/Glancebar.app}
+if [ -n "${GLANCEBAR_RELEASE_BIN:-}" ]; then
+  release_bin=$GLANCEBAR_RELEASE_BIN
+elif [ -x "$repo/tools/ops/glancebar-release" ]; then
+  release_bin=$repo/tools/ops/glancebar-release
+else
+  release_bin=$HOME/.local/bin/glancebar-release
 fi
-app="/Applications/Glancebar.app"
-backup="$HOME/.local/state/glancebar-update/previous-$(date +%Y%m%d-%H%M%S).app"
-pkill -u "$(id -u)" -x Glancebar || true
+
+mkdir -p "$state_dir"
+log=$state_dir/log
+lock=$state_dir/lock
+stage=""
+owned=0
+installed_sha=""
+origin_sha=""
+behind=-1
+run_state=fetch-failed
+detail=""
+
+say() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$log"; }
+
+cleanup() {
+  if [ "$owned" != 1 ]; then return 0; fi
+  if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  rm -rf "$lock"
+}
+trap cleanup EXIT
+
+write_status() {
+  GL_PATH=$state_dir/status.json \
+  GL_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ') \
+  GL_INSTALLED=${installed_sha:-} \
+  GL_ORIGIN=${origin_sha:-} \
+  GL_BEHIND=$behind \
+  GL_STATE=${run_state:-fetch-failed} \
+  GL_DETAIL=${detail:-} \
+  python3 -c '
+import json, os
+doc = {
+    "at": os.environ["GL_AT"],
+    "installed": os.environ.get("GL_INSTALLED", ""),
+    "origin": os.environ.get("GL_ORIGIN", ""),
+    "behind": int(os.environ.get("GL_BEHIND") or -1),
+    "state": os.environ["GL_STATE"],
+    "detail": os.environ.get("GL_DETAIL", ""),
+}
+path = os.environ["GL_PATH"]
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(doc, fh, separators=(", ", ": "))
+    fh.write("\n")
+os.replace(tmp, path)
+'
+}
+
+refresh_refs() {
+  if [ -f "$state_dir/installed" ]; then
+    installed_sha=$(tr -d '[:space:]' < "$state_dir/installed")
+  else
+    installed_sha=""
+  fi
+  origin_sha=$(git rev-parse origin/main 2>/dev/null || true)
+  behind=-1
+  if [ -n "$installed_sha" ] && [ -n "$origin_sha" ] && git cat-file -e "${installed_sha}^{commit}" 2>/dev/null; then
+    if git merge-base --is-ancestor "$installed_sha" "$origin_sha" 2>/dev/null; then
+      count=$(git rev-list --count "${installed_sha}..${origin_sha}" 2>/dev/null) || count=""
+      if [ -n "$count" ]; then behind=$count; fi
+    fi
+  fi
+}
+
+finish() {
+  refresh_refs || true
+  write_status
+  exit "$1"
+}
+
+# mkdir is the lock. A dead owner's pid is stolen once; a live one means another
+# run is in progress and this one must not touch status or the tree.
+if ! mkdir "$lock" 2>/dev/null; then
+  old=$(cat "$lock/pid" 2>/dev/null || true)
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    say "skip: already running"
+    exit 0
+  fi
+  rm -rf "$lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    say "skip: already running"
+    exit 0
+  fi
+fi
+owned=1
+echo $$ > "$lock/pid"
+
+if ! cd "$repo" 2>/dev/null; then
+  run_state=fetch-failed
+  detail="no checkout"
+  say "no checkout"
+  write_status
+  exit 0
+fi
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+if [ "$branch" != main ]; then
+  run_state=not-main
+  detail="not on main"
+  say "skip: not on main"
+  git fetch -q origin main 2>/dev/null || true
+  finish 0
+fi
+
+if ! git fetch -q origin main; then
+  run_state=fetch-failed
+  detail="git fetch failed"
+  say "fetch failed"
+  finish 0
+fi
+
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  run_state=local-changes
+  detail="tracked edits"
+  say "skip: local changes"
+  finish 0
+fi
+
+refresh_refs
+if [ -n "$installed_sha" ] && [ "$installed_sha" = "$origin_sha" ]; then
+  run_state=ok
+  detail="current"
+  finish 0
+fi
+
+move_aside() {
+  err_file=$1
+  dest=$state_dir/untracked-$(date +%Y%m%d-%H%M%S)
+  if [ -e "$dest" ]; then dest=${dest}-$$; fi
+  in_list=0
+  moved=0
+  tab=$(printf '\t')
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *"untracked working tree files would be overwritten"*) in_list=1; continue ;;
+      "Please "*|Aborting*) in_list=0; continue ;;
+    esac
+    if [ "$in_list" != 1 ]; then continue; fi
+    case "$line" in
+      "$tab"*) rel=${line#"$tab"} ;;
+      *) continue ;;
+    esac
+    case "$rel" in
+      ""|/*|*..*) say "refusing to move $rel"; return 1 ;;
+    esac
+    if [ ! -e "$rel" ] && [ ! -L "$rel" ]; then continue; fi
+    mkdir -p "$dest/$(dirname -- "$rel")"
+    mv -- "$rel" "$dest/$rel" || return 1
+    say "moved aside $rel"
+    moved=1
+  done < "$err_file"
+  [ "$moved" = 1 ]
+}
+
+ff_err=$state_dir/ff.err
+if ! git merge -q --ff-only origin/main >"$ff_err" 2>&1; then
+  if ! move_aside "$ff_err"; then
+    run_state=fetch-failed
+    detail="fast-forward failed"
+    say "fast-forward failed"
+    finish 0
+  fi
+  if ! git merge -q --ff-only origin/main >"$ff_err" 2>&1; then
+    run_state=fetch-failed
+    detail="fast-forward failed"
+    say "fast-forward failed after moving untracked files"
+    finish 0
+  fi
+fi
+refresh_refs
+
+stage=$(mktemp -d "$state_dir/stage.XXXXXX")
+if ! "$release_bin" fetch "$repo" "$stage/Glancebar.app" >"$state_dir/build.log" 2>&1; then
+  run_state=no-release
+  detail="matching signed release unavailable"
+  say "matching signed release unavailable; keeping current app"
+  finish 0
+fi
+
+home_app=$HOME/Applications/Glancebar.app
+if [ -d "$home_app" ] && [ "$home_app" != "$app" ]; then
+  if [ "$app" = "/Applications/Glancebar.app" ] && /usr/bin/trash "$home_app"; then
+    say "trashed ~/Applications/Glancebar.app"
+  else
+    home_backup=$state_dir/previous-home-$(date +%Y%m%d-%H%M%S).app
+    if ! mv "$home_app" "$home_backup"; then
+      run_state=install-failed
+      detail="could not move ~/Applications/Glancebar.app"
+      say "$detail"
+      finish 1
+    fi
+    say "moved ~/Applications/Glancebar.app aside"
+  fi
+fi
+
+if [ "$app" = "/Applications/Glancebar.app" ]; then
+  pkill -u "$(id -u)" -x Glancebar || true
+fi
+backup=$state_dir/previous-$(date +%Y%m%d-%H%M%S).app
 if [ -d "$app" ]; then
-  mv "$app" "$backup" || { say "backup failed; leaving existing app"; exit 1; }
+  if ! mv "$app" "$backup"; then
+    run_state=install-failed
+    detail="backup failed"
+    say "backup failed; leaving existing app"
+    finish 1
+  fi
 fi
+mkdir -p "$(dirname -- "$app")"
 if ! mv "$stage/Glancebar.app" "$app"; then
-  [ ! -d "$backup" ] || mv "$backup" "$app"
-  open -g "$app"
-  say "install failed; restored previous app"; exit 1
+  if [ -d "$backup" ]; then mv "$backup" "$app" || true; fi
+  if [ "$app" = "/Applications/Glancebar.app" ] && [ -d "$app" ]; then open -g "$app" || true; fi
+  run_state=install-failed
+  detail="install failed; restored previous app"
+  say "$detail"
+  finish 1
 fi
-open -g "$app"
-echo "$target" > "$HOME/.local/state/glancebar-update/installed"
-say "installed $(git log --oneline -1)"
+if [ "$app" = "/Applications/Glancebar.app" ]; then
+  open -g "$app" || true
+fi
+printf '%s\n' "$origin_sha" > "$state_dir/installed"
+run_state=ok
+detail="installed $(git log --oneline -1 2>/dev/null || echo "$origin_sha")"
+say "$detail"
+finish 0

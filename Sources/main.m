@@ -8546,11 +8546,56 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     for (id m in list) if ([m isKindOfClass:NSDictionary.class] && [m[@"host"] length]) [out addObject:m];
     return out;
 }
-// One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots.
-// At most every 25 s, and only while the popover is open.
+// This Mac's installed Glancebar commit, else the checkout HEAD. Empty when neither is known.
+static NSString *FleetLocalSHA(void) {
+    NSString *home = NSHomeDirectory();
+    NSString *path = [home stringByAppendingPathComponent:@".local/state/glancebar-update/installed"];
+    NSString *sha = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (sha.length) return sha;
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/git"];
+    task.arguments = @[@"-C", [home stringByAppendingPathComponent:@"Projects/glancebar"], @"rev-parse", @"HEAD"];
+    NSPipe *out = [NSPipe pipe];
+    task.standardOutput = out;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    if (![task launchAndReturnError:NULL]) return @"";
+    NSData *data = [out.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) return @"";
+    return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+}
+// Orange fleet word, after the chip temperature when the datum has one, otherwise in front of the limit.
+static void AppendFleetWord(NSTextField *datum, NSString *word) {
+    if (!word.length || !datum) return;
+    NSMutableAttributedString *base = [datum.attributedStringValue mutableCopy] ?: [NSMutableAttributedString new];
+    NSString *plain = base.string ?: @"";
+    NSDictionary *gap = @{NSFontAttributeName: datum.font};
+    NSDictionary *orange = @{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: NSColor.systemOrangeColor};
+    if ([plain isEqual:@"ready"]) {
+        datum.attributedStringValue = [[NSAttributedString alloc] initWithString:word attributes:orange];
+        datum.allowsDefaultTighteningForTruncation = YES;
+        return;
+    }
+    NSRange deg = [plain rangeOfString:@"°"];
+    NSUInteger insertAt = deg.location == NSNotFound ? 0 : NSMaxRange(deg);
+    NSMutableAttributedString *piece = [NSMutableAttributedString new];
+    if (insertAt > 0)
+        [piece appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:gap]];
+    [piece appendAttributedString:[[NSAttributedString alloc] initWithString:word attributes:orange]];
+    if (insertAt == 0 && plain.length)
+        [piece appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:gap]];
+    [base insertAttributedString:piece atIndex:insertAt];
+    datum.allowsDefaultTighteningForTruncation = YES;
+    datum.attributedStringValue = base;
+}
+// One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots,
+// and the fleet-sync status file. At most every 25 s, and only while the popover is open.
 - (void)pollRemoteMachinesIfDue {
     if (!_popover.isShown || !_musicProbesEnabled || CFAbsoluteTimeGetCurrent() - _remotePolledAt < 25) return;
     _remotePolledAt = CFAbsoluteTimeGetCurrent();
+    NSString *localSHA = FleetLocalSHA();
     for (NSDictionary *m in [self remoteMachines]) {
         NSString *host = m[@"host"];
         if ([_remoteInFlight containsObject:host]) continue;
@@ -8560,7 +8605,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ssh"];
             task.arguments = @[@"-o", @"BatchMode=yes", @"-o", @"ConnectTimeout=5", host,
                 (@"G=/Applications/Glancebar.app/Contents/MacOS/Glancebar; [ -x \"$G\" ] || G=\"$HOME/Applications/Glancebar.app/Contents/MacOS/Glancebar\"; "
-                  "\"$G\" --sample; echo @@; cat ~/.local/state/heavy-slot/mode 2>/dev/null; echo @@; ~/.local/bin/heavy-slot status 2>/dev/null")];
+                  "\"$G\" --sample; echo @@; cat ~/.local/state/heavy-slot/mode 2>/dev/null; echo @@; ~/.local/bin/heavy-slot status 2>/dev/null; "
+                  "echo @@; cat ~/.local/state/glancebar-update/status.json 2>/dev/null")];
             NSPipe *out = [NSPipe pipe];
             task.standardOutput = out;
             task.standardError = [NSFileHandle fileHandleWithNullDevice];
@@ -8577,7 +8623,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
                 if ([sample isKindOfClass:NSDictionary.class]) {
                     NSString *mode = parts.count > 1 ? [parts[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
                     NSInteger free = 0, slots = parts.count > 2 ? HeavySlotCounts(parts[2], &free) : 0;
-                    reading = @{@"sample": sample, @"mode": mode ?: @"", @"free": @(free), @"slots": @(slots), @"at": @(CFAbsoluteTimeGetCurrent())};
+                    NSString *glance = parts.count > 3 ? [parts[3] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+                    reading = @{@"sample": sample, @"mode": mode ?: @"", @"free": @(free), @"slots": @(slots),
+                                @"at": @(CFAbsoluteTimeGetCurrent()), @"glancebar": glance ?: @"", @"localSHA": localSHA ?: @""};
                 }
             }
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -8627,9 +8675,14 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         double score = [ready[@"score"] doubleValue];
         NSColor *color = ready ? ReadinessColor(score) : NSColor.tertiaryLabelColor;
         BOOL open = _fleetExpandedHosts ? [_fleetExpandedHosts containsObject:host] : [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
+        NSString *glance = fresh && [reading[@"glancebar"] isKindOfClass:NSString.class] ? reading[@"glancebar"] : nil;
+        NSDictionary *drift = glance.length ? FleetSyncDrift(glance, [reading[@"localSHA"] isKindOfClass:NSString.class] ? reading[@"localSHA"] : @"") : nil;
+        NSString *driftWord = [drift[@"word"] isKindOfClass:NSString.class] ? drift[@"word"] : nil;
+        NSString *driftDetail = [drift[@"detail"] isKindOfClass:NSString.class] ? drift[@"detail"] : nil;
         NSString *tip = ready ? [NSString stringWithFormat:@"%@ · %@ ready · limited by %@ · click for details", name,
                                  [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)], ready[@"limit"]]
                               : [NSString stringWithFormat:@"%@ · %@ · not reachable over ssh (%@)", name, awayText, host];
+        if (driftDetail.length) tip = [tip stringByAppendingFormat:@" · %@", driftDetail];
         ClickRow *row = [[ClickRow alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
         row.target = self;
         row.action = @selector(toggleRemoteMachine:);
@@ -8637,6 +8690,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         row.accessibilityIdentifier = [@"popover.row.remote." stringByAppendingString:host];
         row.accessibilityLabel = tip;
         row.accessibilityHelp = tip;
+        if (driftDetail.length) row.toolTip = tip;
         [self instrumentSymbol:@"laptopcomputer" tint:color identifier:[stem stringByAppendingString:@".symbol"] in:row];
         NSTextField *nameField = [self instrumentName:name identifier:[stem stringByAppendingString:@".name"] in:row];
         CGFloat nameW = ceil([name sizeWithAttributes:@{NSFontAttributeName: nameField.font}].width);
@@ -8669,6 +8723,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
                     attributes:@{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: color}]];
             if (text) datum.attributedStringValue = text;
         }
+        if (driftWord.length) AppendFleetWord(datum, driftWord);
         [root addSubview:row];
         y += kRowH;
         if (!open || !fresh) continue;

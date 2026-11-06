@@ -1,0 +1,81 @@
+#!/bin/bash
+# glancebar-deploy — ship Glancebar from the M5. Refuse a dirty tree or any
+# branch but main, push origin/main, publish a signed release, install it to
+# /Applications (the previous app goes to the Trash), and record the commit.
+# One line per step.
+set -euo pipefail
+export PATH="${GLANCEBAR_PATH_PREFIX:+$GLANCEBAR_PATH_PREFIX:}/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin"
+
+chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+if [ "$chip" != "Apple M5" ]; then
+  echo "refuse: not the M5 (${chip:-unknown})"
+  exit 1
+fi
+
+repo=${1:-${GLANCEBAR_REPO:-$HOME/Projects/glancebar}}
+cd "$repo"
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$branch" != main ]; then
+  echo "refuse: not on main ($branch)"
+  exit 1
+fi
+dirty=$(git status --porcelain --untracked-files=no)
+if [ -n "$dirty" ]; then
+  echo "refuse: tracked files are modified"
+  exit 1
+fi
+
+if ! git push origin main >/dev/null 2>&1; then
+  echo "push failed"
+  exit 1
+fi
+echo "push origin main"
+
+if [ -n "${GLANCEBAR_RELEASE_BIN:-}" ]; then
+  release_bin=$GLANCEBAR_RELEASE_BIN
+else
+  release_bin=$repo/tools/ops/glancebar-release
+fi
+err=$(mktemp)
+if ! dest=$("$release_bin" publish "$repo" 2>"$err"); then
+  echo "publish failed: $(head -n 1 "$err")"
+  rm -f "$err"
+  exit 1
+fi
+rm -f "$err"
+echo "publish $dest"
+
+app=${GLANCEBAR_APP:-/Applications/Glancebar.app}
+stage=$(mktemp -d)
+if ! ditto "$dest/Glancebar.app" "$stage/Glancebar.app"; then
+  echo "install failed"
+  rm -rf "$stage"
+  exit 1
+fi
+if [ "$app" = "/Applications/Glancebar.app" ]; then
+  pkill -u "$(id -u)" -x Glancebar || true
+fi
+if [ -d "$app" ]; then
+  if ! /usr/bin/trash "$app"; then
+    echo "install failed: could not trash existing app"
+    rm -rf "$stage"
+    exit 1
+  fi
+fi
+mkdir -p "$(dirname -- "$app")"
+if ! mv "$stage/Glancebar.app" "$app"; then
+  echo "install failed"
+  rm -rf "$stage"
+  exit 1
+fi
+rmdir "$stage" 2>/dev/null || rm -rf "$stage"
+echo "install $app"
+if [ "$app" = "/Applications/Glancebar.app" ]; then
+  open -g "$app"
+fi
+echo "relaunch"
+sha=$(git rev-parse HEAD)
+state_dir=${GLANCEBAR_STATE_DIR:-$HOME/.local/state/glancebar-update}
+mkdir -p "$state_dir"
+printf '%s\n' "$sha" > "$state_dir/installed"
+echo "installed $sha"
