@@ -2802,6 +2802,189 @@ int main(void) {
             check(!missing.valid && !array.valid && !junk.valid && isnan(missing.position) &&
                   isnan(missing.bpm) && missing.title[0] == '\0' && !missing.playing,
                   @"deck: missing or non-object JSON is not a deck state");
+            check(!now.pending.present && !now.blend.present && !now.immediate &&
+                  isnan(now.pending.startsInS) && isnan(now.blend.progress) && now.error[0] == '\0',
+                  @"deck: a payload without pending_skip or blend leaves both absent");
+            NSData *pending = [@"{\"ok\":true,\"state\":\"playing\",\"position_s\":40,\"track_left_s\":80,"
+                                "\"pending_skip\":{\"mode\":\"smooth\",\"starts_in_s\":12.4,\"bars\":8,"
+                                "\"requested_at\":\"2026-11-06T08:00:00Z\"},\"blend\":null}"
+                               dataUsingEncoding:NSUTF8StringEncoding];
+            GBDeckNow wait = DeckNowFromJSON(pending);
+            check(wait.valid && wait.ok && wait.pending.present && !wait.blend.present && !wait.immediate &&
+                  strcmp(wait.pending.mode, "smooth") == 0 &&
+                  strcmp(wait.pending.requestedAt, "2026-11-06T08:00:00Z") == 0 &&
+                  fabs(wait.pending.startsInS - 12.4) < 1e-9 && fabs(wait.pending.bars - 8) < 1e-9 &&
+                  isnan(wait.blend.progress),
+                  @"deck: pending_skip carries mode, starts_in_s, bars and requested_at; null blend is absent");
+            NSData *mixing = [@"{\"state\":\"playing\",\"position_s\":10,"
+                               "\"blend\":{\"progress\":0.45,\"elapsed_s\":2.7,\"length_s\":6,\"type\":\"eq-power\","
+                               "\"manual\":false,\"incoming\":{\"artist\":\"Someone\",\"title\":\"Next Song\","
+                               "\"path\":\"/n.m4a\",\"bpm\":120,\"key\":\"8A\"}}}"
+                              dataUsingEncoding:NSUTF8StringEncoding];
+            GBDeckNow mix = DeckNowFromJSON(mixing);
+            check(mix.blend.present && mix.blend.manualKnown && !mix.blend.manual &&
+                  fabs(mix.blend.progress - 0.45) < 1e-9 && fabs(mix.blend.elapsedS - 2.7) < 1e-9 &&
+                  fabs(mix.blend.lengthS - 6) < 1e-9 && fabs(mix.blend.bpm - 120) < 1e-9 &&
+                  strcmp(mix.blend.type, "eq-power") == 0 && strcmp(mix.blend.title, "Next Song") == 0 &&
+                  strcmp(mix.blend.artist, "Someone") == 0 && strcmp(mix.blend.path, "/n.m4a") == 0 &&
+                  strcmp(mix.blend.key, "8A") == 0 && !mix.pending.present,
+                  @"deck: blend carries progress, length, incoming track and manual false");
+            GBDeckNow soon = DeckNowFromJSON([@"{\"ok\":true,\"immediate\":true,"
+                                               "\"pending_skip\":{\"mode\":\"soon\",\"starts_in_s\":-3,\"bars\":1},"
+                                               "\"blend\":{\"progress\":1.4,\"manual\":true,\"incoming\":{\"title\":\"Now\"}}}"
+                                              dataUsingEncoding:NSUTF8StringEncoding]);
+            check(soon.immediate && soon.pending.present && strcmp(soon.pending.mode, "soon") == 0 &&
+                  soon.pending.startsInS == 0 && soon.blend.present && soon.blend.manualKnown && soon.blend.manual &&
+                  soon.blend.progress == 1 && strcmp(soon.blend.title, "Now") == 0 &&
+                  !soon.blend.artist[0],
+                  @"deck: negative starts_in_s clamps to 0 and progress clamps into 0..1");
+            GBDeckNow bare = DeckNowFromJSON([@"{\"ok\":true,\"state\":\"playing\"}" dataUsingEncoding:NSUTF8StringEncoding]);
+            GBDeckNow refused = DeckNowFromJSON([@"{\"ok\":false,\"error\":\"missing set\"}" dataUsingEncoding:NSUTF8StringEncoding]);
+            check(!bare.pending.present && !bare.blend.present && !bare.immediate && bare.error[0] == '\0' &&
+                  refused.valid && !refused.ok && strcmp(refused.error, "missing set") == 0,
+                  @"deck: an older ok reply has no mix fields; a refusal keeps its error");
+            GBDeckNow blank = DeckNowBlank();
+            check(!blank.valid && isnan(blank.position) && isnan(blank.pending.startsInS) &&
+                  isnan(blank.blend.progress) && isnan(blank.blend.lengthS),
+                  @"deck: a blank snapshot is not a deck state and has no mix times");
+        }
+        check(kDeckSkipReplyTimeoutSec == 2 && fabs(kDeckSkipFlashSec - 0.15) < 1e-12 &&
+              fabs(kDeckMixPollSec - 0.25) < 1e-12 && kDeckPollSec == 1,
+              @"deck mix: the reply wait is 2s, the cut flash is 150ms, the polls are 4 Hz and 1 Hz");
+        check([DeckMixCountdownText(12) isEqual:@"mix 0:12"] && [DeckMixCountdownText(12.9) isEqual:@"mix 0:12"] &&
+              [DeckMixCountdownText(0) isEqual:@"mix 0:00"] && [DeckMixCountdownText(75) isEqual:@"mix 1:15"] &&
+              [DeckMixCountdownText(3600 + 125) isEqual:@"mix 1:02:05"],
+              @"deck mix: the countdown reads mix m:ss, floored, and gains hours at an hour");
+        check(DeckMixCountdownText(-0.1) == nil && DeckMixCountdownText(NAN) == nil,
+              @"deck mix: a negative or unknown countdown is not a label");
+        check([DeckMixProgressText(0.45) isEqual:@"mix 45%"] && [DeckMixProgressText(0) isEqual:@"mix 0%"] &&
+              [DeckMixProgressText(0.456) isEqual:@"mix 46%"] && [DeckMixProgressText(0.995) isEqual:@"mix 99%"],
+              @"deck mix: blend progress is a whole percent and stays under 100 while the blend is open");
+        check(DeckMixProgressText(1) == nil && DeckMixProgressText(1.2) == nil &&
+              DeckMixProgressText(-0.01) == nil && DeckMixProgressText(NAN) == nil,
+              @"deck mix: a finished or unknown blend has no percent label");
+        check(fabs(DeckMixTickFraction(40, 12, 120) - 52.0 / 120.0) < 1e-12,
+              @"deck mix: the tick sits at position plus starts_in_s");
+        check(DeckMixTickFraction(100, 50, 120) == 1 && DeckMixTickFraction(-5, -2, 120) == 0,
+              @"deck mix: the tick clamps into the track");
+        check(isnan(DeckMixTickFraction(1, 1, 0)) && isnan(DeckMixTickFraction(1, NAN, 10)) &&
+              isnan(DeckMixTickFraction(NAN, 1, 10)),
+              @"deck mix: no tick without a duration and two finite times");
+        check(fabs(DeckMixCountdownRemaining(12, 1000, 1001.4) - 10.6) < 1e-12 &&
+              DeckMixCountdownRemaining(12, 1000, 1020) == 0 &&
+              DeckMixCountdownRemaining(12, 0, 5000) == 12 &&
+              isnan(DeckMixCountdownRemaining(NAN, 1000, 1001)),
+              @"deck mix: the countdown ticks locally from the sample and sticks at zero");
+        check(fabs(DeckMixShownProgress(0.45, 6, 1000, 1001.5) - (0.45 + 1.5 / 6)) < 1e-12 &&
+              DeckMixShownProgress(0.45, 6, 0, 1001.5) == 0.45 &&
+              DeckMixShownProgress(0.9, 1, 1000, 1005) == 0.999 &&
+              DeckMixShownProgress(1, 6, 1000, 1001) == 1 &&
+              isnan(DeckMixShownProgress(NAN, 6, 1000, 1001)),
+              @"deck mix: blend progress advances locally and stops just short of the end");
+        check(DeckNowPollInterval(YES, DeckMixPending) == kDeckMixPollSec &&
+              DeckNowPollInterval(YES, DeckMixBlending) == kDeckMixPollSec &&
+              DeckNowPollInterval(NO, DeckMixPending) == kDeckPollSec &&
+              DeckNowPollInterval(YES, DeckMixArmed) == kDeckPollSec &&
+              DeckNowPollInterval(YES, DeckMixIdle) == kDeckPollSec,
+              @"deck mix: now.json is polled at 4 Hz only while the popover shows a pending skip or a blend");
+        check([DeckSkipFailureTip(nil) isEqual:@"Skip failed"] &&
+              [DeckSkipFailureTip(@"  missing set  ") isEqual:@"Skip failed — missing set"] &&
+              [DeckSkipFailureTip(@"") isEqual:@"Skip failed"],
+              @"deck mix: a failed skip names itself, and the reply's error when it sent one");
+        {
+            NSString *longError = [@"" stringByPaddingToLength:90 withString:@"x" startingAtIndex:0];
+            NSString *prefix = @"Skip failed — ";
+            NSString *tip = DeckSkipFailureTip(longError);
+            check([tip hasPrefix:prefix] && tip.length == prefix.length + 80,
+                  @"deck mix: a long skip error is cut to 80 characters");
+            DeckMixVisual idle = {0};
+            GBDeckNow none = DeckNowBlank();
+            DeckMixVisual armed = DeckMixVisualStep(idle, DeckMixEventBlend, 1000, none, 2);
+            check(armed.phase == DeckMixArmed && armed.requested && !armed.failed && !armed.replySeen &&
+                  armed.since == 1000 && armed.flashUntil == 0,
+                  @"deck mix: a blend arms the light and remembers that this Mac asked");
+            check(DeckMixVisualStep(armed, DeckMixEventClock, 1001.9, none, 2).phase == DeckMixArmed &&
+                  !DeckMixVisualStep(armed, DeckMixEventClock, 1001.9, none, 2).failed,
+                  @"deck mix: the light stays through the reply wait");
+            DeckMixVisual timed = DeckMixVisualStep(armed, DeckMixEventClock, 1002, none, 2);
+            check(timed.phase == DeckMixIdle && timed.failed && !timed.requested,
+                  @"deck mix: no reply in 2s clears the light and records the failure");
+            check(DeckMixVisualStep(armed, DeckMixEventClock, NAN, none, 2).phase == DeckMixArmed,
+                  @"deck mix: a non-finite clock does not drop the arm");
+            GBDeckNow bad = DeckNowBlank();
+            bad.valid = YES;
+            DeckMixVisual refusedMix = DeckMixVisualStep(armed, DeckMixEventReply, 1000.4, bad, 2);
+            check(refusedMix.phase == DeckMixIdle && refusedMix.failed,
+                  @"deck mix: ok:false clears the light and records the failure");
+            GBDeckNow silent = DeckNowBlank();
+            check(DeckMixVisualStep(armed, DeckMixEventReply, 1000.4, silent, 2).failed,
+                  @"deck mix: an empty reply is a failure");
+            GBDeckNow held = DeckNowBlank();
+            held.valid = YES; held.ok = YES; held.pending.present = YES; held.pending.startsInS = 12;
+            DeckMixVisual waiting = DeckMixVisualStep(armed, DeckMixEventReply, 1001, held, 2);
+            check(waiting.phase == DeckMixPending && waiting.requested && waiting.replySeen && !waiting.failed,
+                  @"deck mix: a pending_skip reply moves armed to pending");
+            check(DeckMixVisualStep(waiting, DeckMixEventClock, 1010, none, 2).phase == DeckMixPending,
+                  @"deck mix: once the deck has answered, the 2s timeout does not cancel the mix");
+            GBDeckNow old = DeckNowBlank();
+            old.valid = YES; old.ok = YES;
+            DeckMixVisual acked = DeckMixVisualStep(armed, DeckMixEventReply, 1000.2, old, 2);
+            check(acked.phase == DeckMixIdle && !acked.failed,
+                  @"deck mix: an older deck's bare ok ends the arm without calling it a failure");
+            GBDeckNow nowBlend = DeckNowBlank();
+            nowBlend.valid = YES; nowBlend.ok = YES; nowBlend.immediate = YES;
+            nowBlend.blend.present = YES; nowBlend.blend.progress = 0.2; nowBlend.blend.manualKnown = YES; nowBlend.blend.manual = YES;
+            check(DeckMixVisualStep(armed, DeckMixEventReply, 1000.2, nowBlend, 2).phase == DeckMixBlending,
+                  @"deck mix: a reply that already carries a blend is blending");
+            GBDeckNow instant = DeckNowBlank();
+            instant.valid = YES; instant.ok = YES; instant.immediate = YES;
+            DeckMixVisual instantAck = DeckMixVisualStep(armed, DeckMixEventReply, 1000.2, instant, 2);
+            check(instantAck.phase == DeckMixIdle && !instantAck.failed,
+                  @"deck mix: immediate with no blend ends the arm; the file may still show one");
+            GBDeckNow running = DeckNowBlank();
+            running.blend.present = YES; running.blend.progress = 0.45; running.blend.manualKnown = YES;
+            DeckMixVisual blending = DeckMixVisualStep(waiting, DeckMixEventSnapshot, 1002, running, 2);
+            check(blending.phase == DeckMixBlending && blending.requested,
+                  @"deck mix: a blend snapshot moves pending to blending and keeps the request");
+            GBDeckNow done = DeckNowBlank();
+            done.blend.present = YES; done.blend.progress = 1;
+            check(DeckMixVisualStep(blending, DeckMixEventSnapshot, 1008, done, 2).phase == DeckMixIdle &&
+                  DeckMixVisualStep(blending, DeckMixEventSnapshot, 1008, none, 2).phase == DeckMixIdle,
+                  @"deck mix: progress 1 or a cleared blend returns to idle");
+            check(DeckMixVisualStep(armed, DeckMixEventSnapshot, 1000.5, none, 2).phase == DeckMixArmed,
+                  @"deck mix: a stale snapshot does not cancel an arm the deck has not answered");
+            check(DeckMixVisualStep(armed, DeckMixEventSnapshot, 1000.5, held, 2).phase == DeckMixPending,
+                  @"deck mix: a snapshot that already has pending_skip leaves the arm for pending");
+            GBDeckNow autoBlend = DeckNowBlank();
+            autoBlend.blend.present = YES; autoBlend.blend.progress = 0.1; autoBlend.blend.manualKnown = YES;
+            DeckMixVisual automatic = DeckMixVisualStep(idle, DeckMixEventSnapshot, 50, autoBlend, 2);
+            check(automatic.phase == DeckMixBlending && !automatic.requested,
+                  @"deck mix: a blend Glancebar did not ask for still shows, without the request flag");
+            DeckMixVisual cut = DeckMixVisualStep(idle, DeckMixEventCut, 50, none, 2);
+            check(cut.phase == DeckMixIdle && !cut.failed &&
+                  fabs(cut.flashUntil - (50 + kDeckSkipFlashSec)) < 1e-12 &&
+                  DeckMixFlashActive(cut, 50.149) && !DeckMixFlashActive(cut, 50.15),
+                  @"deck mix: a cut flashes for 150ms and does not arm");
+            DeckMixVisual cutArm = DeckMixVisualStep(armed, DeckMixEventCut, 1000.1, none, 2);
+            check(cutArm.phase == DeckMixIdle && !cutArm.failed && cutArm.flashUntil > 1000.1,
+                  @"deck mix: a cut while armed drops the arm and flashes");
+            DeckMixVisual cutBlend = DeckMixVisualStep(blending, DeckMixEventCut, 1003, none, 2);
+            check(cutBlend.phase == DeckMixBlending && cutBlend.flashUntil > 1003,
+                  @"deck mix: a cut during a blend flashes and leaves the blend to the deck");
+            check(DeckMixTintFor(armed, NO, NO, NO) == DeckMixTintAccent &&
+                  DeckMixTintFor(waiting, NO, NO, NO) == DeckMixTintAccent &&
+                  DeckMixTintFor(blending, YES, YES, YES) == DeckMixTintAccent &&
+                  DeckMixTintFor(automatic, YES, YES, NO) == DeckMixTintSecondary &&
+                  DeckMixTintFor(timed, NO, NO, NO) == DeckMixTintOff,
+                  @"deck mix: our mix is accent, an automatic blend is secondary, idle is off");
+            DeckMixVisual foreign = waiting; foreign.requested = NO;
+            check(DeckMixTintFor(foreign, NO, NO, NO) == DeckMixTintSecondary,
+                  @"deck mix: a pending skip this Mac did not ask for is secondary");
+            check(DeckMixShownTint(armed, 1000.2, NO, NO, NO) == DeckMixTintAccent &&
+                  DeckMixShownTint(cut, 50.05, NO, NO, NO) == DeckMixTintAccent &&
+                  DeckMixShownTint(cutBlend, 1003.05, YES, YES, YES) == DeckMixTintOff &&
+                  DeckMixShownTint(automatic, 50, YES, YES, NO) == DeckMixTintSecondary,
+                  @"deck mix: the flash paints accent, and dips off when the button is already accent");
         }
 
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",

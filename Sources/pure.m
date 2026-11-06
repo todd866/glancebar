@@ -3290,12 +3290,200 @@ static double DeckJSONNumber(id value) {
     return isfinite(number) ? number : NAN;
 }
 
-GBDeckNow DeckNowFromJSON(NSData *json) {
+static GBDeckNow DeckNowEmpty(void) {
     GBDeckNow out;
     memset(&out, 0, sizeof(out));
     out.position = NAN;
     out.duration = NAN;
     out.bpm = NAN;
+    out.pending.startsInS = NAN;
+    out.pending.bars = NAN;
+    out.blend.progress = NAN;
+    out.blend.elapsedS = NAN;
+    out.blend.lengthS = NAN;
+    out.blend.bpm = NAN;
+    return out;
+}
+
+GBDeckNow DeckNowBlank(void) {
+    return DeckNowEmpty();
+}
+
+static BOOL DeckBlendOpen(GBDeckBlend blend) {
+    if (!blend.present) return NO;
+    if (!isfinite(blend.progress)) return YES;
+    return blend.progress < 1.0;
+}
+
+static double DeckMixTimeout(double timeoutSec) {
+    if (!isfinite(timeoutSec) || timeoutSec < 0) return kDeckSkipReplyTimeoutSec;
+    return timeoutSec;
+}
+
+static DeckMixVisual DeckMixClear(double flashUntil, BOOL failed) {
+    DeckMixVisual visual = {0};
+    visual.flashUntil = flashUntil;
+    visual.failed = failed;
+    return visual;
+}
+
+static BOOL DeckMixTimedOut(DeckMixVisual visual, double now, double timeoutSec) {
+    if (visual.phase != DeckMixArmed || visual.replySeen || !(visual.since > 0)) return NO;
+    return now - visual.since >= DeckMixTimeout(timeoutSec);
+}
+
+// A running blend wins over a pending skip. Neither one, on a reply, ends the
+// arm; on a snapshot it ends a mix that was already pending or blending.
+static DeckMixVisual DeckMixApplySnapshot(DeckMixVisual visual, DeckMixEvent event,
+                                          double now, GBDeckNow snapshot, double timeoutSec) {
+    if (DeckBlendOpen(snapshot.blend)) {
+        visual.phase = DeckMixBlending;
+        visual.failed = NO;
+        visual.replySeen = YES;
+        return visual;
+    }
+    if (snapshot.pending.present) {
+        visual.phase = DeckMixPending;
+        visual.failed = NO;
+        visual.replySeen = YES;
+        return visual;
+    }
+    if (event == DeckMixEventReply) {
+        // The socket answered and there is nothing to wait for. Older decks and
+        // an immediate skip with no blend object both end here.
+        return DeckMixClear(visual.flashUntil, NO);
+    }
+    if (DeckMixTimedOut(visual, now, timeoutSec)) return DeckMixClear(visual.flashUntil, YES);
+    if (visual.phase == DeckMixPending || visual.phase == DeckMixBlending)
+        return DeckMixClear(visual.flashUntil, NO);
+    return visual;
+}
+
+const double kDeckSkipReplyTimeoutSec = 2;
+const double kDeckSkipFlashSec = 0.15;
+const double kDeckMixPollSec = 0.25;
+const double kDeckPollSec = 1;
+
+DeckMixVisual DeckMixVisualStep(DeckMixVisual current, DeckMixEvent event, double now,
+                                GBDeckNow snapshot, double timeoutSec) {
+    if (!isfinite(now)) return current;
+    if (event == DeckMixEventBlend) {
+        DeckMixVisual visual = {0};
+        visual.phase = DeckMixArmed;
+        visual.requested = YES;
+        visual.since = now;
+        return visual;
+    }
+    if (event == DeckMixEventCut) {
+        if (current.phase == DeckMixArmed) current = DeckMixClear(0, NO);
+        current.flashUntil = now + kDeckSkipFlashSec;
+        current.failed = NO;
+        return current;
+    }
+    if (event == DeckMixEventReply) {
+        if (!snapshot.valid || !snapshot.ok) return DeckMixClear(current.flashUntil, YES);
+        current.replySeen = YES;
+        current.failed = NO;
+        return DeckMixApplySnapshot(current, event, now, snapshot, timeoutSec);
+    }
+    if (event == DeckMixEventClock || event == DeckMixEventNone) {
+        if (DeckMixTimedOut(current, now, timeoutSec)) return DeckMixClear(current.flashUntil, YES);
+        return current;
+    }
+    if (event == DeckMixEventSnapshot)
+        return DeckMixApplySnapshot(current, event, now, snapshot, timeoutSec);
+    return current;
+}
+
+DeckMixTint DeckMixTintFor(DeckMixVisual visual, BOOL blendPresent,
+                           BOOL blendManualKnown, BOOL blendManual) {
+    if (visual.failed || visual.phase == DeckMixIdle) return DeckMixTintOff;
+    if (visual.phase == DeckMixBlending) {
+        if (blendPresent && blendManualKnown && !blendManual) return DeckMixTintSecondary;
+        if (blendPresent && !blendManualKnown && !visual.requested) return DeckMixTintSecondary;
+        return DeckMixTintAccent;
+    }
+    if (visual.phase == DeckMixPending && !visual.requested) return DeckMixTintSecondary;
+    return DeckMixTintAccent;
+}
+
+BOOL DeckMixFlashActive(DeckMixVisual visual, double now) {
+    return isfinite(now) && isfinite(visual.flashUntil) && visual.flashUntil > now;
+}
+
+DeckMixTint DeckMixShownTint(DeckMixVisual visual, double now, BOOL blendPresent,
+                             BOOL blendManualKnown, BOOL blendManual) {
+    DeckMixTint resting = DeckMixTintFor(visual, blendPresent, blendManualKnown, blendManual);
+    if (!DeckMixFlashActive(visual, now)) return resting;
+    return resting == DeckMixTintAccent ? DeckMixTintOff : DeckMixTintAccent;
+}
+
+double DeckNowPollInterval(BOOL popoverShown, DeckMixPhase phase) {
+    if (popoverShown && (phase == DeckMixPending || phase == DeckMixBlending)) return kDeckMixPollSec;
+    return kDeckPollSec;
+}
+
+NSString *DeckMixCountdownText(double secondsRemaining) {
+    if (!isfinite(secondsRemaining) || secondsRemaining < 0) return nil;
+    int whole = (int)floor(secondsRemaining + 1e-9);
+    if (whole < 0) whole = 0;
+    int hours = whole / 3600;
+    int minutes = (whole % 3600) / 60;
+    int seconds = whole % 60;
+    if (hours > 0) return [NSString stringWithFormat:@"mix %d:%02d:%02d", hours, minutes, seconds];
+    return [NSString stringWithFormat:@"mix %d:%02d", minutes, seconds];
+}
+
+NSString *DeckMixProgressText(double progress) {
+    if (!isfinite(progress) || progress < 0 || progress >= 1) return nil;
+    int percent = (int)lround(progress * 100.0);
+    if (percent < 0) percent = 0;
+    if (percent > 99) percent = 99;
+    return [NSString stringWithFormat:@"mix %d%%", percent];
+}
+
+double DeckMixTickFraction(double position, double startsInS, double duration) {
+    if (!isfinite(position) || !isfinite(startsInS) || !isfinite(duration) || duration <= 0) return NAN;
+    if (position < 0) position = 0;
+    if (startsInS < 0) startsInS = 0;
+    double fraction = (position + startsInS) / duration;
+    if (fraction < 0) fraction = 0;
+    if (fraction > 1) fraction = 1;
+    return fraction;
+}
+
+double DeckMixCountdownRemaining(double startsInS, double sampledAt, double now) {
+    if (!isfinite(startsInS)) return NAN;
+    if (startsInS < 0) startsInS = 0;
+    if (!(sampledAt > 0) || !isfinite(sampledAt) || !isfinite(now)) return startsInS;
+    double left = startsInS - (now - sampledAt);
+    if (left < 0) left = 0;
+    return left;
+}
+
+double DeckMixShownProgress(double progress, double lengthS, double sampledAt, double now) {
+    if (!isfinite(progress)) return NAN;
+    if (progress < 0) progress = 0;
+    if (progress >= 1) return 1;
+    if (!(sampledAt > 0) || !isfinite(sampledAt) || !isfinite(now) || !isfinite(lengthS) ||
+        !(lengthS > 0) || now < sampledAt)
+        return progress;
+    double shown = progress + (now - sampledAt) / lengthS;
+    if (shown < 0) shown = 0;
+    if (shown >= 1) shown = 0.999;
+    return shown;
+}
+
+NSString *DeckSkipFailureTip(NSString *error) {
+    NSString *trimmed = [error isKindOfClass:NSString.class]
+        ? [error stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+    if (!trimmed.length) return @"Skip failed";
+    if (trimmed.length > 80) trimmed = [trimmed substringToIndex:80];
+    return [NSString stringWithFormat:@"Skip failed — %@", trimmed];
+}
+
+GBDeckNow DeckNowFromJSON(NSData *json) {
+    GBDeckNow out = DeckNowEmpty();
     if (![json isKindOfClass:NSData.class] || json.length == 0) return out;
     id obj = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
     if (![obj isKindOfClass:NSDictionary.class]) return out;
@@ -3332,6 +3520,49 @@ GBDeckNow DeckNowFromJSON(NSData *json) {
     double trackBPM = DeckJSONNumber(track[@"bpm"]);
     if (isfinite(effective) && effective > 0) out.bpm = effective;
     else if (isfinite(trackBPM) && trackBPM > 0) out.bpm = trackBPM;
+
+    DeckCopyField(out.error, sizeof(out.error), obj[@"error"]);
+    id immediate = obj[@"immediate"];
+    if ([immediate isKindOfClass:NSNumber.class]) out.immediate = [immediate boolValue];
+
+    NSDictionary *pending = [obj[@"pending_skip"] isKindOfClass:NSDictionary.class] ? obj[@"pending_skip"] : nil;
+    if (pending) {
+        out.pending.present = YES;
+        DeckCopyField(out.pending.mode, sizeof(out.pending.mode), pending[@"mode"]);
+        DeckCopyField(out.pending.requestedAt, sizeof(out.pending.requestedAt), pending[@"requested_at"]);
+        double starts = DeckJSONNumber(pending[@"starts_in_s"]);
+        if (isfinite(starts) && starts < 0) starts = 0;
+        out.pending.startsInS = isfinite(starts) ? starts : NAN;
+        double bars = DeckJSONNumber(pending[@"bars"]);
+        out.pending.bars = isfinite(bars) ? bars : NAN;
+    }
+    NSDictionary *blend = [obj[@"blend"] isKindOfClass:NSDictionary.class] ? obj[@"blend"] : nil;
+    if (blend) {
+        out.blend.present = YES;
+        DeckCopyField(out.blend.type, sizeof(out.blend.type), blend[@"type"]);
+        id manual = blend[@"manual"];
+        if ([manual isKindOfClass:NSNumber.class]) {
+            out.blend.manualKnown = YES;
+            out.blend.manual = [manual boolValue];
+        }
+        double progress = DeckJSONNumber(blend[@"progress"]);
+        if (isfinite(progress)) {
+            if (progress < 0) progress = 0;
+            if (progress > 1) progress = 1;
+            out.blend.progress = progress;
+        }
+        double elapsed = DeckJSONNumber(blend[@"elapsed_s"]);
+        out.blend.elapsedS = isfinite(elapsed) ? elapsed : NAN;
+        double length = DeckJSONNumber(blend[@"length_s"]);
+        out.blend.lengthS = isfinite(length) ? length : NAN;
+        NSDictionary *incoming = [blend[@"incoming"] isKindOfClass:NSDictionary.class] ? blend[@"incoming"] : nil;
+        DeckCopyField(out.blend.title, sizeof(out.blend.title), incoming[@"title"]);
+        DeckCopyField(out.blend.artist, sizeof(out.blend.artist), incoming[@"artist"]);
+        DeckCopyField(out.blend.path, sizeof(out.blend.path), incoming[@"path"]);
+        DeckCopyField(out.blend.key, sizeof(out.blend.key), incoming[@"key"]);
+        double bpm = DeckJSONNumber(incoming[@"bpm"]);
+        out.blend.bpm = (isfinite(bpm) && bpm > 0) ? bpm : NAN;
+    }
     return out;
 }
 

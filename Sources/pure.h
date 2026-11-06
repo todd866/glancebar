@@ -869,12 +869,37 @@ NSString *SelectorDJPath(NSString *appBundle, NSString *buildRoot);
 // on the track or the object. bpm prefers effective_bpm when it is above 0, else
 // track.bpm. ok is the reply's ok flag, or YES when that key is absent (now.json).
 // A non-object or unreadable payload leaves valid NO.
+// pending_skip and blend are absent (present NO, times NAN) when the key is missing
+// or null, which is what an older deck publishes. immediate is the skip reply's
+// {"ok":true,"immediate":true}. error is the reply's error string.
+typedef struct {
+    BOOL present;
+    double startsInS;     // NAN when the object omitted it
+    double bars;
+    char mode[16];        // "smooth", "soon", "cut", or empty
+    char requestedAt[40];
+} GBDeckPendingSkip;
+typedef struct {
+    BOOL present;
+    BOOL manual;          // meaningful only when manualKnown
+    BOOL manualKnown;     // the key was a boolean; older blends omit it
+    double progress;      // 0..1, NAN when omitted
+    double elapsedS;
+    double lengthS;
+    double bpm;
+    char type[32];
+    char title[512];
+    char artist[512];
+    char path[1024];
+    char key[32];
+} GBDeckBlend;
 typedef struct {
     BOOL valid;
     BOOL ok;
     BOOL playing;
     BOOL paused;
     BOOL stopped;
+    BOOL immediate;
     double position;
     double duration;
     double bpm;
@@ -883,8 +908,89 @@ typedef struct {
     char artist[512];
     char path[1024];
     char nextTitle[512];
+    char error[128];
+    GBDeckPendingSkip pending;
+    GBDeckBlend blend;
 } GBDeckNow;
 GBDeckNow DeckNowFromJSON(NSData *json);
+// Zero, with every time NAN. The blank value a caller passes when an event has no payload.
+GBDeckNow DeckNowBlank(void);
+
+// --- Deck skip acknowledgement ---
+// Idle, then the single-tap window resolving to a blend (armed), then the deck's
+// pending_skip, then its blend, then idle again. A reply that never arrives is a
+// failure once the timeout has passed. A cut does not enter this chain; it flashes.
+typedef NS_ENUM(NSInteger, DeckMixPhase) {
+    DeckMixIdle = 0,
+    DeckMixArmed,
+    DeckMixPending,
+    DeckMixBlending,
+};
+// Accent is the mix Glancebar asked for. Secondary is a blend the deck started
+// (blend.manual false, or a pending/blend this Mac did not request).
+typedef NS_ENUM(NSInteger, DeckMixTint) {
+    DeckMixTintOff = 0,
+    DeckMixTintAccent,
+    DeckMixTintSecondary,
+};
+typedef NS_ENUM(NSInteger, DeckMixEvent) {
+    DeckMixEventNone = 0,
+    DeckMixEventBlend,     // the single-tap window resolved to a blend
+    DeckMixEventCut,       // double-tap
+    DeckMixEventReply,     // the skip socket answered
+    DeckMixEventSnapshot,  // a now.json (or status) sample
+    DeckMixEventClock,     // time passed; applies the reply timeout
+};
+typedef struct {
+    DeckMixPhase phase;
+    BOOL requested;     // this Mac asked for the mix
+    BOOL failed;        // the reply was a refusal, or none arrived in time
+    BOOL replySeen;
+    double since;       // when this arm started; 0 when not armed
+    double flashUntil;  // a cut flash is showing while this is still ahead of now
+} DeckMixVisual;
+extern const double kDeckSkipReplyTimeoutSec;   // 2 — no reply clears the light
+extern const double kDeckSkipFlashSec;          // 0.15
+extern const double kDeckMixPollSec;            // 0.25 — 4 Hz while a mix is on screen
+extern const double kDeckPollSec;               // 1 — the ordinary now.json cadence
+// timeoutSec non-finite or negative uses kDeckSkipReplyTimeoutSec. A non-finite now
+// leaves the visual unchanged. A snapshot that lacks pending and blend does not
+// cancel an arm (the file can be a sample from before the skip). It does end a
+// pending or blending mix. ok:true with none of pending, blend, or immediate is an
+// older deck: the arm ends without a failure. immediate:true with no blend ends the
+// same way; a later snapshot can still show the blend.
+DeckMixVisual DeckMixVisualStep(DeckMixVisual current, DeckMixEvent event, double now,
+                                GBDeckNow snapshot, double timeoutSec);
+// Resting colour, ignoring the cut flash.
+DeckMixTint DeckMixTintFor(DeckMixVisual visual, BOOL blendPresent,
+                           BOOL blendManualKnown, BOOL blendManual);
+// YES while now is still before flashUntil.
+BOOL DeckMixFlashActive(DeckMixVisual visual, double now);
+// Colour to paint. A flash is accent, unless the resting colour is already accent,
+// in which case it dips to off so the pulse can be seen.
+DeckMixTint DeckMixShownTint(DeckMixVisual visual, double now, BOOL blendPresent,
+                             BOOL blendManualKnown, BOOL blendManual);
+// 4 Hz only while the popover is open and a skip is pending or a blend is running.
+double DeckNowPollInterval(BOOL popoverShown, DeckMixPhase phase);
+// "mix 0:12". Whole seconds, floored. Nil when seconds is non-finite or negative.
+// An hour or more reads "mix 1:02:03".
+NSString *DeckMixCountdownText(double secondsRemaining);
+// "mix 45%". Nil when progress is non-finite, negative, or already 1 (the blend ended).
+// A progress still under 1 never rounds up to 100.
+NSString *DeckMixProgressText(double progress);
+// (position + startsInS) / duration, clamped to 0..1. NAN when it cannot be placed
+// (non-finite input, or duration <= 0). Negative position or startsInS counts as 0.
+double DeckMixTickFraction(double position, double startsInS, double duration);
+// startsInS minus the time since sampledAt, never negative. sampledAt <= 0 or
+// non-finite keeps startsInS (no local tick yet). Non-finite startsInS is NAN.
+double DeckMixCountdownRemaining(double startsInS, double sampledAt, double now);
+// progress plus the time since sampledAt over lengthS. A snapshot under 1 never
+// extrapolates to 1: the file is what ends the blend, so the shown value stops at
+// 0.999. sampledAt <= 0 keeps progress. Non-finite progress is NAN. 1 stays 1.
+double DeckMixShownProgress(double progress, double lengthS, double sampledAt, double now);
+// "Skip failed", or "Skip failed — …" when the reply named an error. Nil error is
+// the bare sentence. The error is trimmed and cut at 80 characters.
+NSString *DeckSkipFailureTip(NSString *error);
 
 // Fleet row datum when a worker Mac has not answered recently: plain `away` when
 // secondsSinceLastSample is unknown or zero (never this session); `away Nm` under an hour
