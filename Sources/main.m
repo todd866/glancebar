@@ -22,6 +22,7 @@
 #import <mach/mach.h>
 #import <signal.h>
 #import <stdatomic.h>
+#import <sys/attr.h>
 #import <sys/mount.h>
 #import <sys/sysctl.h>
 #import <os/log.h>
@@ -515,16 +516,25 @@ static BOOL StarlinkProbeSucceeded(NSData *data, NSHTTPURLResponse *response) {
 #pragma mark - Disk
 
 @interface Volume : NSObject
-@property (copy) NSString *path, *name;
-@property long long total, available, physicalAvailable;
-@property BOOL isInternal, isLocal, isDiskImage;
+@property (copy) NSString *path, *name, *container, *backingPath, *glanceTooltip;
+@property long long total, available, physicalAvailable, containerBytes, volumeUsed, groupUsed;
+@property BOOL isInternal, isLocal, isDiskImage, hasVolumeUsed, grouped;
+@property (copy) NSArray<NSString *> *memberPaths, *memberNames, *hostedNames;
 @end
 @implementation Volume
 - (long long)used { return MAX(0LL, self.total - self.available); }
 // Finder-style "available" counts purgeable data (caches, staged updates, local
 // snapshots) as free; this is how much of that figure macOS would first have to thin.
 - (long long)purgeable { return MAX(0LL, self.available - self.physicalAvailable); }
-- (double)fraction { return self.total > 0 ? (double)self.used / self.total : 0; }
+- (double)fraction {
+    if (self.grouped && self.total > 0) {
+        long long used = self.groupUsed < 0 ? 0 : self.groupUsed;
+        double fraction = (double)used / (double)self.total;
+        if (fraction < 0) return 0;
+        return fraction > 1 ? 1 : fraction;
+    }
+    return self.total > 0 ? (double)self.used / self.total : 0;
+}
 @end
 
 static NSString *FmtBytes(long long b) {   // volumes: decimal, as Finder shows them
@@ -616,7 +626,7 @@ static Volume *RootVolumeFallback(void) {
 }
 
 static NSDictionary *GlanceRecordForVolume(Volume *volume) {
-    return @{
+    NSMutableDictionary *record = [@{
         @"name": volume.name ?: @"",
         @"path": volume.path ?: @"",
         @"boot": @([volume.path isEqualToString:@"/"]),
@@ -625,7 +635,169 @@ static NSDictionary *GlanceRecordForVolume(Volume *volume) {
         @"diskImage": @(volume.isDiskImage),
         @"totalBytes": @(volume.total),
         @"freeBytes": @(volume.available),
-    };
+    } mutableCopy];
+    // Container id, size and per-volume used let the pure grouping count a shared
+    // APFS container once. Missing fields leave a volume as its own row.
+    if (volume.container.length) {
+        record[@"container"] = volume.container;
+        record[@"containerFreeBytes"] = @(volume.available);
+    }
+    if (volume.containerBytes > 0) record[@"containerBytes"] = @(volume.containerBytes);
+    if (volume.hasVolumeUsed && volume.volumeUsed >= 0) record[@"usedBytes"] = @(volume.volumeUsed);
+    if (volume.backingPath.length) record[@"backingPath"] = volume.backingPath;
+    return record;
+}
+
+static NSString *BSDNameAtPath(NSString *path) {
+    struct statfs info;
+    if (!path.length || statfs(path.fileSystemRepresentation, &info) != 0) return nil;
+    const char *from = info.f_mntfromname;
+    const char *base = strrchr(from, '/');
+    const char *bsd = base ? base + 1 : from;
+    if (!bsd || !bsd[0]) return nil;
+    return [NSString stringWithUTF8String:bsd];
+}
+
+static BOOL MountIsAPFS(NSString *path) {
+    struct statfs info;
+    if (!path.length || statfs(path.fileSystemRepresentation, &info) != 0) return NO;
+    return strcmp(info.f_fstypename, "apfs") == 0;
+}
+
+// ATTR_VOL_SPACEUSED is this volume's bytes, not the container's. The returned
+// attribute sits immediately after the 4-byte length (aligned to 4, not 8).
+static long long VolumeSpaceUsed(NSString *path) {
+    if (!path.length) return -1;
+    struct attrlist attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attr.volattr = ATTR_VOL_SPACEUSED;
+    unsigned char buf[16];
+    memset(buf, 0, sizeof(buf));
+    if (getattrlist(path.fileSystemRepresentation, &attr, buf, sizeof(buf), 0) != 0) return -1;
+    uint32_t length = 0;
+    memcpy(&length, buf, sizeof(length));
+    if (length < sizeof(uint32_t) + sizeof(off_t)) return -1;
+    off_t used = 0;
+    memcpy(&used, buf + sizeof(uint32_t), sizeof(used));
+    return used < 0 ? -1 : (long long)used;
+}
+
+static long long ContainerMediaBytes(DASessionRef session, NSString *container) {
+    if (!session || !container.length) return 0;
+    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, container.UTF8String);
+    if (!disk) return 0;
+    CFDictionaryRef desc = DADiskCopyDescription(disk);
+    long long bytes = 0;
+    if (desc) {
+        CFTypeRef size = CFDictionaryGetValue(desc, kDADiskDescriptionMediaSizeKey);
+        if (size && CFGetTypeID(size) == CFNumberGetTypeID())
+            CFNumberGetValue((CFNumberRef)size, kCFNumberLongLongType, &bytes);
+        CFRelease(desc);
+    }
+    CFRelease(disk);
+    return bytes > 0 ? bytes : 0;
+}
+
+static NSString *DiskImagePathFromRegistry(io_registry_entry_t entry) {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(entry, CFSTR("image-path"), kCFAllocatorDefault, 0);
+    if (!value) return nil;
+    NSString *path = nil;
+    if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        path = [(__bridge NSString *)value copy];
+    } else if (CFGetTypeID(value) == CFDataGetTypeID()) {
+        NSData *data = (__bridge NSData *)value;
+        const unsigned char *bytes = data.bytes;
+        NSUInteger len = data.length;
+        while (len && bytes[len - 1] == 0) len--;
+        path = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
+    }
+    CFRelease(value);
+    return path.length ? path : nil;
+}
+
+static void CollectDiskImageBSDNames(io_registry_entry_t entry, NSString *imagePath,
+                                     NSMutableDictionary<NSString *, NSString *> *out, int depth) {
+    if (!imagePath.length || depth > 12) return;
+    CFTypeRef bsd = IORegistryEntryCreateCFProperty(entry, CFSTR("BSD Name"), kCFAllocatorDefault, 0);
+    if (bsd && CFGetTypeID(bsd) == CFStringGetTypeID()) {
+        NSString *name = (__bridge NSString *)bsd;
+        if (name.length) out[name] = imagePath;
+    }
+    if (bsd) CFRelease(bsd);
+    io_iterator_t children = 0;
+    if (IORegistryEntryGetChildIterator(entry, kIOServicePlane, &children) != KERN_SUCCESS) return;
+    io_registry_entry_t child;
+    while ((child = IOIteratorNext(children))) {
+        CollectDiskImageBSDNames(child, imagePath, out, depth + 1);
+        IOObjectRelease(child);
+    }
+    IOObjectRelease(children);
+}
+
+// BSD name → backing file. One walk, and only when a mount is not already cached.
+static NSDictionary<NSString *, NSString *> *DiskImageBackingByBSD(void) {
+    NSMutableDictionary<NSString *, NSString *> *out = [NSMutableDictionary dictionary];
+    io_iterator_t drives = 0;
+    kern_return_t status = IOServiceGetMatchingServices(kIOMainPortDefault,
+                                                        IOServiceMatching("IOHDIXHDDrive"), &drives);
+    if (status != KERN_SUCCESS || !drives) return out;
+    io_registry_entry_t drive;
+    while ((drive = IOIteratorNext(drives))) {
+        NSString *imagePath = DiskImagePathFromRegistry(drive);
+        if (imagePath.length) CollectDiskImageBSDNames(drive, imagePath, out, 0);
+        IOObjectRelease(drive);
+    }
+    IOObjectRelease(drives);
+    return out;
+}
+
+// Container size and the disk-image backing file do not change while a volume
+// stays on the same BSD name. Used and free are read every scan; this cache
+// keeps DiskArbitration and the IOKit walk off the popover-open path.
+static NSMutableDictionary<NSString *, NSDictionary *> *MountFactCache(void) {
+    static NSMutableDictionary *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    return cache;
+}
+
+static void AnnotateVolumeContainer(Volume *volume, DASessionRef session,
+                                    NSDictionary<NSString *, NSString *> *imagePaths,
+                                    NSMutableDictionary<NSString *, NSNumber *> *containerSizes) {
+    NSString *bsd = BSDNameAtPath(volume.path);
+    if (!bsd.length) return;
+    NSDictionary *cached = MountFactCache()[volume.path];
+    NSString *container = nil;
+    long long containerBytes = 0;
+    NSString *backing = nil;
+    if ([cached[@"bsd"] isEqual:bsd]) {
+        container = cached[@"container"];
+        containerBytes = [cached[@"containerBytes"] longLongValue];
+        backing = cached[@"backing"];
+    } else {
+        container = MountIsAPFS(volume.path) ? VolumeContainerID(bsd) : nil;
+        if (container.length) {
+            NSNumber *known = containerSizes[container];
+            containerBytes = known ? known.longLongValue : ContainerMediaBytes(session, container);
+            if (containerBytes > 0) containerSizes[container] = @(containerBytes);
+        }
+        if (imagePaths) {
+            backing = imagePaths[bsd];
+            // A disk image's volume slice is usually listed; the whole disk is
+            // the fallback when only the container BSD name is in the registry.
+            if (!backing.length && container.length) backing = imagePaths[container];
+        }
+        NSMutableDictionary *facts = [NSMutableDictionary dictionary];
+        facts[@"bsd"] = bsd;
+        if (container.length) facts[@"container"] = container;
+        if (containerBytes > 0) facts[@"containerBytes"] = @(containerBytes);
+        if (backing.length) facts[@"backing"] = backing;
+        MountFactCache()[volume.path] = facts;
+    }
+    volume.container = container;
+    volume.containerBytes = containerBytes;
+    volume.backingPath = backing;
 }
 
 static NSArray<Volume *> *ScanVolumes(void) {
@@ -638,6 +810,7 @@ static NSArray<Volume *> *ScanVolumes(void) {
     NSMutableArray<Volume *> *found = [NSMutableArray array];
     BOOL hasRoot = NO;
     DASessionRef session = DASessionCreate(kCFAllocatorDefault);
+    NSMutableArray<Volume *> *pending = [NSMutableArray array];
     for (NSURL *url in urls) {
         id localValue = nil;
         BOOL haveLocal = [url getResourceValue:&localValue forKey:NSURLVolumeIsLocalKey error:nil];
@@ -645,9 +818,28 @@ static NSArray<Volume *> *ScanVolumes(void) {
         Volume *vol = VolumeFromURL(url, VolumeResourceKeys(isLocal));
         if (!vol) continue;
         vol.isDiskImage = PathIsDiskImage(session, vol.path);
+        long long used = VolumeSpaceUsed(vol.path);
+        vol.hasVolumeUsed = used >= 0;
+        vol.volumeUsed = used;
         if ([vol.path isEqualToString:@"/"]) hasRoot = YES;
+        [pending addObject:vol];
+    }
+    BOOL factsMiss = NO;
+    for (Volume *vol in pending) {
+        NSString *bsd = BSDNameAtPath(vol.path);
+        NSDictionary *cached = bsd.length ? MountFactCache()[vol.path] : nil;
+        if (!bsd.length || ![cached[@"bsd"] isEqual:bsd]) { factsMiss = YES; break; }
+    }
+    NSDictionary<NSString *, NSString *> *imagePaths = factsMiss ? DiskImageBackingByBSD() : nil;
+    NSMutableDictionary<NSString *, NSNumber *> *containerSizes = [NSMutableDictionary dictionary];
+    for (Volume *vol in pending) {
+        AnnotateVolumeContainer(vol, session, imagePaths, containerSizes);
         [found addObject:vol];
     }
+    NSMutableSet<NSString *> *live = [NSMutableSet set];
+    for (Volume *vol in found) if (vol.path.length) [live addObject:vol.path];
+    for (NSString *path in MountFactCache().allKeys)
+        if (![live containsObject:path]) [MountFactCache() removeObjectForKey:path];
     if (session) CFRelease(session);
     if (!hasRoot) {
         Volume *root = RootVolumeFallback();
@@ -5070,6 +5262,40 @@ static const CGFloat kDatumX = 272, kDatumW = 92;              // "resets 21:00"
 static const CGFloat kToggleH = 28, kToggleGap = 6;
 static const CGFloat kKeepW = 106, kLowW = 98, kChargeW = 96;  // 16pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
+// A volume name wider than the column grows it, and every gauge moves with it.
+// The gauge stays at least this wide; a joined name that still cannot fit uses
+// "First +N" instead of truncating.
+static const CGFloat kMinGaugeW = 48;
+static CGFloat gRowNameW = 0;
+static CGFloat MaxInstrumentNameW(void) {
+    return kValueX - 4 - kMinGaugeW - 6 - kAINameX;
+}
+static CGFloat RowNameW(void) { return gRowNameW >= kAINameW ? gRowNameW : kAINameW; }
+static void SetRowNameW(CGFloat width) {
+    CGFloat maxW = MaxInstrumentNameW();
+    if (width < kAINameW) width = kAINameW;
+    if (width > maxW) width = maxW;
+    gRowNameW = width;
+}
+static CGFloat RowGaugeX(void) { return kAINameX + RowNameW() + 6; }
+static CGFloat RowGaugeW(void) {
+    CGFloat width = kValueX - 4 - RowGaugeX();
+    return width >= kMinGaugeW ? width : kGaugeW;
+}
+static NSRect RowGaugeRect(void) {
+    return NSMakeRect(RowGaugeX(), (kRowH - kGaugeH) / 2.0, RowGaugeW(), kGaugeH);
+}
+static NSString *VolumeLabelThatFits(NSString *full, NSArray<NSString *> *names, NSFont *font, CGFloat fieldWidth) {
+    if (![full isKindOfClass:NSString.class]) full = @"";
+    NSFont *face = font ?: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    NSArray<NSString *> *list = [names isKindOfClass:NSArray.class] && names.count ? names : (full.length ? @[full] : @[]);
+    CGFloat limit = fieldWidth - 4;
+    if (limit < 1) limit = fieldWidth;
+    CGFloat fullW = [full sizeWithAttributes:@{NSFontAttributeName: face}].width;
+    if (full.length && fullW <= limit + 0.01) return full;
+    NSString *compact = GlanceVolumeCompactName(list);
+    return compact.length ? compact : (full.length ? full : @"Disk");
+}
 // The details document follows the resizable window. It is only touched on the
 // main thread; keeping the active width here avoids threading a layout argument
 // through every detail-section builder.
@@ -8700,7 +8926,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         chevron.frame = NSMakeRect(NSMinX(nameField.frame) + nameW + 6, (kRowH - 12) / 2.0, 12, 12);
         chevron.accessibilityIdentifier = [stem stringByAppendingString:@".chevron"];
         [row addSubview:chevron];
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        Gauge *g = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         g.fraction = ready ? score : 0; g.color = color; g.markerFraction = -1; g.metricLabel = @"Readiness";
         g.accessibilityIdentifier = [stem stringByAppendingString:@".gauge"];
         [row addSubview:g];
@@ -8743,6 +8969,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     }
     NSArray *reported = [s[@"volumes"] isKindOfClass:NSArray.class] ? s[@"volumes"] : nil;
     NSUInteger volumeIndex = 0;
+    NSFont *nameFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     for (NSDictionary *volume in GlanceExternalVolumes(reported)) {
         id freeValue = volume[@"freeBytes"], totalValue = volume[@"totalBytes"];
         if (![freeValue isKindOfClass:NSNumber.class] || ![totalValue isKindOfClass:NSNumber.class]) continue;
@@ -8750,12 +8977,17 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         if (cap <= 0) continue;
         if (freeBytes < 0) freeBytes = 0;
         if (freeBytes > cap) freeBytes = cap;
-        double used = (double)(cap - freeBytes) / (double)cap;
-        [rows addObject:@[@"externaldrive", volume[@"name"], @(used), DiskColor(used),
+        double used = GlanceExternalUsedFraction(volume);
+        NSString *full = [volume[@"name"] isKindOfClass:NSString.class] ? volume[@"name"] : @"Disk";
+        NSArray *names = [volume[@"names"] isKindOfClass:NSArray.class] ? volume[@"names"] : nil;
+        NSString *shown = VolumeLabelThatFits(full, names, nameFont, RowNameW());
+        NSString *tip = GlanceExternalTooltip(volume) ?: @"";
+        [rows addObject:@[@"externaldrive", shown, @(used), DiskColor(used),
                           [NSString stringWithFormat:@"%d%%", (int)lround(used * 100)],
                           [NSString stringWithFormat:@"%@ free", CompactByteCount(freeBytes)],
                           NSColor.secondaryLabelColor,
-                          [NSString stringWithFormat:@"volume.%lu", (unsigned long)volumeIndex]]];
+                          [NSString stringWithFormat:@"volume.%lu", (unsigned long)volumeIndex],
+                          tip, full]];
         volumeIndex++;
     }
     NSNumber *battN = SampleNumber(s[@"batt"]);
@@ -8798,11 +9030,20 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
         NSString *rs = [NSString stringWithFormat:@"%@.%@", stem, r[7]];
         row.accessibilityIdentifier = rs;
+        NSString *volumeTip = r.count > 8 && [r[8] isKindOfClass:NSString.class] ? r[8] : nil;
+        NSString *fullName = r.count > 9 && [r[9] isKindOfClass:NSString.class] && [r[9] length] ? r[9] : r[1];
+        if (volumeTip.length) {
+            row.accessibilityHelp = volumeTip;
+            row.accessibilityLabel = volumeTip;
+            if (![fullName isEqual:r[1]] || [volumeTip containsString:@"Disk image:"]) row.toolTip = volumeTip;
+        }
         [self instrumentSymbol:r[0] tint:r[3] identifier:[rs stringByAppendingString:@".symbol"] in:row];
         // Grey names: these rows belong to the Mac above, not this one.
-        [self instrumentName:r[1] identifier:[rs stringByAppendingString:@".name"] in:row].textColor = NSColor.secondaryLabelColor;
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
-        g.fraction = [r[2] doubleValue]; g.color = r[3]; g.markerFraction = -1; g.metricLabel = r[1];
+        NSTextField *nameField = [self instrumentName:r[1] identifier:[rs stringByAppendingString:@".name"] in:row];
+        nameField.textColor = NSColor.secondaryLabelColor;
+        if (![fullName isEqual:r[1]]) nameField.accessibilityLabel = fullName;
+        Gauge *g = [[Gauge alloc] initWithFrame:RowGaugeRect()];
+        g.fraction = [r[2] doubleValue]; g.color = r[3]; g.markerFraction = -1; g.metricLabel = fullName;
         g.accessibilityIdentifier = [rs stringByAppendingString:@".gauge"];
         [row addSubview:g];
         [self instrumentValue:r[4] color:r[3] identifier:[rs stringByAppendingString:@".value"] in:row];
@@ -11085,7 +11326,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 - (NSTextField *)instrumentName:(NSString *)text identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
                               color:NSColor.labelColor
-                                 at:NSMakeRect(kAINameX, (NSHeight(row.bounds) - 16) / 2.0, kAINameW, 16)
+                                 at:NSMakeRect(kAINameX, (NSHeight(row.bounds) - 16) / 2.0, RowNameW(), 16)
                               align:NSTextAlignmentLeft];
     field.accessibilityIdentifier = identifier;
     field.maximumNumberOfLines = 1;
@@ -11266,7 +11507,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSTextField *nameField = [self instrumentName:name identifier:@"popover.burn.name" in:row];
     nameField.lineBreakMode = NSLineBreakByTruncatingTail;
     nameField.accessibilityHelp = tip;
-    Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    Gauge *bar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
     bar.fraction = MIN(1, watts / draw);
     bar.color = NSColor.systemOrangeColor;
     bar.metricLabel = @"App share of battery draw";
@@ -11330,7 +11571,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         if (!weekClock.length && tip.length) [parts addObject:tip];
         if (u.limitRefreshError.length) [parts addObject:u.limitRefreshError];
         tip = [parts componentsJoinedByString:@" · "];
-        meter = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        meter = [[QuotaPairGauge alloc] initWithFrame:RowGaugeRect()];
         meter.secondFraction = week;
         meter.accessibilityIdentifier = @"popover.ai.claude.gauge";
         meter.accessibilityLabel = @"Claude weekly allowance remaining, all models";
@@ -11340,7 +11581,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         pct = primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100];
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
 
-        plainGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         plainGauge.fraction = MAX(primary, 0);
         plainGauge.color = valueColor;
         plainGauge.metricLabel = @"Cursor Grok + Composer remaining";
@@ -11349,7 +11590,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     } else if (hasGauge) {
         pct = [self aiPercentText:u];
         valueColor = [self aiStatusColor:u];
-        plainGauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         plainGauge.fraction = u.remainingFraction;
         plainGauge.color = valueColor;
         plainGauge.metricLabel = [NSString stringWithFormat:@"%@ quota remaining", name];
@@ -11407,7 +11648,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
                                        at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
         apiName.accessibilityIdentifier = @"popover.ai.cursor.api.name";
         [apiRow addSubview:apiName];
-        Gauge *apiBar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        Gauge *apiBar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         apiBar.fraction = api; apiBar.color = ink;
         apiBar.metricLabel = @"Cursor API remaining";
         apiBar.accessibilityIdentifier = @"popover.ai.cursor.api.gauge";
@@ -11497,7 +11738,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.accessibilityLabel = [[MeteredName(link) stringByAppendingString:@" — "] stringByAppendingString:figures[@"tip"]];
     [self instrumentSymbol:MeteredSymbol(link) tint:color identifier:[NSString stringWithFormat:@"popover.%@.symbol", link] in:row];
     [self instrumentName:MeteredName(link) identifier:[NSString stringWithFormat:@"popover.%@.name", link] in:row];
-    Gauge *gauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH-kGaugeH)/2, kGaugeW, kGaugeH)];
+    Gauge *gauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
     gauge.fraction = fraction;
     gauge.markerFraction = -1;
     gauge.color = color;
@@ -11539,7 +11780,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         @"thresholdLabel":view.thresholdText ?: @"", @"endpointLabel":view.endpointText ?: @"", @"accessibilityHelp":view.accessibilityHelp ?: @"",
         @"thresholdCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:YES])),
         @"endpointCenterX":@(NSMinX(view.frame)+NSMidX([view labelRect:NO])),
-        @"gaugeStartX":@(kGaugeX), @"gaugeWidth":@(kGaugeW)};
+        @"gaugeStartX":@(RowGaugeX()), @"gaugeWidth":@(RowGaugeW())};
     NSString *stem = [path stringByAppendingPathComponent:[NSString stringWithFormat:@"live-%03d", (int)lround(now - _batteryDebugStarted)]];
     [[NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
         writeToFile:[stem stringByAppendingString:@".json"] atomically:YES];
@@ -11566,7 +11807,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
                                 at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
     name.accessibilityIdentifier = @"popover.charger.name";
     [row addSubview:name];
-    Gauge *bar = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    Gauge *bar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
     bar.metricLabel = @"Share of the Mac's draw the charger covers";
     bar.accessibilityIdentifier = @"popover.charger.gauge";
     [row addSubview:bar];
@@ -11618,7 +11859,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         symbol.accessibilityLabel = symbol.accessibilityHelp;
         [row addSubview:symbol];
         [self instrumentName:@"Battery" identifier:@"popover.battery.name" in:row];
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        Gauge *g = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         g.fraction = _bat.percent / 100.0;
         g.markerFraction = [[self effectiveChargeMode] isEqualToString:@"limit80"] ? 0.80 : -1;
         g.color = BattBarColor(_bat.percent);
@@ -11646,6 +11887,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 
 - (void)rebuildContent {
     _popoverPrepared=YES;
+    SetRowNameW([self popoverNameColumnWidth]);
     [self refreshChargeShortcutsIfStale];
     // macOS 13 throws if a bare NSViewController is asked for a view it never loaded
     // (it looks for a nib); 14 quietly makes an empty one. The first build has none.
@@ -11689,7 +11931,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [self instrumentSymbol:(v.isInternal ? @"internaldrive" : @"externaldrive")
                          tint:symbolTint identifier:@"popover.storage.symbol" in:row];
         [self instrumentName:@"Storage" identifier:@"popover.storage.name" in:row];
-        Gauge *g = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+        Gauge *g = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         g.fraction = v.fraction;
         g.color = DiskColor(v.fraction);
         g.metricLabel = [NSString stringWithFormat:@"%@ storage used", v.name];
@@ -11738,7 +11980,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
                    identifier:@"popover.system.symbol" in:row];
         [self instrumentName:@"System" identifier:@"popover.system.name" in:row];
         [self addSystemInstrumentTo:row
-                              gauge:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)
+                              gauge:RowGaugeRect()
                               value:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH)
                               datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
                                stem:@"popover.system" tip:summary];
@@ -11757,7 +11999,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [self instrumentSymbol:[self heatSymbol] tint:[self heatSymbolColor] identifier:@"popover.heat.symbol" in:row];
         [self instrumentName:@"Speed" identifier:@"popover.heat.name" in:row];
         [self addHeatInstrumentTo:row
-                            gauge:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)
+                            gauge:RowGaugeRect()
                             value:NSMakeRect(kValueX, (kRowH - kValueH) / 2.0, kValueW, kValueH)
                             datum:NSMakeRect(kDatumX, (kRowH - kDatumH) / 2.0, kDatumW, kDatumH)
                              stem:@"popover.heat" tip:tip];
@@ -12281,25 +12523,86 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     return _vols[(NSUInteger)index];
 }
 
-// Local external disks, in scan order. The boot row stays separate.
-- (NSArray<Volume *> *)externalGlanceVolumes {
+// Local external disks, in scan order. Volumes in one APFS container are one row.
+// The boot row stays separate.
+- (NSArray<NSDictionary *> *)externalGlanceRecords {
     if (!_vols.count) return @[];
     NSMutableArray *records = [NSMutableArray arrayWithCapacity:_vols.count];
     for (Volume *volume in _vols) [records addObject:GlanceRecordForVolume(volume)];
+    return GlanceExternalVolumes(records);
+}
+
+- (Volume *)volumeForGlancePath:(NSString *)path {
+    for (Volume *volume in _vols)
+        if ([volume.path isEqualToString:path]) return volume;
+    return nil;
+}
+
+- (NSArray<Volume *> *)externalGlanceVolumes {
     NSMutableArray<Volume *> *out = [NSMutableArray array];
-    for (NSDictionary *row in GlanceExternalVolumes(records)) {
-        NSString *path = row[@"path"];
-        for (Volume *volume in _vols) {
-            if ([volume.path isEqualToString:path]) { [out addObject:volume]; break; }
+    for (NSDictionary *row in [self externalGlanceRecords]) {
+        BOOL hosted = [row[@"hosted"] isKindOfClass:NSArray.class] && [row[@"hosted"] count];
+        if (![row[@"grouped"] boolValue] && !hosted) {
+            Volume *volume = [self volumeForGlancePath:row[@"path"]];
+            if (volume) [out addObject:volume];
+            continue;
         }
+        Volume *volume = [Volume new];
+        volume.name = [row[@"name"] isKindOfClass:NSString.class] && [row[@"name"] length] ? row[@"name"] : @"Disk";
+        volume.path = [row[@"path"] isKindOfClass:NSString.class] ? row[@"path"] : @"";
+        volume.memberNames = [row[@"names"] isKindOfClass:NSArray.class] ? row[@"names"] : @[volume.name];
+        volume.memberPaths = [row[@"paths"] isKindOfClass:NSArray.class] ? row[@"paths"]
+            : (volume.path.length ? @[volume.path] : @[]);
+        volume.total = [row[@"totalBytes"] longLongValue];
+        volume.available = [row[@"freeBytes"] longLongValue];
+        volume.physicalAvailable = volume.available;
+        volume.grouped = [row[@"grouped"] boolValue];
+        volume.groupUsed = [row[@"usedBytes"] longLongValue];
+        volume.hostedNames = hosted ? row[@"hosted"] : nil;
+        volume.glanceTooltip = GlanceExternalTooltip(row);
+        volume.isLocal = YES;
+        [out addObject:volume];
     }
     return out;
+}
+
+- (CGFloat)popoverNameColumnWidth {
+    NSFont *font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    CGFloat maxField = MaxInstrumentNameW();
+    __block CGFloat width = kAINameW;
+    void (^consider)(NSString *, NSArray *) = ^(NSString *full, NSArray *names) {
+        if (![full isKindOfClass:NSString.class] || !full.length) return;
+        NSString *shown = VolumeLabelThatFits(full, names, font, maxField);
+        CGFloat need = ceil([shown sizeWithAttributes:@{NSFontAttributeName: font}].width) + 4;
+        if (need > width) width = need;
+    };
+    for (Volume *volume in [self externalGlanceVolumes])
+        consider(volume.name, volume.memberNames);
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    for (NSDictionary *machine in [self remoteMachines]) {
+        NSString *host = machine[@"host"];
+        if (![host isKindOfClass:NSString.class] || !host.length) continue;
+        BOOL open = _fleetExpandedHosts ? [_fleetExpandedHosts containsObject:host]
+            : [ud boolForKey:[@"remoteOpen." stringByAppendingString:host]];
+        if (!open) continue;
+        NSDictionary *reading = _remote[host];
+        if (![reading isKindOfClass:NSDictionary.class]) continue;
+        double age = CFAbsoluteTimeGetCurrent() - [reading[@"at"] doubleValue];
+        if (age >= 120) continue;
+        NSArray *reported = [reading[@"sample"][@"volumes"] isKindOfClass:NSArray.class] ? reading[@"sample"][@"volumes"] : nil;
+        for (NSDictionary *row in GlanceExternalVolumes(reported))
+            consider(row[@"name"], [row[@"names"] isKindOfClass:NSArray.class] ? row[@"names"] : nil);
+    }
+    return width;
 }
 
 // A volume with its own row is not also a "97% full" note on the boot row.
 - (NSDictionary *)storageSecondaryNotice {
     NSMutableSet<NSString *> *shown = [NSMutableSet set];
-    for (Volume *volume in [self externalGlanceVolumes]) if (volume.path.length) [shown addObject:volume.path];
+    for (Volume *volume in [self externalGlanceVolumes]) {
+        if (volume.memberPaths.count) [shown addObjectsFromArray:volume.memberPaths];
+        else if (volume.path.length) [shown addObject:volume.path];
+    }
     NSMutableArray *fillRows = [NSMutableArray array];
     for (Volume *volume in _vols) {
         if ([shown containsObject:volume.path ?: @""]) continue;
@@ -12317,14 +12620,18 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.action = @selector(showStorageDetails:);
     row.accessibilityRole = NSAccessibilityButtonRole;
     row.accessibilityIdentifier = rowID;
-    NSString *tip = StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable);
+    NSString *tip = volume.glanceTooltip.length ? volume.glanceTooltip
+        : StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable);
     row.accessibilityHelp = tip;
     row.accessibilityLabel = tip;
+    BOOL namesDiffer = volume.name.length && ![displayName isEqual:volume.name];
+    if (namesDiffer || volume.hostedNames.count) row.toolTip = tip;
     [self instrumentSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
                      tint:DiskColor(volume.fraction)
                identifier:[stem stringByAppendingString:@".symbol"] in:row];
-    [self instrumentName:displayName identifier:[stem stringByAppendingString:@".name"] in:row];
-    Gauge *gauge = [[Gauge alloc] initWithFrame:NSMakeRect(kGaugeX, (kRowH - kGaugeH) / 2.0, kGaugeW, kGaugeH)];
+    NSTextField *nameField = [self instrumentName:displayName identifier:[stem stringByAppendingString:@".name"] in:row];
+    if (namesDiffer) nameField.accessibilityLabel = volume.name;
+    Gauge *gauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
     gauge.fraction = volume.fraction;
     gauge.color = DiskColor(volume.fraction);
     gauge.metricLabel = [NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"];
@@ -12346,11 +12653,13 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 
 - (CGFloat)addPopoverExternalStorageTo:(NSView *)root at:(CGFloat)y {
     NSUInteger index = 1;
+    NSFont *nameFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     for (Volume *volume in [self externalGlanceVolumes]) {
         NSString *stem = [NSString stringWithFormat:@"popover.storage.%lu", (unsigned long)index];
         NSString *rowID = [NSString stringWithFormat:@"popover.row.storage.%lu", (unsigned long)index];
+        NSString *full = volume.name.length ? volume.name : @"Disk";
         y = [self addPopoverStorageVolume:volume
-                               displayName:(volume.name.length ? volume.name : @"Disk")
+                               displayName:VolumeLabelThatFits(full, volume.memberNames, nameFont, RowNameW())
                                       stem:stem rowID:rowID to:root at:y];
         index++;
     }
@@ -13260,10 +13569,16 @@ static NSColor *HealthColor(double fraction) {
 - (CGFloat)addOverviewStorageVolume:(Volume *)volume displayName:(NSString *)displayName
                               stem:(NSString *)stem rowID:(NSString *)rowID
                                 to:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
-    NSMutableString *tip = [StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable) mutableCopy];
-    if (volume.path.length) [tip appendFormat:@"\n%@", volume.path];
+    NSMutableString *tip = [(volume.glanceTooltip.length ? volume.glanceTooltip
+        : StorageVolumeTooltip(volume.name, volume.total, volume.available, volume.purgeable)) mutableCopy];
+    if (volume.memberPaths.count > 1) {
+        [tip appendString:@"\n"];
+        [tip appendString:[volume.memberPaths componentsJoinedByString:@"\n"]];
+    } else if (volume.path.length) [tip appendFormat:@"\n%@", volume.path];
     NSColor *tint = DiskColor(volume.fraction);
     NSView *row = [self detailRowAt:y cols:c identifier:rowID tip:tip in:root];
+    BOOL namesDiffer = volume.name.length && ![displayName isEqual:volume.name];
+    if (namesDiffer || volume.hostedNames.count) row.toolTip = tip;
     NSImageView *mark = [self detailSymbol:(volume.isInternal ? @"internaldrive" : @"externaldrive")
                                       size:c.symbol tint:tint frame:DetailLeadRect(c)
                                 identifier:[stem stringByAppendingString:@".symbol"] in:row];
@@ -13275,6 +13590,7 @@ static NSColor *HealthColor(double fraction) {
                                           align:NSTextAlignmentLeft
                                      identifier:[stem stringByAppendingString:@".name"] in:row];
     volumeName.accessibilityHelp = tip;
+    if (namesDiffer) volumeName.accessibilityLabel = volume.name;
     [self detailGauge:DetailGaugeRect(c) fraction:volume.fraction color:tint
                 label:[NSString stringWithFormat:@"%@ storage used", volume.name ?: @"Volume"]
            identifier:[stem stringByAppendingString:@".gauge"] tip:tip in:row];
@@ -13287,11 +13603,13 @@ static NSColor *HealthColor(double fraction) {
 
 - (CGFloat)addOverviewExternalStorageTo:(NSView *)root y:(CGFloat)y cols:(DetailColumns)c {
     NSUInteger index = 1;
+    NSFont *nameFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
     for (Volume *volume in [self externalGlanceVolumes]) {
         NSString *stem = [NSString stringWithFormat:@"details.overview.storage.%lu", (unsigned long)index];
         NSString *rowID = [NSString stringWithFormat:@"details.overview.row.storage.%lu", (unsigned long)index];
+        NSString *full = volume.name.length ? volume.name : @"Disk";
         y = [self addOverviewStorageVolume:volume
-                                displayName:(volume.name.length ? volume.name : @"Disk")
+                                displayName:VolumeLabelThatFits(full, volume.memberNames, nameFont, c.nameW)
                                        stem:stem rowID:rowID to:root y:y cols:c];
         index++;
     }

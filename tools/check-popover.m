@@ -93,6 +93,15 @@ static CGFloat WrappedHeight(NSTextField *field) {
                                                  attributes:@{NSFontAttributeName: field.font}]);
 }
 // The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
+// A container row that cannot show every volume name, and a host disk that has a
+// disk image on it, keep the full names in the row tooltip.
+static BOOL VolumeNamesTip(NSView *view) {
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    if (!view.toolTip.length || ![view.toolTip isEqual:view.accessibilityHelp]) return NO;
+    if ([ident hasPrefix:@"popover.row.storage."]) return YES;
+    if ([ident hasPrefix:@"details.overview.row.storage."]) return YES;
+    return [ident hasPrefix:@"popover.remote."] && [ident containsString:@".volume."];
+}
 static BOOL IntendedControlTip(NSView *view) {
     if (![view.accessibilityIdentifier isEqual:@"popover.music.next"]) return NO;
     NSString *tip = view.toolTip ?: @"";
@@ -212,7 +221,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
-    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) {
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
     }
@@ -949,6 +958,59 @@ int main(int argc, const char **argv) {
                 if (!RenderOffscreen(root, [base stringByAppendingString:@"-external.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
                 if (!RenderOffscreen(root, [base stringByAppendingString:@"-external-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
             }
+            {   // Two APFS volumes in one container are one disk. A disk image on another disk is only in that disk's tooltip.
+                Volume *otv = [Volume new];
+                otv.name = @"OTV Mirror"; otv.path = @"/Volumes/OTV Mirror";
+                otv.total = 2000000000000LL; otv.available = 1800000000000LL; otv.physicalAvailable = otv.available;
+                otv.isLocal = YES; otv.container = @"disk5"; otv.containerBytes = otv.total;
+                otv.hasVolumeUsed = YES; otv.volumeUsed = 200000000000LL;
+                Volume *vault = [Volume new];
+                vault.name = @"Vault-T"; vault.path = @"/Volumes/Vault-T";
+                vault.total = otv.total; vault.available = otv.available; vault.physicalAvailable = vault.available;
+                vault.isLocal = YES; vault.container = @"disk5"; vault.containerBytes = otv.total;
+                vault.hasVolumeUsed = YES; vault.volumeUsed = 300000000000LL;
+                Volume *stash = [Volume new];
+                stash.name = @"Stash"; stash.path = @"/Volumes/Stash";
+                stash.total = 4000000000000LL; stash.available = 1000000000000LL; stash.physicalAvailable = stash.available;
+                stash.isLocal = YES; stash.container = @"disk4";
+                Volume *image = [Volume new];
+                image.name = @"Archive_Encrypted2"; image.path = @"/Volumes/Archive_Encrypted2";
+                image.total = 2000000000000LL; image.available = 500000000000LL; image.physicalAvailable = image.available;
+                image.isLocal = YES; image.isDiskImage = YES; image.container = @"disk9";
+                image.backingPath = @"/Volumes/Stash/Archive_Encrypted2.sparsebundle";
+                image.hasVolumeUsed = YES; image.volumeUsed = 1500000000000LL;
+                NSMutableArray *grouped = [volumes mutableCopy];
+                [grouped addObject:otv]; [grouped addObject:vault];
+                [grouped addObject:stash]; [grouped addObject:image];
+                [c setValue:grouped forKey:@"vols"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSTextField *groupName = (NSTextField *)FindIdentifier(root, @"popover.storage.1.name");
+                NSTextField *groupValue = (NSTextField *)FindIdentifier(root, @"popover.storage.1.value");
+                NSTextField *groupDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.1.datum");
+                NSView *groupRow = FindIdentifier(root, @"popover.row.storage.1");
+                NSTextField *stashName = (NSTextField *)FindIdentifier(root, @"popover.storage.2.name");
+                NSView *stashRow = FindIdentifier(root, @"popover.row.storage.2");
+                if (![groupName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![groupName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    ![groupValue.stringValue isEqual:@"25%"] || ![groupDatum.stringValue isEqual:@"1.8 TB free"] ||
+                    !HasTip(groupRow, @"OTV Mirror · Vault-T") || !HasTip(groupRow, @"Vault-T") ||
+                    ![stashName.stringValue isEqual:@"Stash"] || !HasTip(stashRow, @"Archive_Encrypted2") ||
+                    FindIdentifier(root, @"popover.storage.3.name") ||
+                    !SameColumn(FindIdentifier(root, @"popover.storage.1.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                    !SameColumn(FindIdentifier(root, @"popover.storage.2.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                    !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+                NSScrollView *groupedOverview = [c overviewDetailsView];
+                NSTextField *groupedOverviewName = (NSTextField *)FindIdentifier(groupedOverview.documentView, @"details.overview.storage.1.name");
+                if (![groupedOverviewName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![groupedOverviewName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    FindIdentifier(groupedOverview.documentView, @"details.overview.storage.3.name") ||
+                    groupedOverviewName.toolTip.length) return Fail(__LINE__);
+                if (argc > 1) {
+                    NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+                }
+            }
             [c setValue:volumes forKey:@"vols"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
@@ -1001,6 +1063,40 @@ int main(int argc, const char **argv) {
             if (argc > 1) {
                 NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-remote.png"];
                 if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            {   // The worker's two APFS volumes share disk5, so the drawer has one external row.
+                NSDictionary *pair = @{@"cpu": @91, @"thermal": @"heavy", @"pMHz": @1188, @"pTopMHz": @3504, @"pBusy": @0.8,
+                                       @"memPressure": @"Low", @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES,
+                                       @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37,
+                                       @"volumes": @[
+                                           @{@"name": @"OTV Mirror", @"path": @"/Volumes/OTV Mirror", @"container": @"disk5",
+                                             @"containerBytes": @2000000000000LL, @"containerFreeBytes": @1800000000000LL,
+                                             @"totalBytes": @2000000000000LL, @"freeBytes": @1800000000000LL,
+                                             @"usedBytes": @200000000000LL, @"internal": @NO, @"local": @YES,
+                                             @"diskImage": @NO, @"boot": @NO},
+                                           @{@"name": @"Vault-T", @"path": @"/Volumes/Vault-T", @"container": @"disk5",
+                                             @"containerBytes": @2000000000000LL, @"containerFreeBytes": @1800000000000LL,
+                                             @"totalBytes": @2000000000000LL, @"freeBytes": @1800000000000LL,
+                                             @"usedBytes": @300000000000LL, @"internal": @NO, @"local": @YES,
+                                             @"diskImage": @NO, @"boot": @NO}]};
+                [c setValue:[@{@"m2": @{@"sample": pair, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSTextField *pairName = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.name");
+                NSTextField *pairValue = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.value");
+                NSTextField *pairDatum = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.datum");
+                NSView *pairRow = FindIdentifier(root, @"popover.remote.m2.volume.0");
+                if (![pairName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![pairName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    ![pairValue.stringValue isEqual:@"25%"] || ![pairDatum.stringValue isEqual:@"1.8 TB free"] ||
+                    !HasTip(pairRow, @"OTV Mirror · Vault-T") || FindIdentifier(root, @"popover.remote.m2.volume.1") ||
+                    !SameColumn(pairName, FindIdentifier(root, @"popover.remote.m2.storage.name")) ||
+                    !SameColumn(FindIdentifier(root, @"popover.remote.m2.volume.0.gauge"), FindIdentifier(root, @"popover.remote.m2.storage.gauge")) ||
+                    !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+                if (argc > 1) {
+                    NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-remote.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-remote-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+                }
             }
             [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent() - 600)}} mutableCopy] forKey:@"remote"];
             [c rebuildContent]; root = p.contentViewController.view;

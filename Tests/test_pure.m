@@ -2278,6 +2278,80 @@ int main(void) {
             check(GlanceExternalVolumes(@[unmarked]).count == 0,
                   @"a volume that does not say it is local stays off the glance");
         }
+        check(VolumeContainerID(nil) == nil && VolumeContainerID(@"") == nil &&
+              VolumeContainerID(@"//nas/share") == nil && VolumeContainerID(@"disk") == nil,
+              @"a container id needs a disk BSD name");
+        check([VolumeContainerID(@"disk5s1") isEqual:@"disk5"] &&
+              [VolumeContainerID(@"/dev/disk10s2") isEqual:@"disk10"] &&
+              [VolumeContainerID(@"disk3s1s1") isEqual:@"disk3"] &&
+              [VolumeContainerID(@"disk5") isEqual:@"disk5"],
+              @"a slice's container is the BSD unit, disk10 not disk1");
+        check([GlanceVolumeJoinedName(@[@"OTV Mirror", @"Vault-T"]) isEqual:@"OTV Mirror · Vault-T"] &&
+              [GlanceVolumeCompactName(@[@"OTV Mirror", @"Vault-T"]) isEqual:@"OTV Mirror +1"] &&
+              [GlanceVolumeCompactName(@[@"Stash"]) isEqual:@"Stash"],
+              @"a container row joins names, and the short form keeps the first plus a count");
+        {
+            NSDictionary *otv = @{@"name": @"OTV Mirror", @"path": @"/Volumes/OTV Mirror",
+                                  @"boot": @NO, @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                  @"container": @"disk5", @"containerBytes": @2000000000000LL,
+                                  @"containerFreeBytes": @1500000000000LL,
+                                  @"totalBytes": @2000000000000LL, @"freeBytes": @1500000000000LL,
+                                  @"usedBytes": @200000000000LL};
+            NSDictionary *vault = @{@"name": @"Vault-T", @"path": @"/Volumes/Vault-T",
+                                    @"boot": @NO, @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                    @"container": @"disk5", @"containerBytes": @2000000000000LL,
+                                    @"containerFreeBytes": @1500000000000LL,
+                                    @"totalBytes": @2000000000000LL, @"freeBytes": @1500000000000LL,
+                                    @"usedBytes": @300000000000LL};
+            NSDictionary *stick = @{@"name": @"Stick", @"path": @"/Volumes/Stick",
+                                    @"boot": @NO, @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                    @"container": @"disk7", @"totalBytes": @1000LL, @"freeBytes": @100LL};
+            NSArray *rows = GlanceExternalVolumes(@[otv, vault, stick]);
+            NSDictionary *group = rows.firstObject;
+            check(rows.count == 2 && rows[1] == stick && [group[@"grouped"] boolValue],
+                  @"two APFS volumes in one container are one row; another disk stays itself");
+            check([group[@"name"] isEqual:@"OTV Mirror · Vault-T"] &&
+                  [group[@"names"] isEqual:@[@"OTV Mirror", @"Vault-T"]] &&
+                  [group[@"totalBytes"] longLongValue] == 2000000000000LL &&
+                  [group[@"freeBytes"] longLongValue] == 1500000000000LL &&
+                  [group[@"usedBytes"] longLongValue] == 500000000000LL,
+                  @"the container row sums used, and counts container size and free once");
+            check(fabs(GlanceExternalUsedFraction(group) - 0.25) < 0.0001 &&
+                  fabs(GlanceExternalUsedFraction(stick) - 0.9) < 0.0001,
+                  @"a grouped gauge is summed used over container size");
+            check([GlanceExternalTooltip(group) isEqual:@"OTV Mirror · Vault-T — 500 GB of 2 TB used · 1.5 TB free"],
+                  @"the container tooltip names every volume and the shared free space");
+            NSDictionary *again = GlanceExternalVolumes(@[group, stick])[0];
+            check(again == group, @"grouping an already-grouped row leaves it unchanged");
+            NSDictionary *noUsedA = @{@"name": @"OTV Mirror", @"path": @"/Volumes/OTV Mirror",
+                                      @"local": @YES, @"container": @"disk5",
+                                      @"totalBytes": @2000000000000LL, @"freeBytes": @1500000000000LL};
+            NSDictionary *noUsedB = @{@"name": @"Vault-T", @"path": @"/Volumes/Vault-T",
+                                      @"local": @YES, @"container": @"disk5",
+                                      @"totalBytes": @2000000000000LL, @"freeBytes": @1500000000000LL};
+            NSDictionary *shared = GlanceExternalVolumes(@[noUsedA, noUsedB]).firstObject;
+            check([shared[@"freeBytes"] longLongValue] == 1500000000000LL &&
+                  [shared[@"usedBytes"] longLongValue] == 500000000000LL,
+                  @"without per-volume used, container free is still counted once");
+        }
+        {
+            NSDictionary *stash = @{@"name": @"Stash", @"path": @"/Volumes/Stash",
+                                    @"boot": @NO, @"internal": @NO, @"local": @YES, @"diskImage": @NO,
+                                    @"container": @"disk4", @"totalBytes": @4000000000000LL,
+                                    @"freeBytes": @1000000000000LL};
+            NSDictionary *image = @{@"name": @"Archive_Encrypted2", @"path": @"/Volumes/Archive_Encrypted2",
+                                    @"boot": @NO, @"internal": @NO, @"local": @YES, @"diskImage": @YES,
+                                    @"container": @"disk9", @"totalBytes": @2000000000000LL,
+                                    @"freeBytes": @500000000000LL, @"usedBytes": @1500000000000LL,
+                                    @"backingPath": @"/Volumes/Stash/Archive_Encrypted2.sparsebundle"};
+            NSArray *rows = GlanceExternalVolumes(@[stash, image]);
+            check(rows.count == 1 && [rows[0][@"name"] isEqual:@"Stash"] &&
+                  [rows[0][@"hosted"] isEqual:@[@"Archive_Encrypted2"]] &&
+                  [rows[0][@"usedBytes"] longLongValue] != 1500000000000LL,
+                  @"a disk image whose backing file is on another disk is not its own row");
+            check([GlanceExternalTooltip(rows[0]) containsString:@"Disk image: Archive_Encrypted2"],
+                  @"that disk image is named only in the host disk's tooltip");
+        }
 
         // Heat: macOS's pressure level decides the colour; the temperature is the number.
         check(ThermalLevelFor(-1) == ThermalUnknown, @"thermal: unread pressure is unknown");

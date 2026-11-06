@@ -686,12 +686,34 @@ BOOL ShouldStartPmset(BOOL inFlight);
 // The menu bar and the boot storage row use this. Other local external disks get
 // their own rows beneath it.
 NSInteger StorageHeadlineIndex(NSArray<NSNumber *> *bootFlags);
+// "disk5s1" and "/dev/disk10s2" → "disk5" / "disk10". The container is the BSD unit
+// before the first slice. Snapshot mounts ("disk3s1s1") stay on that unit. Anything
+// that is not a disk BSD name (a network mount, nil, "") is nil.
+NSString *VolumeContainerID(NSString *bsdName);
+// Volume names in list order, separated by " · ". Empty names are skipped.
+NSString *GlanceVolumeJoinedName(NSArray<NSString *> *names);
+// First name, then " +N" for the others, when the joined name cannot fit.
+// One name is that name. None is nil.
+NSString *GlanceVolumeCompactName(NSArray<NSString *> *names);
 // Local external disks that earn their own glance row, in the given order.
 // A row needs a name, a positive totalBytes, local YES, and boot/internal/diskImage NO.
 // The boot mount ("/"), anything under /System/Volumes, disk images and network
 // mounts stay off this list. Nil or a non-array yields an empty array.
-// Qualifying dictionaries are returned unchanged.
+// Volumes that share a non-empty "container" (an APFS container / physical disk)
+// become one row: name is the volume names joined with " · ", usedBytes is the sum
+// of each volume's usedBytes (or the container's used, once, when a member has
+// none), totalBytes is containerBytes or the shared volume total, freeBytes is
+// containerFreeBytes or that shared free space counted once. A single qualifying
+// volume is returned as the same dictionary.
+// A disk image whose backingPath lies on another listed volume is left out, and
+// its name is added to that volume's "hosted" array so the row tooltip can name it.
 NSArray<NSDictionary *> *GlanceExternalVolumes(NSArray<NSDictionary *> *volumes);
+// 0..1. A grouped row uses usedBytes / totalBytes. Anything else uses
+// (totalBytes - freeBytes) / totalBytes, which is how a single volume already reads.
+double GlanceExternalUsedFraction(NSDictionary *row);
+// "Name — used of total · free", plus a "Disk image:" line when hosted is set.
+// Grouped rows take usedBytes; the name is the full joined name.
+NSString *GlanceExternalTooltip(NSDictionary *row);
 // Another mount that is both fuller than the headline and over this percent used
 // gets a secondary popover line. 85 itself does not qualify.
 extern const int kStorageFullSecondaryPercent;   // 85

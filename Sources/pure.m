@@ -2239,28 +2239,267 @@ static BOOL GlanceVolumeFlag(NSDictionary *volume, NSString *key) {
     return [value isKindOfClass:NSNumber.class] && [value boolValue];
 }
 
+static NSString *GlanceString(NSDictionary *volume, NSString *key) {
+    id value = volume[key];
+    return [value isKindOfClass:NSString.class] && [(NSString *)value length] ? value : nil;
+}
+
+static BOOL GlanceHasBytes(NSDictionary *volume, NSString *key) {
+    return [volume[key] isKindOfClass:NSNumber.class];
+}
+
+static long long GlanceBytes(NSDictionary *volume, NSString *key) {
+    return [volume[key] longLongValue];
+}
+
+static NSArray<NSString *> *GlanceCleanNames(NSArray<NSString *> *names) {
+    if (![names isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray<NSString *> *clean = [NSMutableArray array];
+    for (id name in names)
+        if ([name isKindOfClass:NSString.class] && [(NSString *)name length]) [clean addObject:name];
+    return clean;
+}
+
+NSString *VolumeContainerID(NSString *bsdName) {
+    if (![bsdName isKindOfClass:NSString.class] || !bsdName.length) return nil;
+    NSString *name = [bsdName hasPrefix:@"/dev/"] ? [bsdName substringFromIndex:5] : bsdName;
+    if (![name hasPrefix:@"disk"] || name.length < 5) return nil;
+    NSUInteger i = 4;
+    if ([name characterAtIndex:i] < '0' || [name characterAtIndex:i] > '9') return nil;
+    while (i < name.length) {
+        unichar c = [name characterAtIndex:i];
+        if (c < '0' || c > '9') break;
+        i++;
+    }
+    if (i < name.length && [name characterAtIndex:i] != 's') return nil;
+    return [name substringToIndex:i];
+}
+
+NSString *GlanceVolumeJoinedName(NSArray<NSString *> *names) {
+    NSArray<NSString *> *clean = GlanceCleanNames(names);
+    return clean.count ? [clean componentsJoinedByString:@" · "] : nil;
+}
+
+NSString *GlanceVolumeCompactName(NSArray<NSString *> *names) {
+    NSArray<NSString *> *clean = GlanceCleanNames(names);
+    if (!clean.count) return nil;
+    if (clean.count == 1) return clean[0];
+    return [NSString stringWithFormat:@"%@ +%lu", clean[0], (unsigned long)(clean.count - 1)];
+}
+
+static BOOL GlanceVolumeSkippedPath(NSDictionary *volume) {
+    NSString *path = GlanceString(volume, @"path");
+    return [path isEqualToString:@"/"] || [path isEqualToString:@"/System"] ||
+        [path hasPrefix:@"/System/Volumes"];
+}
+
+// A glance row: named, sized, local, and not the boot disk, an internal disk,
+// a system volume, or a disk image.
+static BOOL GlanceExternalCandidate(NSDictionary *volume) {
+    if (GlanceVolumeSkippedPath(volume)) return NO;
+    if (GlanceVolumeFlag(volume, @"boot") || GlanceVolumeFlag(volume, @"internal") ||
+        GlanceVolumeFlag(volume, @"diskImage"))
+        return NO;
+    if (!GlanceVolumeFlag(volume, @"local")) return NO;
+    if (!GlanceHasBytes(volume, @"totalBytes") || GlanceBytes(volume, @"totalBytes") <= 0) return NO;
+    return GlanceString(volume, @"name") != nil;
+}
+
+static BOOL GlanceDiskImageOnADisk(NSDictionary *volume) {
+    if (!GlanceVolumeFlag(volume, @"diskImage") || !GlanceVolumeFlag(volume, @"local")) return NO;
+    if (GlanceVolumeFlag(volume, @"boot") || GlanceVolumeFlag(volume, @"internal")) return NO;
+    if (GlanceVolumeSkippedPath(volume)) return NO;
+    return GlanceString(volume, @"name") != nil;
+}
+
+static BOOL GlanceBackingOnVolume(NSString *volumePath, NSString *backingPath) {
+    if (!volumePath.length || !backingPath.length) return NO;
+    NSString *prefix = [volumePath hasSuffix:@"/"] ? volumePath : [volumePath stringByAppendingString:@"/"];
+    return [backingPath hasPrefix:prefix];
+}
+
+static NSString *GlanceHostPath(NSString *backingPath, NSArray *volumes) {
+    NSString *best = nil;
+    for (id row in volumes) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = GlanceString(row, @"path");
+        if (!GlanceBackingOnVolume(path, backingPath)) continue;
+        if (!best || path.length > best.length) best = path;
+    }
+    return best;
+}
+
+static NSInteger GlanceRowIndexForPath(NSArray<NSDictionary *> *rows, NSString *path) {
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSDictionary *row = rows[i];
+        if ([GlanceString(row, @"path") isEqualToString:path]) return (NSInteger)i;
+        id paths = row[@"paths"];
+        if ([paths isKindOfClass:NSArray.class] && [paths containsObject:path]) return (NSInteger)i;
+    }
+    return NSNotFound;
+}
+
+static NSDictionary *GlanceRowAddingHosted(NSDictionary *row, NSString *imageName) {
+    if (!imageName.length) return row;
+    NSMutableArray *hosted = [NSMutableArray array];
+    if ([row[@"hosted"] isKindOfClass:NSArray.class]) {
+        for (id name in row[@"hosted"])
+            if ([name isKindOfClass:NSString.class] && [(NSString *)name length]) [hosted addObject:name];
+    }
+    if (![hosted containsObject:imageName]) [hosted addObject:imageName];
+    NSMutableDictionary *copy = [row mutableCopy];
+    copy[@"hosted"] = hosted;
+    return copy;
+}
+
+// One physical disk. Shared APFS space is counted once; independent partitions
+// (different totals, no container size) add up instead of dropping a partition.
+static NSDictionary *GlanceAggregateVolumes(NSArray<NSDictionary *> *members, NSString *container) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    long long usedSum = 0;
+    BOOL allUsed = YES;
+    long long totalSum = 0, firstTotal = 0, freeSum = 0, firstFree = 0;
+    BOOL anyTotal = NO, sameTotal = YES, anyFree = NO, sameFree = YES;
+    long long containerBytes = 0, containerFree = 0, largestFree = 0;
+    BOOL haveContainerFree = NO;
+    for (NSDictionary *member in members) {
+        NSString *name = GlanceString(member, @"name");
+        if (name) [names addObject:name];
+        NSString *path = GlanceString(member, @"path");
+        if (path) [paths addObject:path];
+        if (GlanceHasBytes(member, @"usedBytes") && GlanceBytes(member, @"usedBytes") >= 0)
+            usedSum += GlanceBytes(member, @"usedBytes");
+        else allUsed = NO;
+        if (GlanceHasBytes(member, @"totalBytes")) {
+            long long total = GlanceBytes(member, @"totalBytes");
+            if (!anyTotal) { firstTotal = total; anyTotal = YES; }
+            else if (total != firstTotal) sameTotal = NO;
+            if (total > 0) totalSum += total;
+        }
+        if (GlanceHasBytes(member, @"freeBytes")) {
+            long long free = MAX(0LL, GlanceBytes(member, @"freeBytes"));
+            if (!anyFree) { firstFree = free; anyFree = YES; }
+            else if (free != firstFree) sameFree = NO;
+            freeSum += free;
+            if (free > largestFree) largestFree = free;
+        }
+        if (GlanceHasBytes(member, @"containerBytes"))
+            containerBytes = MAX(containerBytes, GlanceBytes(member, @"containerBytes"));
+        if (!haveContainerFree && GlanceHasBytes(member, @"containerFreeBytes")) {
+            containerFree = MAX(0LL, GlanceBytes(member, @"containerFreeBytes"));
+            haveContainerFree = YES;
+        }
+    }
+    BOOL shared = containerBytes > 0 || (anyTotal && sameTotal);
+    long long total = containerBytes > 0 ? containerBytes : (shared ? firstTotal : totalSum);
+    long long free = haveContainerFree && shared ? containerFree
+        : (shared && sameFree) ? firstFree
+        : shared ? largestFree
+        : freeSum;
+    if (free < 0) free = 0;
+    if (shared && total > 0 && free > total) free = total;
+    long long used;
+    if (allUsed) used = usedSum;
+    else if (shared) used = MAX(0LL, total - free);
+    else {
+        used = 0;
+        for (NSDictionary *member in members) {
+            long long partTotal = GlanceHasBytes(member, @"totalBytes") ? GlanceBytes(member, @"totalBytes") : 0;
+            long long partFree = GlanceHasBytes(member, @"freeBytes") ? GlanceBytes(member, @"freeBytes") : 0;
+            if (partFree < 0) partFree = 0;
+            if (partFree > partTotal) partFree = partTotal;
+            used += MAX(0LL, partTotal - partFree);
+        }
+    }
+    return @{
+        @"name": [names componentsJoinedByString:@" · "] ?: @"",
+        @"names": names,
+        @"path": paths.firstObject ?: @"",
+        @"paths": paths,
+        @"container": container ?: @"",
+        @"totalBytes": @(total),
+        @"freeBytes": @(free),
+        @"usedBytes": @(MAX(0LL, used)),
+        @"local": @YES,
+        @"boot": @NO,
+        @"internal": @NO,
+        @"diskImage": @NO,
+        @"grouped": @YES,
+    };
+}
+
+double GlanceExternalUsedFraction(NSDictionary *row) {
+    if (![row isKindOfClass:NSDictionary.class]) return 0;
+    long long total = GlanceHasBytes(row, @"totalBytes") ? GlanceBytes(row, @"totalBytes") : 0;
+    if (total <= 0) return 0;
+    if (GlanceVolumeFlag(row, @"grouped") && GlanceHasBytes(row, @"usedBytes")) {
+        long long used = GlanceBytes(row, @"usedBytes");
+        if (used < 0) used = 0;
+        return MIN(1.0, (double)used / (double)total);
+    }
+    long long free = GlanceHasBytes(row, @"freeBytes") ? GlanceBytes(row, @"freeBytes") : 0;
+    if (free < 0) free = 0;
+    if (free > total) free = total;
+    return (double)(total - free) / (double)total;
+}
+
+NSString *GlanceExternalTooltip(NSDictionary *row) {
+    if (![row isKindOfClass:NSDictionary.class]) return nil;
+    long long total = GlanceHasBytes(row, @"totalBytes") ? MAX(0LL, GlanceBytes(row, @"totalBytes")) : 0;
+    long long free = GlanceHasBytes(row, @"freeBytes") ? GlanceBytes(row, @"freeBytes") : 0;
+    if (free < 0) free = 0;
+    if (total > 0 && free > total) free = total;
+    long long used = GlanceVolumeFlag(row, @"grouped") && GlanceHasBytes(row, @"usedBytes")
+        ? MAX(0LL, GlanceBytes(row, @"usedBytes")) : MAX(0LL, total - free);
+    NSString *name = GlanceString(row, @"name") ?: @"Volume";
+    NSString *line = [NSString stringWithFormat:@"%@ — %@ of %@ used · %@ free",
+                      name, PreciseByteCount(used), PreciseByteCount(total), PreciseByteCount(free)];
+    NSMutableArray<NSString *> *hosted = [NSMutableArray array];
+    if ([row[@"hosted"] isKindOfClass:NSArray.class]) {
+        for (id image in row[@"hosted"])
+            if ([image isKindOfClass:NSString.class] && [(NSString *)image length]) [hosted addObject:image];
+    }
+    if (hosted.count == 1)
+        line = [line stringByAppendingFormat:@"\nDisk image: %@", hosted[0]];
+    else if (hosted.count > 1)
+        line = [line stringByAppendingFormat:@"\nDisk images: %@", [hosted componentsJoinedByString:@" · "]];
+    return line;
+}
+
 NSArray<NSDictionary *> *GlanceExternalVolumes(NSArray<NSDictionary *> *volumes) {
     if (![volumes isKindOfClass:NSArray.class]) return @[];
-    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *candidates = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *images = [NSMutableArray array];
     for (id row in volumes) {
         if (![row isKindOfClass:NSDictionary.class]) continue;
         NSDictionary *volume = row;
-        id pathValue = volume[@"path"];
-        if ([pathValue isKindOfClass:NSString.class]) {
-            NSString *path = pathValue;
-            if ([path isEqualToString:@"/"] || [path isEqualToString:@"/System"] ||
-                [path hasPrefix:@"/System/Volumes"])
-                continue;
+        if (GlanceExternalCandidate(volume)) [candidates addObject:volume];
+        else if (GlanceDiskImageOnADisk(volume)) [images addObject:volume];
+    }
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *groups = [NSMutableDictionary dictionary];
+    NSUInteger alone = 0;
+    for (NSDictionary *volume in candidates) {
+        NSString *container = GlanceString(volume, @"container");
+        NSString *key = container ?: [NSString stringWithFormat:@"\n%lu", (unsigned long)alone++];
+        if (!groups[key]) {
+            groups[key] = [NSMutableArray array];
+            [order addObject:key];
         }
-        if (GlanceVolumeFlag(volume, @"boot") || GlanceVolumeFlag(volume, @"internal") ||
-            GlanceVolumeFlag(volume, @"diskImage"))
-            continue;
-        if (!GlanceVolumeFlag(volume, @"local")) continue;
-        id total = volume[@"totalBytes"];
-        if (![total isKindOfClass:NSNumber.class] || [total longLongValue] <= 0) continue;
-        id name = volume[@"name"];
-        if (![name isKindOfClass:NSString.class] || ![(NSString *)name length]) continue;
-        [out addObject:volume];
+        [groups[key] addObject:volume];
+    }
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (NSString *key in order) {
+        NSArray<NSDictionary *> *members = groups[key];
+        if (members.count == 1) [out addObject:members[0]];
+        else [out addObject:GlanceAggregateVolumes(members, [key hasPrefix:@"\n"] ? nil : key)];
+    }
+    for (NSDictionary *image in images) {
+        NSString *host = GlanceHostPath(GlanceString(image, @"backingPath"), volumes);
+        NSInteger index = GlanceRowIndexForPath(out, host);
+        if (index == NSNotFound) continue;
+        out[(NSUInteger)index] = GlanceRowAddingHosted(out[(NSUInteger)index], GlanceString(image, @"name"));
     }
     return out;
 }
