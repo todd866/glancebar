@@ -2,25 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>
-  <string>com.iantodd.mixpool-liked</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/iantodd/Projects/glancebar/tools/mixpool/mixpool.py</string>
-    <string>pull-liked</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>/Users/iantodd/Projects/glancebar</string>
-  <key>StartInterval</key>
-  <integer>21600</integer>
-  <key>LowPriorityIO</key>
-  <true/>
-  <key>Nice</key>
-  <integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>/Users/iantodd/.local/state/glancebar-mix/logs/pull-liked.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/iantodd/.local/state/glancebar-mix/logs/pull-liked.log</string>
+	<key>Label</key>
+	<string>com.iantodd.mixpool-liked</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>/usr/bin/python3 /Users/iantodd/Projects/glancebar/tools/mixpool/mixpool.py pull-liked; /Users/iantodd/.local/state/glancebar-mix/offload-am.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/iantodd/.local/state/glancebar-mix/logs/pull-liked.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/iantodd/.local/state/glancebar-mix/logs/pull-liked.log</string>
+	<key>StartInterval</key>
+	<integer>21600</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/iantodd/Projects/glancebar</string>
 </dict>
 </plist>
