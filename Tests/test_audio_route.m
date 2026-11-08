@@ -16,6 +16,11 @@ int main(void) { @autoreleasepool {
     NSDictionary *teams = Dev(@"MSLoopbackDriverDevice_UID", @"Microsoft Teams Audio", GlanceAudioTransportVirtual, 2);
     NSDictionary *ours = Dev(@"com.iantodd.glancebar.route.com.apple.Music.1", @"Glancebar Music", GlanceAudioTransportAggregate, 2);
     NSDictionary *usb = Dev(@"usbdac", @"USB DAC", GlanceAudioTransportUSB, 2);
+    NSDictionary *headphones = Dev(@"bose-headphones", @"Bose QC Ultra Headphones", GlanceAudioTransportBluetooth, 2);
+    NSDictionary *airpods = Dev(@"airpods", @"Ian’s AirPods Pro", GlanceAudioTransportBluetooth, 2);
+    NSDictionary *headset = Dev(@"usb-headset", @"USB Headset", GlanceAudioTransportUSB, 2);
+    NSMutableDictionary *jack = [Dev(@"usb-jack", @"USB DAC", GlanceAudioTransportUSB, 2) mutableCopy];
+    jack[@"dataSource"] = @"Headphones";
     NSArray *home = @[mic, speakers, iphone, teams];
     NSArray *withBose = @[mic, speakers, bose, iphone, teams, ours];
 
@@ -52,6 +57,16 @@ int main(void) { @autoreleasepool {
     Check(GBRouteResolveTarget(autoRule, home) == nil, @"automatic: no external output, no target (Teams and iPhone are not speakers)");
     Check([GBRouteResolveTarget(autoRule, @[speakers, usb, bose]) isEqual:bose[@"uid"]], @"Bluetooth before USB");
     Check(GBRouteResolveTarget(autoRule, @[speakers, ours]) == nil, @"never one of our own aggregates");
+    for (NSDictionary *personal in @[headphones, airpods, headset, jack])
+        Check(GBRouteResolveTarget(autoRule, @[speakers, personal]) == nil,
+              [NSString stringWithFormat:@"automatic never takes headphones: %@", personal[@"name"]]);
+    Check([GBRouteResolveTarget(autoRule, @[speakers, headphones, bose]) isEqual:bose[@"uid"]],
+          @"automatic skips headphones but preserves the real Bluetooth speaker");
+    Check([GBRouteResolveTarget(autoRule, @[speakers, headphones, usb]) isEqual:usb[@"uid"]],
+          @"automatic skips Bluetooth headphones and still finds a USB output");
+    NSDictionary *chosenHeadphones = @{@"bundleID": @"com.apple.Music", @"target": headphones[@"uid"], @"enabled": @YES};
+    Check([GBRouteResolveTarget(chosenHeadphones, @[speakers, headphones]) isEqual:headphones[@"uid"]],
+          @"an explicitly chosen headphone target is respected");
     NSDictionary *pinned = @{@"bundleID": @"com.apple.Music", @"target": @"usbdac", @"enabled": @YES};
     Check([GBRouteResolveTarget(pinned, @[speakers, usb, bose]) isEqual:@"usbdac"], @"a chosen output wins");
     Check(GBRouteResolveTarget(pinned, withBose) == nil, @"a chosen output that is absent is no target, not a fallback");
@@ -75,6 +90,15 @@ int main(void) { @autoreleasepool {
     Check([plan[@"routes"] count] == 0 && plan[@"hold"] == nil, @"routing to the speakers is no route");
     plan = GBRoutePlan(base, @[bose]);
     Check([plan[@"routes"] count] == 1 && plan[@"hold"] == nil, @"no local speakers: route, but nothing to hold on");
+
+    plan = GBRoutePlan(base, @[speakers, headphones]);
+    Check([plan[@"routes"] count] == 0 && !plan[@"hold"], @"headphones alone never hold other apps on Mac speakers");
+    NSDictionary *oldHeadphoneHold = @{@"hold": speakers[@"uid"], @"output": headphones[@"uid"], @"system": headphones[@"uid"]};
+    NSDictionary *released = GBRouteDefaultsStep(plan[@"hold"], oldHeadphoneHold, speakers[@"uid"], speakers[@"uid"], YES, @[speakers, headphones]);
+    Check([released[@"setOutput"] isEqual:headphones[@"uid"]] && [released[@"setSystem"] isEqual:headphones[@"uid"]] && released[@"saved"] == NSNull.null,
+          @"old automatic headphone hold restores both outputs and clears on upgrade");
+    Check([ChooseNewOutputDevice(@[speakers], @[speakers, headphones], YES) isEqual:headphones[@"uid"]],
+          @"normal new-output switching still adopts connected headphones");
 
     // Defaults: hold begins.
     NSDictionary *step = GBRouteDefaultsStep(@"BuiltInSpeakerDevice", nil, bose[@"uid"], bose[@"uid"], YES, withBose);

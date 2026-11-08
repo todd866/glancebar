@@ -33,7 +33,8 @@ NSString *GBRouteLocalSpeakerUID(NSArray<NSDictionary *> *devices);
 
 // Where a rule sends its app now, or nil when that output is not connected. Automatic picks
 // the first external output (Bluetooth, then USB, then display); never the built-in
-// speakers, a virtual device, or one of Glancebar's own aggregates.
+// speakers, headphones/headsets, a virtual device, or one of Glancebar's own aggregates.
+// An explicitly selected headphone target is still respected.
 NSString *GBRouteResolveTarget(NSDictionary *rule, NSArray<NSDictionary *> *devices);
 
 // Whether a process with this bundle ID belongs to the app (the app or one of its helpers).

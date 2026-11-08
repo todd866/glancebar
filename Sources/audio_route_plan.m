@@ -82,6 +82,10 @@ NSString *GBRouteResolveTarget(NSDictionary *rule, NSArray<NSDictionary *> *devi
         for (NSDictionary *device in devices) {
             if ([device[@"transport"] integerValue] != transport.integerValue) continue;
             if (Channels(device) <= 0 || IsOurs(device) || !Str(device[@"uid"])) continue;
+            // Automatic isolation is for shared speakers, not personal listening. Reuse
+            // the output menu's name/data-source classifier; explicit targets above remain valid.
+            if ([AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue],
+                                   Str(device[@"name"]), Str(device[@"dataSource"])) isEqual:@"headphones"]) continue;
             return device[@"uid"];
         }
     }
