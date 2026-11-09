@@ -4818,6 +4818,16 @@ static NSImage *StationTileImage(BOOL dimmed) {
 
 // Left click cycles outputs. Right click (and Option-click, handled in the action)
 // opens the full device menu.
+// The slider keeps the UID that the user actually saw; never redirect a drag to a new device.
+@interface GBOutputVolumeSlider : NSSlider
+@property (nonatomic, copy) NSString *outputUID;
+@end
+@implementation GBOutputVolumeSlider @end
+@interface GBPickerChevron : NSImageView @end
+@implementation GBPickerChevron
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+@end
+
 @interface OutputCycleButton : NSButton
 @end
 @implementation OutputCycleButton
@@ -5021,6 +5031,8 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
         old.enabled = new.enabled;
         old.trackFillColor = new.trackFillColor;
         old.target = new.target; old.action = new.action;
+        if ([old isKindOfClass:GBOutputVolumeSlider.class] && [new isKindOfClass:GBOutputVolumeSlider.class] && !(NSEvent.pressedMouseButtons & 1))
+            ((GBOutputVolumeSlider *)old).outputUID = ((GBOutputVolumeSlider *)new).outputUID;
     } else if ([existing isKindOfClass:NSSwitch.class]) {
         // The routing switch (addAudioRoutesTo:): its state is the rule's.
         NSSwitch *old = (NSSwitch *)existing, *new = (NSSwitch *)fresh;
@@ -6435,15 +6447,41 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!_audioDevices) _audioDevices = ReadAudioDevices();
     if (_popover.isShown) [self rebuildContent];
 }
-- (AudioObjectID)defaultOutputDeviceID {
-    for (NSDictionary *row in _audioDevices)
-        if ([row[@"uid"] isEqual:_defaultOutputUID]) return (AudioObjectID)[row[@"deviceID"] unsignedIntValue];
-    return kAudioObjectUnknown;
+- (NSDictionary *)playerOutputChoice {
+    BOOL music = _amLoaded && !_localMode && !_deckMode && !_musicOff;
+    NSString *uid = _defaultOutputUID;
+    NSString *note = nil;
+    BOOL separate = NO;
+    if (music) for (NSDictionary *rule in [self routeRules]) {
+        if (![rule[@"bundleID"] isEqual:kAppleMusicBundleID] || ![rule[@"enabled"] boolValue]) continue;
+        NSString *target = GBRouteResolveTarget(rule, _audioDevices);
+        GBRouteStatus status = _router ? [_router statusForBundleID:kAppleMusicBundleID] : GBRouteStatusUnsupported;
+        if (!target) note = @"Music's selected speaker is not connected; using Mac output.";
+        else if (status == GBRouteStatusSilent || status == GBRouteStatusFailed || status == GBRouteStatusUnsupported)
+            note = @"Music routing is unavailable; using Mac output.";
+        else if (![target isEqual:GBRouteLocalSpeakerUID(_audioDevices)]) {
+            uid = target;
+            separate = ![target isEqual:_defaultOutputUID];
+            if (status == GBRouteStatusIdle) note = @"Selected Music destination; waiting for Music audio.";
+        }
+        break;
+    }
+    NSDictionary *device = nil;
+    for (NSDictionary *row in _audioDevices) if ([row[@"uid"] isEqual:uid] && [row[@"outputChannels"] integerValue] > 0) { device = row; break; }
+    return @{@"uid": device ? uid : @"", @"device": device ?: @{}, @"name": device[@"name"] ?: @"No output device",
+             @"scope": music ? (separate ? @"Music" : @"Mac + Music") : @"Mac",
+             @"music": @(music), @"separate": @(separate), @"note": note ?: @""};
+}
+- (AudioObjectID)playerOutputDeviceID {
+    return [[self playerOutputChoice][@"device"][@"deviceID"] unsignedIntValue];
+}
+- (void)writeOutputVolume:(double)value device:(AudioObjectID)device {
+    if (_musicProbesEnabled && device != kAudioObjectUnknown) SetOutputVolume(device, value);
 }
 // Listen to the current output's volume and mute, moving the listener when the output changes.
 - (void)watchOutputVolume {
     if (!_musicProbesEnabled || _audioFrozen) return;
-    AudioObjectID device = [self defaultOutputDeviceID];
+    AudioObjectID device = [self playerOutputDeviceID];
     if (device == _volumeWatched) return;
     void (^each)(AudioObjectID, BOOL) = ^(AudioObjectID d, BOOL add) {
         NSMutableArray *addresses = [NSMutableArray array];
@@ -6461,8 +6499,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _volumeWatched = device;
 }
 - (void)refreshOutputVolume {
-    AudioObjectID device = [self defaultOutputDeviceID];
-    if (!_musicProbesEnabled || _audioFrozen || device == kAudioObjectUnknown) return;   // keep the last reading
+    AudioObjectID device = [self playerOutputDeviceID];
+    if (!_musicProbesEnabled || _audioFrozen) return;
+    if (device == kAudioObjectUnknown) { _outputVolume = -1; _outputMuted = NO; return; }
     BOOL muted = NO;
     _outputVolume = ReadOutputVolume(device, &muted);
     _outputMuted = muted;
@@ -6817,7 +6856,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     }
     NSData *index = [NSJSONSerialization dataWithJSONObject:@{@"tracks": sources} options:0 error:nil];
     if ([index writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-source-index.json"] atomically:YES])
-        [self setOfflineRequest:@"station:triplej" title:@"triple j for you" tracks:tracks];
+        [self setOfflineRequest:@"station:triplej" title:@"New music for you" tracks:tracks];
 }
 // selector play, off the main thread. Planning can take several seconds. A missing
 // binary, a non-zero exit or a dead socket runs fallback on the main thread — the
@@ -7094,8 +7133,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [task launchAndReturnError:nil];
 }
 - (IBAction)setOutputVolumeFromSlider:(NSSlider *)slider {
+    NSDictionary *choice = [self playerOutputChoice];
+    NSString *bound = [slider isKindOfClass:GBOutputVolumeSlider.class] ? ((GBOutputVolumeSlider *)slider).outputUID : nil;
+    if (!bound.length || ![bound isEqual:choice[@"uid"]]) return;
+    AudioObjectID device = [choice[@"device"][@"deviceID"] unsignedIntValue];
+    if (device == kAudioObjectUnknown) return;
     _volumeSetAt = CFAbsoluteTimeGetCurrent();
-    SetOutputVolume([self defaultOutputDeviceID], slider.doubleValue);
+    [self writeOutputVolume:slider.doubleValue device:device];
     _outputVolume = slider.doubleValue;
     _outputMuted = NO;
     NSTextField *level = nil;
@@ -9392,46 +9436,50 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [self ensureAudioDisplay];
     [self watchOutputVolume];
     [self refreshOutputVolume];
-    const CGFloat h = 22, levelW = 40, sliderW = 104;
+    NSDictionary *choice = [self playerOutputChoice];
+    const CGFloat levelW = 40, volumeH = 22;
+    NSButton *output = [self outputButton];
+    CGFloat textW = kW - 2 * kPad - 38;
+    CGFloat textH = ceil([output.attributedTitle boundingRectWithSize:NSMakeSize(textW, 1000)
+        options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading].size.height);
+    CGFloat pickerH = MAX(24, textH + 6), h = pickerH + volumeH;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
     line.accessibilityIdentifier = @"popover.sound.line";
-    NSButton *output = [self outputButton];
-    NSString *name = [output.accessibilityLabel hasPrefix:@"Sound output, "]
-        ? [output.accessibilityLabel substringFromIndex:@"Sound output, ".length] : @"Output";
-    if (_outputMuted) {
-        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
-        output.image = [[NSImage imageWithSystemSymbolName:@"speaker.slash" accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
-        output.contentTintColor = NSColor.systemRedColor;
-    } else {
-        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
-        output.image = [output.image imageWithSymbolConfiguration:cfg] ?: output.image;
-    }
-    output.imagePosition = NSImageLeading;
-    output.imageHugsTitle = YES;
-    output.alignment = NSTextAlignmentLeft;
-    output.attributedTitle = [[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:name] attributes:@{
-        NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
-    CGFloat sliderX = kW - kPad - levelW - 6 - sliderW;
-    output.frame = NSMakeRect(kPad - 2, 1, sliderX - 8 - (kPad - 2), 20);
+    // Root is flipped, this plain line is not: destination above the volume control.
+    output.frame = NSMakeRect(kPad - 2, volumeH + 1, kW - 2 * kPad + 4, pickerH - 2);
+    GBPickerChevron *chevron = [GBPickerChevron imageViewWithImage:[[NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightRegular]]];
+    chevron.contentTintColor = NSColor.secondaryLabelColor;
+    chevron.frame = NSMakeRect(NSWidth(output.frame) - 14, (NSHeight(output.frame) - 12) / 2, 12, 12);
+    chevron.accessibilityIdentifier = @"popover.sound.picker.chevron";
+    [output addSubview:chevron];
     [line addSubview:output];
-    BOOL known = _outputVolume >= 0;
-    NSSlider *slider = [NSSlider sliderWithValue:known ? _outputVolume : 0 minValue:0 maxValue:1
-                                          target:self action:@selector(setOutputVolumeFromSlider:)];
+    NSImageView *speaker = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:_outputMuted ? @"speaker.slash" : @"speaker.wave.2" accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]]];
+    speaker.contentTintColor = _outputMuted ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+    speaker.frame = NSMakeRect(kPad, 3, 18, 16);
+    speaker.accessibilityIdentifier = @"popover.sound.volume.symbol";
+    [line addSubview:speaker];
+    CGFloat sliderX = kPad + 26, sliderW = kW - kPad - levelW - 6 - sliderX;
+    BOOL known = _outputVolume >= 0 && [choice[@"uid"] length];
+    GBOutputVolumeSlider *slider = [GBOutputVolumeSlider sliderWithValue:known ? _outputVolume : 0 minValue:0 maxValue:1
+        target:self action:@selector(setOutputVolumeFromSlider:)];
+    slider.outputUID = choice[@"uid"];
     slider.controlSize = NSControlSizeSmall;
     slider.continuous = YES;
     slider.enabled = known;
-    slider.trackFillColor = OutputVolumeFill(_outputVolume, _outputMuted);
+    slider.trackFillColor = OutputVolumeFill(known ? _outputVolume : -1, known && _outputMuted);
     slider.frame = NSMakeRect(sliderX, 2, sliderW, 18);
     slider.accessibilityIdentifier = @"popover.sound.volume";
-    slider.accessibilityLabel = @"Volume";
-    slider.accessibilityHelp = [NSString stringWithFormat:@"Volume on %@", name];
+    slider.accessibilityLabel = [NSString stringWithFormat:@"%@ speaker volume", choice[@"scope"]];
+    slider.accessibilityHelp = [NSString stringWithFormat:@"Hardware volume on %@", choice[@"name"]];
     [line addSubview:slider];
-    NSTextField *level = [self text:OutputVolumeText(_outputVolume, _outputMuted)
-                               font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
-                              color:OutputVolumeColor(_outputVolume, _outputMuted)
-                                 at:NSMakeRect(kW - kPad - levelW, 3, levelW, 16) align:NSTextAlignmentRight];
+    NSTextField *level = [self text:OutputVolumeText(known ? _outputVolume : -1, known && _outputMuted)
+        font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
+        color:OutputVolumeColor(known ? _outputVolume : -1, known && _outputMuted)
+        at:NSMakeRect(kW - kPad - levelW, 3, levelW, 16) align:NSTextAlignmentRight];
     level.accessibilityIdentifier = @"popover.sound.level";
-    level.accessibilityLabel = _outputMuted ? @"Muted" : [NSString stringWithFormat:@"Volume %@", level.stringValue];
+    level.accessibilityLabel = known && _outputMuted ? @"Muted" : [NSString stringWithFormat:@"Volume %@", level.stringValue];
     [line addSubview:level];
     [root addSubview:line];
     return y + h;
@@ -9476,31 +9524,29 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 }
 - (NSButton *)outputButton {
     [self ensureAudioDisplay];
-    NSArray<NSDictionary *> *menu = AudioOutputMenuDevices(_audioDevices, _defaultOutputUID);
-    NSDictionary *current = nil;
-    for (NSDictionary *row in menu)
-        if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
-    if (!current)
-        for (NSDictionary *row in _audioDevices)
-            if ([row[@"uid"] isEqual:_defaultOutputUID]) { current = row; break; }
-    NSString *name = current[@"name"] ?: @"No output device";
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
-    NSImage *image = [[NSImage imageWithSystemSymbolName:AudioSymbolName(current) accessibilityDescription:nil]
-                      imageWithSymbolConfiguration:cfg];
-    if (!image) image = [NSImage imageWithSystemSymbolName:@"speaker.wave.2" accessibilityDescription:nil];
-    OutputCycleButton *button = [OutputCycleButton buttonWithImage:image target:self action:@selector(cycleOutput:)];
-    button.title = @"";   // buttonWithImage: leaves the stock "Button" title
+    NSDictionary *choice = [self playerOutputChoice];
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:[choice[@"music"] boolValue] ? @"music.note" : @"laptopcomputer"
+        accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+    OutputCycleButton *button = [OutputCycleButton buttonWithImage:image target:self action:@selector(showOutputMenu:)];
     button.bordered = NO;
-    button.imagePosition = NSImageOnly;
+    button.imagePosition = NSImageLeading;
+    button.imageHugsTitle = YES;
+    button.alignment = NSTextAlignmentLeft;
     button.imageScaling = NSImageScaleProportionallyDown;
     button.contentTintColor = NSColor.secondaryLabelColor;
+    NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
+    paragraph.lineBreakMode = NSLineBreakByWordWrapping;
+    NSString *title = [NSString stringWithFormat:@" %@ → %@", choice[@"scope"], choice[@"name"]];
+    button.attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor,
+        NSParagraphStyleAttributeName: paragraph}];
+    ((NSButtonCell *)button.cell).wraps = YES;
+    ((NSButtonCell *)button.cell).usesSingleLineMode = NO;
+    ((NSButtonCell *)button.cell).lineBreakMode = NSLineBreakByWordWrapping;
     button.accessibilityIdentifier = @"popover.sound";
-    button.accessibilityLabel = [NSString stringWithFormat:@"Sound output, %@", name];
-    NSString *nextUID = NextOutputUID(menu, _defaultOutputUID);
-    NSString *nextName = nil;
-    for (NSDictionary *row in menu)
-        if ([row[@"uid"] isEqual:nextUID]) { nextName = row[@"name"]; break; }
-    button.accessibilityHelp = nextName.length ? [NSString stringWithFormat:@"%@ — click for %@", name, nextName] : name;
+    button.accessibilityLabel = [NSString stringWithFormat:@"%@ output, %@", choice[@"scope"], choice[@"name"]];
+    button.accessibilityHelp = [choice[@"note"] length] ? choice[@"note"] : @"Choose output. The volume control changes this speaker's hardware volume.";
     return button;
 }
 - (IBAction)cycleOutput:(id)sender {
@@ -9607,7 +9653,8 @@ static NSArray<NSString *> *InstalledRouteApps(void) {
     }
     [self applyDefaultsForHold:hold devices:devices devicesChanged:devicesChanged];
     if (!routes.count) [_router applyRoutes:routes];
-    _defaultOutputUID = DefaultOutputUID(devices);
+    _audioDevices = ReadAudioDevices();
+    _defaultOutputUID = DefaultOutputUID(_audioDevices);
 }
 - (NSDictionary *)routeDevice:(NSString *)uid {
     for (NSDictionary *row in _audioDevices) if ([row[@"uid"] isEqual:uid]) return row;
@@ -9618,93 +9665,7 @@ static NSArray<NSString *> *InstalledRouteApps(void) {
 // The arrow is the indicator: green while the app is tapped to the speaker, grey when the
 // rule is off or the speaker is away, amber with a warning glyph when Core Audio refused or
 // the tap only hears silence (audio-capture permission).
-- (CGFloat)addAudioRoutesTo:(NSView *)root at:(CGFloat)y {
-    [self ensureAudioDisplay];
-    for (NSDictionary *rule in [self routeRules]) {
-        NSString *bundle = rule[@"bundleID"];
-        NSURL *appURL = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundle];
-        if (!appURL) continue;
-        const CGFloat h = 24;   // the system switch is 24pt tall at every control size
-        NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
-        line.accessibilityIdentifier = [@"popover.route." stringByAppendingString:bundle];
-        NSString *appName = [NSFileManager.defaultManager displayNameAtPath:appURL.path].stringByDeletingPathExtension ?: bundle;
-        NSImageView *icon = [NSImageView imageViewWithImage:[NSWorkspace.sharedWorkspace iconForFile:appURL.path]];
-        icon.frame = NSMakeRect(kPad, 4, 16, 16);
-        icon.imageScaling = NSImageScaleProportionallyUpOrDown;
-        [line addSubview:icon];
-        NSTextField *name = [self text:appName font:[NSFont systemFontOfSize:12] color:NSColor.secondaryLabelColor
-                                    at:NSMakeRect(kPad + 21, 4, 58, 16) align:NSTextAlignmentLeft];
-        name.lineBreakMode = NSLineBreakByTruncatingTail;
-        [line addSubview:name];
-
-        BOOL enabled = [rule[@"enabled"] boolValue];
-        NSString *target = GBRouteResolveTarget(rule, _audioDevices);
-        NSString *local = GBRouteLocalSpeakerUID(_audioDevices);
-        BOOL routed = enabled && target && ![target isEqual:local];
-        GBRouteStatus status = routed && _router ? [_router statusForBundleID:bundle] : GBRouteStatusIdle;
-        BOOL trouble = routed && (status == GBRouteStatusSilent || status == GBRouteStatusFailed ||
-                                  status == GBRouteStatusUnsupported);
-        NSColor *tint = trouble ? NSColor.systemYellowColor
-            : (routed && status == GBRouteStatusActive) ? NSColor.systemGreenColor
-            : routed ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;
-        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:11 weight:NSFontWeightSemibold];
-        NSImageView *arrow = [NSImageView imageViewWithImage:
-            [[NSImage imageWithSystemSymbolName:trouble ? @"exclamationmark.triangle.fill" : @"arrow.right"
-                       accessibilityDescription:nil] imageWithSymbolConfiguration:cfg]];
-        arrow.contentTintColor = tint;
-        arrow.frame = NSMakeRect(kAINameX + 50, 4, 18, 16);
-        arrow.accessibilityElement = YES;
-        arrow.accessibilityRole = NSAccessibilityImageRole;
-        arrow.accessibilityIdentifier = [@"popover.route.state." stringByAppendingString:bundle];
-        NSString *state = !enabled ? @"off" : !target ? @"speaker not connected"
-            : [target isEqual:local] ? @"on the Mac's speakers"
-            : status == GBRouteStatusActive ? @"routed"
-            : status == GBRouteStatusSilent ? @"silent — allow Glancebar in Privacy & Security › Screen & System Audio Recording"
-            : status == GBRouteStatusFailed ? [NSString stringWithFormat:@"Core Audio refused (%@)", _router.lastError ?: @"?"]
-            : status == GBRouteStatusUnsupported ? @"needs macOS 14.2"
-            : [NSString stringWithFormat:@"waiting for %@", appName];
-        arrow.accessibilityLabel = state;
-        arrow.accessibilityHelp = state;
-        [line addSubview:arrow];
-
-        NSDictionary *device = target ? [self routeDevice:target] : nil;
-        NSString *targetName = device[@"name"] ?: ([rule[@"target"] length] ? (rule[@"targetName"] ?: @"Output") : @"Automatic");
-        NSImage *glyph = [[NSImage imageWithSystemSymbolName:device ? AudioSymbolName(device) : @"speaker.wave.2"
-                                    accessibilityDescription:nil]
-                          imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]];
-        NSButton *pick = [NSButton buttonWithImage:glyph target:self action:@selector(showRouteTargetMenu:)];
-        pick.bordered = NO;
-        pick.imagePosition = NSImageLeading;
-        pick.imageHugsTitle = YES;
-        pick.alignment = NSTextAlignmentLeft;
-        pick.contentTintColor = device ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;
-        pick.attributedTitle = [[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:targetName] attributes:@{
-            NSFontAttributeName: [NSFont systemFontOfSize:12],
-            NSForegroundColorAttributeName: device ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor}];
-        ((NSButtonCell *)pick.cell).lineBreakMode = NSLineBreakByTruncatingTail;
-        CGFloat switchW = 54;
-        CGFloat pickX = NSMaxX(arrow.frame) + 4;
-        pick.frame = NSMakeRect(pickX, 2, kW - kPad - switchW - 8 - pickX, 20);
-        pick.accessibilityIdentifier = [@"popover.route.target." stringByAppendingString:bundle];
-        pick.accessibilityLabel = [NSString stringWithFormat:@"%@ output, %@", appName, targetName];
-        [line addSubview:pick];
-
-        NSSwitch *toggle = [NSSwitch new];
-        toggle.controlSize = NSControlSizeMini;
-        toggle.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
-        toggle.target = self;
-        toggle.action = @selector(toggleRoute:);
-        [toggle sizeToFit];
-        toggle.frame = NSMakeRect(kW - kPad - NSWidth(toggle.frame), (h - NSHeight(toggle.frame)) / 2,
-                                  NSWidth(toggle.frame), NSHeight(toggle.frame));
-        toggle.accessibilityIdentifier = [@"popover.route.toggle." stringByAppendingString:bundle];
-        toggle.accessibilityLabel = [NSString stringWithFormat:@"Route %@ to its own speaker", appName];
-        [line addSubview:toggle];
-        [root addSubview:line];
-        y += h;
-    }
-    return y;
-}
+- (CGFloat)addAudioRoutesTo:(NSView *)root at:(CGFloat)y { (void)root; return y; }
 static NSString *RouteBundleFrom(NSView *control, NSString *prefix) {
     NSString *identifier = control.accessibilityIdentifier;
     return [identifier hasPrefix:prefix] ? [identifier substringFromIndex:prefix.length] : nil;
@@ -9715,28 +9676,41 @@ static NSString *RouteBundleFrom(NSView *control, NSString *prefix) {
     [self setRouteRules:GBRouteRulesUpdating([self routeRules], bundle,
                                              @{@"enabled": @(sender.state == NSControlStateValueOn)})];
 }
-- (void)showRouteTargetMenu:(NSButton *)sender {
-    NSString *bundle = RouteBundleFrom(sender, @"popover.route.target.");
-    NSDictionary *rule = nil;
-    for (NSDictionary *r in [self routeRules]) if ([r[@"bundleID"] isEqual:bundle]) rule = r;
-    if (!rule) return;
-    NSArray<NSDictionary *> *devices = _musicProbesEnabled ? ReadAudioDevices() : _audioDevices;
-    NSMenu *menu = [NSMenu new];
-    NSMenuItem *automatic = [menu addItemWithTitle:@"Automatic" action:@selector(chooseRouteTarget:) keyEquivalent:@""];
+- (NSMenu *)routeMenuForRule:(NSDictionary *)rule devices:(NSArray *)devices {
+    NSString *bundle = rule[@"bundleID"];
+    NSMenu *menu = [NSMenu new]; menu.autoenablesItems = NO;
+    BOOL enabled = [rule[@"enabled"] boolValue];
+    NSMenuItem *follow = [menu addItemWithTitle:@"Follow Mac output" action:@selector(followMacOutput:) keyEquivalent:@""];
+    follow.target = self; follow.representedObject = bundle;
+    follow.state = enabled ? NSControlStateValueOff : NSControlStateValueOn;
+    NSMenuItem *automatic = [menu addItemWithTitle:@"Automatic external speaker" action:@selector(chooseRouteTarget:) keyEquivalent:@""];
     automatic.target = self;
     automatic.representedObject = @{@"bundleID": bundle, @"target": @"", @"targetName": @""};
-    automatic.state = [rule[@"target"] length] ? NSControlStateValueOff : NSControlStateValueOn;
-    automatic.image = [NSImage imageWithSystemSymbolName:@"wand.and.stars" accessibilityDescription:nil];
+    automatic.state = enabled && ![rule[@"target"] length] ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:NSMenuItem.separatorItem];
+    NSString *local = GBRouteLocalSpeakerUID(devices);
     for (NSDictionary *device in AudioOutputMenuDevices(devices, nil)) {
-        if ([device[@"uid"] hasPrefix:GBRouteAggregateUIDPrefix]) continue;
+        // This router does not isolate an app to the built-in speaker: use Follow Mac.
+        if ([device[@"uid"] hasPrefix:GBRouteAggregateUIDPrefix] || [device[@"uid"] isEqual:local]) continue;
         NSMenuItem *item = [menu addItemWithTitle:device[@"name"] ?: @"Output" action:@selector(chooseRouteTarget:) keyEquivalent:@""];
         item.target = self;
         item.representedObject = @{@"bundleID": bundle, @"target": device[@"uid"], @"targetName": device[@"name"] ?: @""};
-        item.state = [device[@"uid"] isEqual:rule[@"target"]] ? NSControlStateValueOn : NSControlStateValueOff;
+        item.state = enabled && [device[@"uid"] isEqual:rule[@"target"]] ? NSControlStateValueOn : NSControlStateValueOff;
         item.image = [NSImage imageWithSystemSymbolName:AudioSymbolName(device) accessibilityDescription:nil];
     }
-    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
+    return menu;
+}
+- (void)followMacOutput:(NSMenuItem *)sender {
+    NSString *bundle = [sender.representedObject isKindOfClass:NSString.class] ? sender.representedObject : nil;
+    if (!bundle.length) return;
+    [self setRouteRules:GBRouteRulesUpdating([self routeRules], bundle, @{@"enabled": @NO})];
+}
+- (void)showRouteTargetMenu:(NSButton *)sender {
+    NSString *bundle = RouteBundleFrom(sender, @"popover.route.target.");
+    for (NSDictionary *rule in [self routeRules]) if ([rule[@"bundleID"] isEqual:bundle]) {
+        [[self routeMenuForRule:rule devices:_audioDevices] popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
+        return;
+    }
 }
 - (void)chooseRouteTarget:(NSMenuItem *)item {
     NSDictionary *choice = item.representedObject;
@@ -9755,30 +9729,53 @@ static NSString *RouteBundleFrom(NSView *control, NSString *prefix) {
     [root addSubview:hint];
     return y + 16;
 }
-- (void)showOutputMenu:(NSView *)sender {
-    [self ensureAudioDisplay];
-    NSArray<NSDictionary *> *devices = _audioDevices;
-    // Layout tests preset the device list and must not touch CoreAudio.
-    if (_musicProbesEnabled) {
-        devices = ReadAudioDevices();
-        _audioDevices = devices;
-        NSString *live = DefaultOutputUID(devices);
-        if (live.length) _defaultOutputUID = live;
+- (NSMenu *)playerOutputMenu {
+    NSMenu *menu = [NSMenu new]; menu.autoenablesItems = NO;
+    NSDictionary *choice = [self playerOutputChoice];
+    if ([choice[@"note"] length]) {
+        NSMenuItem *status = [menu addItemWithTitle:choice[@"note"] action:nil keyEquivalent:@""];
+        status.enabled = NO;
+        [menu addItem:NSMenuItem.separatorItem];
     }
-    NSMenu *menu = [NSMenu new];
-    NSArray<NSDictionary *> *items = AudioOutputMenuDevices(devices, _defaultOutputUID);
-    if (!items.count) {
-        NSMenuItem *empty = [menu addItemWithTitle:@"No output devices" action:nil keyEquivalent:@""];
-        empty.enabled = NO;
+    // Current-source actions stay at the top; Mac sounds and other apps remain reachable.
+    NSDictionary *musicRule = nil;
+    for (NSDictionary *rule in [self routeRules]) if ([rule[@"bundleID"] isEqual:kAppleMusicBundleID]) musicRule = rule;
+    if ([choice[@"music"] boolValue] && musicRule) {
+        NSMenuItem *header = [menu addItemWithTitle:@"Music output" action:nil keyEquivalent:@""]; header.enabled = NO;
+        NSMenu *music = [self routeMenuForRule:musicRule devices:_audioDevices];
+        for (NSMenuItem *item in [music.itemArray copy]) { [music removeItem:item]; [menu addItem:item]; }
+        [menu addItem:NSMenuItem.separatorItem];
     }
-    for (NSDictionary *device in items) {
-        NSMenuItem *item = [menu addItemWithTitle:device[@"name"] ?: @"Output" action:@selector(chooseOutputDevice:) keyEquivalent:@""];
-        item.target = self;
-        item.representedObject = device[@"uid"];
+    NSMenu *mac = [NSMenu new]; mac.autoenablesItems = NO;
+    for (NSDictionary *device in AudioOutputMenuDevices(_audioDevices, _defaultOutputUID)) {
+        NSMenuItem *item = [mac addItemWithTitle:device[@"name"] ?: @"Output" action:@selector(chooseOutputDevice:) keyEquivalent:@""];
+        item.target = self; item.representedObject = device[@"uid"];
         item.state = [device[@"uid"] isEqual:_defaultOutputUID] ? NSControlStateValueOn : NSControlStateValueOff;
         item.image = [NSImage imageWithSystemSymbolName:AudioSymbolName(device) accessibilityDescription:nil];
     }
-    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
+    if (!mac.numberOfItems) { NSMenuItem *empty = [mac addItemWithTitle:@"No output devices" action:nil keyEquivalent:@""]; empty.enabled = NO; }
+    if ([choice[@"music"] boolValue]) {
+        NSMenuItem *item = [menu addItemWithTitle:@"Mac sounds" action:nil keyEquivalent:@""]; item.submenu = mac;
+    } else {
+        NSMenuItem *header = [menu addItemWithTitle:@"Mac output" action:nil keyEquivalent:@""]; header.enabled = NO;
+        for (NSMenuItem *item in [mac.itemArray copy]) { [mac removeItem:item]; [menu addItem:item]; }
+        [menu addItem:NSMenuItem.separatorItem];
+    }
+    for (NSDictionary *rule in [self routeRules]) {
+        NSString *bundle = rule[@"bundleID"];
+        if ([choice[@"music"] boolValue] && [bundle isEqual:kAppleMusicBundleID]) continue;
+        NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundle];
+        if (!app) continue;
+        NSString *name = [NSFileManager.defaultManager displayNameAtPath:app.path].stringByDeletingPathExtension;
+        NSMenuItem *item = [menu addItemWithTitle:[name stringByAppendingString:@" output"] action:nil keyEquivalent:@""];
+        item.submenu = [self routeMenuForRule:rule devices:_audioDevices];
+    }
+    return menu;
+}
+- (void)showOutputMenu:(NSView *)sender {
+    [self ensureAudioDisplay];
+    if (_musicProbesEnabled) { _audioDevices = ReadAudioDevices(); _defaultOutputUID = DefaultOutputUID(_audioDevices); }
+    [[self playerOutputMenu] popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(sender.bounds)) inView:sender];
 }
 - (void)chooseOutputDevice:(NSMenuItem *)item {
     NSString *uid = item.representedObject;
