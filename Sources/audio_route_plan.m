@@ -98,11 +98,24 @@ BOOL GBRouteBundleMatches(NSString *processBundleID, NSString *appBundleID) {
     return [processBundleID hasPrefix:[appBundleID stringByAppendingString:@"."]];
 }
 
-NSDictionary *GBRoutePlan(NSArray<NSDictionary *> *rules, NSArray<NSDictionary *> *devices) {
+static BOOL IsHeadphones(NSString *uid, NSArray<NSDictionary *> *devices) {
+    if (!uid.length) return NO;
+    for (NSDictionary *device in devices) {
+        if (![device[@"uid"] isEqual:uid]) continue;
+        return [AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue],
+                                  Str(device[@"name"]), Str(device[@"dataSource"])) isEqual:@"headphones"];
+    }
+    return NO;
+}
+
+NSDictionary *GBRoutePlan(NSArray<NSDictionary *> *rules, NSArray<NSDictionary *> *devices,
+                          NSString *defaultOutputUID) {
     NSString *local = GBRouteLocalSpeakerUID(devices);
+    BOOL personal = IsHeadphones(defaultOutputUID, devices);
     NSMutableArray *routes = [NSMutableArray array];
     for (NSDictionary *rule in rules) {
         if (![rule[@"enabled"] boolValue]) continue;
+        if (personal && !Str(rule[@"target"]).length) continue;   // automatic stands down
         NSString *target = GBRouteResolveTarget(rule, devices);
         if (!target || [target isEqual:local]) continue;
         [routes addObject:@{@"bundleID": rule[@"bundleID"], @"target": target}];

@@ -34,7 +34,8 @@ NSString *GBRouteLocalSpeakerUID(NSArray<NSDictionary *> *devices);
 // Where a rule sends its app now, or nil when that output is not connected. Automatic picks
 // the first external output (Bluetooth, then USB, then display); never the built-in
 // speakers, headphones/headsets, a virtual device, or one of Glancebar's own aggregates.
-// An explicitly selected headphone target is still respected.
+// An explicitly selected headphone target is still respected. (GBRoutePlan also drops
+// automatic routes while headphones are the current output.)
 NSString *GBRouteResolveTarget(NSDictionary *rule, NSArray<NSDictionary *> *devices);
 
 // Whether a process with this bundle ID belongs to the app (the app or one of its helpers).
@@ -42,8 +43,13 @@ BOOL GBRouteBundleMatches(NSString *processBundleID, NSString *appBundleID);
 
 // The routing plan: routes is [{bundleID, target}] for every enabled rule whose output is
 // connected and is not the local speakers; hold is the local-speaker UID the system default
-// should sit on while any route applies, or nil.
-NSDictionary *GBRoutePlan(NSArray<NSDictionary *> *rules, NSArray<NSDictionary *> *devices);
+// should sit on while any route applies, or nil. defaultOutputUID is the output the Mac is
+// playing on now (nil when unknown): while that is headphones the listener has chosen
+// personal listening, so automatic rules stand down and the app plays there with everything
+// else. (10 Nov 2026: Music was tapped away to a docked monitor while the Bose headphones
+// were the output, so pressing play was silent.) An explicitly chosen target still applies.
+NSDictionary *GBRoutePlan(NSArray<NSDictionary *> *rules, NSArray<NSDictionary *> *devices,
+                          NSString *defaultOutputUID);
 
 // One step of holding and restoring the system defaults.
 //   hold:   the plan's hold UID, or nil

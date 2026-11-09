@@ -79,19 +79,31 @@ int main(void) { @autoreleasepool {
     Check(!GBRouteBundleMatches(nil, @"com.apple.Music"), @"no bundle ID");
 
     // Plan.
-    NSDictionary *plan = GBRoutePlan(base, withBose);
+    NSDictionary *plan = GBRoutePlan(base, withBose, @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 1 && [plan[@"routes"][0][@"target"] isEqual:bose[@"uid"]], @"Music routed to the Bose");
     Check([plan[@"hold"] isEqual:@"BuiltInSpeakerDevice"], @"everything else held on the speakers");
-    plan = GBRoutePlan(base, home);
+    plan = GBRoutePlan(base, home, @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 0 && plan[@"hold"] == nil, @"speaker gone: no route, no hold");
-    plan = GBRoutePlan(GBRouteRulesUpdating(base, @"com.apple.Music", @{@"enabled": @NO}), withBose);
+    plan = GBRoutePlan(GBRouteRulesUpdating(base, @"com.apple.Music", @{@"enabled": @NO}), withBose, @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 0 && plan[@"hold"] == nil, @"rule off: no route, no hold");
-    plan = GBRoutePlan(GBRouteRulesUpdating(base, @"com.apple.Music", @{@"target": @"BuiltInSpeakerDevice"}), withBose);
+    plan = GBRoutePlan(GBRouteRulesUpdating(base, @"com.apple.Music", @{@"target": @"BuiltInSpeakerDevice"}), withBose, @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 0 && plan[@"hold"] == nil, @"routing to the speakers is no route");
-    plan = GBRoutePlan(base, @[bose]);
+    plan = GBRoutePlan(base, @[bose], @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 1 && plan[@"hold"] == nil, @"no local speakers: route, but nothing to hold on");
 
-    plan = GBRoutePlan(base, @[speakers, headphones]);
+    // Headphones are the output: automatic stands down even with a monitor or speaker attached.
+    NSDictionary *monitor = @{@"uid": @"dell", @"name": @"DELL U2424HE", @"transport": @(GlanceAudioTransportDisplay), @"outputChannels": @2};
+    plan = GBRoutePlan(base, @[speakers, headphones, monitor], headphones[@"uid"]);
+    Check([plan[@"routes"] count] == 0 && !plan[@"hold"], @"headphones are the output: Music is not sent to the monitor");
+    plan = GBRoutePlan(base, @[speakers, headphones, bose], headphones[@"uid"]);
+    Check([plan[@"routes"] count] == 0 && !plan[@"hold"], @"headphones are the output: Music is not sent to the speaker either");
+    plan = GBRoutePlan(base, @[speakers, headphones, bose], speakers[@"uid"]);
+    Check([plan[@"routes"] count] == 1 && [plan[@"routes"][0][@"target"] isEqual:bose[@"uid"]], @"Mac speakers are the output: the speaker route applies");
+    plan = GBRoutePlan(base, @[speakers, headphones, bose], nil);
+    Check([plan[@"routes"] count] == 1, @"unknown output: the route applies");
+    plan = GBRoutePlan(GBRouteRulesUpdating(base, @"com.apple.Music", @{@"target": bose[@"uid"]}), @[speakers, headphones, bose], headphones[@"uid"]);
+    Check([plan[@"routes"] count] == 1, @"an explicitly chosen target applies whatever the output");
+    plan = GBRoutePlan(base, @[speakers, headphones], @"BuiltInSpeakerDevice");
     Check([plan[@"routes"] count] == 0 && !plan[@"hold"], @"headphones alone never hold other apps on Mac speakers");
     NSDictionary *oldHeadphoneHold = @{@"hold": speakers[@"uid"], @"output": headphones[@"uid"], @"system": headphones[@"uid"]};
     NSDictionary *released = GBRouteDefaultsStep(plan[@"hold"], oldHeadphoneHold, speakers[@"uid"], speakers[@"uid"], YES, @[speakers, headphones]);

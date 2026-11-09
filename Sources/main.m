@@ -4650,7 +4650,7 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     const CGFloat width = 220, pad = 8;
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     NSMutableArray *lines = [NSMutableArray array];
-    [lines addObject:@{@"text": @"triple j", @"secondary": @NO, @"id": @"popover.mix.station.large.title"}];
+    [lines addObject:@{@"text": @"New music", @"secondary": @NO, @"id": @"popover.mix.station.large.title"}];
     NSUInteger i = 0;
     for (NSDictionary *pick in self.picks) {
         if (![pick isKindOfClass:NSDictionary.class] || i >= 8) break;
@@ -6390,7 +6390,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         NSArray<NSDictionary *> *now = ReadAudioDevices();
         NSString *adopt = ChooseNewOutputDevice(self->_audioPrevious, now, SwitchToNewOutputs());
         // A routed speaker arriving is the routed app's, not everything's.
-        if (self->_router && GBRoutePlan([self routeRules], now)[@"hold"]) adopt = nil;
+        // (Judged with the output about to be adopted: arriving headphones are still adopted,
+        // and the plan then stands down for them.)
+        NSString *outputAfter = adopt ?: GBAudioDefaultUID(kAudioHardwarePropertyDefaultOutputDevice);
+        if (self->_router && GBRoutePlan([self routeRules], now, outputAfter)[@"hold"]) adopt = nil;
         self->_audioPrevious = now;
         self->_audioDevices = now;
         if (adopt) {
@@ -6406,7 +6409,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)audioDefaultChanged {
     // macOS moves the default to a speaker that just connected, sometimes after the device
     // list has settled; that is part of the arrival, so the routing hold answers it.
-    if (_router && CFAbsoluteTimeGetCurrent() - _audioDevicesChangedAt < 3) [self applyAudioRoutes:YES];
+    // Any other change is a choice: re-plan without re-asserting the hold, so choosing
+    // headphones releases an automatic route and choosing a speaker lets it resume.
+    if (_router) [self applyAudioRoutes:CFAbsoluteTimeGetCurrent() - _audioDevicesChangedAt < 3];
     _defaultOutputUID = DefaultOutputUID(_audioDevices ?: ReadAudioDevices());
     if (!_audioDevices) _audioDevices = ReadAudioDevices();
     if (_popover.isShown) [self rebuildContent];
@@ -6682,6 +6687,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     }
     // Drop Glancebar's player before the deck starts, or the two play at once and
     // both answer the media keys. A failed launch puts the queue player back.
+    [self pauseAppleMusicForLocalSource];
     [self tearDownLocalPlayer];
     _localMode = NO;
     [self disableRemoteCommands];
@@ -7193,9 +7199,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
 }
+// One source at a time. The deck and the local player are started from here while Apple
+// Music may still be playing (10 Nov 2026: the station played over the Apple Music song).
+// Pause it, never quit it; a closed Music is left closed.
+- (void)pauseAppleMusicForLocalSource {
+    if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;
+    RunAppleScript(@"tell application \"Music\"\nif player state is playing then pause\nend tell",
+                   ^(NSString *output, NSString *errorText, int status) {
+        (void)output;
+        if (status != 0) GBLog("apple music: pause for local source status=%d err=%{public}@", status, errorText);
+    });
+}
 - (void)playLocalIndex:(NSInteger)index {
     if (_deckMode) [self leaveDeckModeStopDeck:YES reason:@"local"];
     if (!_localURLs.count) return;
+    if (!_localMode) [self pauseAppleMusicForLocalSource];
     index = [self wrappedLocalIndex:index];
     _localIndex = index;
     NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
@@ -9143,8 +9161,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     station.alphaValue = stationOn ? 1 : 0.4;
     station.accessibilityIdentifier = @"popover.mix.station";
     NSUInteger pickCount = station.picks.count;
-    station.accessibilityLabel = @"triple j for you";
-    station.accessibilityHelp = stationOn ? @"Play triple j for you" : @"triple j for you is not available";
+    station.accessibilityLabel = @"New music for you";
+    station.accessibilityHelp = stationOn ? @"Play new music for you" : @"New music for you is not available";
     if (stationPlaying) { station.layer.borderWidth = 2; station.layer.borderColor = NSColor.controlAccentColor.CGColor; }
     station.frame = NSMakeRect(x, capH, side, side);
     [line addSubview:station];
@@ -9157,7 +9175,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     }
     {
         CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
-        NSArray *captions = @[@"triple j", @"for you"];
+        NSArray *captions = @[@"New music", @"for you"];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.font = capFont;
@@ -9401,7 +9419,8 @@ static NSArray<NSString *> *InstalledRouteApps(void) {
     if (!_router) return;
     NSArray<NSDictionary *> *devices = ReadAudioDevices();
     _audioDevices = devices;
-    NSDictionary *plan = GBRoutePlan([self routeRules], devices);
+    NSDictionary *plan = GBRoutePlan([self routeRules], devices,
+                                     GBAudioDefaultUID(kAudioHardwarePropertyDefaultOutputDevice));
     NSArray *routes = plan[@"routes"];
     // Tap before moving the default, untap after restoring it: the routed app never plays
     // on the wrong output in between.

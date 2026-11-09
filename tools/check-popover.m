@@ -806,7 +806,7 @@ int main(int argc, const char **argv) {
                 fabs(NSMidY(picks.frame) - NSMidY(station.frame)) > 0.5 ||
                 fabs(NSMinX(s0.frame) - kPad) > 0.6 || fabs(NSMaxX(picks.frame) - (kW - kPad)) > 0.6 ||
                 fabs(gapSeeds - gapStation) > 0.6 || fabs(gapSeeds - gapButton) > 0.6 || gapSeeds < 2 ||
-                ![stCap.stringValue isEqual:@"triple j"] || ![stArt.stringValue isEqual:@"for you"] ||
+                ![stCap.stringValue isEqual:@"New music"] || ![stArt.stringValue isEqual:@"for you"] ||
                 !badge || ![badge.accessibilityLabel isEqual:@"3 new picks"] || station.alphaValue < 0.95)
                 return Fail(__LINE__);
             {   // A cover tile carries its image for the large hover view.
