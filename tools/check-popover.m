@@ -7,6 +7,9 @@
 #import "../Sources/main.m"
 #undef main
 #pragma clang diagnostic pop
+#import "../Tests/offline_fixture.h"
+static NSString *gOfflineFixtureHome;
+static void CleanupOfflineFixture(void) { if (gOfflineFixtureHome) [NSFileManager.defaultManager removeItemAtPath:gOfflineFixtureHome error:nil]; }
 
 static void PrimeBatteryForecast(Controller *controller, BatteryState battery, BOOL limit80) {
     BatteryForecastTracker *tracker = [BatteryForecastTracker new];
@@ -416,7 +419,17 @@ int main(int argc, const char **argv) {
         if (fabs(lowOpus.redComponent-amber.redComponent)>0.03 ||
             fabs(lowOpus.greenComponent-amber.greenComponent)>0.03 ||
             fabs(lowOpus.blueComponent-amber.blueComponent)>0.03) return Fail(__LINE__);
+        NSString *fixtureHome = [NSHomeDirectory() stringByAppendingPathComponent:[@".glancebar-offline-test-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        gOfflineFixtureHome = fixtureHome; atexit(CleanupOfflineFixture);
+        NSString *fixtureMusic = [fixtureHome stringByAppendingPathComponent:@"Music"];
+        [NSFileManager.defaultManager createDirectoryAtPath:fixtureMusic withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *stationFixture = [fixtureMusic stringByAppendingPathComponent:@"station.m4a"];
+        [@"synthetic silent fixture" writeToFile:stationFixture atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        setenv("GLANCEBAR_HOME", fixtureHome.UTF8String, 1);
         Controller *c = [Controller new];
+        NSDictionary *offline = OfflineFixture(stationFixture, @"station:triplej");
+        [c setValue:[@{@"station:triplej": offline[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:offline[@"manifest"] forKey:@"offlineManifest"];
         // Seed tiles from a fixture: the harness never reads the real Music library.
         [c setValue:@YES forKey:@"mixFrozen"];
         [c setValue:@YES forKey:@"audioFrozen"];   // never read this Mac's live volume mid-check
@@ -427,9 +440,9 @@ int main(int argc, const char **argv) {
               forKey:@"mixSeeds"];
         [c setValue:@YES forKey:@"stationLoaded"];
         [c setValue:@YES forKey:@"stationAvailable"];
-        [c setValue:@[@"/tmp/glancebar-station-a.m4a"] forKey:@"stationFiles"];
+        [c setValue:@[stationFixture] forKey:@"stationFiles"];
         [c setValue:@[
-            @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @"/tmp/glancebar-station-a.m4a"},
+            @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": stationFixture},
             @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
             @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
         ] forKey:@"stationPicks"];
@@ -705,7 +718,7 @@ int main(int argc, const char **argv) {
         NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");
         if (![claudeDatum.stringValue hasPrefix:@"resets "]) return Fail(__LINE__);
         NSView *output = FindIdentifier(root, @"popover.sound");
-        if (!SoundRow(root, @"Favourite Songs", @"Shuffle · Apple Music", NO) ||
+        if (!SoundRow(root, @"Favourite Songs", @"Offline playlist not prepared", NO) ||
             !FindIdentifier(root, @"popover.music.open") ||
             ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
             ![output.accessibilityHelp isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
@@ -792,7 +805,8 @@ int main(int argc, const char **argv) {
             if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !picks || !station || !s3 ||
                 FindIdentifier(root, @"popover.mix.seed.4") ||
                 ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
-                ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] ||
+                ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] || s1.enabled || s1.alphaValue > 0.45 ||
+                ![s1.accessibilityHelp containsString:@"Offline playlist not prepared"] ||
                 ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
                 c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
                 fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || fabs(NSMinY(a0.frame) - NSMinY(stArt.frame)) > 0.5 ||
@@ -881,7 +895,7 @@ int main(int argc, const char **argv) {
                     ![cardTile isKindOfClass:GBStationTile.class]) return Fail(__LINE__);
                 [c setValue:@YES forKey:@"stationAvailable"];
                 [c setValue:@[
-                    @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @"/tmp/glancebar-station-a.m4a"},
+                    @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": stationFixture},
                     @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
                     @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
                 ] forKey:@"stationPicks"];
@@ -1359,7 +1373,7 @@ int main(int argc, const char **argv) {
             [c setValue:@NO forKey:@"playbackPlaying"];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (!SoundRow(root, @"Favourite Songs", @"Shuffle · Apple Music", NO) || !FitsChildren(root))
+            if (!SoundRow(root, @"Favourite Songs", @"Offline playlist not prepared", NO) || !FitsChildren(root))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "apple") == 0) {
             [c setValue:@NO forKey:@"ytTabOpen"];
@@ -1444,8 +1458,8 @@ int main(int argc, const char **argv) {
             [c setValue:@83 forKey:@"trackElapsed"];
             [c setValue:@243 forKey:@"trackDuration"];
             [c setValue:@0 forKey:@"localIndex"];
-            [c setValue:@[[NSURL fileURLWithPath:@"/tmp/glancebar-station-a.m4a"]] forKey:@"localURLs"];
-            [c setValue:@[@{@"file": @"/tmp/glancebar-station-a.m4a", @"artist": @"Tame Impala",
+            [c setValue:@[[NSURL fileURLWithPath:stationFixture]] forKey:@"localURLs"];
+            [c setValue:@[@{@"file": stationFixture, @"artist": @"Tame Impala",
                             @"title": @"Kiss from a Rose", @"key": @"tame impala|kiss from a rose"}] forKey:@"stationTracks"];
             [c setValue:@[
                 @{@"uid": @"speakers", @"name": @"MacBook Air Speakers",

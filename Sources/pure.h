@@ -875,8 +875,12 @@ NSArray<NSDictionary *> *MixSeedTracks(NSDictionary *seed, NSArray<NSDictionary 
 NSString *SeedCaption(NSString *title);
 // Local m4a files for a seed when Apple Music cannot play it. The seed's own file
 // (artist and title both in the filename) comes first, then other files by that artist,
-// at most 40. Empty when nothing on disk matches — the tile then does nothing.
+// at most 40. Legacy grouping only; never evidence of offline playlist readiness.
 NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths);
+// A complete, ordered snapshot only. Missing/stale files never yield a partial queue.
+// Fast UI checks validate identity, size, inode and nanosecond mtime; playback uses verifyHash.
+NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash);
+NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);
 // station.json: queue file paths (file or path) and this week's picks (title, artist, reason, file).
 // tracks keeps each queue file with its artist, title and identity key. nil when the data is
 // missing or not an object. An empty queue is still a station.

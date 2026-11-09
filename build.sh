@@ -65,6 +65,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$APP/Contents/MacOS/Glancebar"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
+install -m 0644 tools/offline-cache/offline_cache.py "$APP/Contents/Resources/offline_cache.py"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 
 # Sign with a stable identity. Ad-hoc signing pins the designated requirement to the code

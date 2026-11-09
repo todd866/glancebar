@@ -4508,7 +4508,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @end
 @interface GBSeedTile : NSButton <GBTileHover>
 @property (nonatomic, strong) NSImage *cover;
-@property (nonatomic, copy) NSString *songTitle, *songArtist, *seedKey;
+@property (nonatomic, copy) NSString *songTitle, *songArtist, *seedKey, *offlineStatus;
 - (void)showLarge;
 - (void)hideLarge;
 - (NSView *)largeCard;
@@ -4546,6 +4546,16 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     const CGFloat side = 220, pad = 8;
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     CGFloat y = pad;
+    if (self.offlineStatus.length) {
+        NSTextField *status = [NSTextField wrappingLabelWithString:self.offlineStatus];
+        status.font = [NSFont systemFontOfSize:11];
+        status.textColor = NSColor.secondaryLabelColor;
+        status.alignment = NSTextAlignmentCenter;
+        status.preferredMaxLayoutWidth = side;
+        status.frame = NSMakeRect(pad, y, side, ceil([status.cell cellSizeForBounds:NSMakeRect(0, 0, side, 400)].height));
+        status.accessibilityIdentifier = @"popover.mix.large.offline";
+        [content addSubview:status]; y = NSMaxY(status.frame) + 4;
+    }
     NSArray *texts = @[self.songArtist ?: @"", self.songTitle ?: @""];   // built bottom-up
     for (NSUInteger i = 0; i < texts.count; i++) {
         if (![texts[i] length]) continue;
@@ -4627,7 +4637,7 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 
 // Orange station tile. Hover lists this week's picks; a double-click opens Selector.
 @interface GBStationTile : NSButton <GBTileHover>
-@property (nonatomic, copy) NSString *seedKey;
+@property (nonatomic, copy) NSString *seedKey, *offlineStatus;
 @property (nonatomic, copy) NSArray<NSDictionary *> *picks;
 - (NSView *)largeCard;
 @end
@@ -4651,6 +4661,7 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
     NSMutableArray *lines = [NSMutableArray array];
     [lines addObject:@{@"text": @"New music", @"secondary": @NO, @"id": @"popover.mix.station.large.title"}];
+    if (self.offlineStatus.length) [lines addObject:@{@"text": self.offlineStatus, @"secondary": @YES, @"id": @"popover.mix.station.large.offline"}];
     NSUInteger i = 0;
     for (NSDictionary *pick in self.picks) {
         if (![pick isKindOfClass:NSDictionary.class] || i >= 8) break;
@@ -4667,12 +4678,12 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     CGFloat y = pad;
     for (NSDictionary *line in lines.reverseObjectEnumerator) {
         BOOL secondary = [line[@"secondary"] boolValue];
-        NSTextField *t = [NSTextField labelWithString:line[@"text"]];
+        NSTextField *t = [NSTextField wrappingLabelWithString:line[@"text"]];
         t.font = secondary ? [NSFont systemFontOfSize:11] : [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
         t.textColor = secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
         t.alignment = NSTextAlignmentLeft;
-        t.lineBreakMode = NSLineBreakByTruncatingTail;
-        t.frame = NSMakeRect(pad, y, width, secondary ? 14 : 16);
+        t.preferredMaxLayoutWidth = width;
+        t.frame = NSMakeRect(pad, y, width, MAX(secondary ? 14 : 16, ceil([t.cell cellSizeForBounds:NSMakeRect(0, 0, width, 400)].height)));
         t.accessibilityIdentifier = line[@"id"];
         [content addSubview:t];
         y = NSMaxY(t.frame) + (secondary ? 6 : 1);
@@ -5577,6 +5588,7 @@ static NSString *AppleMusicScript(NSString *command) {
         "end tell", command ?: @""];
 }
 static NSString *const kAppleMusicAutomationNote = @"Allow Glancebar to control Music: System Settings ▸ Privacy & Security ▸ Automation";
+static NSString *const kAppleMusicUnresponsiveNote = @"Music did not respond. Playback status is unavailable.";
 static NSString *AppleMusicArtPath(void) {
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
         ?: [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
@@ -6089,8 +6101,15 @@ static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *do
     NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
     NSMutableSet<NSString *> *_mixLiked;                       // track ids given a 👍 (mix/feedback.jsonl)
     NSString *_mixPlayingKey, *_mixStartingKey;
-    NSArray<NSString *> *_mixLocalPaths;
+    NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
+    NSDictionary *_offlineManifest;
+    BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain, _offlineVerifyBusy;
+    CFAbsoluteTime _offlineExportChecked, _offlinePreparedAt;
+    NSDate *_offlineExportDate;
+    NSUInteger _offlinePlayGeneration;
     BOOL _stationLoaded, _stationAvailable;
+    CFAbsoluteTime _stationChecked;
+    NSDate *_stationDate;
     NSArray *_stationFiles, *_stationPicks, *_stationTracks;
     dispatch_queue_t _mixQueue;
     NSMutableDictionary<NSString *, NSDictionary *> *_remote;   // host → {sample, mode, free, slots, at}
@@ -6469,6 +6488,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:@"mixSeeds"];
         if ([saved isKindOfClass:NSArray.class] && saved.count) _mixSeeds = saved;
     }
+    [self ensureOfflinePlaylists];
     if (!_musicProbesEnabled || [self musicOffline] || !AppleMusicIsRunning()) return;
     // Scripting Music launches it: read the library only while it is already open. On a Mac with an
     // empty library this retried and relaunched Music (1 Nov 2026).
@@ -6495,6 +6515,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 // Four seeds a day (the same all day), or a fresh set on New picks. Recent seeds sit out.
 - (void)chooseMixSeeds:(BOOL)fresh {
+    if (fresh) { ++_offlinePlayGeneration; _mixStartingKey = nil; }
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSInteger day = (NSInteger)floor((NSDate.date.timeIntervalSince1970 + NSTimeZone.localTimeZone.secondsFromGMT) / 86400);
     NSArray *saved = [ud arrayForKey:@"mixSeeds"];
@@ -6512,8 +6533,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [ud setObject:keep forKey:@"mixRecentSeeds"];
         [ud setObject:seeds forKey:@"mixSeeds"];
         [ud setInteger:day forKey:@"mixSeedsDay"];
+        for (NSDictionary *old in _mixSeeds) [_offlineRequests removeObjectForKey:old[@"key"]];
         _mixSeeds = seeds;
         [_mixPrepared removeAllObjects];
+        [self saveOfflineRequests];
     }
     for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed]; [self prepareMix:seed then:nil]; }
     if (_popover.isShown) [self rebuildContent];
@@ -6556,36 +6579,152 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         else { [NSFileManager.defaultManager removeItemAtPath:path error:nil]; fromCatalogue(); }
     });
 }
-// Mixes are built ahead in the background (Claude can take a while), one at a time.
+// Requests are durable, fixed playlist snapshots. No regeneration on Play and no network
+// fallback: a displayed queue is playable only when every exact recording is on this Mac.
+- (NSString *)offlinePrimaryKey { return [@"playlist:" stringByAppendingString:[self appleMusicPlaylistName]]; }
+- (NSDictionary *)offlineCoverage:(NSString *)key verifyHash:(BOOL)verifyHash {
+    return OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest,
+        [GBHomeDirectory() stringByAppendingPathComponent:@"Music"], verifyHash);
+}
+- (NSString *)offlineStatus:(NSDictionary *)coverage {
+    NSUInteger total = [coverage[@"total"] unsignedIntegerValue], available = [coverage[@"available"] unsignedIntegerValue];
+    if (!total) return @"Offline playlist not prepared";
+    return [coverage[@"ready"] boolValue]
+        ? [NSString stringWithFormat:@"%lu tracks downloaded · saved offline playlist", (unsigned long)total]
+        : [NSString stringWithFormat:@"%lu of %lu downloaded · unavailable offline", (unsigned long)available, (unsigned long)total];
+}
+- (void)prepareOfflineCache {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    if (_offlineCacheBusy) { _offlineCacheAgain = YES; return; }
+    NSString *script = [NSBundle.mainBundle pathForResource:@"offline_cache" ofType:@"py"];
+    if (!script.length) return;  // Test executables have no helper and must never scan a real music pool.
+    _offlineCacheBusy = YES;
+    _offlinePreparedAt = CFAbsoluteTimeGetCurrent();
+    NSString *dir = MixDirectory(nil);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        NSMutableArray *args = [@[script, @"prepare", @"--requests", [dir stringByAppendingPathComponent:@"offline-requests.json"],
+            @"--manifest", [dir stringByAppendingPathComponent:@"offline-manifest.json"]] mutableCopy];
+        NSString *index = [dir stringByAppendingPathComponent:@"offline-source-index.json"];
+        if ([NSFileManager.defaultManager fileExistsAtPath:index]) [args addObjectsFromArray:@[@"--index", index]];
+        task.arguments = args;
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        BOOL launched = [task launchAndReturnError:nil];
+        if (launched) [task waitUntilExit];
+        NSDictionary *manifest = nil;
+        if (launched && task.terminationReason == NSTaskTerminationReasonExit && (task.terminationStatus == 0 || task.terminationStatus == 2)) {
+            NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"offline-manifest.json"]];
+            id parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            if ([parsed isKindOfClass:NSDictionary.class]) manifest = parsed;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_offlineCacheBusy = NO;
+            if (manifest) self->_offlineManifest = manifest;
+            if (self->_popover.isShown) [self rebuildContent];
+            if (self->_offlineCacheAgain) { self->_offlineCacheAgain = NO; [self prepareOfflineCache]; }
+        });
+    });
+}
+- (void)saveOfflineRequests {
+    NSMutableArray *requests = [NSMutableArray array];
+    for (NSDictionary *seed in _mixSeeds) if (_offlineRequests[seed[@"key"]]) [requests addObject:_offlineRequests[seed[@"key"]]];
+    NSDictionary *primary = _offlineRequests[[self offlinePrimaryKey]];
+    if (primary) [requests addObject:primary];
+    if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
+    if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) [self prepareOfflineCache];
+}
+- (void)setOfflineRequest:(NSString *)key title:(NSString *)title tracks:(NSArray *)tracks {
+    NSMutableArray *identities = [NSMutableArray array];
+    for (NSDictionary *track in tracks) {
+        if (![track isKindOfClass:NSDictionary.class] || ![track[@"id"] isKindOfClass:NSString.class] || ![track[@"id"] length]) { [identities removeAllObjects]; break; }
+        NSMutableDictionary *identity = [NSMutableDictionary dictionary];
+        for (NSString *field in @[@"id", @"title", @"artist", @"album"])
+            identity[field] = [track[field] isKindOfClass:NSString.class] ? track[field] : @"";
+        [identities addObject:identity];
+    }
+    if (!_offlineRequests) _offlineRequests = [NSMutableDictionary dictionary];
+    NSDictionary *request = @{@"key": key, @"title": title ?: key, @"tracks": identities};
+    if ([_offlineRequests[key] isEqual:request]) return;
+    _offlineRequests[key] = request;
+    [self saveOfflineRequests];
+}
+- (void)ensureOfflinePlaylists {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    if (!_offlineLoaded) {
+        _offlineLoaded = YES;
+        _offlineRequests = [NSMutableDictionary dictionary];
+        if (!_mixPrepared) _mixPrepared = [NSMutableDictionary dictionary];
+        NSString *dir = MixDirectory(nil);
+        NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"offline-requests.json"]];
+        id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([saved isKindOfClass:NSDictionary.class] && [saved[@"schemaVersion"] isEqual:@1] && [saved[@"playlists"] isKindOfClass:NSArray.class]) {
+            for (id request in saved[@"playlists"]) {
+                if (![request isKindOfClass:NSDictionary.class] || ![request[@"key"] isKindOfClass:NSString.class] || ![request[@"tracks"] isKindOfClass:NSArray.class]) continue;
+                NSMutableArray *ids = [NSMutableArray array];
+                for (id track in request[@"tracks"]) if ([track isKindOfClass:NSDictionary.class] && [track[@"id"] isKindOfClass:NSString.class]) [ids addObject:track[@"id"]];
+                if (ids.count != [request[@"tracks"] count]) continue;
+                _offlineRequests[request[@"key"]] = request;
+                if (ids.count) _mixPrepared[request[@"key"]] = ids;
+            }
+        }
+        data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"offline-manifest.json"]];
+        id manifest = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([manifest isKindOfClass:NSDictionary.class]) _offlineManifest = manifest;
+        [self prepareOfflineCache];
+    }
+    // The existing exporter provides a named playlist snapshot without launching Music,
+    // acquiring a playback lease, or consulting the stale download inventory.
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) [self prepareOfflineCache];
+    if (_offlineExportChecked > 0 && now - _offlineExportChecked < 60) return;
+    _offlineExportChecked = now;
+    NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Library-export/playlists.json"];
+    NSDate *date = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (!date || ([_offlineExportDate isEqual:date] && _offlineRequests[[self offlinePrimaryKey]])) return;
+    _offlineExportDate = date;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    id playlists = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![playlists isKindOfClass:NSArray.class]) {
+        [self setOfflineRequest:[self offlinePrimaryKey] title:[self appleMusicPlaylistName] tracks:@[]];
+        return;
+    }
+    for (id playlist in playlists) {
+        if ([playlist isKindOfClass:NSDictionary.class] && [playlist[@"name"] isEqual:[self appleMusicPlaylistName]] && [playlist[@"tracks"] isKindOfClass:NSArray.class]) {
+            [self setOfflineRequest:[self offlinePrimaryKey] title:playlist[@"name"] tracks:playlist[@"tracks"]];
+            return;
+        }
+    }
+    [self setOfflineRequest:[self offlinePrimaryKey] title:[self appleMusicPlaylistName] tracks:@[]];
+}
+// Mixes are built ahead once, then persisted. New picks explicitly replaces the snapshot.
 - (void)prepareMix:(NSDictionary *)seed then:(void (^)(NSArray *ids))done {
     NSString *key = seed[@"key"];
     if (_mixPrepared[key]) { if (done) done(_mixPrepared[key]); return; }
-    if ([_mixPreparing containsObject:key] && !done) return;
+    if ([_mixPreparing containsObject:key] || !_mixLibrary.count) return;
     [_mixPreparing addObject:key];
     NSArray *tracks = _mixLibrary;
     BOOL claude = [NSUserDefaults.standardUserDefaults objectForKey:@"mixWithClaude"]
         ? [NSUserDefaults.standardUserDefaults boolForKey:@"mixWithClaude"] : YES;
     uint64_t salt = (uint64_t)[NSUserDefaults.standardUserDefaults integerForKey:@"mixPickCount"] * 31 + key.hash;
     dispatch_async(_mixQueue, ^{
-        NSArray *ids = self->_mixPrepared[key] ?: BuildSeedMix(tracks, seed, claude, salt);
+        NSArray *ids = BuildSeedMix(tracks, seed, claude, salt);
         dispatch_async(dispatch_get_main_queue(), ^{
             [self->_mixPreparing removeObject:key];
-            if (ids.count) self->_mixPrepared[key] = ids;
+            if (![self->_mixSeeds containsObject:seed]) return;
+            NSMutableArray *selected = [NSMutableArray array];
+            for (NSString *trackID in ids) for (NSDictionary *track in tracks)
+                if ([track[@"id"] isEqual:trackID]) { [selected addObject:track]; break; }
+            if (ids.count && selected.count == ids.count) {
+                self->_mixPrepared[key] = ids;
+                [self setOfflineRequest:key title:seed[@"title"] tracks:selected];
+            }
             if (done) done(ids);
         });
     });
-}
-- (NSArray<NSString *> *)mixLocalPaths {
-    if (_mixLocalPaths) return _mixLocalPaths;
-    NSMutableArray *paths = [NSMutableArray array];
-    for (NSString *sub in @[@"Music/YouTube Liked", @"Music/Glancebar Radio"]) {
-        NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:sub];
-        NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
-            includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
-        for (NSURL *url in urls) if (url.path.length) [paths addObject:url.path];
-    }
-    _mixLocalPaths = LikedMusicAudioFiles(paths);
-    return _mixLocalPaths;
 }
 - (void)playLocalPaths:(NSArray<NSString *> *)paths {
     if (!_musicProbesEnabled || !paths.count) return;
@@ -6595,62 +6734,55 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _localURLs = urls;
     [self playLocalIndex:0];
 }
-// The same player the offline Liked folder uses, in the seed's order: its own file, then that artist.
-- (void)playSeedLocally:(NSDictionary *)seed {
-    NSArray *paths = LocalSeedFiles(seed, [self mixLocalPaths]);
+- (void)playOfflinePlaylist:(NSString *)key {
+    if (!_musicProbesEnabled || _offlineVerifyBusy) return;
+    NSUInteger generation = ++_offlinePlayGeneration;
     _mixStartingKey = nil;
-    if (!paths.count) {
+    NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    if (![coverage[@"ready"] boolValue]) {
+        _musicNote = [self offlineStatus:coverage];
+        [self prepareOfflineCache];
         if (_popover.isShown) [self rebuildContent];
         return;
     }
-    _mixPlayingKey = seed[@"key"];
-    [self playLocalPaths:paths];
-}
-- (IBAction)playSeedMix:(NSButton *)sender {
-    if (sender.tag < 0 || sender.tag >= (NSInteger)_mixSeeds.count) return;
-    NSDictionary *seed = _mixSeeds[sender.tag];
-    NSString *key = seed[@"key"];
-    if ([self musicOffline] || !AppleMusicIsRunning()) {
-        _mixStartingKey = key;
+    // Never start a second source underneath Music, Chrome or the DJ process.
+    if (_amLoaded || _ytTabOpen || _deckMode) {
+        _musicNote = @"Stop the current player before starting the saved offline playlist.";
         if (_popover.isShown) [self rebuildContent];
-        [self playSeedLocally:seed];
         return;
     }
     _mixStartingKey = key;
-    [self rebuildContent];
-    [self prepareMix:seed then:^(NSArray *ids) {
-        if (!ids.count || [self musicOffline] || !AppleMusicIsRunning()) {
-            [self playSeedLocally:seed];
-            return;
-        }
-        NSMutableArray *quoted = [NSMutableArray array];
-        for (NSString *i in ids) [quoted addObject:AppleScriptQuoted(i)];
-        NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
-            "if not (exists user playlist %@) then make new user playlist with properties {name:%@}\n"
-            "set p to user playlist %@\n"
-            "delete every track of p\n"
-            "set lib to library playlist 1\n"
-            "repeat with i in {%@}\n"
-            "try\nduplicate (first track of lib whose persistent ID is (contents of i)) to p\nend try\n"
-            "end repeat\n"
-            "set shuffle enabled to false\n"
-            "play p\n"
-            "end tell\nreturn \"ok\"",
-            AppleScriptQuoted(kMixPlaylistName), AppleScriptQuoted(kMixPlaylistName), AppleScriptQuoted(kMixPlaylistName),
-            [quoted componentsJoinedByString:@", "]];
-        RunAppleScriptTimed(script, 60, ^(__unused NSString *output, __unused NSString *errorText, int status) {
-            self->_mixStartingKey = nil;
-            if (status == 0) {
-                self->_mixPlayingKey = key;
-                // Next time this seed plays, draw a different mix.
-                [self->_mixPrepared removeObjectForKey:key];
-                [self prepareMix:seed then:nil];
+    _offlineVerifyBusy = YES;
+    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    if (_popover.isShown) [self rebuildContent];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *verified = OfflinePlaylistCoverage(request, manifest, root, YES);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_offlineVerifyBusy = NO;
+            if (generation != self->_offlinePlayGeneration) {
+                if (self->_popover.isShown) [self rebuildContent];
+                return;
             }
-            // Read the new track and playlist now, so the row and the tile's outline follow.
-            [self runAppleMusicCommand:@"" followUp:YES];
+            self->_mixStartingKey = nil;
+            BOOL current = [key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"];
+            for (NSDictionary *seed in self->_mixSeeds) if ([seed[@"key"] isEqual:key]) current = YES;
+            if (self->_musicProbesEnabled && !self->_musicOff && current && [verified[@"ready"] boolValue] && [self->_offlineRequests[key] isEqual:request] &&
+                !self->_amLoaded && !self->_ytTabOpen && !self->_deckMode &&
+                [OfflinePlaylistCoverage(request, manifest, root, NO)[@"ready"] boolValue] &&
+                [[self offlineCoverage:key verifyHash:NO][@"paths"] isEqual:verified[@"paths"]]) {
+                self->_musicNote = nil;
+                self->_mixPlayingKey = key;
+                [self playLocalPaths:verified[@"paths"]];
+            } else self->_musicNote = @"Offline playlist changed or is incomplete. Nothing was started.";
             if (self->_popover.isShown) [self rebuildContent];
         });
-    }];
+    });
+}
+- (void)playSeedLocally:(NSDictionary *)seed { [self playOfflinePlaylist:seed[@"key"]]; }
+- (IBAction)playSeedMix:(NSButton *)sender {
+    if (sender.tag < 0 || sender.tag >= (NSInteger)_mixSeeds.count) return;
+    [self playSeedLocally:_mixSeeds[sender.tag]];
 }
 - (IBAction)newMixPicks:(id)sender {
     (void)sender;
@@ -6658,15 +6790,34 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self chooseMixSeeds:YES];
 }
 - (void)ensureStation {
-    if (_mixFrozen || _stationLoaded) return;
-    _stationLoaded = YES;
+    if (_mixFrozen || !_musicProbesEnabled) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_stationLoaded && now - _stationChecked < 60) return;
+    _stationChecked = now;
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/station.json"];
+    NSDate *date = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (_stationLoaded && [_stationDate isEqual:date]) return;
+    _stationLoaded = YES; _stationDate = date;
     NSData *data = [NSData dataWithContentsOfFile:path];
     NSDictionary *station = StationFromJSON(data);
     _stationAvailable = station != nil;
     _stationFiles = station[@"files"] ?: @[];
     _stationPicks = station[@"picks"] ?: @[];
     _stationTracks = station[@"tracks"] ?: @[];
+    id raw = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSArray *queue = [raw isKindOfClass:NSDictionary.class] && [raw[@"queue"] isKindOfClass:NSArray.class] ? raw[@"queue"] : @[];
+    NSMutableArray *tracks = [NSMutableArray array], *sources = [NSMutableArray array];
+    for (NSUInteger i = 0; i < queue.count; i++) {
+        NSDictionary *row = [queue[i] isKindOfClass:NSDictionary.class] ? queue[i] : @{};
+        NSString *file = [row[@"file"] isKindOfClass:NSString.class] ? row[@"file"] : ([row[@"path"] isKindOfClass:NSString.class] ? row[@"path"] : @"");
+        NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObject:[NSString stringWithFormat:@"station:%lu:%@", (unsigned long)i, file] forKey:@"id"];
+        for (NSString *field in @[@"title", @"artist", @"album"]) track[field] = [row[field] isKindOfClass:NSString.class] ? row[field] : @"";
+        [tracks addObject:track];
+        if (file.length) { NSMutableDictionary *source = [track mutableCopy]; source[@"path"] = file; [sources addObject:source]; }
+    }
+    NSData *index = [NSJSONSerialization dataWithJSONObject:@{@"tracks": sources} options:0 error:nil];
+    if ([index writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-source-index.json"] atomically:YES])
+        [self setOfflineRequest:@"station:triplej" title:@"triple j for you" tracks:tracks];
 }
 // selector play, off the main thread. Planning can take several seconds. A missing
 // binary, a non-zero exit or a dead socket runs fallback on the main thread — the
@@ -6917,26 +7068,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_popover.isShown) [self rebuildContent];
     [self sendDeckCommand:cmd mode:nil];
 }
+- (NSDictionary *)stationOfflineCoverage { return [self offlineCoverage:@"station:triplej" verifyHash:NO]; }
 - (IBAction)playStation:(id)sender {
     (void)sender;
-    if (!_musicProbesEnabled || !_stationAvailable) return;
-    NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    for (id file in _stationFiles) {
-        if (![file isKindOfClass:NSString.class] || ![file length]) continue;
-        if ([NSFileManager.defaultManager fileExistsAtPath:file]) [paths addObject:file];
-    }
-    if (!paths.count) return;
-    [self startSelectorPlay:@[@"play", @"--station-order"] label:@"station" success:^{
-        self->_mixPlayingKey = @"station:triplej";
-        self->_mixStartingKey = nil;
-        self->_playbackKnown = YES;
-        self->_playbackPlaying = YES;
-        [self enterDeckModeFromPoll:NO];
-    } fallback:^{
-        self->_mixPlayingKey = @"station:triplej";
-        self->_mixStartingKey = nil;
-        [self playLocalPaths:paths];
-    }];
+    if (!_stationAvailable) return;
+    [self playOfflinePlaylist:@"station:triplej"];
 }
 - (IBAction)openSelectorDJ:(id)sender {
     (void)sender;
@@ -7313,8 +7449,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self playLocalIndex:0];
 }
 - (void)toggleLocalPlayback {
+    ++_offlinePlayGeneration; _mixStartingKey = nil;
+    if (!_musicProbesEnabled) return;
     if (_deckMode) { [self toggleDeckPlayback]; return; }
-    if (!_localPlayer) { [self startOfflinePlayback]; return; }
+    if (!_localPlayer) { [self playOfflinePlaylist:_mixPlayingKey ?: [self offlinePrimaryKey]]; return; }
     // Pause finishes the fade first, so the incoming track is the one that pauses
     // and the outgoing player is not left audible underneath.
     if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
@@ -7330,6 +7468,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_popover.isShown) [self rebuildContent];
 }
 - (void)yieldLocalMusicIfIdle {
+    if (_mixPlayingKey.length && _offlineRequests[_mixPlayingKey]) return;
     BOOL playing = _localPlayer.rate > 0;
     if (!YieldLocalMusic(_localMode, _networkKnown && _networkOnline, playing)) return;
     [self tearDownLocalPlayer];
@@ -7342,6 +7481,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_popover.isShown) [self rebuildContent];
 }
 - (void)stopLocalForYouTube {
+    ++_offlinePlayGeneration; _mixStartingKey = nil;
     [self tearDownLocalPlayer];
     _localMode = NO;
     _localEmpty = NO;
@@ -7552,6 +7692,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     return 0;
 }
 - (NSInteger)remotePause:(id)event {
+    ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)event; if (_localPlayer.rate > 0) [self toggleLocalPlayback];
     return 0;
 }
@@ -7656,7 +7797,19 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp {
     [self runAppleMusicCommand:command followUp:followUp done:nil];
 }
+- (void)noteAppleMusicUnavailable:(NSString *)note {
+    // Keep the last track as a snapshot, but never animate it as verified playback.
+    _musicNote = note;
+    if (_amLoaded && !_localMode && !_deckMode) {
+        _playbackKnown = NO;
+        _playbackPlaying = NO;
+        _trackSampledAt = 0;
+    }
+    if (_popover.isShown) [self rebuildContent];
+}
 - (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp done:(void (^)(BOOL ok))done {
+    // Timer/notification probes must not invalidate a button command's callback.
+    if (!command.length && _amStatusInFlight) { if (done) done(NO); return; }
     if (!_musicProbesEnabled) { if (done) done(NO); return; }
     if (!AppleMusicIsRunning()) { [self clearAppleMusic]; if (done) done(NO); return; }
     NSUInteger generation = ++_amGen;
@@ -7668,12 +7821,15 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             GBLog("apple music: command=%{public}@ status=%d out=%{public}@ err=%{public}@", command, status,
                   [output stringByReplacingOccurrencesOfString:YouTubeStatusSeparator withString:@"|"], errorText);
         if (ChromeAutomationDenied(errorText)) {
-            self->_musicNote = kAppleMusicAutomationNote;
-            if (self->_popover.isShown) [self rebuildContent];
+            [self noteAppleMusicUnavailable:kAppleMusicAutomationNote];
             if (done) done(NO);
             return;
         }
-        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) { if (done) done(NO); return; }   // timeout: keep what we had
+        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) {
+            [self noteAppleMusicUnavailable:kAppleMusicUnresponsiveNote];
+            if (done) done(NO);
+            return;
+        }
         [self applyAppleMusicStatus:ParseAppleMusicStatus(output)];
         if (followUp)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -7684,7 +7840,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)applyAppleMusicStatus:(NSDictionary *)status {
     if (_deckMode) return;   // the deck owns transport until now.json says it stopped
-    if ([_musicNote isEqualToString:kAppleMusicAutomationNote]) _musicNote = nil;
+    if ([_musicNote isEqualToString:kAppleMusicAutomationNote] || [_musicNote isEqualToString:kAppleMusicUnresponsiveNote]) _musicNote = nil;
     _amShuffle = [status[@"shuffle"] boolValue];
     if (![status[@"loaded"] boolValue]) {
         BOOL was = _amLoaded;
@@ -8007,6 +8163,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
+    ++_offlinePlayGeneration;
+    _mixStartingKey = nil;
     GBLog("music play: local=%d am=%d yt=%d netKnown=%d online=%d pending=%d", _localMode, _amLoaded, _ytTabOpen,
           _networkKnown, _networkOnline, _amStartPending);
     if (_deckMode) { [self toggleDeckPlayback]; return; }
@@ -8016,8 +8174,6 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             [self requestAppleMusicBlendStopThen:^{ [self musicPlay:nil]; }];
             return;
         }
-        _playbackPlaying = !_playbackPlaying;
-        if (_popover.isShown) [self rebuildContent];
         [self runAppleMusicCommand:@"playpause\ndelay 0.3" followUp:YES];
         return;
     }
@@ -8029,10 +8185,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY];
         return;
     }
-    if (_networkKnown && !_networkOnline) { [self startOfflinePlayback]; return; }
-    [self startAppleMusicPlayback];
+    [self ensureOfflinePlaylists];
+    [self playOfflinePlaylist:[self offlinePrimaryKey]];
 }
 - (IBAction)musicPrevious:(id)sender {
+    ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
     if (!_musicProbesEnabled || _deckMode) return;
     if (_localMode) {
@@ -8505,6 +8662,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     });
 }
 - (IBAction)musicNext:(id)sender {
+    ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
     if (!_musicProbesEnabled) return;
     BOOL blending = [self musicBlendRunning];
@@ -8605,10 +8763,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _trackDuration = (isfinite(duration) && duration > 0) ? duration : 0;
 }
 - (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
+    [self ensureOfflinePlaylists];
     BOOL offline = [self musicOffline];
     BOOL am = _amLoaded && !_localMode && !_deckMode;
     BOOL loaded = _ytTabOpen || _localMode || am || _deckMode;
-    // Idle and online, Play starts Apple Music; the cover slot shows Music's icon until then.
+    // Existing Music transport remains controllable; idle Play uses the saved offline snapshot.
     BOOL amTarget = !_deckMode && (am || (!_localMode && !_ytTabOpen && !offline));
     if (_musicProbesEnabled && offline && !_localMode) {
         NSArray *tracks = [self offlineTrackPaths];
@@ -8654,6 +8813,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSButton *play = [self transportButton:symbol pointSize:24 side:28
                                     action:@selector(musicPlay:) identifier:@"popover.music.play" label:playLabel];
     play.frame = NSOffsetRect(play.frame, x, 0);
+    if (!loaded) {
+        NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
+        play.enabled = [coverage[@"ready"] boolValue] && !_offlineVerifyBusy;
+        play.accessibilityHelp = [self offlineStatus:coverage];
+    }
     [row addSubview:play];
     x = NSMaxX(play.frame) + 2;
     NSString *nextTip = kMusicNextTip;
@@ -8740,7 +8904,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         textRight = NSMinX(thumb.frame) - 6;
     }
     CGFloat textW = textRight - textX;
-    NSString *titleText = trackTitle.length ? trackTitle : (amTarget ? [self appleMusicPlaylistName] : @"Liked Music");
+    NSString *titleText = trackTitle.length ? trackTitle : [self appleMusicPlaylistName];
     // The row is a plain NSView, so y grows up; the flipped popover only applies to the root.
     // Title and subtitle are one block, centred in the row with the symbols.
     const CGFloat titleH = 15, subtitleH = 14, textGap = 1;
@@ -8757,10 +8921,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSString *time = loaded && !am ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
     NSString *subtitleText;
     if (!loaded) {
-        if (offline && _localEmpty) subtitleText = @"No offline music";
-        else if (offline) subtitleText = [NSString stringWithFormat:@"Shuffle · %lu offline",
-                                          (unsigned long)[self offlineTrackPaths].count];
-        else subtitleText = @"Shuffle · Apple Music";
+        NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
+        subtitleText = [coverage[@"total"] unsignedIntegerValue]
+            ? [NSString stringWithFormat:@"%@/%@ downloaded · saved playlist", coverage[@"available"], coverage[@"total"]]
+            : @"Offline playlist not prepared";
     } else if (trackArtist.length && time.length) {
         subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
     } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
@@ -9106,6 +9270,10 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         seedTile.songTitle = SeedCaption(seed[@"title"]);
         seedTile.songArtist = seed[@"artist"];
         seedTile.seedKey = seed[@"key"];
+        NSDictionary *coverage = [self offlineCoverage:seed[@"key"] verifyHash:NO];
+        seedTile.offlineStatus = [self offlineStatus:coverage];
+        seedTile.enabled = [coverage[@"ready"] boolValue] && !_offlineVerifyBusy;
+        seedTile.alphaValue = seedTile.enabled ? 1 : 0.4;
         seedTile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
         if (!cover) seedTile.contentTintColor = NSColor.tertiaryLabelColor;
         seedTile.tag = (NSInteger)i;
@@ -9121,6 +9289,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
                                    seed[@"title"], seed[@"subtitle"]];
         seedTile.accessibilityHelp = [NSString stringWithFormat:@"%@ — %@ · a mix around this %@", seed[@"title"], seed[@"subtitle"],
                                   album ? @"album" : @"song"];
+        seedTile.accessibilityHelp = [seedTile.accessibilityHelp stringByAppendingFormat:@" · %@", seedTile.offlineStatus];
         if (!cover) seedTile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
         if (playing) { seedTile.layer.borderWidth = 2; seedTile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
         if (starting) seedTile.alphaValue = 0.45;
@@ -9146,7 +9315,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [line addSubview:hover];
         x += side + gap;
     }
-    BOOL stationOn = _stationAvailable;
+    NSDictionary *stationCoverage = [self stationOfflineCoverage];
+    BOOL stationOn = _stationAvailable && [stationCoverage[@"ready"] boolValue];
     BOOL stationPlaying = [_mixPlayingKey isEqual:@"station:triplej"];
     GBStationTile *station = [GBStationTile buttonWithImage:StationTileImage(!stationOn) target:self action:@selector(playStation:)];
     station.seedKey = @"station:triplej";
@@ -9159,10 +9329,12 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     station.layer.cornerRadius = 4;
     station.layer.masksToBounds = YES;
     station.alphaValue = stationOn ? 1 : 0.4;
+    station.enabled = stationOn && !_offlineVerifyBusy;
+    station.offlineStatus = [self offlineStatus:stationCoverage];
     station.accessibilityIdentifier = @"popover.mix.station";
     NSUInteger pickCount = station.picks.count;
     station.accessibilityLabel = @"New music for you";
-    station.accessibilityHelp = stationOn ? @"Play new music for you" : @"New music for you is not available";
+    station.accessibilityHelp = [@"New music for you · " stringByAppendingString:station.offlineStatus];
     if (stationPlaying) { station.layer.borderWidth = 2; station.layer.borderColor = NSColor.controlAccentColor.CGColor; }
     station.frame = NSMakeRect(x, capH, side, side);
     [line addSubview:station];

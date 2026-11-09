@@ -5,6 +5,76 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
+#import <sys/stat.h>
+
+static BOOL OfflineStat(NSString *path, NSString *root, struct stat *st) {
+    if (![path isKindOfClass:NSString.class] || !path.isAbsolutePath || !root.length) return NO;
+    NSString *clean = path.stringByStandardizingPath;
+    NSString *base = root.stringByStandardizingPath;
+    if (![clean isEqual:path] || ![clean hasPrefix:[base stringByAppendingString:@"/"]]) return NO;
+    if ([clean.pathComponents containsObject:@"CloudStorage"] || [clean.pathComponents containsObject:@"Mobile Documents"]) return NO;
+    for (NSString *p = clean; p.length > 1; p = p.stringByDeletingLastPathComponent) {
+        struct stat part;
+        if (lstat(p.fileSystemRepresentation, &part) || S_ISLNK(part.st_mode)) return NO;
+    }
+    if (stat(clean.fileSystemRepresentation, st) || !S_ISREG(st->st_mode) || st->st_size <= 0 || (st->st_flags & SF_DATALESS)) return NO;
+    return [NSFileManager.defaultManager isReadableFileAtPath:clean];
+}
+
+NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot) {
+    NSUInteger total = [paths isKindOfClass:NSArray.class] ? paths.count : 0, available = 0;
+    for (id path in (total ? paths : @[])) { struct stat st; if (OfflineStat(path, musicRoot, &st)) available++; }
+    BOOL ready = total > 0 && available == total;
+    return @{@"total": @(total), @"available": @(available), @"ready": @(ready), @"paths": ready ? paths : @[]};
+}
+
+NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash) {
+    NSArray *wanted = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
+    NSDictionary *entry = nil;
+    if ([manifest[@"schemaVersion"] isEqual:@1] && [manifest[@"playlists"] isKindOfClass:NSArray.class]) {
+        for (id candidate in manifest[@"playlists"])
+            if ([candidate isKindOfClass:NSDictionary.class] && [candidate[@"key"] isEqual:request[@"key"]]) { entry = candidate; break; }
+    }
+    NSMutableArray *paths = [NSMutableArray array];
+    BOOL current = wanted.count && [entry[@"requestedTracks"] isEqual:wanted];
+    NSArray *records = current && [entry[@"tracks"] isKindOfClass:NSArray.class] ? entry[@"tracks"] : @[];
+    NSUInteger cursor = 0;
+    BOOL inOrder = YES;
+    for (id record in records) {
+        if (![record isKindOfClass:NSDictionary.class]) { inOrder = NO; continue; }
+        NSDictionary *identity = @{@"id": record[@"id"] ?: @"", @"title": record[@"title"] ?: @"",
+            @"artist": record[@"artist"] ?: @"", @"album": record[@"album"] ?: @""};
+        while (cursor < wanted.count && ![wanted[cursor] isEqual:identity]) cursor++;
+        if (cursor == wanted.count) { inOrder = NO; continue; }
+        cursor++;
+        struct stat st;
+        NSString *path = record[@"path"], *digest = record[@"sha256"];
+        if (!OfflineStat(path, musicRoot, &st) || ![record[@"sizeBytes"] isKindOfClass:NSNumber.class] ||
+            st.st_size != [record[@"sizeBytes"] longLongValue] || ![digest isKindOfClass:NSString.class] || digest.length != 64) continue;
+        NSString *stamp = [NSString stringWithFormat:@"%lld", (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec];
+        if (![record[@"mtimeNs"] isEqual:stamp] || ![record[@"inode"] isEqual:[NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino]]) continue;
+        if (verifyHash) {
+            NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:path];
+            [stream open];
+            CC_SHA256_CTX hash; CC_SHA256_Init(&hash);
+            uint8_t buffer[65536], bytes[CC_SHA256_DIGEST_LENGTH];
+            NSInteger n;
+            while ((n = [stream read:buffer maxLength:sizeof(buffer)]) > 0) CC_SHA256_Update(&hash, buffer, (CC_LONG)n);
+            [stream close];
+            if (n < 0) continue;
+            CC_SHA256_Final(bytes, &hash);
+            NSMutableString *actual = [NSMutableString string];
+            for (NSUInteger i = 0; i < sizeof(bytes); i++) [actual appendFormat:@"%02x", bytes[i]];
+            struct stat after;
+            if (![actual isEqual:digest] || !OfflineStat(path, musicRoot, &after) || after.st_ino != st.st_ino ||
+                after.st_size != st.st_size || after.st_mtimespec.tv_sec != st.st_mtimespec.tv_sec ||
+                after.st_mtimespec.tv_nsec != st.st_mtimespec.tv_nsec) continue;
+        }
+        [paths addObject:path];
+    }
+    BOOL ready = current && inOrder && records.count == wanted.count && paths.count == wanted.count;
+    return @{@"total": @(wanted.count), @"available": @(paths.count), @"ready": @(ready), @"paths": ready ? paths : @[]};
+}
 
 static NSCalendar *MeteredCalendar(NSTimeZone *zone) {
     NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];

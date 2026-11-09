@@ -3,6 +3,8 @@
 set -euo pipefail
 cd "${0:A:h}"
 
+/usr/bin/python3 -m unittest discover -s tools/offline-cache -v
+
 CC="${CC:-$(xcrun --find clang)}"
 SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -72,6 +74,13 @@ fi
     -o "$WORK_DIR/glancebar_ai_reader_tests"
 
 "$WORK_DIR/glancebar_ai_reader_tests"
+
+# Exact offline requests, no partial playback and intercepted source/player boundaries.
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/audio_route_plan.m Sources/audio_route.m Sources/deck_client.m Tests/test_offline.m \
+    -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
+    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -o "$WORK_DIR/glancebar_offline_tests"
+"$WORK_DIR/glancebar_offline_tests"
 
 # Metered-link transport and persistence coverage. The harness imports the private monitor
 # but stubs both interface counters and NSURLSession-facing tick paths.
