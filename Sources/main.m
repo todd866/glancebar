@@ -4587,11 +4587,18 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 + (void)closeLarge { [gSeedLarge close]; gSeedLarge = nil; gSeedLargeKey = nil; }
 @end
 
+@class Controller;
+
+@protocol GBMixPreloadHovering <NSObject>
+- (void)schedulePreloadHover:(NSString *)key;
+- (void)cancelPreloadHover;
+@end
+
 // Clicks pass through to the tile; only the hover is caught, over the tile and both caption lines.
 @interface GBSeedHover : NSView
 @property (nonatomic, weak) id<GBTileHover> tile;
 @property (nonatomic, copy) NSString *preloadKey;
-@property (nonatomic, weak) Controller *controller;
+@property (nonatomic, weak) id<GBMixPreloadHovering> controller;
 @end
 @implementation GBSeedHover
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
@@ -5339,7 +5346,7 @@ static NSString *PopoverRequestObject(void) {
     return [NSString stringWithFormat:@"uid:%u", getuid()];
 }
 
-@interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate>
+@interface Controller : NSObject <NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate, GBMixPreloadHovering>
 @property(nonatomic, copy) NSString *showDestinationOnLaunch;
 @end
 
@@ -5362,6 +5369,7 @@ static NSString *PopoverRequestObject(void) {
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
+- (NSUInteger)coalescedSeekApplyCount;
 @end
 
 // CoreAudio property reads. Output streams are the output scope of kAudioDevicePropertyStreams;
@@ -5860,6 +5868,8 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     BOOL _musicTimingEnabled;
     NSTimer *_seekCoalesceTimer;
     double _seekCoalesceSeconds;
+    NSUInteger _coalescedSeekCount;
+    double _popoverLastRebuildMs;
     BOOL _musiclibBusy, _musiclibAgain;
     CFAbsoluteTime _musiclibLastSyncAttemptAt;
     NSUInteger _musiclibSyncFailures, _offlineRequestsGeneration, _musiclibSyncedRequestGeneration;
@@ -6478,15 +6488,21 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (NSDictionary *)offlineCoverageForDisplay:(NSString *)key {
     NSString *cacheKey = [self offlineCoverageCacheKey:key];
+    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
     NSDictionary *cached = _offlineCoverageCache[cacheKey];
     if (cached) {
-        NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
-        NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
         [self refreshOfflineCoverageCacheIfStale:key cached:cached request:request manifest:manifest root:root cacheKey:cacheKey];
         return cached[@"coverage"];
     }
-    [self scheduleOfflineCoverageRefresh:key];
-    return @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
+    __block NSDictionary *computed = nil;
+    __block NSArray *fingerprints = nil;
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        computed = OfflinePlaylistCoverage(request, manifest, root, NO);
+        fingerprints = OfflinePlaylistDiskFingerprints(request, manifest, root);
+    });
+    [self storeOfflineCoverage:computed fingerprints:fingerprints forKey:key cacheKey:cacheKey request:request manifest:manifest];
+    return computed ?: @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
 }
 - (NSDictionary *)offlineCoverage:(NSString *)key verifyHash:(BOOL)verifyHash {
     if (verifyHash) {
@@ -6997,7 +7013,8 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
     NSString *path = [coverage[@"paths"] isKindOfClass:NSArray.class] ? [coverage[@"paths"] firstObject] : nil;
     if (!path.length) return;
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    NSDictionary *assetOpts = @{AVURLAssetPreferPreciseDurationAndTimingKey: @NO};
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:assetOpts];
     AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
     item.preferredForwardBufferDuration = 2;
     _preparedPlaylistKey = [key copy];
@@ -7021,7 +7038,9 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     _preloadHoverKey = nil;
 }
 - (BOOL)offlinePlaylistStillVisible:(NSString *)key {
+    if (!key.length) return NO;
     if ([key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"]) return YES;
+    if (_offlineRequests[key]) return YES;
     for (NSDictionary *seed in _mixSeeds) if ([seed[@"key"] isEqual:key]) return YES;
     return NO;
 }
@@ -7124,13 +7143,14 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 }
 - (void)playOfflinePlaylist:(NSString *)key {
     if (!_musicProbesEnabled) return;
-    if ([key isEqual:_mixPlayingKey] && _localPlayer) return;
+    if ([key isEqual:_mixPlayingKey] && _localPlayer && _localPlayer.rate > 0) return;
     NSUInteger generation = ++_offlinePlayGeneration;
     _mixStartingKey = key;
     _musicTimingClick = CFAbsoluteTimeGetCurrent();
-    OfflinePlaylistResetHashMetrics();
     [self musicTimingMark:@"click"];
-    NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    NSDictionary *cached = _offlineCoverageCache[[self offlineCoverageCacheKey:key]];
+    NSDictionary *coverage = cached[@"coverage"];
+    if (!coverage) coverage = [self offlineCoverage:key verifyHash:NO];
     [self musicTimingMark:@"verify"];
     NSDictionary *tile = [self isMixPlaylistKey:key] ? [self mixTileStateForKey:key] : nil;
     if (tile) {
@@ -7169,10 +7189,8 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         return;
     }
     if (![key isEqual:_preparedPlaylistKey]) [self discardPreparedPlaylist];
-    __weak Controller *weak = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        Controller *self = weak;
-        if (!self || generation != self->_offlinePlayGeneration) {
+    void (^start)(void) = ^{
+        if (generation != self->_offlinePlayGeneration) {
             self->_mixStartingKey = nil;
             if (self->_popover.isShown) [self rebuildContent];
             return;
@@ -7192,7 +7210,9 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         [self playLocalPaths:paths];
         [self scheduleOfflineHashVerifyForKey:key paths:paths generation:generation];
         if (self->_popover.isShown) [self rebuildContent];
-    });
+    };
+    if ([NSThread isMainThread]) start();
+    else dispatch_async(dispatch_get_main_queue(), start);
 }
 - (void)playSeedLocally:(NSDictionary *)seed { [self playOfflinePlaylist:seed[@"key"]]; }
 - (IBAction)playSeedMix:(NSButton *)sender {
@@ -7587,7 +7607,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
 }
 - (void)playLocalIndex:(NSInteger)index {
     if (!_localURLs.count) return;
-    if (!_localMode) [self pauseAppleMusicForLocalSource];
+    if (!_localMode && !_musicSilentQA) [self pauseAppleMusicForLocalSource];
     _externalPlayback = nil;
     index = [self wrappedLocalIndex:index];
     _localIndex = index;
@@ -7602,6 +7622,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     }
     [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
+    _localPlayer.automaticallyWaitsToMinimizeStalling = NO;
     float level = MusicPlayerOutputVolume(_musicSilentQA);
     _localPlayer.volume = level;
     _localPlayer.muted = _musicSilentQA;
@@ -8037,9 +8058,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     if (_popover.isShown) [self rebuildContent];
 }
+- (NSUInteger)coalescedSeekApplyCount { return _coalescedSeekCount; }
 - (void)performCoalescedSeek {
     _seekCoalesceTimer = nil;
     if (!_localMode || !_localPlayer) return;
+    _coalescedSeekCount++;
     double seconds = _seekCoalesceSeconds;
     CMTime target = CMTimeMakeWithSeconds(seconds, NSEC_PER_SEC);
     [_localPlayer seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero
@@ -11561,6 +11584,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [self focusFleetRows];
         _fleetFocusPending = NO; // no later refresh may override manual scrolling
     }
+    _popoverLastRebuildMs = (CFAbsoluteTimeGetCurrent() - rebuildStarted) * 1000.0;
 }
 
 // 16pt template glyph. Every actionable menu item, Details tab, and instrument heading
