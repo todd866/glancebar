@@ -100,3 +100,22 @@ version). `itunes_song` now requires the title and the artist to agree. `mixpool
 audit-liked` lists the affected rows (dry run); `--apply` moves them from `done` to
 `wrong_song` in `liked-pulled.json` so the next `pull-liked` looks for the right song. The
 files already downloaded stay in the masters folder.
+
+`pull-liked` finds a song in three steps: the song search; if that leaves the song out (it
+often does: "artist title" returns the artist's popular songs), the artist's own album list
+and the wanted album's tracks; then the artist's songs. Catalogue calls are paced (about one
+every three seconds) and a failed call is never recorded as "no match": the row is tried
+again on the next run. `pull-liked --retry-no-match` looks again for rows recorded as
+no-match by the weaker search.
+
+## Things that went wrong on 11 Nov 2026, and what now catches them
+
+- The favourites job hung for 42 hours on an `ssh` with no timeout (home-network name, away
+  from home). `offload-am.sh` now tries the home name then the tailnet name, with connect
+  timeouts and keep-alives, and waits its turn for the M2's drive with `disk-slot`.
+- The wider matching made the app's status read take 17 s of CPU every 30 s. Matching is now
+  indexed (0.1 s) with a speed test, and the app asks every ten minutes unless a sync or a
+  request change asks sooner.
+- The playback harness ran its later scenarios on a made-up output device, so every track
+  failed and the timing checks passed against a dead player. It now restores a real output
+  and asserts that audio is advancing.
