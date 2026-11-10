@@ -6932,7 +6932,9 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     // acquiring a playback lease, or consulting the stale download inventory.
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) _libraryRefreshWantsCache = YES;
-    if (now - _musicLibraryStatusAt >= 30) _libraryRefreshWantsStatus = YES;
+    // A background look every ten minutes. A sync finishing or a request changing asks for a
+    // status read at once; polling every 30 s ran a helper process around the clock.
+    if (now - _musicLibraryStatusAt >= 600) _libraryRefreshWantsStatus = YES;
     [self maybeScheduleMusicLibrarySync];
     [self libraryRefreshPump];
     if (_offlineExportChecked > 0 && now - _offlineExportChecked < 60) return;

@@ -118,6 +118,17 @@ class MusicLibLogicTests(unittest.TestCase):
             self.assertEqual(hits, [], track)
             self.assertEqual(reason, 'no catalogue match')
 
+    def test_matching_a_large_library_is_fast(self):
+        import time
+        entries = [{'relativePath': f'A/{i}.m4a', 'sizeBytes': 1, 'sha256': 'a' * 64,
+                    'tags': {'title': f'Song {i} (Remastered)', 'artist': f'Artist {i % 97} & Friends'}}
+                   for i in range(1500)]
+        tracks = [{'artist': f'Artist {i % 97} & Friends', 'title': f'Song {i} (Remastered)'} for i in range(1500)]
+        start = time.monotonic()
+        found = sum(1 for t in tracks if m.match_track(t, entries)[0])
+        self.assertEqual(found, 1500)
+        self.assertLess(time.monotonic() - start, 2.0)
+
     def test_match_normalisation_rules(self):
         entries = [
             {

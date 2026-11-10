@@ -379,6 +379,29 @@ def duration_ok(request_dur, entry_dur, tolerance=2.0):
     return abs(request_dur - entry_dur) <= tolerance
 
 
+_MATCH_INDEX = {}
+
+
+def catalogue_match_index(catalogue_entries):
+    """Match key -> catalogue entries, built once per entries list.
+
+    Without it every track recomputed the keys of every catalogue entry: a status read over
+    1,500 tracks and 1,300 entries took 17 s of CPU (11 Nov 2026), and the app asks for one
+    every 30 s.
+    """
+    cached = _MATCH_INDEX.get(id(catalogue_entries))
+    if cached and cached[0] is catalogue_entries and cached[1] == len(catalogue_entries):
+        return cached[2]
+    index = {}
+    for position, entry in enumerate(catalogue_entries):
+        tags = entry.get('tags') or {}
+        for key in oc.catalogue_match_keys(tags.get('artist', ''), tags.get('title', '')):
+            index.setdefault(key, []).append((position, entry))
+    _MATCH_INDEX.clear()
+    _MATCH_INDEX[id(catalogue_entries)] = (catalogue_entries, len(catalogue_entries), index)
+    return index
+
+
 def match_track(track, catalogue_entries):
     """Return (matches, reason). matches is a list of entries; reason set when empty."""
     req_keys = oc.catalogue_match_keys(track.get('artist', ''), track.get('title', ''))
@@ -386,12 +409,15 @@ def match_track(track, catalogue_entries):
         return [], 'missing title or artist'
     req_dur = track_duration_seconds(track)
     exact_key = match_key(track.get('artist', ''), track.get('title', ''))
+    index = catalogue_match_index(catalogue_entries)
+    candidates = {}
+    for key in req_keys:
+        for position, entry in index.get(key, ()):
+            candidates[position] = entry
     hits = []
-    for entry in catalogue_entries:
+    for position in sorted(candidates):
+        entry = candidates[position]
         tags = entry.get('tags') or {}
-        ekeys = oc.catalogue_match_keys(tags.get('artist', ''), tags.get('title', ''))
-        if not req_keys & ekeys:
-            continue
         entry_dur = entry.get('durationSeconds')
         if not duration_ok(req_dur, entry_dur):
             continue
