@@ -587,6 +587,12 @@ int main(void) {
         if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 3.0)) Fail(__LINE__);
         if (!WaitUntil(^BOOL { return (NSInteger)[[c valueForKey:@"localURLs"] count] == 2; }, 8.0)) Fail(__LINE__);
         if (LocalPlayer(c).rate <= 0 || LocalIndex(c) != 0) Fail(__LINE__);
+        // The rejected file must be gone from the player's own queue, not only from the list.
+        for (AVPlayerItem *queued in LocalPlayer(c).items) {
+            NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
+            if ([queuedURL.path isEqual:hashPaths[2]]) Fail(__LINE__);
+        }
+        if (LocalPlayer(c).items.count != 2) Fail(__LINE__);
 
         CFAbsoluteTime pauseT0 = CFAbsoluteTimeGetCurrent();
         [c musicPlay:nil];
@@ -642,6 +648,59 @@ int main(void) {
                 "Next cut %.0f ms, seeks %lu/30 events, rebuild stall %.1f ms\n",
                 resp40StartMs, (unsigned long)respHashBeforeAudio, respPauseMs, respResumeMs, respNextCutMs,
                 (unsigned long)respSeekApplies, respRebuildStallMs);
+
+        // --- a rejected track leaves by path; pause is kept; a deferred seek stays on its track ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        NSArray *dropSpecs = @[
+            @{@"id": @"D0", @"title": @"Drop Zero", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D1", @"title": @"Drop One", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D2", @"title": @"Drop Two", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D3", @"title": @"Drop Three", @"artist": @"Resp", @"album": @""},
+        ];
+        NSArray *dropPaths = GenerateTracks(musicRoot, dropSpecs);
+        if (dropPaths.count != 4) Fail(__LINE__);
+        NSDictionary *dropFixture = PlaylistFixture(dropSpecs, dropPaths, @"song:drop");
+        if (!dropFixture) Fail(__LINE__);
+        [c setValue:[@{@"song:drop": dropFixture[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:dropFixture[@"manifest"] forKey:@"offlineManifest"];
+        [c playOfflinePlaylist:@"song:drop"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 3.0)) Fail(__LINE__);
+        AssertSilentQA(c, __LINE__);
+        // An upcoming track is dropped while the first plays: the current item is untouched.
+        AVPlayerItem *dropCurrent = LocalPlayer(c).currentItem;
+        [c dropLocalPath:dropPaths[2] reason:@"harness"];
+        if ([[c valueForKey:@"localURLs"] count] != 3 || LocalIndex(c) != 0) Fail(__LINE__);
+        if (LocalPlayer(c).currentItem != dropCurrent || LocalPlayer(c).rate <= 0) Fail(__LINE__);
+        if (LocalPlayer(c).items.count != 3) Fail(__LINE__);
+        for (AVPlayerItem *queued in LocalPlayer(c).items) {
+            NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
+            if ([queuedURL.path isEqual:dropPaths[2]]) Fail(__LINE__);
+        }
+        // The current track is dropped while paused: the next one is loaded and stays paused.
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 0.25)) Fail(__LINE__);
+        [c dropLocalPath:dropPaths[0] reason:@"harness"];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.4]);
+        if ([[c valueForKey:@"localURLs"] count] != 2 || LocalIndex(c) != 0) Fail(__LINE__);
+        if (LocalPlayer(c).rate != 0 || [[c valueForKey:@"playbackPlaying"] boolValue]) Fail(__LINE__);
+        NSURL *dropNow = [LocalPlayer(c).currentItem.asset isKindOfClass:AVURLAsset.class]
+            ? ((AVURLAsset *)LocalPlayer(c).currentItem.asset).URL : nil;
+        if (![dropNow.path isEqual:dropPaths[1]]) Fail(__LINE__);
+        // A scrub followed at once by a cut to the next track: the seek must not land on the new track.
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 0.5)) Fail(__LINE__);
+        NSInteger seekFrom = LocalIndex(c);
+        [c musicSeek:SeekSlider(6.0)];
+        [c musicNext:nil];
+        [c musicNext:nil];
+        if (!WaitUntil(^BOOL { return LocalIndex(c) != seekFrom; }, 0.3)) Fail(__LINE__);
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        if (PlayerSeconds(LocalPlayer(c)) > 3.0) {
+            fprintf(stderr, "deferred seek landed on the next track (%.1f s)\n", PlayerSeconds(LocalPlayer(c)));
+            Fail(__LINE__);
+        }
+        fprintf(stderr, "Drop/seek: rejected track leaves the queue, pause kept, seek stays on its track\n");
 
         // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
         [c tearDownLocalPlayer];

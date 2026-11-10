@@ -5741,6 +5741,8 @@ static NSArray<NSString *> *BuildSeedMix(NSArray<NSDictionary *> *tracks, NSDict
 
 static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap cuts";
 
+static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
+
 @implementation Controller {
     MeteredMonitor *_meteredMonitor;
     NSDictionary *_metered;
@@ -5858,7 +5860,9 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain;
     NSUInteger _offlineHashGeneration;
     dispatch_queue_t _offlineHashQueue;
-    NSMutableIndexSet *_offlineHashVerified;
+    NSMutableSet<NSString *> *_offlineHashOK, *_offlineHashPending;   // main thread only
+    BOOL _localStartPaused;
+    AVPlayerItem *_seekCoalesceItem;
     NSString *_preparedPlaylistKey;
     AVPlayerItem *_preparedFirstItem;
     NSTimer *_preloadHoverTimer;
@@ -7044,24 +7048,59 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     for (NSDictionary *seed in _mixSeeds) if ([seed[@"key"] isEqual:key]) return YES;
     return NO;
 }
-- (void)purgeLocalTrackAtIndex:(NSInteger)index reason:(NSString *)reason {
-    if (index < 0 || index >= (NSInteger)_localURLs.count) return;
-    NSString *path = _localURLs[index].path;
+// A track whose bytes no longer match its manifest hash leaves the queue. Addressed by path, never
+// by index: the list may have changed since the hash was started. Transport intent is kept: a
+// paused player stays paused, and a playing one moves to the next track.
+- (void)dropLocalPath:(NSString *)path reason:(NSString *)reason {
+    if (!_localMode || !path.length || !_localURLs.count) return;
+    NSInteger current = _localIndex, removedBefore = 0;
+    BOOL removedCurrent = NO;
+    NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:_localURLs.count];
+    for (NSInteger i = 0; i < (NSInteger)_localURLs.count; i++) {
+        if ([_localURLs[i].path isEqual:path]) {
+            if (i < current) removedBefore++;
+            else if (i == current) removedCurrent = YES;
+            continue;
+        }
+        [urls addObject:_localURLs[i]];
+    }
+    if (urls.count == _localURLs.count) return;
     GBLog("music: dropping track %{public}@ (%{public}@)", path.lastPathComponent, reason);
-    NSMutableArray<NSURL *> *urls = [_localURLs mutableCopy];
-    [urls removeObjectAtIndex:(NSUInteger)index];
-    _localURLs = urls;
     _libraryRefreshWantsSync = YES;
     [self libraryRefreshPump];
-    if (!_localURLs.count) {
+    BOOL wasPlaying = _playbackPlaying;
+    _localURLs = urls;
+    if (!urls.count) {
         [self tearDownLocalPlayer];
         _localMode = NO;
         _mixPlayingKey = nil;
+        _playbackPlaying = NO;
+        [self publishNowPlaying];
+        if (_popover.isShown) [self rebuildContent];
         return;
     }
-    if (index < _localIndex) _localIndex--;
-    else if (index == _localIndex) [self playLocalIndex:_localIndex];
-    else if (index < _localQueueEnd) _localQueueEnd--;
+    NSInteger index = current - removedBefore;
+    AVPlayerItem *currentItem = _localPlayer.currentItem;
+    if (removedCurrent || !currentItem) {
+        if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
+        _localStartPaused = !wasPlaying;
+        [self playLocalIndex:index];
+        _localStartPaused = NO;
+        return;
+    }
+    // The current item is sound: rebuild only what is queued after it from the corrected list.
+    _localIndex = index;
+    NSMutableArray<AVPlayerItem *> *observed = [_localObservedItems mutableCopy] ?: [NSMutableArray array];
+    for (AVPlayerItem *item in [_localPlayer.items copy]) {
+        if (item == currentItem) continue;
+        [NSNotificationCenter.defaultCenter removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+        [observed removeObjectIdenticalTo:item];
+        [_localPlayer removeItem:item];
+    }
+    _localObservedItems = observed;
+    _localQueueEnd = _localIndex + 1;
+    [self maintainLocalPlayerQueue];
+    if (_popover.isShown) [self rebuildContent];
 }
 - (NSDictionary *)offlineManifestRecordForPath:(NSString *)path key:(NSString *)key {
     NSDictionary *manifest = _offlineManifest;
@@ -7076,45 +7115,40 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     }
     return nil;
 }
-- (void)scheduleOfflineHashVerifyForKey:(NSString *)key paths:(NSArray *)paths generation:(NSUInteger)generation {
+// Background verification. All bookkeeping is on the main thread; the hash queue only ever sees
+// immutable manifest records and reports back by path. A new playlist start changes the
+// generation, which abandons queued work and ignores late results.
+- (void)resetOfflineHashVerify:(NSUInteger)generation {
     _offlineHashGeneration = generation;
-    if (!_offlineHashVerified) _offlineHashVerified = [NSMutableIndexSet indexSet];
-    else [_offlineHashVerified removeAllIndexes];
-    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
-    dispatch_async([self offlineHashQueue], ^{
-        for (NSInteger i = 0; i < (NSInteger)paths.count; i++) {
-            if (generation != self->_offlineHashGeneration) return;
-            NSString *path = paths[i];
-            if ([self->_offlineHashVerified containsIndex:(NSUInteger)i]) continue;
-            NSDictionary *record = [self offlineManifestRecordForPath:path key:key];
-            if (!record) continue;
-            BOOL ok = OfflinePlaylistVerifyRecordHash(record, root);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (generation != self->_offlineHashGeneration || ![key isEqual:self->_mixPlayingKey]) return;
-                if (ok) [self->_offlineHashVerified addIndex:(NSUInteger)i];
-                else [self purgeLocalTrackAtIndex:i reason:@"sha256 mismatch"];
-            });
-            if (!ok) break;
-        }
-    });
+    atomic_store(&gOfflineHashLiveGeneration, generation);
+    _offlineHashOK = [NSMutableSet set];
+    _offlineHashPending = [NSMutableSet set];
 }
 - (void)maintainOfflineHashVerifyAhead {
-    if (!_mixPlayingKey.length || !_localURLs.count) return;
+    if (!_mixPlayingKey.length || !_localURLs.count || !_offlineHashOK) return;
     NSUInteger generation = _offlineHashGeneration;
     NSString *key = _mixPlayingKey, *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
-    NSInteger start = _localIndex + 1, end = MIN((NSInteger)_localURLs.count, _localIndex + 10);
+    NSInteger count = (NSInteger)_localURLs.count, from = MAX(0, MIN(_localIndex, count - 1));
+    NSMutableArray<NSDictionary *> *batch = [NSMutableArray array];
+    for (NSInteger step = 0; step < MIN(count, 10); step++) {
+        NSString *path = _localURLs[(from + step) % count].path;
+        if (!path.length || [_offlineHashOK containsObject:path] || [_offlineHashPending containsObject:path]) continue;
+        NSDictionary *record = [self offlineManifestRecordForPath:path key:key];
+        if (!record) continue;
+        [_offlineHashPending addObject:path];
+        [batch addObject:record];
+    }
+    if (!batch.count) return;
     dispatch_async([self offlineHashQueue], ^{
-        for (NSInteger i = start; i < end; i++) {
-            if (generation != self->_offlineHashGeneration) return;
-            if ([self->_offlineHashVerified containsIndex:(NSUInteger)i]) continue;
-            NSString *path = self->_localURLs[i].path;
-            NSDictionary *record = [self offlineManifestRecordForPath:path key:key];
-            if (!record) continue;
+        for (NSDictionary *record in batch) {
+            if (atomic_load(&gOfflineHashLiveGeneration) != generation) return;
             BOOL ok = OfflinePlaylistVerifyRecordHash(record, root);
+            NSString *path = record[@"path"];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (generation != self->_offlineHashGeneration) return;
-                if (ok) [self->_offlineHashVerified addIndex:(NSUInteger)i];
-                else [self purgeLocalTrackAtIndex:i reason:@"sha256 mismatch"];
+                [self->_offlineHashPending removeObject:path];
+                if (ok) [self->_offlineHashOK addObject:path];
+                else if ([key isEqual:self->_mixPlayingKey]) [self dropLocalPath:path reason:@"sha256 mismatch"];
             });
         }
     });
@@ -7200,8 +7234,8 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         self->_musicNote = nil;
         self->_mixPlayingKey = key;
         [self musicTimingMark:@"queue"];
+        [self resetOfflineHashVerify:generation];
         [self playLocalPaths:paths];
-        [self scheduleOfflineHashVerifyForKey:key paths:paths generation:generation];
         if (self->_popover.isShown) [self rebuildContent];
     });
 }
@@ -7526,7 +7560,13 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         _localOutgoing = nil;
     }
 }
+- (void)cancelCoalescedSeek {
+    [_seekCoalesceTimer invalidate];
+    _seekCoalesceTimer = nil;
+    _seekCoalesceItem = nil;
+}
 - (void)tearDownLocalPlayer {
+    [self cancelCoalescedSeek];
     [_localBlendTimer invalidate];
     _localBlendTimer = nil;
     [self detachLocalObservers];
@@ -7625,7 +7665,8 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     [self maintainLocalPlayerQueue];
     [self applyLocalItemURL:_localURLs[index]];
     [self enableRemoteCommands];
-    [_localPlayer play];
+    if (_localStartPaused) _playbackPlaying = NO;   // replacing a rejected track while paused
+    else [_localPlayer play];
     OfflinePlaylistNotePlaybackStarted();
     [self musicTimingMark:@"rate"];
     [self maintainOfflineHashVerifyAhead];
@@ -8052,7 +8093,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (NSUInteger)coalescedSeekApplyCount { return _coalescedSeekCount; }
 - (void)performCoalescedSeek {
     _seekCoalesceTimer = nil;
-    if (!_localMode || !_localPlayer) return;
+    AVPlayerItem *item = _seekCoalesceItem;
+    _seekCoalesceItem = nil;
+    // A deferred seek belongs to the track it was made on: never applied to its successor.
+    if (!_localMode || !_localPlayer || !item || _localPlayer.currentItem != item) return;
     _coalescedSeekCount++;
     double seconds = _seekCoalesceSeconds;
     CMTime target = CMTimeMakeWithSeconds(seconds, NSEC_PER_SEC);
@@ -8069,6 +8113,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _trackElapsed = seconds;
     _trackSampledAt = CFAbsoluteTimeGetCurrent();
     _seekCoalesceSeconds = seconds;
+    _seekCoalesceItem = _localPlayer.currentItem;
     [_seekCoalesceTimer invalidate];
     _seekCoalesceTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:self selector:@selector(performCoalescedSeek)
                                                         userInfo:nil repeats:NO];
@@ -8089,6 +8134,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
     double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
     if (seconds > 3) {
+        [self cancelCoalescedSeek];
         [_localPlayer seekToTime:kCMTimeZero completionHandler:^(BOOL __unused finished) {
             dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
         }];
