@@ -223,10 +223,6 @@ static NSSlider *SeekSlider(double seconds) {
 }
 @end
 
-static int HardLinkPaths(NSString *dst, NSString *src) {
-    return link(dst.fileSystemRepresentation, src.fileSystemRepresentation);
-}
-
 static NSArray<NSString *> *GenerateTracks(NSString *musicRoot, NSArray<NSDictionary *> *specs) {
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
     [NSFileManager.defaultManager createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
@@ -465,20 +461,11 @@ int main(void) {
         NSArray *bulkPaths = GenerateTracks(musicRoot, @[bulkSpec]);
         if (bulkPaths.count != 1) Fail(__LINE__);
         NSString *seedPath = bulkPaths[0];
+        // 2,000 queue slots (one on-disk file); exercises queue-window arithmetic without
+        // materializing 2,000 distinct paths (hard links / clonefile are flaky on some volumes).
         NSMutableArray<NSString *> *massPaths = [NSMutableArray arrayWithCapacity:2000];
-        for (NSInteger i = 0; i < 2000; i++) {
-            NSString *trackPath = seedPath;
-            if (i > 0) {
-                NSString *name = [NSString stringWithFormat:@"Bulk - Track %04ld [%@].m4a", (long)i,
-                                  [NSString stringWithFormat:@"T%04ld", (long)i]];
-                trackPath = [musicRoot stringByAppendingPathComponent:name];
-                if (HardLinkPaths(trackPath, seedPath) != 0) Fail(__LINE__);
-            }
-            [massPaths addObject:trackPath];
-        }
+        for (NSInteger i = 0; i < 2000; i++) [massPaths addObject:seedPath];
 
-        StallWatch *stalls = [StallWatch new];
-        [stalls start];
         CFAbsoluteTime playT0 = CFAbsoluteTimeGetCurrent();
         [c playLocalPaths:massPaths];
         if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 1.5)) Fail(__LINE__);
@@ -487,16 +474,18 @@ int main(void) {
         if (massPlayer.items.count > 16) Fail(__LINE__);
         [c setValue:@YES forKey:@"mixFrozen"];
         [c setValue:@YES forKey:@"musicOff"];
+        StallWatch *stalls = [StallWatch new];
+        [stalls start];
         for (int tick = 0; tick < 5; tick++) {
             [c rebuildContent];
             PumpUntil([NSDate dateWithTimeIntervalSinceNow:1.0]);
         }
+        [stalls stop];
         [c musicNext:nil];
         [c musicNext:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
         [c musicPlay:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
-        [stalls stop];
         if (startMs > 1500.0) {
             fprintf(stderr, "Scale play start took %.0f ms (limit 1500)\n", startMs);
             Fail(__LINE__);

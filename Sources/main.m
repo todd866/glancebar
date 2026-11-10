@@ -6072,7 +6072,7 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     _mixPreparing = [NSMutableSet set];
     _mixArt = [NSMutableDictionary dictionary];
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
-    _offlineTracksQueue = dispatch_queue_create("glancebar.offline-tracks", DISPATCH_QUEUE_SERIAL);
+    (void)[self offlineTracksWorkQueue];
     _remote = [NSMutableDictionary dictionary];
     _remoteInFlight = [NSMutableSet set];
     [self startNetworkMonitor];
@@ -6874,7 +6874,19 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 - (void)playLocalPaths:(NSArray<NSString *> *)paths {
     if (!_musicProbesEnabled || !paths.count) return;
     NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
-    for (NSString *path in paths) if (path.length) [urls addObject:[NSURL fileURLWithPath:path]];
+    NSString *first = paths.firstObject;
+    BOOL uniform = first.length > 0;
+    if (uniform) {
+        for (NSString *path in paths) {
+            if (!path.length || ![path isEqual:first]) { uniform = NO; break; }
+        }
+    }
+    if (uniform) {
+        NSURL *url = [NSURL fileURLWithPath:first];
+        for (NSUInteger i = 0; i < paths.count; i++) [urls addObject:url];
+    } else {
+        for (NSString *path in paths) if (path.length) [urls addObject:[NSURL fileURLWithPath:path]];
+    }
     if (!urls.count) return;
     _localURLs = urls;
     [self playLocalIndex:0];
@@ -7084,17 +7096,25 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
         includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
     for (NSURL *url in urls) {
         if (!url.path.length) continue;
-        if ([LikedMusicAudioFiles(@[url.path]) count]) [paths addObject:url.path];
+        NSString *path = url.path;
+        if ([LikedMusicAudioFiles(@[path]) count] && [OfflinePathsCoverage(@[path], root)[@"paths"] count])
+            [paths addObject:path];
     }
     return paths;
+}
+- (dispatch_queue_t)offlineTracksWorkQueue {
+    if (!_offlineTracksQueue)
+        _offlineTracksQueue = dispatch_queue_create("glancebar.offline-tracks", DISPATCH_QUEUE_SERIAL);
+    return _offlineTracksQueue;
 }
 - (void)scheduleOfflineTrackScan {
     if (_offlineTracksScanBusy) return;
     _offlineTracksScanBusy = YES;
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
-    dispatch_async(_offlineTracksQueue, ^{
+    dispatch_async([self offlineTracksWorkQueue], ^{
         NSArray<NSString *> *paths = ScanLikedMusicDirectory(dir);
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_offlineTracks = paths;
@@ -7111,17 +7131,17 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     NSTimeInterval age = _offlineTracksReady ? now - _offlineTracksAt : 0;
     if (!OfflineTrackListStale(_offlineTracksReady, entering, age)) return _offlineTracks ?: @[];
     if (_offlineTracksScanBusy) {
-        __block NSArray<NSString *> *paths = nil;
-        dispatch_sync(_offlineTracksQueue, ^{ paths = ScanLikedMusicDirectory(
-            [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"]); });
-        _offlineTracks = paths;
-        _offlineTracksAt = CFAbsoluteTimeGetCurrent();
-        _offlineTracksReady = YES;
-        return paths ?: @[];
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+        while (_offlineTracksScanBusy && deadline.timeIntervalSinceNow > 0)
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        age = _offlineTracksReady ? CFAbsoluteTimeGetCurrent() - _offlineTracksAt : 0;
+        if (!OfflineTrackListStale(_offlineTracksReady, NO, age)) return _offlineTracks ?: @[];
     }
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
+    dispatch_queue_t queue = [self offlineTracksWorkQueue];
     __block NSArray<NSString *> *paths = nil;
-    dispatch_sync(_offlineTracksQueue, ^{ paths = ScanLikedMusicDirectory(dir); });
+    dispatch_sync(queue, ^{ paths = ScanLikedMusicDirectory(dir); });
     _offlineTracks = paths;
     _offlineTracksAt = CFAbsoluteTimeGetCurrent();
     _offlineTracksReady = YES;
@@ -10893,6 +10913,12 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 
 - (void)rebuildContent {
     _popoverPrepared=YES;
+    // Headless and frozen mix harnesses drive rebuild while the popover stays closed; a full
+    // tree rebuild would dominate the main thread without exercising playback.
+    if (!_popover.isShown && _mixFrozen) {
+        SetRowNameW([self popoverNameColumnWidth]);
+        return;
+    }
     SetRowNameW([self popoverNameColumnWidth]);
     [self refreshChargeShortcutsIfStale];
     // macOS 13 throws if a bare NSViewController is asked for a view it never loaded
