@@ -338,6 +338,9 @@ int main(void) {
         PlaybackController *c = [PlaybackController new];
         if (!MusicSilentQAEnabled()) Fail(__LINE__);
         [c setValue:@YES forKey:@"musicSilentQA"];
+        // Never script the real Music app from the harness: a popover rebuild would otherwise read
+        // the owner's library when Music happens to be open (and crashed here, having no mix queue).
+        [c setValue:@YES forKey:@"mixLibraryLoading"];
         [c setValue:@YES forKey:@"musicProbesEnabled"];
         AssertSilentQA(c, __LINE__);
         [c setValue:@YES forKey:@"mixFrozen"];
@@ -535,6 +538,12 @@ int main(void) {
         [c setValue:@NO forKey:@"localMode"];
         [c setValue:@NO forKey:@"mixFrozen"];
         [c setValue:@NO forKey:@"musicOff"];
+        // The scenario above pins the player to a made-up device UID. Left in place, every item in
+        // the scenarios below fails with a clock error and the timings are measured on a dead
+        // player. Back to "follows the system default" (the player stays muted in silent QA).
+        [c setValue:@[builtinOut] forKey:@"audioDevices"];
+        [c setValue:@"builtin" forKey:@"defaultOutputUID"];
+        [c setPlayerOutputChoiceUID:@"" name:@""];
         NSMutableArray *fortySpecs = [NSMutableArray array];
         for (NSUInteger i = 0; i < 40; i++) {
             [fortySpecs addObject:@{@"id": [NSString stringWithFormat:@"F%lu", (unsigned long)i],
@@ -559,6 +568,7 @@ int main(void) {
         [c playOfflinePlaylist:@"song:resp40"];
         if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 1.0)) Fail(__LINE__);
         resp40StartMs = (CFAbsoluteTimeGetCurrent() - clickT0) * 1000.0;
+        if (LocalPlayer(c).audioOutputDeviceUniqueID.length) Fail(__LINE__);
         respHashBeforeAudio = OfflinePlaylistHashCallsBeforeFirstAudio();
         if (resp40StartMs > 300.0) {
             fprintf(stderr, "40-track tile click: rate > 0 took %.0f ms (limit 300)\n", resp40StartMs);
@@ -568,6 +578,8 @@ int main(void) {
             fprintf(stderr, "hash calls before first audio: %lu (expected 0)\n", (unsigned long)respHashBeforeAudio);
             Fail(__LINE__);
         }
+        // rate > 0 is only the request: the track must really be moving.
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
         player = LocalPlayer(c);
         [c tearDownLocalPlayer];
         [c setValue:@NO forKey:@"localMode"];
@@ -592,7 +604,13 @@ int main(void) {
             NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
             if ([queuedURL.path isEqual:hashPaths[2]]) Fail(__LINE__);
         }
-        if (LocalPlayer(c).items.count != 2) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).items.count == 2; }, 1.0)) {
+            fprintf(stderr, "after a hash drop the player holds %lu items (want 2); urls %lu index %ld rate %.1f current %s queueEnd %ld player %p\n",
+                    (unsigned long)LocalPlayer(c).items.count, (unsigned long)[[c valueForKey:@"localURLs"] count], (long)LocalIndex(c),
+                    LocalPlayer(c).rate, LocalPlayer(c).currentItem ? "yes" : "no", (long)[[c valueForKey:@"localQueueEnd"] integerValue], LocalPlayer(c));
+            Fail(__LINE__);
+        }
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
 
         CFAbsoluteTime pauseT0 = CFAbsoluteTimeGetCurrent();
         [c musicPlay:nil];
@@ -667,12 +685,16 @@ int main(void) {
         [c playOfflinePlaylist:@"song:drop"];
         if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 3.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
         // An upcoming track is dropped while the first plays: the current item is untouched.
         AVPlayerItem *dropCurrent = LocalPlayer(c).currentItem;
         [c dropLocalPath:dropPaths[2] reason:@"harness"];
         if ([[c valueForKey:@"localURLs"] count] != 3 || LocalIndex(c) != 0) Fail(__LINE__);
         if (LocalPlayer(c).currentItem != dropCurrent || LocalPlayer(c).rate <= 0) Fail(__LINE__);
-        if (LocalPlayer(c).items.count != 3) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).items.count == 3; }, 1.0)) {
+            fprintf(stderr, "after a drop the player holds %lu items (want 3)\n", (unsigned long)LocalPlayer(c).items.count);
+            Fail(__LINE__);
+        }
         for (AVPlayerItem *queued in LocalPlayer(c).items) {
             NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
             if ([queuedURL.path isEqual:dropPaths[2]]) Fail(__LINE__);

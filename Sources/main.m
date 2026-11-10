@@ -7088,17 +7088,23 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         _localStartPaused = NO;
         return;
     }
-    // The current item is sound: rebuild only what is queued after it from the corrected list.
+    // The current item is sound. Take only the rejected file out of the player's queue: the items
+    // after the current one mirror consecutive list entries, so the window end moves back by the
+    // number removed.
     _localIndex = index;
     NSMutableArray<AVPlayerItem *> *observed = [_localObservedItems mutableCopy] ?: [NSMutableArray array];
+    NSInteger removedQueued = 0;
     for (AVPlayerItem *item in [_localPlayer.items copy]) {
         if (item == currentItem) continue;
+        NSURL *url = [item.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)item.asset).URL : nil;
+        if (![url.path isEqual:path]) continue;
         [NSNotificationCenter.defaultCenter removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:item];
         [observed removeObjectIdenticalTo:item];
         [_localPlayer removeItem:item];
+        removedQueued++;
     }
     _localObservedItems = observed;
-    _localQueueEnd = _localIndex + 1;
+    _localQueueEnd = MAX(_localIndex + 1, _localQueueEnd - removedQueued);
     [self maintainLocalPlayerQueue];
     if (_popover.isShown) [self rebuildContent];
 }
