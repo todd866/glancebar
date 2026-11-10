@@ -7582,9 +7582,17 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         return;
     }
     if ([[self heartedKeys] containsObject:key]) return;
+    // The heart is a local fact first (10 Nov 2026: hearting a playing track did nothing
+    // whenever Apple Music had no match, e.g. a YouTube DJ set, because the heart was only
+    // saved after the Apple Music add succeeded). Save it and fill the button now; mirroring
+    // it to Apple Music is best effort in the background and never undoes the heart.
+    [self rememberHeart:key];
+    _localHeartError = nil;
+    _localHeartEpoch++;
+    if (_popover.isShown) [self rebuildContent];
     NSString *script = LikesSyncScript();
     if (![NSFileManager.defaultManager fileExistsAtPath:script]) {
-        [self noteLocalHeartError:@"Likes sync is not installed"];
+        GBLog("heart: saved locally; likes sync is not installed");
         return;
     }
     _localLoveInFlight = YES;
@@ -7599,7 +7607,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         if (![task launchAndReturnError:NULL]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_localLoveInFlight = NO;
-                [self noteLocalHeartError:@"Couldn't add to Apple Music"];
+                GBLog("heart: saved locally; the Apple Music mirror could not start");
             });
             return;
         }
@@ -7615,15 +7623,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             NSDictionary *payload = LoveResultJSON(stdoutText);
             NSString *result = [payload[@"result"] isKindOfClass:NSString.class] ? payload[@"result"] : @"";
             int status = task.terminationReason == NSTaskTerminationReasonExit ? task.terminationStatus : 1;
-            if (status == 0 && [result isEqual:@"ok"]) {
-                [self rememberHeart:key];
-                self->_localHeartError = nil;
-                self->_localHeartEpoch++;
-                if (self->_popover.isShown) [self rebuildContent];
-                return;
-            }
-            NSString *why = status == 3 || [result isEqual:@"no-match"] ? @"No Apple Music match" : stderrText;
-            [self noteLocalHeartError:why];
+            if (status == 0 && [result isEqual:@"ok"]) return;
+            NSString *why = status == 3 || [result isEqual:@"no-match"] ? @"no Apple Music match" : stderrText;
+            if (why.length > 160) why = [why substringToIndex:160];
+            GBLog("heart: saved locally; not mirrored to Apple Music (%{public}@)", why ?: @"");
         });
     });
 }
