@@ -34,7 +34,10 @@ are retained. Empty playlists are not ready. The optional `--index` is a trusted
 local JSON object `{"tracks":[...]}` whose rows have `path`, plus a stable library
 `id` and/or full title/artist/album. An ID does not override conflicting metadata.
 
-Default source pools are `~/Music/YouTube Liked` and `~/Music/Glancebar Radio`, plus `~/Music/Glancebar Offline`.
+Default source pools are the music-library `hot_dir` (`~/Music/Glancebar Lossless` by
+default, from `~/.config/glancebar/music-library.json` when present), then
+`~/Music/YouTube Liked`, `~/Music/Glancebar Radio`, and `~/Music/Glancebar Offline`.
+Lossless files under `hot_dir` are preferred over byte-different lossy matches.
 Repeat `--root` to replace those defaults with pinned local pools. M4A/MP4
 metadata is read directly from bounded iTunes text atoms, never inferred from
 filenames or fuzzy song-title comparisons. Every artist/title/album field must

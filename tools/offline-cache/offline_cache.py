@@ -15,8 +15,33 @@ import unicodedata
 HOME = Path.home()
 BASE = HOME / 'Library/Application Support/Glancebar/mix'
 CACHE = HOME / 'Music/Glancebar Offline'
+MUSIC_LIBRARY_CONFIG = HOME / '.config/glancebar/music-library.json'
+DEFAULT_HOT_DIR = HOME / 'Music/Glancebar Lossless'
 FLOOR = 150_000_000_000  # M5 placement.toml floor_gb, decimal GB; never lower.
 AUDIO = {'.m4a', '.mp3', '.flac', '.wav', '.aiff', '.aif', '.aac', '.alac', '.mp4'}
+
+
+def music_library_hot_dir(config=MUSIC_LIBRARY_CONFIG):
+    try:
+        doc = json.loads(config.expanduser().read_text())
+        raw = doc.get('hot_dir') or DEFAULT_HOT_DIR
+        hot = Path(str(raw)).expanduser()
+        return hot if hot.is_absolute() else DEFAULT_HOT_DIR
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return DEFAULT_HOT_DIR
+
+
+def default_audio_roots():
+    hot = music_library_hot_dir()
+    roots = [hot, HOME / 'Music/YouTube Liked', HOME / 'Music/Glancebar Radio', CACHE]
+    out = []
+    seen = set()
+    for root in roots:
+        key = str(root.expanduser())
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
 
 
 def normal(value):
@@ -180,7 +205,8 @@ def inventory(roots, index=None, cached=None):
     return result
 
 
-def select(track, sources, verification_cache=None):
+def select(track, sources, verification_cache=None, hot_dir=None):
+    hot_dir = Path(hot_dir).expanduser().resolve() if hot_dir else music_library_hot_dir().resolve()
     candidates = []
     for row in sources:
         # Explicit persistent-ID binding, with no contradictory supplied metadata.
@@ -200,7 +226,15 @@ def select(track, sources, verification_cache=None):
             return None, 'ambiguous exact match'
         if len({(row['sha256'], row['sizeBytes']) for row in checks}) != 1:
             return None, 'ambiguous exact match'
-        preferred = sorted(paths, key=lambda path: (not Path(path).is_relative_to(CACHE), path))[0]
+        def rank(path):
+            p = Path(path)
+            try:
+                under_hot = p.resolve().is_relative_to(hot_dir)
+            except (OSError, ValueError):
+                under_hot = False
+            return (not under_hot, p.is_relative_to(CACHE), path)
+
+        preferred = sorted(paths, key=rank)[0]
         return next(row for row in candidates if row.get('path') == preferred), None
     if not paths:
         return None, 'no exact recording match'
@@ -265,7 +299,8 @@ def copy_verified(info, cache, floor):
             temp.unlink(missing_ok=True)  # Only this command's unpublished temporary file.
 
 
-def audit(requests, sources, copy=False, cache=CACHE, floor=FLOOR, verification_cache=None):
+def audit(requests, sources, copy=False, cache=CACHE, floor=FLOOR, verification_cache=None, hot_dir=None):
+    hot_dir = hot_dir if hot_dir is not None else music_library_hot_dir()
     if requests.get('schemaVersion') != 1 or not isinstance(requests.get('playlists'), list):
         raise ValueError('unsupported request schema')
     output = {'schemaVersion': 1, 'generatedAt': int(time.time()), 'playlists': []}
@@ -284,7 +319,7 @@ def audit(requests, sources, copy=False, cache=CACHE, floor=FLOOR, verification_
             item = {k: track.get(k, '') for k in ('id', 'title', 'artist', 'album')}
             result['requestedTrackIDs'].append(track['id'])
             result['requestedTracks'].append(dict(item))
-            source, reason = select(track, sources, verification_cache)
+            source, reason = select(track, sources, verification_cache, hot_dir=hot_dir)
             if source:
                 try:
                     path = source['path']
@@ -359,8 +394,11 @@ def main():
                     verification_cache = saved.get('verified', {})
             except (OSError, ValueError):
                 pass
-        sources = inventory(args.root if args.root is not None else [HOME / 'Music/YouTube Liked', HOME / 'Music/Glancebar Radio', CACHE], args.index, scan_cache)
-        result = audit(json.loads(args.requests.read_text()), sources, args.copy, args.cache, floor, verification_cache)
+        hot = music_library_hot_dir()
+        roots = args.root if args.root is not None else default_audio_roots()
+        sources = inventory(roots, args.index, scan_cache)
+        result = audit(json.loads(args.requests.read_text()), sources, args.copy, args.cache, floor,
+                       verification_cache, hot_dir=hot)
         result['storage'] = {'physicalFreeBytes': physical_free(args.cache), 'floorBytes': floor}
         if args.command == 'prepare':
             publish(result, args.manifest)

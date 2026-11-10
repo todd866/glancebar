@@ -16,9 +16,14 @@ import time
 import unicodedata
 from pathlib import Path
 
-TOOLS = Path(__file__).resolve().parent.parent
-if str(TOOLS / 'offline-cache') not in sys.path:
-    sys.path.insert(0, str(TOOLS / 'offline-cache'))
+_HERE = Path(__file__).resolve().parent
+_bundle = _HERE / 'offline_cache.py'
+_dev = _HERE.parent / 'offline-cache'
+if _bundle.is_file():
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+elif _dev.is_dir() and str(_dev) not in sys.path:
+    sys.path.insert(0, str(_dev))
 import offline_cache as oc  # noqa: E402
 
 HOME = Path.home()

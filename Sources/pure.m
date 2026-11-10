@@ -72,8 +72,45 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
         }
         [paths addObject:path];
     }
+    BOOL complete = current && inOrder && wanted.count > 0 && paths.count == wanted.count;
     BOOL ready = current && inOrder && paths.count > 0;
-    return @{@"total": @(wanted.count), @"available": @(paths.count), @"ready": @(ready), @"paths": paths};
+    return @{@"total": @(wanted.count), @"available": @(paths.count), @"ready": @(ready),
+            @"complete": @(complete), @"paths": paths};
+}
+
+BOOL MusicSilentQAEnabled(void) {
+    const char *env = getenv("GLANCEBAR_SILENT_QA");
+    if (env && env[0] && strcmp(env, "0") != 0) return YES;
+    return [NSUserDefaults.standardUserDefaults boolForKey:@"musicSilentQA"];
+}
+
+float MusicPlayerOutputVolume(BOOL silentQA) { return silentQA ? 0.f : 1.f; }
+
+BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow) {
+    if (!networkOnline || metered || lastError.length || unmatched || overflow) return YES;
+    return NO;
+}
+
+NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch) {
+    NSUInteger total = [coverage[@"total"] unsignedIntegerValue];
+    NSUInteger available = [coverage[@"available"] unsignedIntegerValue];
+    BOOL complete = [coverage[@"complete"] boolValue];
+    NSString *countText = !total ? @"0 of 0 on this Mac"
+        : [NSString stringWithFormat:@"%lu of %lu on this Mac", (unsigned long)available, (unsigned long)total];
+    if (!total) {
+        return @{@"state": @"empty", @"enabled": @NO, @"alpha": @0.4, @"tooltip": countText, @"partial": @NO};
+    }
+    if (complete) {
+        return @{@"state": @"ready", @"enabled": @YES, @"alpha": @1.0, @"tooltip": countText, @"partial": @NO};
+    }
+    if (cannotFetch) {
+        BOOL enabled = available > 0;
+        return @{@"state": enabled ? @"partial" : @"unavailable", @"enabled": @(enabled),
+                 @"alpha": enabled ? @0.85 : @0.4, @"tooltip": countText, @"partial": @(enabled)};
+    }
+    NSString *tip = [NSString stringWithFormat:@"fetching %lu of %lu", (unsigned long)available, (unsigned long)total];
+    if (!syncBusy && available >= total) tip = countText;
+    return @{@"state": @"fetching", @"enabled": @NO, @"alpha": @0.4, @"tooltip": tip, @"partial": @NO};
 }
 
 static NSCalendar *MeteredCalendar(NSTimeZone *zone) {

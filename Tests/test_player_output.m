@@ -44,6 +44,24 @@ int main(void) { @autoreleasepool {
                                                     @"Player State": @"Paused"}, @"spotify");
     Check(![paused[@"playing"] boolValue] && ![paused[@"valid"] boolValue], @"paused is not shown");
 
+    unsetenv("GLANCEBAR_SILENT_QA");
+    Check(!MusicSilentQAEnabled() || [NSUserDefaults.standardUserDefaults boolForKey:@"musicSilentQA"],
+          @"silent QA defaults off without env");
+    setenv("GLANCEBAR_SILENT_QA", "1", 1);
+    Check(MusicSilentQAEnabled(), @"silent QA follows GLANCEBAR_SILENT_QA");
+    unsetenv("GLANCEBAR_SILENT_QA");
+    Check(MusicPlayerOutputVolume(YES) == 0.f && MusicPlayerOutputVolume(NO) == 1.f, @"silent QA forces zero player volume");
+    NSDictionary *full = @{@"total": @4, @"available": @4, @"complete": @YES, @"ready": @YES};
+    NSDictionary *ready = OfflineMixTileState(full, NO, NO);
+    Check([ready[@"state"] isEqual:@"ready"] && [ready[@"enabled"] boolValue], @"full mix tile is ready");
+    NSDictionary *fetching = OfflineMixTileState(@{@"total": @40, @"available": @12, @"complete": @NO, @"ready": @YES},
+                                                 YES, NO);
+    Check([fetching[@"state"] isEqual:@"fetching"] && ![fetching[@"enabled"] boolValue], @"incomplete mix waits while fetching");
+    Check([fetching[@"tooltip"] isEqual:@"fetching 12 of 40"], @"fetch tooltip shows progress");
+    NSDictionary *partial = OfflineMixTileState(@{@"total": @40, @"available": @12, @"complete": @NO, @"ready": @YES},
+                                                NO, YES);
+    Check([partial[@"partial"] boolValue] && [partial[@"enabled"] boolValue], @"cannot-fetch allows partial play");
+
     fprintf(stderr, "OK: %d player output checks passed\n", checks);
     return 0;
 }}

@@ -740,7 +740,8 @@ int main(int argc, const char **argv) {
             outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
             if (![outputButton.title containsString:@"Bose Flex SoundLink"] || fabs(volume.doubleValue - 0.55) > 0.001 ||
                 !volume.enabled || ![level.stringValue isEqual:@"55%"] || ![level.textColor isEqual:NSColor.secondaryLabelColor] ||
-                outputButton.attributedTitle.size.width + 22 > NSWidth(outputButton.frame) || !FitsChildren(root)) return Fail(__LINE__);
+                ((NSButtonCell *)outputButton.cell).lineBreakMode != NSLineBreakByTruncatingTail ||
+                FindIdentifier(root, @"popover.sound.picker.chevron") || !FitsChildren(root)) return Fail(__LINE__);
             [c setValue:@0.85 forKey:@"outputVolume"]; [c rebuildContent]; root = p.contentViewController.view;
             level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
             if (![level.stringValue isEqual:@"85%"] || ![level.textColor isEqual:NSColor.systemOrangeColor]) return Fail(__LINE__);
@@ -1341,12 +1342,14 @@ int main(int argc, const char **argv) {
                   @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""}
             ] forKey:@"audioDevices"];
             [c setValue:@"speakers" forKey:@"defaultOutputUID"];
+            [c setValue:@"speakers" forKey:@"playerOutputUID"];
+            [c setValue:@"MacBook Air Speakers" forKey:@"playerOutputName"];
             [c rebuildContent];
             root = p.contentViewController.view;
             NSView *playingOut = FindIdentifier(root, @"popover.sound");
             if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
-                ![playingOut.accessibilityHelp containsString:@"click for"] ||
-                ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"] ||
+                ![playingOut.accessibilityHelp containsString:@"Glancebar's player"] ||
+                ![playingOut.accessibilityLabel isEqual:@"Player output, MacBook Air Speakers"] ||
                 !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "idle") == 0) {

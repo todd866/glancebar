@@ -894,9 +894,15 @@ NSString *SeedCaption(NSString *title);
 // at most 40. Legacy grouping only; never evidence of offline playlist readiness.
 NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths);
 // Ordered snapshot: verified files play in order; missing entries are skipped. Ready when at least one file is on disk.
-// Fast UI checks validate identity, size, inode and nanosecond mtime; playback uses verifyHash.
+// complete is YES when every requested track is present in order. Fast UI checks validate identity, size, inode and
+// nanosecond mtime; playback uses verifyHash.
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash);
 NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);
+// Seed / New music tiles: wait for fetch unless sync reports it cannot continue; then partial play is allowed.
+NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch);
+BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow);
+BOOL MusicSilentQAEnabled(void);
+float MusicPlayerOutputVolume(BOOL silentQA);
 // station.json: queue file paths (file or path) and this week's picks (title, artist, reason, file).
 // tracks keeps each queue file with its artist, title and identity key. nil when the data is
 // missing or not an object. An empty queue is still a station.

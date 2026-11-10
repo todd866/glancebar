@@ -5816,6 +5816,13 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
     NSDictionary *_offlineManifest;
     BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain, _offlineVerifyBusy;
+    BOOL _musiclibBusy, _musiclibAgain;
+    NSDictionary *_musicLibraryStatus;
+    NSString *_musicLibraryLastError, *_musicLibraryHotDir;
+    BOOL _musicLibraryUnmatched, _musicLibraryOverflow;
+    CFAbsoluteTime _musicLibraryStatusAt;
+    NSArray<NSDictionary *> *_mixSeedsNext;
+    BOOL _musicSilentQA;
     CFAbsoluteTime _offlineExportChecked, _offlinePreparedAt;
     NSDate *_offlineExportDate;
     NSUInteger _offlinePlayGeneration;
@@ -6018,6 +6025,8 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     // Only music stops: _musicProbesEnabled also gates the charge limit, remote Macs and the network
     // monitor, and folding musicEnabled into it left the M1 charging to 100% (1 Nov 2026).
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
+    _musicSilentQA = MusicSilentQAEnabled();
+    if (_musicSilentQA) GBLog("music: silent QA mode — player volume forced to 0");
     _outputVolume = -1;
     _mixPrepared = [NSMutableDictionary dictionary];
     _mixPreparing = [NSMutableSet set];
@@ -6145,7 +6154,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSString *uid = [choice[@"system"] boolValue] ? nil : choice[@"effectiveUID"];
     if (!uid.length) uid = nil;
     for (AVQueuePlayer *player in @[_localPlayer, _localOutgoing])
-        if (player) player.audioOutputDeviceUniqueID = uid;
+        if (player) {
+            player.audioOutputDeviceUniqueID = uid;
+            player.muted = _musicSilentQA;
+        }
 }
 - (NSDictionary *)playerOutputChoice {
     [self ensureAudioDisplay];
@@ -6268,12 +6280,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         for (NSDictionary *seed in seeds) [keep addObject:seed[@"key"]];
         while (keep.count > 24) [keep removeObjectAtIndex:0];
         [ud setObject:keep forKey:@"mixRecentSeeds"];
-        [ud setObject:seeds forKey:@"mixSeeds"];
         [ud setInteger:day forKey:@"mixSeedsDay"];
-        for (NSDictionary *old in _mixSeeds) [_offlineRequests removeObjectForKey:old[@"key"]];
-        _mixSeeds = seeds;
-        [_mixPrepared removeAllObjects];
-        [self saveOfflineRequests];
+        if (fresh) {
+            _mixSeedsNext = seeds;
+            for (NSDictionary *seed in seeds) {
+                [self loadMixArt:seed];
+                [self prepareMix:seed then:nil];
+            }
+            [self saveOfflineRequests];
+        } else {
+            for (NSDictionary *old in _mixSeeds) [_offlineRequests removeObjectForKey:old[@"key"]];
+            _mixSeeds = seeds;
+            [ud setObject:seeds forKey:@"mixSeeds"];
+            [_mixPrepared removeAllObjects];
+            for (NSDictionary *seed in seeds) {
+                [self loadMixArt:seed];
+                [self prepareMix:seed then:nil];
+            }
+            [self saveOfflineRequests];
+        }
     }
     for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed]; [self prepareMix:seed then:nil]; }
     if (_popover.isShown) [self rebuildContent];
@@ -6352,6 +6377,137 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _onDiskLibraryAt = now;
     return _onDiskLibraryIDs;
 }
+- (NSString *)musicLibraryHotDirPath {
+    if (_musicLibraryHotDir.length) return _musicLibraryHotDir;
+    NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".config/glancebar/music-library.json"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    id doc = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSString *hot = [doc isKindOfClass:NSDictionary.class] && [doc[@"hot_dir"] isKindOfClass:NSString.class] ? doc[@"hot_dir"] : @"";
+    if (!hot.length) hot = @"~/Music/Glancebar Lossless";
+    if ([hot hasPrefix:@"~"]) hot = [GBHomeDirectory() stringByAppendingPathComponent:[hot substringFromIndex:2]];
+    _musicLibraryHotDir = hot.stringByStandardizingPath;
+    return _musicLibraryHotDir;
+}
+- (BOOL)meteredLinkActive {
+    return [NSFileManager.defaultManager fileExistsAtPath:
+        [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/METERED_LINK"]];
+}
+- (BOOL)musicLibraryCannotFetch {
+    return MusicLibraryCannotFetch(_networkKnown ? _networkOnline : YES, [self meteredLinkActive],
+                                   _musicLibraryLastError, _musicLibraryUnmatched, _musicLibraryOverflow);
+}
+- (BOOL)isMixPlaylistKey:(NSString *)key {
+    if (!key.length) return NO;
+    if ([key isEqual:@"station:triplej"]) return YES;
+    for (NSDictionary *seed in _mixSeeds)
+        if ([seed[@"key"] isEqual:key]) return YES;
+    for (NSDictionary *seed in _mixSeedsNext)
+        if ([seed[@"key"] isEqual:key]) return YES;
+    return NO;
+}
+- (NSDictionary *)mixTileStateForKey:(NSString *)key {
+    NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    if (![self isMixPlaylistKey:key]) return coverage;
+    return OfflineMixTileState(coverage, _musiclibBusy, [self musicLibraryCannotFetch]);
+}
+- (void)reloadMusicLibraryStatus {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_musicLibraryStatusAt > 0 && now - _musicLibraryStatusAt < 30) return;
+    _musicLibraryStatusAt = now;
+    NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
+    if (!script.length) return;
+    NSString *dir = MixDirectory(nil);
+    NSString *requests = [dir stringByAppendingPathComponent:@"offline-requests.json"];
+    NSString *stateErr = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/glancebar-music-library/last-status.json"];
+    NSData *errData = [NSData dataWithContentsOfFile:stateErr];
+    id errDoc = errData ? [NSJSONSerialization JSONObjectWithData:errData options:0 error:nil] : nil;
+        if ([errDoc isKindOfClass:NSDictionary.class]) {
+        id err = errDoc[@"lastError"];
+        _musicLibraryLastError = [err isKindOfClass:NSString.class] ? err : (err == [NSNull null] ? @"" : @"");
+        NSString *low = _musicLibraryLastError.lowercaseString;
+        _musicLibraryUnmatched = [low containsString:@"unmatched"] || [low containsString:@"ambiguous"];
+        _musicLibraryOverflow = [low containsString:@"cap exceeded"] || [low containsString:@"overflow"];
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        task.arguments = @[script, @"status", @"--requests", requests];
+        NSPipe *pipe = [NSPipe pipe];
+        task.standardOutput = pipe;
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        NSDictionary *status = nil;
+        if ([task launchAndReturnError:nil]) {
+            [task waitUntilExit];
+            NSData *out = [pipe.fileHandleForReading readDataToEndOfFile];
+            id parsed = out.length ? [NSJSONSerialization JSONObjectWithData:out options:0 error:nil] : nil;
+            if ([parsed isKindOfClass:NSDictionary.class]) status = parsed;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (status) self->_musicLibraryStatus = status;
+            [self maybeSwapMixSeedsNext];
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+- (void)prepareMusicLibrarySync {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    if (_musiclibBusy) { _musiclibAgain = YES; return; }
+    NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
+    if (!script.length) return;
+    _musiclibBusy = YES;
+    NSString *dir = MixDirectory(nil);
+    NSString *requests = [dir stringByAppendingPathComponent:@"offline-requests.json"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        task.arguments = @[script, @"sync", @"--requests", requests];
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        BOOL launched = [task launchAndReturnError:nil];
+        if (launched) [task waitUntilExit];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_musiclibBusy = NO;
+            self->_musicLibraryStatusAt = 0;
+            [self reloadMusicLibraryStatus];
+            [self prepareOfflineCache];
+            if (self->_popover.isShown) [self rebuildContent];
+            if (self->_musiclibAgain) { self->_musiclibAgain = NO; [self prepareMusicLibrarySync]; }
+        });
+    });
+}
+- (void)touchMusicLibraryFile:(NSString *)path {
+    if (!_musicProbesEnabled || !path.length) return;
+    NSString *hot = [self musicLibraryHotDirPath];
+    if (!hot.length || ![path hasPrefix:hot]) return;
+    NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
+    if (!script.length) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        task.arguments = @[script, @"touch", path];
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        [task launchAndReturnError:nil];
+    });
+}
+- (void)maybeSwapMixSeedsNext {
+    if (!_mixSeedsNext.count) return;
+    for (NSDictionary *seed in _mixSeedsNext) {
+        NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
+        if (![tile[@"state"] isEqual:@"ready"]) return;
+    }
+    for (NSDictionary *old in _mixSeeds) [_offlineRequests removeObjectForKey:old[@"key"]];
+    _mixSeeds = _mixSeedsNext;
+    _mixSeedsNext = nil;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    [ud setObject:_mixSeeds forKey:@"mixSeeds"];
+    [self saveOfflineRequests];
+    if (_popover.isShown) [self rebuildContent];
+}
 - (void)prepareOfflineCache {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
     if (_offlineCacheBusy) { _offlineCacheAgain = YES; return; }
@@ -6385,6 +6541,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                 self->_offlineManifest = manifest;
                 [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
                 [self retryUnpreparedMixSeeds];
+                [self maybeSwapMixSeedsNext];
+                self->_musicLibraryStatusAt = 0;
+                [self reloadMusicLibraryStatus];
             }
             if (self->_popover.isShown) [self rebuildContent];
             if (self->_offlineCacheAgain) { self->_offlineCacheAgain = NO; [self prepareOfflineCache]; }
@@ -6394,11 +6553,16 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)saveOfflineRequests {
     NSMutableArray *requests = [NSMutableArray array];
     for (NSDictionary *seed in _mixSeeds) if (_offlineRequests[seed[@"key"]]) [requests addObject:_offlineRequests[seed[@"key"]]];
+    for (NSDictionary *seed in _mixSeedsNext)
+        if (_offlineRequests[seed[@"key"]]) [requests addObject:_offlineRequests[seed[@"key"]]];
     NSDictionary *primary = _offlineRequests[[self offlinePrimaryKey]];
     if (primary) [requests addObject:primary];
     if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
-    if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) [self prepareOfflineCache];
+    if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
+        [self prepareOfflineCache];
+        [self prepareMusicLibrarySync];
+    }
 }
 - (void)setOfflineRequest:(NSString *)key title:(NSString *)title tracks:(NSArray *)tracks {
     NSMutableArray *identities = [NSMutableArray array];
@@ -6443,6 +6607,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     // acquiring a playback lease, or consulting the stale download inventory.
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) [self prepareOfflineCache];
+    if (now - _musicLibraryStatusAt >= 30) [self reloadMusicLibraryStatus];
     if (_offlineExportChecked > 0 && now - _offlineExportChecked < 60) return;
     _offlineExportChecked = now;
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Library-export/playlists.json"];
@@ -6504,7 +6669,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSUInteger generation = ++_offlinePlayGeneration;
     _mixStartingKey = nil;
     NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
-    if (![coverage[@"ready"] boolValue]) {
+    NSDictionary *tile = [self isMixPlaylistKey:key] ? [self mixTileStateForKey:key] : nil;
+    if (tile) {
+        NSString *state = tile[@"state"];
+        if ([state isEqual:@"fetching"]) {
+            _musicNote = tile[@"tooltip"];
+            [self prepareMusicLibrarySync];
+            [self prepareOfflineCache];
+            if (_popover.isShown) [self rebuildContent];
+            return;
+        }
+        if (![tile[@"enabled"] boolValue]) {
+            _musicNote = tile[@"tooltip"];
+            if (_popover.isShown) [self rebuildContent];
+            return;
+        }
+    } else if (![coverage[@"ready"] boolValue]) {
         _musicNote = [self offlineStatus:coverage];
         [self prepareOfflineCache];
         if (_popover.isShown) [self rebuildContent];
@@ -6556,6 +6736,35 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (_stationLoaded && now - _stationChecked < 60) return;
     _stationChecked = now;
+    NSString *scoutPath = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/glancebar-music-scout/new-music.json"];
+    NSData *scoutData = [NSData dataWithContentsOfFile:scoutPath];
+    id scoutRaw = scoutData ? [NSJSONSerialization JSONObjectWithData:scoutData options:0 error:nil] : nil;
+    NSArray *scoutTracks = [scoutRaw isKindOfClass:NSDictionary.class] && [scoutRaw[@"tracks"] isKindOfClass:NSArray.class]
+        ? scoutRaw[@"tracks"] : nil;
+    if (scoutTracks.count) {
+        _stationLoaded = YES;
+        _stationDate = [NSFileManager.defaultManager attributesOfItemAtPath:scoutPath error:nil][NSFileModificationDate];
+        NSMutableArray *tracks = [NSMutableArray array], *picks = [NSMutableArray array];
+        for (id row in scoutTracks) {
+            if (![row isKindOfClass:NSDictionary.class]) continue;
+            NSString *trackKey = [row[@"track_key"] isKindOfClass:NSString.class] ? row[@"track_key"] : @"";
+            NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
+            NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
+            if (!trackKey.length || !title.length) continue;
+            NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObjectsAndKeys:trackKey, @"id", title, @"title", artist, @"artist", @"", @"album", nil];
+            [tracks addObject:track];
+            NSString *why = [row[@"why"] isKindOfClass:NSString.class] ? row[@"why"] : @"";
+            [picks addObject:@{@"title": title, @"artist": artist, @"reason": why}];
+        }
+        if (tracks.count) {
+            _stationAvailable = YES;
+            _stationFiles = @[];
+            _stationPicks = picks;
+            _stationTracks = tracks;
+            [self setOfflineRequest:@"station:triplej" title:@"New music for you" tracks:tracks];
+            return;
+        }
+    }
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/station.json"];
     NSDate *date = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
     if (_stationLoaded && [_stationDate isEqual:date]) return;
@@ -6678,6 +6887,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     GlanceRemoteCommandsDisable(self);
 }
 - (void)applyLocalItemURL:(NSURL *)url {
+    [self touchMusicLibraryFile:url.path];
     NSDictionary *parsed = ParseLikedTrackFilename(url.lastPathComponent);
     _localTitle = parsed[@"title"] ?: @"";
     _localArtist = parsed[@"artist"] ?: @"";
@@ -6751,7 +6961,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _localBlendTimer = nil;
     // The incoming player is the one the UI already shows. Full volume, then the
     // outgoing player can go: a fade abandoned at the bottom would stay quiet.
-    if (_localPlayer) _localPlayer.volume = 1;
+    if (_localPlayer) _localPlayer.volume = MusicPlayerOutputVolume(_musicSilentQA);
     if (_localOutgoing) {
         [_localOutgoing pause];
         _localOutgoing = nil;
@@ -6782,7 +6992,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [_localOutgoing pause];
         _localOutgoing = nil;
     }
-    if (_localPlayer) _localPlayer.volume = 1;
+    if (_localPlayer) _localPlayer.volume = MusicPlayerOutputVolume(_musicSilentQA);
 }
 // The queue advances by itself and never updates the index, so Next would jump
 // backwards and the label would stay on the finished song. At the end, wrap the
@@ -6830,7 +7040,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
     [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
-    _localPlayer.volume = 1;
+    float level = MusicPlayerOutputVolume(_musicSilentQA);
+    _localPlayer.volume = level;
+    _localPlayer.muted = _musicSilentQA;
     [self attachLocalObservers:items];
     _localMode = YES;
     _localEmpty = NO;
@@ -6851,8 +7063,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     double t = (CFAbsoluteTimeGetCurrent() - _localBlendStarted) / duration;
     if (!(t < 1)) { [self finishLocalBlend]; return; }
     MusicBlendGain gain = MusicBlendGainAt(t);
-    _localOutgoing.volume = (float)gain.outgoing;
-    _localPlayer.volume = (float)gain.incoming;
+    float cap = MusicPlayerOutputVolume(_musicSilentQA);
+    _localOutgoing.volume = (float)gain.outgoing * cap;
+    _localPlayer.volume = (float)gain.incoming * cap;
 }
 // Keeps the current player. The new queue is built the same way as playLocalIndex:,
 // at volume 0, and the row switches to it immediately.
@@ -6866,11 +7079,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     AVQueuePlayer *outgoing = _localPlayer;
     [self detachLocalObservers];
     [self keepOnlyCurrentItemOn:outgoing];
-    outgoing.volume = 1;
+    float cap = MusicPlayerOutputVolume(_musicSilentQA);
+    outgoing.volume = cap;
+    outgoing.muted = _musicSilentQA;
     _localOutgoing = outgoing;
     NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
     AVQueuePlayer *incoming = [AVQueuePlayer queuePlayerWithItems:items];
     incoming.volume = 0;
+    incoming.muted = _musicSilentQA;
     _localPlayer = incoming;
     [self attachLocalObservers:items];
     _localIndex = index;
@@ -7758,10 +7974,10 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         seedTile.songTitle = SeedCaption(seed[@"title"]);
         seedTile.songArtist = seed[@"artist"];
         seedTile.seedKey = seed[@"key"];
-        NSDictionary *coverage = [self offlineCoverage:seed[@"key"] verifyHash:NO];
-        seedTile.offlineStatus = [self offlineStatus:coverage];
-        seedTile.enabled = [coverage[@"ready"] boolValue] && !_offlineVerifyBusy;
-        seedTile.alphaValue = seedTile.enabled ? 1 : 0.4;
+        NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
+        seedTile.offlineStatus = tile[@"tooltip"];
+        seedTile.enabled = [tile[@"enabled"] boolValue] && !_offlineVerifyBusy;
+        seedTile.alphaValue = [tile[@"alpha"] doubleValue];
         seedTile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
         if (!cover) seedTile.contentTintColor = NSColor.tertiaryLabelColor;
         seedTile.tag = (NSInteger)i;
@@ -7803,8 +8019,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [line addSubview:hover];
         x += side + gap;
     }
-    NSDictionary *stationCoverage = [self stationOfflineCoverage];
-    BOOL stationOn = _stationAvailable && [stationCoverage[@"ready"] boolValue];
+    NSDictionary *stationTile = [self mixTileStateForKey:@"station:triplej"];
+    BOOL stationOn = _stationAvailable && [stationTile[@"enabled"] boolValue];
+    if (!_stationAvailable) stationTile = @{@"alpha": @0.4, @"tooltip": stationTile[@"tooltip"] ?: @"", @"enabled": @NO, @"state": @"empty"};
     BOOL stationPlaying = [_mixPlayingKey isEqual:@"station:triplej"];
     GBStationTile *station = [GBStationTile buttonWithImage:StationTileImage(!stationOn) target:self action:@selector(playStation:)];
     station.seedKey = @"station:triplej";
@@ -7816,9 +8033,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     station.wantsLayer = YES;
     station.layer.cornerRadius = 4;
     station.layer.masksToBounds = YES;
-    station.alphaValue = stationOn ? 1 : 0.4;
+    station.alphaValue = [stationTile[@"alpha"] doubleValue];
     station.enabled = stationOn && !_offlineVerifyBusy;
-    station.offlineStatus = [self offlineStatus:stationCoverage];
+    station.offlineStatus = stationTile[@"tooltip"];
     station.accessibilityIdentifier = @"popover.mix.station";
     NSUInteger pickCount = station.picks.count;
     station.accessibilityLabel = @"New music for you";
@@ -7881,52 +8098,47 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [self watchOutputVolume];
     [self refreshOutputVolume];
     NSDictionary *choice = [self playerOutputChoice];
-    const CGFloat levelW = 40, volumeH = 22;
+    const CGFloat levelW = 40, rowH = 24, sliderMin = 88;
     NSButton *output = [self outputButton];
-    CGFloat textW = kW - 2 * kPad - 38;
-    CGFloat textH = ceil([output.attributedTitle boundingRectWithSize:NSMakeSize(textW, 1000)
-        options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading].size.height);
-    CGFloat pickerH = MAX(24, textH + 6), h = pickerH + volumeH;
-    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
+    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
     line.accessibilityIdentifier = @"popover.sound.line";
-    // Root is flipped, this plain line is not: destination above the volume control.
-    output.frame = NSMakeRect(kPad - 2, volumeH + 1, kW - 2 * kPad + 4, pickerH - 2);
-    GBPickerChevron *chevron = [GBPickerChevron imageViewWithImage:[[NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:nil]
-        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightRegular]]];
-    chevron.contentTintColor = NSColor.secondaryLabelColor;
-    chevron.frame = NSMakeRect(NSWidth(output.frame) - 14, (NSHeight(output.frame) - 12) / 2, 12, 12);
-    chevron.accessibilityIdentifier = @"popover.sound.picker.chevron";
-    [output addSubview:chevron];
+    CGFloat nameW = kW - 2 * kPad - levelW - 4 - sliderMin - 26;
+    output.frame = NSMakeRect(kPad, 1, nameW, rowH - 2);
     [line addSubview:output];
-    NSImageView *speaker = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:_outputMuted ? @"speaker.slash" : @"speaker.wave.2" accessibilityDescription:nil]
+    CGFloat sliderX = NSMaxX(output.frame) + 4;
+    CGFloat sliderW = kW - kPad - levelW - 4 - sliderX;
+    BOOL known = _outputVolume >= 0 && [choice[@"effectiveUID"] length];
+    BOOL showMute = _musicSilentQA || (known && _outputMuted);
+    NSImageView *speaker = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:showMute ? @"speaker.slash" : @"speaker.wave.2" accessibilityDescription:nil]
         imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]]];
-    speaker.contentTintColor = _outputMuted ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
-    speaker.frame = NSMakeRect(kPad, 3, 18, 16);
+    speaker.contentTintColor = showMute ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+    speaker.frame = NSMakeRect(sliderX, 3, 18, 16);
     speaker.accessibilityIdentifier = @"popover.sound.volume.symbol";
     [line addSubview:speaker];
-    CGFloat sliderX = kPad + 26, sliderW = kW - kPad - levelW - 6 - sliderX;
-    BOOL known = _outputVolume >= 0 && [choice[@"effectiveUID"] length];
+    sliderX += 22;
+    sliderW -= 22;
     GBOutputVolumeSlider *slider = [GBOutputVolumeSlider sliderWithValue:known ? _outputVolume : 0 minValue:0 maxValue:1
         target:self action:@selector(setOutputVolumeFromSlider:)];
     slider.outputUID = choice[@"effectiveUID"];
     slider.controlSize = NSControlSizeSmall;
     slider.continuous = YES;
     slider.enabled = known;
-    slider.trackFillColor = OutputVolumeFill(known ? _outputVolume : -1, known && _outputMuted);
+    slider.trackFillColor = OutputVolumeFill(known ? _outputVolume : -1, showMute);
     slider.frame = NSMakeRect(sliderX, 2, sliderW, 18);
     slider.accessibilityIdentifier = @"popover.sound.volume";
     slider.accessibilityLabel = @"Player speaker volume";
     slider.accessibilityHelp = [NSString stringWithFormat:@"Hardware volume on %@", choice[@"name"]];
     [line addSubview:slider];
-    NSTextField *level = [self text:OutputVolumeText(known ? _outputVolume : -1, known && _outputMuted)
+    NSTextField *level = [self text:OutputVolumeText(known ? _outputVolume : -1, showMute)
         font:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular]
-        color:OutputVolumeColor(known ? _outputVolume : -1, known && _outputMuted)
+        color:OutputVolumeColor(known ? _outputVolume : -1, showMute)
         at:NSMakeRect(kW - kPad - levelW, 3, levelW, 16) align:NSTextAlignmentRight];
     level.accessibilityIdentifier = @"popover.sound.level";
-    level.accessibilityLabel = known && _outputMuted ? @"Muted" : [NSString stringWithFormat:@"Volume %@", level.stringValue];
+    level.accessibilityLabel = showMute ? @"Muted" : [NSString stringWithFormat:@"Volume %@", level.stringValue];
+    if (_musicSilentQA) level.accessibilityHelp = @"Silent QA mode: player output forced to mute";
     [line addSubview:level];
     [root addSubview:line];
-    return y + h;
+    return y + rowH;
 }
 // Elapsed, a seek slider, and the length under the transport row.
 - (CGFloat)addAppleMusicScrubberTo:(NSView *)root at:(CGFloat)y elapsed:(double)elapsed {
@@ -7973,17 +8185,14 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     button.alignment = NSTextAlignmentLeft;
     button.imageScaling = NSImageScaleProportionallyDown;
     button.contentTintColor = NSColor.secondaryLabelColor;
-    NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
-    paragraph.lineBreakMode = NSLineBreakByWordWrapping;
     NSString *title = [choice[@"system"] boolValue] || !_playerOutputUID.length
         ? [NSString stringWithFormat:@" System → %@", choice[@"name"]]
         : [NSString stringWithFormat:@" %@", choice[@"name"]];
     button.attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
-        NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor,
-        NSParagraphStyleAttributeName: paragraph}];
-    ((NSButtonCell *)button.cell).wraps = YES;
-    ((NSButtonCell *)button.cell).usesSingleLineMode = NO;
-    ((NSButtonCell *)button.cell).lineBreakMode = NSLineBreakByWordWrapping;
+        NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
+    ((NSButtonCell *)button.cell).wraps = NO;
+    ((NSButtonCell *)button.cell).usesSingleLineMode = YES;
+    ((NSButtonCell *)button.cell).lineBreakMode = NSLineBreakByTruncatingTail;
     button.accessibilityIdentifier = @"popover.sound";
     NSString *label = _playerOutputUID.length
         ? [NSString stringWithFormat:@"Player output, %@", choice[@"name"]]

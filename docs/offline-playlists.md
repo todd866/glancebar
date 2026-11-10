@@ -2,11 +2,14 @@
 
 ## Contract
 
-A visible playlist is a fixed, ordered snapshot. Its Play control is enabled when
-at least one requested recording is verified on this Mac; Glancebar plays only
-those tracks, in order, and skips the rest. Tiles dim when zero tracks are on disk.
-There is no cloud-streaming fallback, same-artist substitution, or silent gap-fill.
-Tooltips and large cards say how many tracks are present (`31 of 40 on this Mac`).
+A visible playlist is a fixed, ordered snapshot. The primary export playlist still
+plays when at least one requested recording is verified on this Mac (only those
+tracks, in order; missing entries are skipped). Seed mixes and the New music tile
+wait until every requested lossless track is on disk unless `musiclib.py` reports
+it cannot fetch (metered link, offline, cap overflow, unmatched catalogue rows) —
+then they play what is verified, dimmed with `N of M on this Mac`. While tracks are
+still being fetched the tile stays dimmed with `fetching N of M`. There is no
+cloud-streaming fallback, same-artist substitution, or silent gap-fill.
 
 Seed mixes are persisted after generation and restored across app restarts.
 `New picks` explicitly replaces them. The primary idle Play shuffles verified files
@@ -94,6 +97,6 @@ an available reviewer; the larger offline patch was reviewed previously.
 
 Glancebar music playback is only the in-app `AVQueuePlayer`. Transport controls,
 seed tiles, the station tile, hearts, thumbs-up, and the scrubber all use that
-player. Partial playlists and partial stations play what is on disk. Idle Play
-shuffles liked local files. Apple Music is paused when local playback starts and
+player. Idle Play shuffles liked local files. Seed and New music tiles wait for the hot-set
+sync unless fetch is blocked. Apple Music is paused when local playback starts and
 is not otherwise controlled by Glancebar in this phase.

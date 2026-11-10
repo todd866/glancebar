@@ -55,7 +55,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -isysroot "$SDKROOT" \
     -mmacosx-version-min=13.0 \
     "${ARCH_FLAGS[@]}" \
-    Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/deck_client.m Sources/main.m \
+    Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/main.m \
     -framework Cocoa -framework Carbon \
     -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
     -framework CoreAudio -framework AudioToolbox \
@@ -66,6 +66,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -o "$APP/Contents/MacOS/Glancebar"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 tools/offline-cache/offline_cache.py "$APP/Contents/Resources/offline_cache.py"
+install -m 0644 tools/music-library/musiclib.py "$APP/Contents/Resources/musiclib.py"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 
 # Sign with a stable identity. Ad-hoc signing pins the designated requirement to the code
