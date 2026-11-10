@@ -59,7 +59,9 @@ muted for verification.
    the Apple Music tree is later empty.
 3. **After pull** — `~/.local/state/glancebar-mix/offload-am.sh` rsyncs
    `~/Music/Apple Music` to the M2, verifies sizes, then moves the local tree to Trash.
-4. **03:40 (M2)** — `glancebar-music-push` uploads masters to R2 and refreshes `catalogue.json`.
+4. **03:40 (M5 → M2 over ssh)** — `glancebar-music-push` uploads masters to R2 and refreshes
+   `catalogue.json`. Started on the M5 since 11 Nov 2026: as a LaunchAgent on the M2 the
+   script could not read the external drive (workarounds ledger W17).
 5. **Later (M5)** — `musiclib.py sync` fetches wanted tracks into the hot set; the New music
    tile and offline-cache can bind via `catalogue_relative_path` + `sha256` or metadata match.
 
