@@ -37,7 +37,10 @@ local JSON object `{"tracks":[...]}` whose rows have `path`, plus a stable libra
 Default source pools are the music-library `hot_dir` (`~/Music/Glancebar Lossless` by
 default, from `~/.config/glancebar/music-library.json` when present), then
 `~/Music/YouTube Liked`, `~/Music/Glancebar Radio`, and `~/Music/Glancebar Offline`.
-Lossless files under `hot_dir` are preferred over byte-different lossy matches.
+Lossless files under `hot_dir` are preferred over byte-different lossy matches:
+`select()` resolves ambiguity within the hot pool first, then falls back to other pools.
+Requests may carry a trusted binding (`local_path` or `catalogue_relative_path` + `sha256`
+from music-scout `publish`) matched by verified bytes without album-tuple equality.
 Repeat `--root` to replace those defaults with pinned local pools. M4A/MP4
 metadata is read directly from bounded iTunes text atoms, never inferred from
 filenames or fuzzy song-title comparisons. Every artist/title/album field must

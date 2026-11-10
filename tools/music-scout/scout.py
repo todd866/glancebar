@@ -49,6 +49,7 @@ DEFAULTS: dict[str, Any] = {
     "new_release_days": 60,
     "llm_suggestions": 15,
     "avg_track_mb": 75,
+    "mb_per_minute": 7,
     "dead_source_nights": 3,
     "triplej_state": str(HOME / ".local/state/selector"),
     "library_export": str(HOME / "Music/Library-export"),
@@ -70,6 +71,7 @@ _YT_NAME = re.compile(
     re.IGNORECASE,
 )
 _AUDIO = {".m4a", ".mp3", ".flac", ".alac", ".aac", ".wav", ".aiff", ".aif"}
+GIB = 1024 ** 3
 
 
 def utc_now() -> datetime:
@@ -110,22 +112,42 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
 def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
 
 
-def read_jsonl(path: Path) -> list[dict]:
+def read_jsonl(path: Path) -> tuple[list[dict], str | None]:
     if not path.is_file():
-        return []
+        return [], None
+    raw = path.read_text(encoding="utf-8")
+    if not raw:
+        return [], None
+    lines = raw.splitlines()
+    torn: str | None = None
     rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in lines[:-1]:
         line = line.strip()
         if not line:
             continue
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
-            continue
+            torn = line
+            break
+    last = lines[-1].strip()
+    if last:
+        try:
+            rows.append(json.loads(last))
+        except json.JSONDecodeError:
+            torn = last
+    return rows, torn
+
+
+def read_jsonl_rows(path: Path) -> list[dict]:
+    rows, _ = read_jsonl(path)
     return rows
 
 
@@ -284,7 +306,7 @@ class ScoutPaths:
         self.ledger = state_dir / "ledger.jsonl"
         self.last_run = state_dir / "last-run.json"
         self.source_stats = state_dir / "source-stats.json"
-        self.lock = state_dir / "run.lock"
+        self.lock = state_dir / "scout.lock"
 
 
 def acquire_defer_reason(runners: Runners) -> str | None:
@@ -328,7 +350,7 @@ def load_feedback(paths: list[Path]) -> dict[str, dict]:
     """Last event per track_key from feedback jsonl."""
     out: dict[str, dict] = {}
     for path in paths:
-        for row in read_jsonl(path):
+        for row in read_jsonl_rows(path):
             key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
             if key:
                 out[normal(key)] = row
@@ -371,6 +393,19 @@ def catalogue_keys(catalogue_path: Path) -> set[str]:
     return keys
 
 
+def music_sync_owned(inv_path: Path) -> set[str]:
+    keys: set[str] = set()
+    if not inv_path.is_file():
+        return keys
+    data = json.loads(inv_path.read_text(encoding="utf-8"))
+    for row in data.get("am_fav") or []:
+        keys.add(track_key(row.get("artist", ""), row.get("title", "")))
+    for row in data.get("yt") or []:
+        if row.get("artist") and row.get("title"):
+            keys.add(track_key(row.get("artist", ""), row.get("title", "")))
+    return keys
+
+
 def mixpool_owned(mix_state: Path) -> set[str]:
     keys: set[str] = set()
     liked = mix_state / "liked-pulled.json"
@@ -384,7 +419,7 @@ def mixpool_owned(mix_state: Path) -> set[str]:
 
 def ledger_keys(ledger: Path, *, actions: set[str] | None = None) -> set[str]:
     keys: set[str] = set()
-    for row in read_jsonl(ledger):
+    for row in read_jsonl_rows(ledger):
         if actions and row.get("action") not in actions:
             continue
         keys.add(track_key(row.get("artist", ""), row.get("title", "")))
@@ -396,8 +431,20 @@ def owned_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
     keys |= walk_library_export(Path(cfg["library_export"]).expanduser())
     keys |= catalogue_keys(Path(cfg["music_library_state"]).expanduser() / "catalogue.json")
     keys |= mixpool_owned(Path(cfg["mixpool_state"]).expanduser())
+    keys |= music_sync_owned(Path(cfg["music_sync_inventory"]).expanduser())
     keys |= yt_liked_keys(Path(cfg["yt_liked_dir"]).expanduser())
     keys |= ledger_keys(paths.ledger)
+    return keys
+
+
+def ownership_sources(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
+    keys: set[str] = set()
+    keys |= walk_library_export(Path(cfg["library_export"]).expanduser())
+    keys |= catalogue_keys(Path(cfg["music_library_state"]).expanduser() / "catalogue.json")
+    keys |= mixpool_owned(Path(cfg["mixpool_state"]).expanduser())
+    keys |= music_sync_owned(Path(cfg["music_sync_inventory"]).expanduser())
+    keys |= yt_liked_keys(Path(cfg["yt_liked_dir"]).expanduser())
+    keys |= ledger_keys(paths.ledger, actions={"acquired", "no_match"})
     return keys
 
 
@@ -683,7 +730,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     # recent offers this week (per artist cap)
     week_ago = utc_now() - timedelta(days=7)
     artist_week: Counter[str] = Counter()
-    for row in read_jsonl(paths.ledger):
+    for row in read_jsonl_rows(paths.ledger):
         at = parse_iso(row.get("at") or "")
         if not at or at < week_ago:
             continue
@@ -758,19 +805,41 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     return ranked
 
 
-def weekly_acquired_stats(ledger: Path, now: datetime) -> tuple[int, float]:
+def estimate_track_bytes(song: dict, mb_per_minute: float) -> int:
+    millis = song.get("trackTimeMillis") or song.get("trackTime")
+    try:
+        seconds = float(millis) / 1000.0
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds <= 0:
+        return 0
+    return int(seconds / 60.0 * mb_per_minute * 1024 * 1024)
+
+
+def weekly_acquired_stats(ledger: Path, now: datetime) -> tuple[int, int]:
     week_ago = now - timedelta(days=7)
     count = 0
-    mb = 0.0
-    for row in read_jsonl(ledger):
+    total_bytes = 0
+    for row in read_jsonl_rows(ledger):
         if row.get("action") != "acquired":
             continue
         at = parse_iso(row.get("at") or "")
         if not at or at < week_ago:
             continue
         count += 1
-        mb += float(row.get("size_mb") or 0)
-    return count, mb
+        if row.get("size_bytes") is not None:
+            total_bytes += int(row["size_bytes"])
+        else:
+            total_bytes += int(float(row.get("size_mb") or 0) * 1024 * 1024)
+    return count, total_bytes
+
+
+def _amdl_result(result: tuple) -> tuple[bool, bool, str, dict]:
+    if len(result) >= 4:
+        ok, infra, error, meta = result[0], result[1], result[2], result[3]
+        return ok, infra, error, meta if isinstance(meta, dict) else {}
+    ok, infra, error = result[0], result[1], result[2] if len(result) > 2 else ""
+    return ok, infra, error, {}
 
 
 def cmd_acquire(
@@ -786,21 +855,25 @@ def cmd_acquire(
 
     queue = json.loads(paths.queue.read_text(encoding="utf-8")).get("tracks") or []
     now = parse_iso(runners.clock()) or utc_now()
-    acquired_count, acquired_mb = weekly_acquired_stats(paths.ledger, now)
+    acquired_count, acquired_bytes = weekly_acquired_stats(paths.ledger, now)
     track_budget = int(cfg["tracks_per_week"])
     gb_budget = float(cfg["gb_per_week"])
-    avg_mb = float(cfg["avg_track_mb"])
+    mb_per_min = float(cfg.get("mb_per_minute", DEFAULTS["mb_per_minute"]))
 
     remaining_tracks = max(0, track_budget - acquired_count)
-    remaining_mb = max(0.0, gb_budget * 1024 - acquired_mb)
+    remaining_bytes = max(0, int(gb_budget * GIB) - acquired_bytes)
 
     results: list[dict] = []
     for row in queue:
-        if remaining_tracks <= 0 or remaining_mb <= 0:
+        if remaining_tracks <= 0 or remaining_bytes <= 0:
             break
         artist = row.get("artist") or ""
         title = row.get("title") or ""
         key = row.get("track_key") or track_key(artist, title)
+        if key in ownership_sources(cfg, paths) or normal(key) in load_hearts(Path(cfg["hearts_path"]).expanduser()):
+            rec = {"at": runners.clock(), "action": "skipped_owned", "artist": artist, "title": title, "track_key": key}
+            results.append(rec)
+            continue
         song = None
         if row.get("track_id"):
             song = {"trackId": row["track_id"], "trackName": title, "artistName": artist}
@@ -809,6 +882,20 @@ def cmd_acquire(
         if not song:
             rec = {"at": runners.clock(), "action": "no_match", "artist": artist, "title": title, "track_key": key}
             append_jsonl(paths.ledger, rec)
+            results.append(rec)
+            continue
+        est_bytes = estimate_track_bytes(song, mb_per_min)
+        if est_bytes <= 0:
+            est_bytes = int(float(cfg.get("avg_track_mb", 75)) * 1024 * 1024)
+        if est_bytes > remaining_bytes:
+            rec = {
+                "at": runners.clock(),
+                "action": "skipped_budget",
+                "artist": artist,
+                "title": title,
+                "track_key": key,
+                "estimate_bytes": est_bytes,
+            }
             results.append(rec)
             continue
         url = song_url(song)
@@ -820,10 +907,12 @@ def cmd_acquire(
                 "title": title,
                 "track_key": key,
                 "url": url,
+                "estimate_bytes": est_bytes,
             }
             results.append(rec)
             continue
-        ok, infra, error = runners.run_amdl(url)
+        ok, infra, error, meta = _amdl_result(runners.run_amdl(url))
+        size_bytes = int(meta.get("size_bytes") or est_bytes)
         if ok:
             rec = {
                 "at": runners.clock(),
@@ -832,10 +921,16 @@ def cmd_acquire(
                 "title": title,
                 "track_key": key,
                 "url": url,
-                "size_mb": avg_mb,
+                "size_bytes": size_bytes,
+                "album": song.get("collectionName") or row.get("album") or "",
+                "duration_seconds": (float(song.get("trackTimeMillis") or 0) / 1000.0) or None,
+                "local_path": meta.get("local_path"),
+                "catalogue_relative_path": meta.get("catalogue_relative_path"),
+                "sha256": meta.get("sha256"),
             }
+            append_jsonl(paths.ledger, rec)
             remaining_tracks -= 1
-            remaining_mb -= avg_mb
+            remaining_bytes -= size_bytes
         elif infra:
             rec = {
                 "at": runners.clock(),
@@ -876,7 +971,7 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
     cutoff = utc_now() - timedelta(days=fresh_days)
     hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
     tracks: list[dict] = []
-    for row in read_jsonl(paths.ledger):
+    for row in read_jsonl_rows(paths.ledger):
         if row.get("action") != "acquired":
             continue
         at = parse_iso(row.get("at") or "")
@@ -885,15 +980,21 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
         key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
         if normal(key) in hearts:
             continue
-        tracks.append(
-            {
-                "track_key": key,
-                "artist": row.get("artist") or "",
-                "title": row.get("title") or "",
-                "why": row.get("why") or "new acquisition",
-                "acquired_at": row.get("at"),
-            }
-        )
+        item = {
+            "track_key": key,
+            "artist": row.get("artist") or "",
+            "title": row.get("title") or "",
+            "album": row.get("album") or "",
+            "duration_seconds": row.get("duration_seconds"),
+            "why": row.get("why") or "new acquisition",
+            "acquired_at": row.get("at"),
+        }
+        if row.get("local_path"):
+            item["local_path"] = row["local_path"]
+        if row.get("catalogue_relative_path") and row.get("sha256"):
+            item["catalogue_relative_path"] = row["catalogue_relative_path"]
+            item["sha256"] = row["sha256"]
+        tracks.append(item)
     tracks.sort(key=lambda r: r.get("acquired_at") or "", reverse=True)
     doc = {
         "schemaVersion": 1,
@@ -915,10 +1016,11 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
     if paths.queue.is_file():
         queue_len = len(json.loads(paths.queue.read_text(encoding="utf-8")).get("tracks") or [])
     now = parse_iso(runners.clock()) or utc_now()
-    acquired_count, acquired_mb = weekly_acquired_stats(paths.ledger, now)
-    failures = sum(1 for r in read_jsonl(paths.ledger) if r.get("action") == "failed")
+    acquired_count, acquired_bytes = weekly_acquired_stats(paths.ledger, now)
+    _, torn = read_jsonl(paths.ledger)
+    failures = sum(1 for r in read_jsonl_rows(paths.ledger) if r.get("action") == "failed")
     last_acquire: datetime | None = None
-    for row in read_jsonl(paths.ledger):
+    for row in read_jsonl_rows(paths.ledger):
         if row.get("action") != "acquired":
             continue
         at = parse_iso(row.get("at") or "")
@@ -934,13 +1036,17 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
         "source_stats": source_doc,
         "queue_length": queue_len,
         "acquired_this_week": acquired_count,
-        "acquired_mb_this_week": round(acquired_mb, 1),
+        "acquired_bytes_this_week": acquired_bytes,
+        "acquired_gb_this_week": round(acquired_bytes / GIB, 3),
         "budget_tracks": int(cfg["tracks_per_week"]),
         "budget_gb": float(cfg["gb_per_week"]),
         "failures_total": failures,
+        "ledger_torn_line": torn,
         "last_acquired_at": last_acquire.isoformat().replace("+00:00", "Z") if last_acquire else None,
     }
     code = 0
+    if torn:
+        code = 1
     if last.get("ok") is False:
         code = 1
     if last_acquire is None or (now - last_acquire) > timedelta(days=7):
@@ -999,14 +1105,18 @@ def main(argv: list[str] | None = None) -> None:
     runners = Runners()
 
     if args.cmd == "candidates":
-        cmd_candidates(cfg, paths, runners)
+        with run_lock(paths.lock):
+            cmd_candidates(cfg, paths, runners)
     elif args.cmd == "rank":
-        cmd_rank(cfg, paths, runners)
+        with run_lock(paths.lock):
+            cmd_rank(cfg, paths, runners)
     elif args.cmd == "acquire":
-        summary = cmd_acquire(cfg, paths, runners, go=args.go)
+        with run_lock(paths.lock):
+            summary = cmd_acquire(cfg, paths, runners, go=args.go)
         print(json.dumps(summary, indent=2))
     elif args.cmd == "publish":
-        doc = cmd_publish(cfg, paths, runners)
+        with run_lock(paths.lock):
+            doc = cmd_publish(cfg, paths, runners)
         print(json.dumps({"tracks": len(doc.get("tracks") or [])}))
     elif args.cmd == "status":
         doc, code = cmd_status(cfg, paths, runners)

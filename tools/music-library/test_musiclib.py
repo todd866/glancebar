@@ -199,6 +199,103 @@ class MusicLibLogicTests(unittest.TestCase):
         st2 = m.build_status(self.requests, self.catalogue, cfg, self.state, {'lastError': None})
         self.assertTrue(st2['healthy'])
 
+    def test_eviction_skipped_when_remote_unconfirmed(self):
+        old = 'stale/track.m4a'
+        (self.hot / old).parent.mkdir(parents=True)
+        (self.hot / old).write_bytes(audio_bytes('Stale', 'A', 'B'))
+        cfg = m.load_config(self.config)
+        sha = m.sha256_file(self.hot / old)
+        plan = {
+            'overflow': False,
+            'toFetch': [],
+            'capBytes': m.cap_bytes_from_config(cfg),
+            'evict': [{
+                'relativePath': old,
+                'sizeBytes': (self.hot / old).stat().st_size,
+                'catalogue': {'relativePath': old, 'sizeBytes': 999, 'sha256': sha},
+            }],
+        }
+        status = m.sync_execute(plan, cfg, self.state, {old}, remote_meta=lambda *_: None)
+        self.assertTrue((self.hot / old).is_file())
+        self.assertEqual(len(status['evictionSkipped']), 1)
+
+    def test_part_bytes_count_toward_cap(self):
+        part = self.hot / (self.rel + '.part')
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b'x' * 500_000)
+        hot_map = m.hot_file_state(self.hot)
+        self.assertGreater(m.hot_byte_usage(self.hot, hot_map), m.bytes_in_hot(hot_map))
+
+    def test_sweep_stale_parts_at_sync(self):
+        part = self.hot / 'orphan.m4a.part'
+        part.write_bytes(b'partial')
+        plan = m.compute_plan(
+            self.requests, self.catalogue, self.hot, {}, {}, {self.rel}, 5_000_000, 14)
+        plan['toFetch'] = []
+        plan['overflow'] = False
+        cfg = m.load_config(self.config)
+        m.sync_execute(plan, cfg, self.state, {self.rel})
+        self.assertFalse(part.exists())
+
+    def test_bad_hot_file_refetched(self):
+        path = self.hot / self.rel
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'corrupt')
+        verified = {}
+        trash = self.root / 'trash2'
+        trash.write_text('#!/bin/sh\nexit 0\n')
+        os.chmod(trash, 0o755)
+        local, refetch = m.reconcile_wanted_hot(
+            self.hot,
+            m.wanted_entries_from_requests(self.requests, self.catalogue)[1],
+            verified,
+            trash_cmd=trash,
+        )
+        self.assertEqual(len(refetch), 1)
+        self.assertEqual(len(local), 0)
+        plan = m.compute_plan(
+            self.requests, self.catalogue, self.hot, {}, {}, {self.rel}, 5_000_000, 14,
+            verified_state=verified, trash_cmd=trash)
+        self.assertEqual(len(plan['toFetch']), 1)
+
+    def test_playlist_fetch_priority(self):
+        other_rel = 'Band/LP/other.m4a'
+        other_path = self.masters / other_rel
+        other_path.parent.mkdir(parents=True)
+        other_body = audio_bytes('Other', 'Band', 'LP')
+        other_path.write_bytes(other_body)
+        req = {
+            'schemaVersion': 1,
+            'playlists': [
+                {'key': 'b', 'title': 'B', 'tracks': [{'id': '2', 'title': 'Song', 'artist': 'Artist', 'album': 'Album'}]},
+                {'key': 'a', 'title': 'A', 'tracks': [{'id': '1', 'title': 'Other', 'artist': 'Band', 'album': 'LP'}]},
+            ],
+        }
+        cat = {
+            'schemaVersion': 1,
+            'entries': [
+                self.catalogue['entries'][0],
+                {
+                    'relativePath': other_rel,
+                    'sizeBytes': len(other_body),
+                    'sha256': m.sha256_file(other_path),
+                    'tags': {'title': 'Other', 'artist': 'Band', 'album': 'LP'},
+                    'durationSeconds': 200.0,
+                },
+            ],
+        }
+        plan = m.compute_plan(req, cat, self.hot, {}, {}, {self.rel, other_rel}, 50_000_000, 14, playlist_first='a')
+        order = [row['playlistKey'] for row in plan['toFetch']]
+        self.assertEqual(order[0], 'a')
+
+    def test_metered_plan_uses_cache_only(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'catalogue.json').write_text(json.dumps(self.catalogue))
+        plan = m.compute_plan(
+            self.requests, self.catalogue, self.hot, {}, {}, {self.rel},
+            m.cap_bytes_from_config(m.load_config(self.config)), 14)
+        self.assertEqual(len(plan['toFetch']), 1)
+
 
 @unittest.skipUnless(m.rclone_bin(), 'rclone not installed')
 class MusicLibRcloneTests(unittest.TestCase):
@@ -265,12 +362,21 @@ class FakeTrash(unittest.TestCase):
             script = root / 'trash'
             script.write_text('#!/bin/sh\necho "$@" >> "' + str(trash_log) + '"\n')
             os.chmod(script, 0o755)
+            body = audio_bytes('x', 'y', 'z')
+            sha = m.sha256_file(hot / old)
             plan = {
                 'overflow': False,
                 'toFetch': [],
-                'evict': [{'relativePath': old, 'sizeBytes': 100}],
+                'capBytes': 10_000_000,
+                'evict': [{
+                    'relativePath': old,
+                    'sizeBytes': len(body),
+                    'catalogue': {'relativePath': old, 'sizeBytes': len(body), 'sha256': sha},
+                }],
             }
-            m.sync_execute(plan, cfg, state, {old}, trash_cmd=script, now=time.time())
+            meta = {'sizeBytes': len(body), 'sha256': sha}
+            m.sync_execute(plan, cfg, state, {old}, trash_cmd=script, now=time.time(),
+                           remote_meta=lambda remote, rel: meta)
             self.assertIn(old, trash_log.read_text())
         finally:
             tmp.cleanup()

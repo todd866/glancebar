@@ -14,15 +14,18 @@ the triple j station queue.
   "remote": "glancebar-lossless:apple-music",
   "hot_dir": "~/Music/Glancebar Lossless",
   "cap_gb": 15,
-  "keep_days": 14
+  "keep_days": 14,
+  "min_free_gb": 20
 }
 ```
 
 - **remote** — rclone remote path (see below). Masters upload here; the laptop
   reads `catalogue.json` and fetches tracks from the same tree.
 - **hot_dir** — laptop lossless cache; relative paths mirror the masters tree.
-- **cap_gb** — decimal gigabyte cap for `hot_dir` (fetch is refused if the plan
-  would exceed this even after eviction).
+- **cap_gb** — hot-set cap in **binary GiB** (`cap_gb × 1024³` bytes). Incomplete
+  `*.part` downloads count toward the cap. Sync evicts before fetching and refuses
+  a fetch that would exceed the cap or drop free disk below **min_free_gb** (default
+  20, also binary GiB).
 - **keep_days** — do not evict files played or fetched within this window.
 
 Today you can point **remote** at an SFTP tree on the M2, e.g.
@@ -39,6 +42,7 @@ All tool state under `~/.local/state/glancebar-music-library/`:
 | `catalogue-build-cache.json` | Incremental hash cache on the masters machine |
 | `played.json` | Last play time per hot-set relative path (`touch`) |
 | `fetched.json` | Last successful fetch time per path |
+| `verified-hot.json` | Last cheap-verify stamp per wanted hot path |
 | `sync.lock` | Exclusive lock for `sync` |
 | `last-status.json` | Last sync time and error |
 
@@ -107,7 +111,7 @@ Incremental rebuild reuses entries whose size and mtime are unchanged.
 python3 tools/music-library/musiclib.py catalogue --masters /path/to/masters
 python3 tools/music-library/musiclib.py push --masters /path/to/masters
 python3 tools/music-library/musiclib.py plan [--refresh-catalogue]
-python3 tools/music-library/musiclib.py sync [--allow-metered] [--refresh-catalogue]
+python3 tools/music-library/musiclib.py sync [--allow-metered] [--refresh-catalogue] [--playlist KEY]
 python3 tools/music-library/musiclib.py status
 python3 tools/music-library/musiclib.py touch /path/in/hot_dir/track.m4a
 ```
@@ -120,14 +124,15 @@ Support mix path).
 | `catalogue` | Masters | Walk masters, write local + upload `catalogue.json` |
 | `push` | Masters | `rclone copy` masters → remote, `--checksum`, no deletes |
 | `plan` | Laptop | JSON plan: wanted, local, `toFetch`, `unmatched`, `evict` |
-| `sync` | Laptop | Fetch `.part` → verify sha256 → rename; evict to Trash |
+| `sync` | Laptop | Sweep stale `.part`; verify wanted locals; evict (remote size/hash check) then fetch |
 | `status` | Laptop | Per-playlist counts; exit 1 if gaps or last sync error |
 | `touch` | Laptop | Record play time for eviction |
 
 Guards:
 
-- Refuse `sync` fetch when `~/.local/state/METERED_LINK` exists unless
-  `--allow-metered`.
+- Refuse `sync` entirely when `~/.local/state/METERED_LINK` exists unless
+  `--allow-metered` (before any rclone call). `plan` and `status` use the cached
+  `catalogue.json` and report `catalogueSource: cache` on a metered link.
 - Refuse `sync` when the plan still exceeds `cap_gb` after eviction (lists
   affected playlists).
 - `sync` exit **75** if another run holds the lock.
