@@ -381,17 +381,24 @@ def duration_ok(request_dur, entry_dur, tolerance=2.0):
 
 def match_track(track, catalogue_entries):
     """Return (matches, reason). matches is a list of entries; reason set when empty."""
-    key = match_key(track.get('artist', ''), track.get('title', ''))
-    if not key[0] or not key[1]:
+    req_keys = oc.catalogue_match_keys(track.get('artist', ''), track.get('title', ''))
+    if not req_keys:
         return [], 'missing title or artist'
     req_dur = track_duration_seconds(track)
+    exact_key = match_key(track.get('artist', ''), track.get('title', ''))
     hits = []
     for entry in catalogue_entries:
         tags = entry.get('tags') or {}
-        ekey = match_key(tags.get('artist', ''), tags.get('title', ''))
-        if ekey != key:
+        ekeys = oc.catalogue_match_keys(tags.get('artist', ''), tags.get('title', ''))
+        if not req_keys & ekeys:
             continue
-        if not duration_ok(req_dur, entry.get('durationSeconds')):
+        entry_dur = entry.get('durationSeconds')
+        if not duration_ok(req_dur, entry_dur):
+            continue
+        exact = match_key(tags.get('artist', ''), tags.get('title', '')) == exact_key
+        if not exact and (req_dur is None or entry_dur is None):
+            # A loose match (suffix, "feat.", primary artist) is only trusted when the
+            # durations confirm it is the same recording.
             continue
         hits.append(entry)
     if not hits:

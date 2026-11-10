@@ -99,6 +99,59 @@ class MusicLibLogicTests(unittest.TestCase):
             self.assertIsNone(m.inside(hot, 'link/x.m4a'))
             self.assertIsNotNone(m.inside(hot, 'Artist/x.m4a'))
 
+    def test_loose_match_never_binds_a_different_recording(self):
+        entries = [
+            {'relativePath': 'A/B/01 Song (Someone Remix).m4a', 'sizeBytes': 1, 'sha256': 'd' * 64,
+             'tags': {'title': 'Song (Someone Remix)', 'artist': 'Artist'}, 'durationSeconds': 200.0},
+            {'relativePath': 'A/B/02 Other (Live).m4a', 'sizeBytes': 1, 'sha256': 'e' * 64,
+             'tags': {'title': 'Other (Live)', 'artist': 'Artist'}, 'durationSeconds': 200.0},
+            {'relativePath': 'A/B/03 Third.m4a', 'sizeBytes': 1, 'sha256': 'f' * 64,
+             'tags': {'title': 'Third (Remastered 2011)', 'artist': 'Artist'}},
+        ]
+        for track in (
+            {'artist': 'Artist', 'title': 'Song', 'durationSeconds': 200.0},
+            {'artist': 'Artist', 'title': 'Other', 'durationSeconds': 200.0},
+            # loose match with no duration on the catalogue side: not trusted
+            {'artist': 'Artist', 'title': 'Third', 'durationSeconds': 180.0},
+        ):
+            hits, reason = m.match_track(track, entries)
+            self.assertEqual(hits, [], track)
+            self.assertEqual(reason, 'no catalogue match')
+
+    def test_match_normalisation_rules(self):
+        entries = [
+            {
+                'relativePath': 'J Cole/2014 Forest Hills Drive/06 No Role Modelz.m4a',
+                'sizeBytes': 100,
+                'sha256': 'a' * 64,
+                'tags': {'title': 'No Role Modelz', 'artist': 'J. Cole', 'album': '2014 Forest Hills Drive'},
+                'durationSeconds': 291.0,
+            },
+            {
+                'relativePath': 'Khruangbin/Mordechai/01 So We Wont Forget.m4a',
+                'sizeBytes': 100,
+                'sha256': 'b' * 64,
+                'tags': {'title': 'So We Won\'t Forget', 'artist': 'Khruangbin & Friends', 'album': 'Mordechai'},
+                'durationSeconds': 240.0,
+            },
+            {
+                'relativePath': 'Radiohead/OK Computer/02 Paranoid Android.m4a',
+                'sizeBytes': 100,
+                'sha256': 'c' * 64,
+                'tags': {'title': 'Paranoid Android (Remastered)', 'artist': 'Radiohead', 'album': 'OK Computer'},
+                'durationSeconds': 383.0,
+            },
+        ]
+        cases = [
+            ({'artist': 'J Cole', 'title': 'No Role Modelz', 'durationSeconds': 291.5}, 1),
+            ({'artist': 'Khruangbin', 'title': 'So We Won\'t Forget', 'durationSeconds': 240.0}, 1),
+            ({'artist': 'The Radiohead', 'title': 'Paranoid Android', 'durationSeconds': 383.0}, 1),
+        ]
+        for track, want in cases:
+            hits, reason = m.match_track(track, entries)
+            self.assertIsNone(reason, track)
+            self.assertEqual(len(hits), want, track)
+
     def test_duration_tolerance(self):
         track = dict(self.requests['playlists'][0]['tracks'][0], durationSeconds=201.5)
         ok, reason = m.match_track(track, self.catalogue['entries'])

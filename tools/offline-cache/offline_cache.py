@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import struct
 import tempfile
@@ -47,6 +48,110 @@ def default_audio_roots():
 def normal(value):
     # Do not remove punctuation, live/remaster/version qualifiers or collaborators.
     return ' '.join(unicodedata.normalize('NFC', str(value or '')).casefold().split())
+
+
+_MATCH_PUNCT = re.compile(r'[^\w\s]+', re.UNICODE)
+# Only suffixes that name the SAME recording. "(… Remix)", "(Live)", "(Radio Edit)", "(Acoustic
+# Version)" are different recordings and must never be stripped.
+_MATCH_SUFFIX = re.compile(
+    r'\s*(?:[\(\[][^\)\]]*\b(?:remaster(?:ed)?|clean|explicit|album version|single version)\b[^\)\]]*[\)\]]'
+    r'|-\s*single)\s*$',
+    re.IGNORECASE,
+)
+_MATCH_FEAT_IN_TITLE = re.compile(
+    r'\s*[\(\[](?:feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]',
+    re.IGNORECASE,
+)
+_MATCH_FEAT_TRAIL = re.compile(r'\s+(?:feat\.?|ft\.?|featuring)\s+.+$', re.IGNORECASE)
+_REMIX_WORD = re.compile(r'\b(?:remix(?:es)?|rework|edit|flip|bootleg)\b', re.IGNORECASE)
+
+
+def match_fold(value):
+    """Loose fold for catalogue matching only (not offline identity)."""
+    text = unicodedata.normalize('NFC', str(value or '')).casefold()
+    text = text.replace('&', ' and ')
+    text = _MATCH_PUNCT.sub(' ', text)
+    return ' '.join(text.split())
+
+
+def strip_match_suffixes(title):
+    text = str(title or '')
+    changed = True
+    while changed:
+        changed = False
+        stripped = _MATCH_SUFFIX.sub('', text).strip()
+        if stripped != text:
+            text = stripped
+            changed = True
+    return text
+
+
+def split_primary_artist(artist):
+    text = str(artist or '').strip()
+    text = _MATCH_FEAT_TRAIL.sub('', text).strip()
+    lower = text.lower()
+    for sep in (' & ', ' and ', ',', ';'):
+        idx = lower.find(sep)
+        if idx > 0:
+            text = text[:idx].strip()
+            lower = text.lower()
+    return text
+
+
+def title_match_variants(title):
+    base = str(title or '').strip()
+    variants = {base}
+    stripped = strip_match_suffixes(base)
+    variants.add(stripped)
+    no_feat = _MATCH_FEAT_IN_TITLE.sub('', base).strip()
+    variants.add(no_feat)
+    variants.add(strip_match_suffixes(no_feat))
+    out = []
+    seen = set()
+    for item in variants:
+        folded = match_fold(item)
+        if folded and folded not in seen:
+            seen.add(folded)
+            out.append(item)
+    return out
+
+
+def match_key_pairs(artist, title):
+    """Distinct (artist, title) pairs to try when binding to catalogue entries."""
+    artist = str(artist or '').strip()
+    titles = title_match_variants(title)
+    primary = split_primary_artist(artist)
+    pairs = []
+    seen = set()
+    artists = [artist, primary]
+    if artist.lower().startswith('the '):
+        artists.append(artist[4:].strip())
+    if primary.lower().startswith('the '):
+        artists.append(primary[4:].strip())
+    for a in artists:
+        if not a:
+            continue
+        for t in titles:
+            if not t:
+                continue
+            key = (match_fold(a), match_fold(t))
+            if key not in seen:
+                seen.add(key)
+                pairs.append((a, t))
+    return pairs
+
+
+def catalogue_match_keys(artist, title):
+    keys = set()
+    for a, t in match_key_pairs(artist, title):
+        fa, ft = match_fold(a), match_fold(t)
+        if fa and ft:
+            keys.add((fa, ft))
+    return keys
+
+
+def looks_like_remix(title):
+    return bool(_REMIX_WORD.search(str(title or '')))
 
 
 def identity(row):

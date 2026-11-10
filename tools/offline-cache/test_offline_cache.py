@@ -40,6 +40,12 @@ class CacheTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_catalogue_match_keys_normalisation(self):
+        keys = c.catalogue_match_keys('Khruangbin & Friends', 'So We Won\'t Forget (Remastered)')
+        self.assertIn(c.match_fold('Khruangbin'), {k[0] for k in keys})
+        self.assertIn(c.match_fold('So We Won\'t Forget'), {k[1] for k in keys})
+        self.assertTrue(c.looks_like_remix('Breathing (The Remixes)'))
+
     def test_tag_scan_and_exact_audit(self):
         rows = c.inventory([self.root])
         result = c.audit(self.request, rows)['playlists'][0]

@@ -12,6 +12,7 @@ Subcommands:
   pull --artists "A,B" [--per-artist N]     plan, then pull each album with amdl
   pull --urls URL [URL...]                  pull explicit Apple Music URLs
   pull-liked [--retry-failed]               acquire each Apple Music favourite
+  retry-unmatched [--go]                    re-resolve no_match/failed favourites
 
 State: ~/.local/state/glancebar-mix/pulled.json (album id -> metadata).
 Liked pulls: ~/.local/state/glancebar-mix/liked-pulled.json
@@ -185,6 +186,73 @@ def _song_score(res: dict, artist: str, title: str, album: str) -> float:
     return score
 
 
+def _fold_variants(values) -> set[str]:
+    import offline_cache as oc  # noqa: WPS433
+
+    return {f for f in (oc.match_fold(v) for v in values) if f}
+
+
+_MIXED_TAG = re.compile(r"\s*[\(\[]mixed[\)\]]", re.IGNORECASE)
+
+
+def _title_agrees(got: str, wanted: str) -> bool:
+    import offline_cache as oc  # noqa: WPS433
+
+    # "(Mixed)" marks the copy inside a DJ-mix album; the stand-alone track is the same song.
+    got, wanted = _MIXED_TAG.sub("", got), _MIXED_TAG.sub("", wanted)
+    return bool(_fold_variants(oc.title_match_variants(got)) & _fold_variants(oc.title_match_variants(wanted)))
+
+
+def _artist_agrees(got: str, wanted: str) -> bool:
+    import offline_cache as oc  # noqa: WPS433
+
+    a = _fold_variants([got, oc.split_primary_artist(got)])
+    b = _fold_variants([wanted, oc.split_primary_artist(wanted)])
+    return bool(a & b)
+
+
+def _same_song(res: dict, artist: str, title: str) -> bool:
+    return _title_agrees(str(res.get("trackName", "")), title) and _artist_agrees(
+        str(res.get("artistName", "")), artist
+    )
+
+
+_SONG_URL = re.compile(r"/song/(.*)/(\d+)$")
+
+
+def audit_liked(*, apply: bool = False) -> int:
+    """Find favourites recorded as done whose downloaded song has a different title.
+
+    The state keeps only the song URL, whose slug is the downloaded track's name. Dry run by
+    default; with apply the rows move from "done" to "wrong_song" (record kept), so the next
+    pull-liked looks for the right song. Files already downloaded are left alone.
+    """
+    state = _load_liked()
+    wrong = []
+    for key, meta in sorted((state.get("done") or {}).items()):
+        if "|" not in key or not isinstance(meta, dict):
+            continue
+        m = _SONG_URL.search(str(meta.get("url", "")))
+        if not m:
+            continue
+        got = m.group(1).replace("-", " ")
+        title = key.split("|", 1)[1]
+        # The slug has lost its hyphens and case: compare with punctuation folded away.
+        if _title_agrees(got, title.replace("-", " ")):
+            continue
+        wrong.append((key, got))
+        print(f"wrong-song  {key}  ←  downloaded: {got}", flush=True)
+    print(f"audit-liked: {len(wrong)} of {len(state.get('done') or {})} done rows hold a different song"
+          f" ({'moved to wrong_song' if apply else 'dry run'})", flush=True)
+    if apply and wrong:
+        bucket = state.setdefault("wrong_song", {})
+        for key, got in wrong:
+            row = state["done"].pop(key)
+            bucket[key] = dict(row, downloaded=got)
+        _save_liked(state)
+    return 0
+
+
 def _year_anthology(name: str) -> bool:
     years = list(_YEAR.finditer(name))
     kinds = list(_ANTHOLOGY.finditer(name))
@@ -232,6 +300,11 @@ def itunes_song(artist: str, title: str, album: str = "") -> list[dict]:
     scored: list[tuple[float, int, dict]] = []
     for i, res in enumerate(results):
         if res.get("wrapperType") != "track":
+            continue
+        # A result must BE the wanted song. Until 11 Nov 2026 an artist match alone cleared the
+        # bar, so about fifty favourites were recorded as done with a different song by the
+        # same artist ("Maggot Brain" bound to "Can You Get To That").
+        if not _same_song(res, artist, title):
             continue
         score = _song_score(res, artist, title, album)
         if score >= 0.5:
@@ -605,6 +678,112 @@ def _save_liked(state: dict) -> None:
     LIKED_STATE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
+_MUSICLIB = Path(__file__).resolve().parent.parent / "music-library"
+_OFFLINE_CACHE = Path(__file__).resolve().parent.parent / "offline-cache"
+for _p in (_MUSICLIB, _OFFLINE_CACHE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+
+def _load_catalogue_entries() -> list[dict]:
+    import musiclib as ml  # noqa: WPS433
+
+    cache = Path.home() / ".local/state/glancebar-music-library/catalogue.json"
+    if not cache.is_file():
+        return []
+    doc = json.loads(cache.read_text(encoding="utf-8"))
+    return ml.index_catalogue(doc)
+
+
+def _track_from_liked_key(key: str, meta: object) -> dict:
+    artist, title = key.split("|", 1)
+    track = {"artist": artist, "title": title}
+    if isinstance(meta, dict):
+        if meta.get("album"):
+            track["album"] = meta["album"]
+    return track
+
+
+def _retry_search_variants(track: dict) -> list[tuple[str, str, str]]:
+    import offline_cache as oc  # noqa: WPS433
+
+    artist = track.get("artist", "")
+    title = track.get("title", "")
+    album = str(track.get("album") or "")
+    variants: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(a: str, t: str, al: str) -> None:
+        row = (a, t, al)
+        if row not in seen and a and t:
+            seen.add(row)
+            variants.append(row)
+
+    add(artist, title, album)
+    add(artist, title, "")
+    add(oc.split_primary_artist(artist), oc.strip_match_suffixes(title), "")
+    add(oc.split_primary_artist(artist), title, "")
+    for _a, t in oc.match_key_pairs(artist, title):
+        add(_a, t, album)
+        add(_a, t, "")
+    return variants
+
+
+def retry_unmatched(*, go: bool = False, catalogue_path: Path | None = None) -> int:
+    """Re-try puller no_match/failed rows with improved catalogue match and iTunes variants."""
+    import musiclib as ml  # noqa: WPS433
+
+    state = _load_liked()
+    targets: list[tuple[str, dict, str]] = []
+    for bucket in ("no_match", "failed"):
+        for key, meta in (state.get(bucket) or {}).items():
+            if "|" not in key:
+                continue
+            track = _track_from_liked_key(key, meta)
+            if isinstance(meta, dict):
+                track.update({k: meta[k] for k in ("album",) if meta.get(k)})
+            targets.append((key, track, bucket))
+
+    cache = catalogue_path or Path.home() / ".local/state/glancebar-music-library/catalogue.json"
+    entries = []
+    if cache.is_file():
+        doc = json.loads(cache.read_text(encoding="utf-8"))
+        entries = ml.index_catalogue(doc)
+    print(
+        f"retry-unmatched: {len(targets)} targets "
+        f"({'GO' if go else 'dry-run'})",
+        flush=True,
+    )
+    planned = 0
+    for key, track, bucket in targets:
+        hits, reason = ml.match_track(track, entries)
+        if hits:
+            rel = hits[0].get("relativePath")
+            print(f"catalogue-match  {key}  →  {rel}", flush=True)
+            planned += 1
+            continue
+        song = None
+        for a, t, al in _retry_search_variants(track):
+            ranked = itunes_song(a, t, al)
+            if ranked:
+                song = ranked[0]
+                break
+        if not song:
+            print(f"still-unmatched  {key}  ({bucket})", flush=True)
+            continue
+        url = _song_url(song)
+        planned += 1
+        print(
+            f"would-acquire      {key}  "
+            f"{song.get('artistName')} — {song.get('trackName')}  {url}",
+            flush=True,
+        )
+        if go:
+            print("  (skipped: --go not implemented in worker; lead runs amdl)", flush=True)
+    print(f"retry-unmatched: {planned} resolvable", flush=True)
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -623,6 +802,26 @@ def main() -> None:
         action="store_true",
         help="retry tracks recorded as failed",
     )
+    p_audit = sub.add_parser(
+        "audit-liked",
+        help="list favourites recorded as done with a different song (dry run by default)",
+    )
+    p_audit.add_argument("--apply", action="store_true", help="move them to wrong_song so pull-liked retries")
+    p_retry = sub.add_parser(
+        "retry-unmatched",
+        help="re-resolve liked puller no_match/failed rows (dry-run by default)",
+    )
+    p_retry.add_argument(
+        "--go",
+        action="store_true",
+        help="actually acquire (default: print would-acquire lines only)",
+    )
+    p_retry.add_argument(
+        "--catalogue",
+        type=Path,
+        default=None,
+        help="catalogue.json path (default: glancebar-music-library cache)",
+    )
     args = ap.parse_args()
 
     state = load_state()
@@ -638,6 +837,15 @@ def main() -> None:
             getattr(args, "inventory", None),
             retry_failed=getattr(args, "retry_failed", False),
         ))
+    elif args.cmd == "audit-liked":
+        sys.exit(audit_liked(apply=bool(args.apply)))
+    elif args.cmd == "retry-unmatched":
+        sys.exit(
+            retry_unmatched(
+                go=bool(getattr(args, "go", False)),
+                catalogue_path=getattr(args, "catalogue", None),
+            )
+        )
     elif args.cmd == "pull":
         if args.urls:
             plan = [
