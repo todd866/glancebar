@@ -6298,10 +6298,20 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
             if (tracks.count < 20) return;   // Music closed, or permission not given yet
             NSSet *liked = [self mixLiked];
+            NSString *hist =
+                [NSString stringWithContentsOfFile:[GBHomeDirectory() stringByAppendingPathComponent:
+                                                   @".local/state/selector/heart-history.jsonl"]
+                                        encoding:NSUTF8StringEncoding
+                                           error:nil];
+            NSSet *everHearted = HeartHistoryEverHeartedKeys(hist);
             NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
             for (NSDictionary *t in tracks) {
-                if (![liked containsObject:t[@"id"]]) { [marked addObject:t]; continue; }
-                NSMutableDictionary *m = [t mutableCopy]; m[@"thumb"] = @YES; [marked addObject:m];
+                NSMutableDictionary *m = [t mutableCopy];
+                if ([liked containsObject:t[@"id"]]) m[@"thumb"] = @YES;
+                NSString *selKey = SelectorTrackKey(t[@"artist"], t[@"title"]);
+                if (selKey.length && [everHearted containsObject:selKey] && ![m[@"fav"] boolValue])
+                    m[@"everHeart"] = @YES;
+                [marked addObject:m];
             }
             self->_mixLibrary = marked;
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
@@ -7530,6 +7540,27 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     }
     return _heartedKeys;
 }
+- (NSString *)heartHistoryJSONL {
+    return [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/heart-history.jsonl"];
+}
+- (void)appendHeartHistory:(NSString *)action
+                  trackKey:(NSString *)key
+                    artist:(NSString *)artist
+                     title:(NSString *)title
+                      path:(NSString *)path {
+    if (!_musicProbesEnabled) return;
+    NSString *line = HeartHistoryLine(action, key, artist, title, path, NSDate.date);
+    if (!line.length) return;
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *histPath = [dir stringByAppendingPathComponent:@"heart-history.jsonl"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:histPath])
+        [@"" writeToFile:histPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:histPath];
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
 - (void)rememberHeart:(NSString *)key {
     if (!key.length) return;
     [[self heartedKeys] addObject:key];
@@ -7540,6 +7571,17 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     NSString *next = HeartCacheAdding(existing, key);
     if (![next writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+    [_heartedKeys setSet:[NSSet setWithArray:HeartCacheKeys(next)]];
+}
+- (void)forgetHeart:(NSString *)key {
+    if (!key.length) return;
+    [[self heartedKeys] removeObject:key];
+    if (!_musicProbesEnabled) return;
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector"];
+    NSString *path = [dir stringByAppendingPathComponent:@"hearts.json"];
+    NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *next = HeartCacheRemoving(existing, key);
+    if (!next.length || ![next writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
     [_heartedKeys setSet:[NSSet setWithArray:HeartCacheKeys(next)]];
 }
 - (void)noteLocalHeartError:(NSString *)reason {
@@ -7587,6 +7629,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     // saved after the Apple Music add succeeded). Save it and fill the button now; mirroring
     // it to Apple Music is best effort in the background and never undoes the heart.
     [self rememberHeart:key];
+    [self appendHeartHistory:@"heart" trackKey:key artist:artist title:title path:ident[@"path"] ?: @""];
     _localHeartError = nil;
     _localHeartEpoch++;
     if (_popover.isShown) [self rebuildContent];
@@ -7630,6 +7673,59 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         });
     });
 }
+- (void)unloveCurrentLocalTrack {
+    if (!_musicProbesEnabled || _localLoveInFlight) return;
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *artist = ident[@"artist"] ?: @"";
+    NSString *title = ident[@"title"] ?: @"";
+    NSString *key = ident[@"trackKey"] ?: @"";
+    if (!artist.length || !title.length || !key.length) return;
+    if (![[self heartedKeys] containsObject:key]) return;
+    [self forgetHeart:key];
+    [self appendHeartHistory:@"unheart" trackKey:key artist:artist title:title path:ident[@"path"] ?: @""];
+    _localHeartError = nil;
+    _localHeartEpoch++;
+    if (_popover.isShown) [self rebuildContent];
+    NSString *script = LikesSyncScript();
+    if (![NSFileManager.defaultManager fileExistsAtPath:script]) {
+        GBLog("unheart: saved locally; likes sync is not installed");
+        return;
+    }
+    _localLoveInFlight = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:Python3Path()];
+        task.arguments = @[script, @"unlove", @"--artist", artist, @"--title", title, @"--apply"];
+        NSPipe *out = [NSPipe pipe], *errPipe = [NSPipe pipe];
+        task.standardOutput = out;
+        task.standardError = errPipe;
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        if (![task launchAndReturnError:NULL]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_localLoveInFlight = NO;
+                GBLog("unheart: saved locally; the Apple Music mirror could not start");
+            });
+            return;
+        }
+        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:120];
+        NSData *outData = [out.fileHandleForReading readDataToEndOfFile];
+        NSData *errData = [errPipe.fileHandleForReading readDataToEndOfFile];
+        [task waitUntilExit];
+        [watchdog disarm];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_localLoveInFlight = NO;
+            NSString *stdoutText = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
+            NSString *stderrText = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding];
+            NSDictionary *payload = LoveResultJSON(stdoutText);
+            NSString *result = [payload[@"result"] isKindOfClass:NSString.class] ? payload[@"result"] : @"";
+            int status = task.terminationReason == NSTaskTerminationReasonExit ? task.terminationStatus : 1;
+            if (status == 0 && [result isEqual:@"ok"]) return;
+            NSString *why = status == 3 || [result isEqual:@"no-match"] ? @"no Apple Music match" : stderrText;
+            if (why.length > 160) why = [why substringToIndex:160];
+            GBLog("unheart: saved locally; not mirrored to Apple Music (%{public}@)", why ?: @"");
+        });
+    });
+}
 - (void)appendSelectorFeedbackForArtist:(NSString *)artist title:(NSString *)title source:(NSString *)source {
     if (!_musicProbesEnabled) return;
     NSString *line = SelectorFeedbackLine(artist, title, source, NSDate.date);
@@ -7647,7 +7743,10 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (IBAction)musicFavorite:(id)sender {
     (void)sender;
     if (!_localMode) return;
-    [self loveCurrentLocalTrack];
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *key = ident[@"trackKey"] ?: @"";
+    if (key.length && [[self heartedKeys] containsObject:key]) [self unloveCurrentLocalTrack];
+    else [self loveCurrentLocalTrack];
 }
 - (NSMutableSet<NSString *> *)mixLiked {
     if (!_mixLiked) {
@@ -7935,6 +8034,14 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             heart.accessibilityHelp = _localHeartError;
         } else {
             heart.contentTintColor = hearted ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
+            NSString *hist = [NSString stringWithContentsOfFile:[self heartHistoryJSONL]
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:nil];
+            NSString *heartTip = HeartHistoryTooltip(hist, key, hearted);
+            if (heartTip.length) {
+                heart.toolTip = heartTip;
+                heart.accessibilityHelp = heartTip;
+            }
         }
         [row addSubview:heart];
         BOOL liked = thumbID.length && [[self mixLiked] containsObject:thumbID];

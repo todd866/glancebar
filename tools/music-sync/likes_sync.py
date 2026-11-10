@@ -800,11 +800,20 @@ def apple_quote(text: str) -> str:
 
 
 def favorite_script(pid: str) -> str:
-    # Only ever sets true. This sync does not un-favourite.
     quoted = apple_quote(pid)
     return (
         'tell application "Music"\n'
         f"set favorited of (first track of library playlist 1 whose persistent ID is {quoted}) to true\n"
+        "end tell\n"
+        'return "ok"\n'
+    )
+
+
+def unfavorite_script(pid: str) -> str:
+    quoted = apple_quote(pid)
+    return (
+        'tell application "Music"\n'
+        f"set favorited of (first track of library playlist 1 whose persistent ID is {quoted}) to false\n"
         "end tell\n"
         'return "ok"\n'
     )
@@ -2343,6 +2352,21 @@ def favourite_apple_track(
     }
 
 
+def unfavourite_apple_track(artist: str, title: str, runners: Runners, library: list) -> dict:
+    """Clear favourited on a library hit only. No catalog search or browser."""
+    if not has_names(artist, title):
+        return {"action": "library-match", "result": "no-match", "ids": {}}
+    library_hit = pick_hit(artist, title, library)
+    if library_hit and library_hit.get("pid"):
+        runners.osascript(unfavorite_script(library_hit["pid"]))
+        return {
+            "action": "clear-favorited",
+            "result": "ok",
+            "ids": {"pid": library_hit["pid"]},
+        }
+    return {"action": "library-match", "result": "no-match", "ids": {}}
+
+
 def apply_apple(items, runners: Runners, record, limit: int, applied_ok) -> tuple[list[dict], bool]:
     # Nothing queued: don't open Music. The read is the slow part, and it can launch the app.
     if not pending_items(items, "am", applied_ok, limit):
@@ -2620,6 +2644,59 @@ def cmd_love(args, runners: Runners) -> int:
     return 1
 
 
+def cmd_unlove(args, runners: Runners) -> int:
+    """Clear favourited on one Apple Music library song. Dry-run unless --apply."""
+    artist = args.artist or ""
+    title = args.title or ""
+    if not args.apply:
+        _print_love("dry-run", "")
+        return 0
+
+    applied_path = state_dir() / "applied.jsonl"
+
+    def record(action: str, result: str, ids: dict) -> None:
+        append_applied(
+            applied_path,
+            {
+                "at": runners.clock(),
+                "side": "am",
+                "key": _love_key(artist, title),
+                "action": action,
+                "result": result,
+                "ids": ids if isinstance(ids, dict) else {},
+            },
+        )
+
+    if not has_names(artist, title):
+        record("library-match", "no-match", {})
+        _print_love("no-match", "")
+        return 3
+
+    try:
+        library = collect_library(runners)
+        raw = unfavourite_apple_track(artist, title, runners, library)
+    except (SystemExit, Exception) as exc:
+        print(redact_secrets(str(exc))[:300], file=sys.stderr)
+        record("write", "error", {})
+        _print_love("error", "")
+        return 1
+
+    result = str(raw.get("result") or "error")
+    if result not in {"ok", "no-match", "error"}:
+        result = "error"
+    ids = raw.get("ids") if isinstance(raw.get("ids"), dict) else {}
+    record(str(raw.get("action") or "write"), result, ids)
+    song_id = ""
+    if result == "ok":
+        song_id = str(ids.get("pid") or "")
+    _print_love(result, song_id)
+    if result == "ok":
+        return 0
+    if result == "no-match":
+        return 3
+    return 1
+
+
 _NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 
 
@@ -2864,6 +2941,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a Chrome web-player tab for catalog search when not in the library",
     )
     love.set_defaults(func=cmd_love)
+
+    unlove = sub.add_parser(
+        "unlove",
+        help="clear favourited on one Apple Music library song (never opens a browser)",
+    )
+    unlove.add_argument("--artist", required=True)
+    unlove.add_argument("--title", required=True)
+    unlove.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the account write; without this flag, print a dry run",
+    )
+    unlove.set_defaults(func=cmd_unlove)
     return parser
 
 

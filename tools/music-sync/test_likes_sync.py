@@ -1813,6 +1813,18 @@ class LoveCommandTests(unittest.TestCase):
         logged = self._applied()
         self.assertEqual(logged[0]["result"], "error")
 
+    def test_unlove_clears_library_favorite(self):
+        osa = ScriptedOSA(library=library_text([("P123", "Song", "Band", "LP", "true")]))
+        code, stdout, stderr, osa = self._run(osa, ["unlove", "--artist", "Band", "--title", "Song", "--apply"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "ok", "id": "P123"})
+        self.assertEqual(len(osa.favorited), 1)
+        self.assertIn("P123", osa.favorited[0])
+        self.assertIn("to false", osa.favorited[0])
+        logged = self._applied()
+        self.assertEqual(logged[-1]["action"], "clear-favorited")
+        self.assertEqual(logged[-1]["result"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

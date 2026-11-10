@@ -3571,6 +3571,7 @@ static uint64_t MixNext(uint64_t *state) {
 static double MixTrackWeight(NSDictionary *t) {
     double w = 1 + log1p([t[@"plays"] doubleValue]);
     if ([t[@"fav"] boolValue]) w *= 2;
+    else if ([t[@"everHeart"] boolValue]) w *= 1.15;   // once hearted in Glancebar, still a weak nudge
     return w;
 }
 
@@ -3733,6 +3734,106 @@ NSString *HeartCacheAdding(NSString *json, NSString *key) {
 
 BOOL HeartCacheContains(NSString *json, NSString *key) {
     return key.length && [HeartCacheKeys(json) containsObject:key];
+}
+
+NSString *HeartCacheRemoving(NSString *json, NSString *key) {
+    if (!key.length) return json;
+    NSMutableArray *tracks = [HeartCacheKeys(json) mutableCopy];
+    [tracks removeObject:key];
+    [tracks sortUsingSelector:@selector(compare:)];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"tracks": tracks} options:NSJSONWritingSortedKeys error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
+
+NSString *HeartHistoryLine(NSString *action, NSString *trackKey, NSString *artist, NSString *title,
+                           NSString *path, NSDate *at) {
+    if (!trackKey.length || (![action isEqual:@"heart"] && ![action isEqual:@"unheart"])) return nil;
+    NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
+    NSMutableDictionary *o =
+        [@{@"at": [f stringFromDate:at ?: NSDate.date], @"action": action, @"trackKey": trackKey,
+           @"artist": artist ?: @"", @"title": title ?: @""} mutableCopy];
+    if (path.length) o[@"path"] = path;
+    NSData *d = [NSJSONSerialization dataWithJSONObject:o options:NSJSONWritingSortedKeys error:nil];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+}
+
+static NSDictionary *HeartHistoryEmptyState(void) {
+    return @{
+        @"currentlyHearted": @NO,
+        @"everHearted": @NO,
+        @"firstHeartedAt": @"",
+        @"lastChangeAt": @"",
+    };
+}
+
+NSDictionary *HeartHistoryState(NSString *jsonl, NSString *trackKey) {
+    if (!trackKey.length) return HeartHistoryEmptyState();
+    BOOL current = NO, ever = NO;
+    NSString *firstHeart = nil, *lastChange = nil;
+    for (NSString *line in [jsonl ?: @"" componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *o = line.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if (![o isKindOfClass:NSDictionary.class]) continue;
+        NSString *k = [o[@"trackKey"] isKindOfClass:NSString.class] ? o[@"trackKey"] : @"";
+        if (![k isEqual:trackKey]) continue;
+        NSString *action = [o[@"action"] isKindOfClass:NSString.class] ? o[@"action"] : @"";
+        NSString *at = [o[@"at"] isKindOfClass:NSString.class] ? o[@"at"] : @"";
+        if (at.length) lastChange = at;
+        if ([action isEqual:@"heart"]) {
+            ever = YES;
+            if (!firstHeart.length) firstHeart = at;
+            current = YES;
+        } else if ([action isEqual:@"unheart"]) {
+            current = NO;
+        }
+    }
+    return @{
+        @"currentlyHearted": @(current),
+        @"everHearted": @(ever),
+        @"firstHeartedAt": firstHeart ?: @"",
+        @"lastChangeAt": lastChange ?: @"",
+    };
+}
+
+NSSet<NSString *> *HeartHistoryEverHeartedKeys(NSString *jsonl) {
+    NSMutableSet *out = [NSMutableSet set];
+    for (NSString *line in [jsonl ?: @"" componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *o = line.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if (![o isKindOfClass:NSDictionary.class] || ![o[@"action"] isEqual:@"heart"]) continue;
+        NSString *k = [o[@"trackKey"] isKindOfClass:NSString.class] ? o[@"trackKey"] : @"";
+        if (k.length) [out addObject:k];
+    }
+    return out;
+}
+
+static NSString *HeartHistoryDayLabel(NSString *iso) {
+    if (!iso.length) return @"";
+    NSISO8601DateFormatter *inF = [NSISO8601DateFormatter new];
+    NSDate *when = [inF dateFromString:iso];
+    if (!when) return @"";
+    NSDateFormatter *out = [NSDateFormatter new];
+    out.dateFormat = @"d MMM";
+    return [out stringFromDate:when] ?: @"";
+}
+
+NSString *HeartHistoryTooltip(NSString *jsonl, NSString *trackKey, BOOL heartedNow) {
+    if (!trackKey.length) return @"";
+    NSDictionary *state = HeartHistoryState(jsonl, trackKey);
+    BOOL ever = [state[@"everHearted"] boolValue];
+    NSString *first = state[@"firstHeartedAt"], *last = state[@"lastChangeAt"];
+    if (heartedNow) {
+        NSString *when = HeartHistoryDayLabel(last.length ? last : first);
+        return when.length ? [NSString stringWithFormat:@"Hearted %@", when] : @"Hearted";
+    }
+    if (ever) {
+        NSMutableString *tip =
+            [NSMutableString stringWithFormat:@"Un-hearted %@", HeartHistoryDayLabel(last)];
+        NSString *firstDay = HeartHistoryDayLabel(first);
+        if (firstDay.length) [tip appendFormat:@", first hearted %@", firstDay];
+        return tip;
+    }
+    return @"";
 }
 
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at) {

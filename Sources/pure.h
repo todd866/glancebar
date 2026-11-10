@@ -878,8 +878,16 @@ NSString *SelectorFeedbackLine(NSString *artist, NSString *title, NSString *sour
 NSDictionary *LocalTrackIdentity(NSArray *stationRows, NSString *path, NSString *tagArtist, NSString *tagTitle, NSString *filename);
 // hearts.json is {"tracks":[track_key, ...]}. Adding a blank key leaves the cache unchanged.
 NSString *HeartCacheAdding(NSString *json, NSString *key);
+NSString *HeartCacheRemoving(NSString *json, NSString *key);
 BOOL HeartCacheContains(NSString *json, NSString *key);
 NSArray<NSString *> *HeartCacheKeys(NSString *json);
+// heart-history.jsonl: one {"at","action":"heart"|"unheart","trackKey",...} per line.
+NSString *HeartHistoryLine(NSString *action, NSString *trackKey, NSString *artist, NSString *title,
+                           NSString *path, NSDate *at);
+// currentlyHearted, everHearted, firstHeartedAt, lastChangeAt (ISO-8601; empty when unknown).
+NSDictionary *HeartHistoryState(NSString *jsonl, NSString *trackKey);
+NSSet<NSString *> *HeartHistoryEverHeartedKeys(NSString *jsonl);
+NSString *HeartHistoryTooltip(NSString *jsonl, NSString *trackKey, BOOL heartedNow);
 NSString *MixArtURLFromSearch(NSData *json, NSString *artist, NSUInteger px);
 // Tracks that suit the seed, best first: same artist, same family, near years, favourites
 // and plays; nothing disliked or played in the last minIdleDays (the seed's own tracks excepted).

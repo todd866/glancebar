@@ -168,6 +168,7 @@ static NSDictionary *PlaylistFixture(NSArray<NSDictionary *> *tracks, NSArray<NS
 
 @interface PlaybackController : Controller
 @property NSUInteger loveLaunches;
+@property NSUInteger unloveLaunches;
 @end
 @implementation PlaybackController
 - (void)loveCurrentLocalTrack {
@@ -179,8 +180,37 @@ static NSDictionary *PlaylistFixture(NSArray<NSDictionary *> *tracks, NSArray<NS
     if ([[self heartedKeys] containsObject:key]) return;
     self.loveLaunches++;
     [self rememberHeart:key];
+    [self appendHeartHistory:@"heart" trackKey:key artist:ident[@"artist"] title:ident[@"title"]
+                        path:ident[@"path"] ?: @""];
+}
+- (void)unloveCurrentLocalTrack {
+    if (![[self valueForKey:@"musicProbesEnabled"] boolValue]) return;
+    if ([[self valueForKey:@"localLoveInFlight"] boolValue]) return;
+    NSDictionary *ident = [self currentLocalIdentity];
+    if (![ident[@"trackKey"] length]) return;
+    NSString *key = ident[@"trackKey"];
+    if (![[self heartedKeys] containsObject:key]) return;
+    self.unloveLaunches++;
+    [self forgetHeart:key];
+    [self appendHeartHistory:@"unheart" trackKey:key artist:ident[@"artist"] title:ident[@"title"]
+                        path:ident[@"path"] ?: @""];
 }
 @end
+
+static NSUInteger HeartHistoryEventCount(NSString *home) {
+    NSString *path = [home stringByAppendingPathComponent:@".local/state/selector/heart-history.jsonl"];
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSUInteger n = 0;
+    for (NSString *line in [text ?: @"" componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet])
+        if (line.length) n++;
+    return n;
+}
+
+static BOOL HeartButtonFilled(Controller *c) {
+    NSDictionary *ident = [c currentLocalIdentity];
+    NSString *key = ident[@"trackKey"];
+    return key.length && [[c heartedKeys] containsObject:key];
+}
 
 static BOOL PlayerAdvancing(Controller *c, double minDelta, double window) {
     AVQueuePlayer *player = LocalPlayer(c);
@@ -422,18 +452,34 @@ int main(void) {
         if (urls.count != 1) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
-        // --- heart on playing track: like path once, no python ---
+        // --- heart toggle: heart → unheart → heart; history append-only ---
         if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
         [c playOfflinePlaylist:@"song:playback"];
         if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 5)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
-        if (((PlaybackController *)c).loveLaunches) Fail(__LINE__);
+        PlaybackController *pc = (PlaybackController *)c;
+        if (pc.loveLaunches || pc.unloveLaunches) Fail(__LINE__);
+        if (HeartButtonFilled(c)) Fail(__LINE__);
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.5]);
-        if (((PlaybackController *)c).loveLaunches != 1) Fail(__LINE__);
+        if (pc.loveLaunches != 1 || pc.unloveLaunches) Fail(__LINE__);
+        if (!HeartButtonFilled(c)) Fail(__LINE__);
+        NSString *heartsPath = [gFixtureHome stringByAppendingPathComponent:@".local/state/selector/hearts.json"];
+        NSString *heartsJSON = [NSString stringWithContentsOfFile:heartsPath encoding:NSUTF8StringEncoding error:nil];
+        if (!HeartCacheContains(heartsJSON, @"artist one|track one")) Fail(__LINE__);
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
-        if (((PlaybackController *)c).loveLaunches != 1) Fail(__LINE__);
+        if (pc.loveLaunches != 1 || pc.unloveLaunches != 1) Fail(__LINE__);
+        if (HeartButtonFilled(c)) Fail(__LINE__);
+        heartsJSON = [NSString stringWithContentsOfFile:heartsPath encoding:NSUTF8StringEncoding error:nil];
+        if (HeartCacheContains(heartsJSON, @"artist one|track one")) Fail(__LINE__);
+        [c musicFavorite:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
+        if (pc.loveLaunches != 2 || pc.unloveLaunches != 1) Fail(__LINE__);
+        if (!HeartButtonFilled(c)) Fail(__LINE__);
+        heartsJSON = [NSString stringWithContentsOfFile:heartsPath encoding:NSUTF8StringEncoding error:nil];
+        if (HeartCacheKeys(heartsJSON).count != 1) Fail(__LINE__);
+        if (HeartHistoryEventCount(gFixtureHome) != 3) Fail(__LINE__);
 
         // --- silent system default: player pins built-in, not the display ---
         [c tearDownLocalPlayer];

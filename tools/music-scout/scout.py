@@ -417,6 +417,22 @@ def load_hearts(path: Path) -> set[str]:
     return {normal(k) if "|" in str(k) else str(k) for k in tracks}
 
 
+def heart_history_path(cfg: dict[str, Any]) -> Path:
+    return Path(cfg["hearts_path"]).expanduser().parent / "heart-history.jsonl"
+
+
+def load_ever_hearted(path: Path) -> set[str]:
+    """Track keys that were hearted at least once (un-heart does not remove them)."""
+    out: set[str] = set()
+    for row in read_jsonl_rows(path):
+        if row.get("action") != "heart":
+            continue
+        key = row.get("trackKey") or row.get("track_key") or ""
+        if key:
+            out.add(normal(key))
+    return out
+
+
 def load_feedback(paths: list[Path]) -> dict[str, dict]:
     """Last event per track_key from feedback jsonl."""
     out: dict[str, dict] = {}
@@ -525,10 +541,15 @@ def liked_artists(cfg: dict[str, Any]) -> list[str]:
     if inv.is_file():
         for row in json.loads(inv.read_text(encoding="utf-8")).get("am_fav") or []:
             artists[normal(row.get("artist", ""))] += 3
-    hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+    hearts_path = Path(cfg["hearts_path"]).expanduser()
+    hearts = load_hearts(hearts_path)
+    ever = load_ever_hearted(heart_history_path(cfg))
     for key in hearts:
         if "|" in key:
             artists[key.split("|", 1)[0]] += 5
+    for key in ever - hearts:
+        if "|" in key:
+            artists[key.split("|", 1)[0]] += 1
     export = Path(cfg["library_export"]).expanduser()
     if export.is_dir():
         for p in export.rglob("*"):
@@ -771,6 +792,9 @@ def score_candidate(
     c: dict,
     feedback: dict[str, dict],
     artist_affinity: Counter[str],
+    *,
+    ever_hearted: set[str] | None = None,
+    current_hearts: set[str] | None = None,
 ) -> float:
     base = float(c.get("score_hint") or 0.5)
     key = track_key(c.get("artist", ""), c.get("title", ""))
@@ -780,6 +804,11 @@ def score_candidate(
         base += 0.4
     elif event in ("skip", "dislike"):
         base -= 0.5
+    nkey = normal(key)
+    hearts_now = current_hearts or set()
+    ever = ever_hearted or set()
+    if nkey in ever and nkey not in hearts_now:
+        base += 0.15
     art = normal(c.get("artist", ""))
     if artist_affinity.get(art, 0) > 0:
         base += 0.15
@@ -793,7 +822,9 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     candidates = data.get("candidates") or []
     owned = owned_keys(cfg, paths)
     feedback = load_feedback([Path(p).expanduser() for p in cfg["feedback_paths"]])
-    hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+    hearts_path = Path(cfg["hearts_path"]).expanduser()
+    hearts = load_hearts(hearts_path)
+    ever_hearted = load_ever_hearted(heart_history_path(cfg))
     artist_affinity = Counter()
     for a in liked_artists(cfg):
         artist_affinity[a] += 1
@@ -823,7 +854,9 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         if key in owned or normal(key) in hearts:
             continue
         scored = dict(c)
-        scored["score"] = score_candidate(c, feedback, artist_affinity)
+        scored["score"] = score_candidate(
+            c, feedback, artist_affinity, ever_hearted=ever_hearted, current_hearts=hearts
+        )
         scored["track_key"] = key
         if c.get("source") == "taste-expansion":
             explore_pool.append(scored)

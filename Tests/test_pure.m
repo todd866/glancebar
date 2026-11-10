@@ -2591,12 +2591,37 @@ int main(void) {
             NSString *hearts = HeartCacheAdding(nil, @"tame impala|kiss from a rose");
             NSString *again = HeartCacheAdding(hearts, @"tame impala|kiss from a rose");
             NSString *junk = HeartCacheAdding(@"not json", @"a|b");
+            NSString *removed = HeartCacheRemoving(hearts, @"tame impala|kiss from a rose");
             check(HeartCacheContains(hearts, @"tame impala|kiss from a rose") &&
                   !HeartCacheContains(hearts, @"fred again|delilah") &&
                   HeartCacheKeys(again).count == 1 &&
                   HeartCacheContains(junk, @"a|b") && !HeartCacheContains(nil, @"a|b") &&
-                  [HeartCacheKeys(HeartCacheAdding(hearts, @"")) isEqual:HeartCacheKeys(hearts)],
+                  [HeartCacheKeys(HeartCacheAdding(hearts, @"")) isEqual:HeartCacheKeys(hearts)] &&
+                  !HeartCacheContains(removed, @"tame impala|kiss from a rose"),
                   @"hearts: a key stays filled, a blank key is not stored, junk JSON still accepts a new key");
+            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+            NSDate *d1 = [iso dateFromString:@"2026-11-10T10:00:00Z"];
+            NSDate *d2 = [iso dateFromString:@"2026-11-12T08:00:00Z"];
+            NSDate *d3 = [iso dateFromString:@"2026-11-13T09:00:00Z"];
+            NSString *k = @"artist one|track one";
+            NSMutableString *hist = [NSMutableString string];
+            [hist appendFormat:@"%@\n", HeartHistoryLine(@"heart", k, @"Artist One", @"Track One", @"/a.m4a", d1)];
+            [hist appendFormat:@"%@\n", HeartHistoryLine(@"unheart", k, @"Artist One", @"Track One", @"/a.m4a", d2)];
+            [hist appendString:HeartHistoryLine(@"heart", k, @"Artist One", @"Track One", @"/a.m4a", d3)];
+            NSDictionary *after = HeartHistoryState(hist, k);
+            check([after[@"currentlyHearted"] boolValue] && [after[@"everHearted"] boolValue] &&
+                  [after[@"firstHeartedAt"] isEqual:@"2026-11-10T10:00:00Z"] &&
+                  [after[@"lastChangeAt"] isEqual:@"2026-11-13T09:00:00Z"] &&
+                  [HeartHistoryEverHeartedKeys(hist) containsObject:k] &&
+                  [HeartHistoryTooltip(hist, k, YES) isEqual:@"Hearted 13 Nov"] &&
+                  [HeartHistoryTooltip(hist, @"nope|x", NO) isEqual:@""],
+                  @"heart history: last event sets current; ever hearted survives un-heart");
+            NSMutableString *midHist = [NSMutableString string];
+            [midHist appendFormat:@"%@\n", HeartHistoryLine(@"heart", k, @"Artist One", @"Track One", @"/a.m4a", d1)];
+            [midHist appendString:HeartHistoryLine(@"unheart", k, @"Artist One", @"Track One", @"/a.m4a", d2)];
+            check(![HeartHistoryState(midHist, k)[@"currentlyHearted"] boolValue] &&
+                  [HeartHistoryTooltip(midHist, k, NO) hasPrefix:@"Un-hearted 12 Nov"],
+                  @"heart history: un-hearted tooltip names first and last heart");
         }
         // Worker readiness.
         {

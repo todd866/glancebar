@@ -242,6 +242,23 @@ class ScoutLogicTests(unittest.TestCase):
         doc = json.loads(self.paths.source_stats.read_text(encoding="utf-8"))
         self.assertTrue(doc["sources"]["triplej"]["flagged_dead"])
 
+    def test_unhearted_ever_hearted_is_weak_positive_not_penalty(self):
+        key = scout.track_key("Band", "Song")
+        base = scout.score_candidate(
+            {"artist": "Band", "title": "Song"},
+            {scout.normal(key): {"event": "skip"}},
+            scout.Counter(),
+        )
+        with_ever = scout.score_candidate(
+            {"artist": "Band", "title": "Song"},
+            {scout.normal(key): {"event": "skip"}},
+            scout.Counter(),
+            ever_hearted={scout.normal(key)},
+            current_hearts=set(),
+        )
+        self.assertLess(base, 0.5)
+        self.assertGreater(with_ever, base)
+
     def test_publish_graduation_and_age_out(self):
         hearts_path = self.root / "hearts.json"
         hearts_path.write_text(json.dumps({"tracks": [scout.track_key("Hearted", "Song")]}), encoding="utf-8")
