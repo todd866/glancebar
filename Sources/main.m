@@ -5416,6 +5416,7 @@ static int OutputChannelCount(AudioObjectID device) {
     free(streams);
     return channels;
 }
+static BOOL DeviceHasVolumeControl(AudioObjectID device);
 static NSArray<NSDictionary *> *ReadAudioDevices(void) {
     AudioObjectPropertyAddress addr = AudioAddr(kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal);
     UInt32 size = 0;
@@ -5439,7 +5440,8 @@ static NSArray<NSDictionary *> *ReadAudioDevices(void) {
         [rows addObject:@{
             @"uid": uid, @"name": name, @"transport": @(GlanceTransport(transport)),
             @"outputChannels": @(OutputChannelCount(devices[i])), @"deviceID": @(devices[i]),
-            @"dataSource": AudioDataSourceName(devices[i]) ?: @""
+            @"dataSource": AudioDataSourceName(devices[i]) ?: @"",
+            @"volumeControllable": @(DeviceHasVolumeControl(devices[i]))
         }];
     }
     free(devices);
@@ -5479,6 +5481,20 @@ static NSArray<NSNumber *> *OutputVolumeElements(AudioObjectID device) {
         if (AudioObjectHasProperty(device, &a)) [out addObject:@(e)];
     }
     return out;
+}
+static BOOL DeviceHasVolumeControl(AudioObjectID device) {
+    if (!device) return NO;
+    AudioObjectPropertyAddress a = {kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+                                    kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+    Boolean settable = false;
+    if (AudioObjectHasProperty(device, &a) && AudioObjectIsPropertySettable(device, &a, &settable) == noErr && settable)
+        return YES;
+    for (NSNumber *e in OutputVolumeElements(device)) {
+        AudioObjectPropertyAddress ch = {kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyScopeOutput, e.unsignedIntValue};
+        if (AudioObjectHasProperty(device, &ch) && AudioObjectIsPropertySettable(device, &ch, &settable) == noErr && settable)
+            return YES;
+    }
+    return NO;
 }
 // 0…1, or -1 when the device has no volume control; *muted from the device's mute switch.
 static double ReadOutputVolume(AudioObjectID device, BOOL *muted) {
@@ -5872,6 +5888,10 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     NSArray<NSString *> *_offlineTracks;
     CFAbsoluteTime _offlineTracksAt;
     BOOL _offlineTracksReady;
+    BOOL _offlineTracksScanBusy;
+    dispatch_queue_t _offlineTracksQueue;
+    NSMutableDictionary<NSString *, NSDictionary *> *_offlineCoverageCache;
+    NSInteger _localQueueEnd;
     double _trackElapsed, _trackDuration;
     CFAbsoluteTime _trackSampledAt;
     NSTimer *_trackTick;
@@ -6052,6 +6072,7 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     _mixPreparing = [NSMutableSet set];
     _mixArt = [NSMutableDictionary dictionary];
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
+    _offlineTracksQueue = dispatch_queue_create("glancebar.offline-tracks", DISPATCH_QUEUE_SERIAL);
     _remote = [NSMutableDictionary dictionary];
     _remoteInFlight = [NSMutableSet set];
     [self startNetworkMonitor];
@@ -6110,7 +6131,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _playerOutputName = [ud stringForKey:kPlayerOutputNameKey];
     if (![_playerOutputName isKindOfClass:NSString.class]) _playerOutputName = @"";
     __weak Controller *weakSelf = self;
-    GBFineVolumeSetTargetProvider(^AudioObjectID { return [weakSelf playerOutputDeviceID]; });
+    GBFineVolumeSetTargetProvider(^AudioObjectID { return [weakSelf fineVolumeTargetDeviceID]; });
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(musicPlayerInfo:)
         name:@"com.apple.Music.playerInfo" object:nil];
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(spotifyPlaybackChanged:)
@@ -6169,9 +6190,17 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self refreshOutputVolume];
     if (_popover.isShown) [self rebuildContent];
 }
+- (AudioObjectID)fineVolumeTargetDeviceID {
+    if (!_localPlayer || _localPlayer.rate <= 0) return kAudioObjectUnknown;
+    NSDictionary *defaultDevice = nil;
+    for (NSDictionary *row in _audioDevices)
+        if ([row[@"uid"] isEqual:_defaultOutputUID]) { defaultDevice = row; break; }
+    if (AudioOutputKind(defaultDevice) == GlanceAudioOutputKindAudibleControllable) return kAudioObjectUnknown;
+    return [self playerOutputDeviceID];
+}
 - (void)applyPlayerAudioOutput {
     NSDictionary *choice = [self playerOutputChoice];
-    NSString *uid = [choice[@"system"] boolValue] ? nil : choice[@"effectiveUID"];
+    NSString *uid = [choice[@"followsSystemDefault"] boolValue] ? nil : choice[@"effectiveUID"];
     if (!uid.length) uid = nil;
     AVQueuePlayer *lp = _localPlayer, *out = _localOutgoing;
     for (AVQueuePlayer *player in (lp && out ? @[lp, out] : lp ? @[lp] : out ? @[out] : @[])) {
@@ -6366,9 +6395,33 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // Requests are durable, fixed playlist snapshots. Play uses verified on-disk files in order;
 // missing entries are skipped. Tiles are unavailable only when nothing is on this Mac.
 - (NSString *)offlinePrimaryKey { return [@"playlist:" stringByAppendingString:[self appleMusicPlaylistName]]; }
+- (NSString *)offlineCoverageCacheKey:(NSString *)key {
+    return [NSString stringWithFormat:@"%@|%lu|%lu", key ?: @"", (unsigned long)_offlineRequestsGeneration,
+            (unsigned long)(_offlineManifest ? _offlineManifest.hash : 0)];
+}
+- (void)invalidateOfflineCoverageCache {
+    [_offlineCoverageCache removeAllObjects];
+}
 - (NSDictionary *)offlineCoverage:(NSString *)key verifyHash:(BOOL)verifyHash {
-    return OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest,
-        [GBHomeDirectory() stringByAppendingPathComponent:@"Music"], verifyHash);
+    if (verifyHash) {
+        return OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest,
+            [GBHomeDirectory() stringByAppendingPathComponent:@"Music"], verifyHash);
+    }
+    NSString *cacheKey = [self offlineCoverageCacheKey:key];
+    NSDictionary *cached = _offlineCoverageCache[cacheKey];
+    if (cached) return cached;
+    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    __block NSDictionary *computed = nil;
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        computed = OfflinePlaylistCoverage(request, manifest, root, NO);
+    });
+    if (!computed) {
+        computed = @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
+    }
+    if (!_offlineCoverageCache) _offlineCoverageCache = [NSMutableDictionary dictionary];
+    _offlineCoverageCache[cacheKey] = computed;
+    return computed;
 }
 - (NSString *)offlineStatus:(NSDictionary *)coverage {
     NSUInteger total = [coverage[@"total"] unsignedIntegerValue], available = [coverage[@"available"] unsignedIntegerValue];
@@ -6686,6 +6739,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             self->_offlineCacheBusy = NO;
             if (manifest) {
                 self->_offlineManifest = manifest;
+                [self invalidateOfflineCoverageCache];
                 [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
                 [self retryUnpreparedMixSeeds];
                 [self maybeSwapMixSeedsNext];
@@ -6711,6 +6765,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
     if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
         _offlineRequestsGeneration++;
+        [self invalidateOfflineCoverageCache];
         [self libraryRefreshScheduleAfterRequestSave];
     }
 }
@@ -7025,28 +7080,61 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     });
     nw_path_monitor_start(monitor);
 }
+static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
+    NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
+        includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *url in urls) {
+        if (!url.path.length) continue;
+        if ([LikedMusicAudioFiles(@[url.path]) count]) [paths addObject:url.path];
+    }
+    return paths;
+}
+- (void)scheduleOfflineTrackScan {
+    if (_offlineTracksScanBusy) return;
+    _offlineTracksScanBusy = YES;
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
+    dispatch_async(_offlineTracksQueue, ^{
+        NSArray<NSString *> *paths = ScanLikedMusicDirectory(dir);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_offlineTracks = paths;
+            self->_offlineTracksAt = CFAbsoluteTimeGetCurrent();
+            self->_offlineTracksReady = YES;
+            self->_offlineTracksScanBusy = NO;
+        });
+    });
+}
+- (NSArray<NSString *> *)offlineTrackPathsBlockingRefresh {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL entering = _offlineTracksEntering;
+    _offlineTracksEntering = NO;
+    NSTimeInterval age = _offlineTracksReady ? now - _offlineTracksAt : 0;
+    if (!OfflineTrackListStale(_offlineTracksReady, entering, age)) return _offlineTracks ?: @[];
+    if (_offlineTracksScanBusy) {
+        __block NSArray<NSString *> *paths = nil;
+        dispatch_sync(_offlineTracksQueue, ^{ paths = ScanLikedMusicDirectory(
+            [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"]); });
+        _offlineTracks = paths;
+        _offlineTracksAt = CFAbsoluteTimeGetCurrent();
+        _offlineTracksReady = YES;
+        return paths ?: @[];
+    }
+    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
+    __block NSArray<NSString *> *paths = nil;
+    dispatch_sync(_offlineTracksQueue, ^{ paths = ScanLikedMusicDirectory(dir); });
+    _offlineTracks = paths;
+    _offlineTracksAt = CFAbsoluteTimeGetCurrent();
+    _offlineTracksReady = YES;
+    return paths ?: @[];
+}
 - (NSArray<NSString *> *)offlineTrackPaths {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     BOOL entering = _offlineTracksEntering;
     _offlineTracksEntering = NO;
     NSTimeInterval age = _offlineTracksReady ? now - _offlineTracksAt : 0;
-    // Rebuilding the popover used to list the folder every time. Refresh on the way
-    // into offline playback, and otherwise at most once a minute.
     if (!OfflineTrackListStale(_offlineTracksReady, entering, age)) return _offlineTracks ?: @[];
-    NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/YouTube Liked"];
-    NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
-        includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
-    NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
-    for (NSURL *url in urls) {
-        if (!url.path.length) continue;
-        NSString *path = url.path;
-        if ([LikedMusicAudioFiles(@[path]) count] && [OfflinePathsCoverage(@[path], root)[@"paths"] count]) [paths addObject:path];
-    }
-    _offlineTracks = paths;
-    _offlineTracksAt = CFAbsoluteTimeGetCurrent();
-    _offlineTracksReady = YES;
-    return _offlineTracks;
+    [self scheduleOfflineTrackScan];
+    return _offlineTracks ?: @[];
 }
 - (void)publishNowPlaying {
     if (!_localMode) return;
@@ -7103,11 +7191,31 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(localItemEnded:)
                                                    name:AVPlayerItemDidPlayToEndTimeNotification object:item];
 }
+static const NSInteger kLocalPlayerQueueAhead = 8;
 - (NSArray<AVPlayerItem *> *)localItemsFromIndex:(NSInteger)index {
     NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
-    for (NSInteger i = index; i < (NSInteger)_localURLs.count; i++)
+    NSInteger end = MIN((NSInteger)_localURLs.count, index + kLocalPlayerQueueAhead);
+    for (NSInteger i = index; i < end; i++)
         [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
+    _localQueueEnd = end;
     return items;
+}
+- (void)extendLocalPlayerQueueIfNeeded {
+    if (!_localPlayer || !_localURLs.count || _localQueueEnd >= (NSInteger)_localURLs.count) return;
+    NSURL *url = _localURLs[_localQueueEnd];
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    [_localPlayer insertItem:item afterItem:nil];
+    NSMutableArray *observed = [_localObservedItems mutableCopy] ?: [NSMutableArray array];
+    [observed addObject:item];
+    _localObservedItems = observed;
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(localItemEnded:)
+                                               name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    _localQueueEnd++;
+}
+- (void)maintainLocalPlayerQueue {
+    if (!_localPlayer || !_localURLs.count) return;
+    while (_localQueueEnd < (NSInteger)_localURLs.count && _localPlayer.items.count < kLocalPlayerQueueAhead)
+        [self extendLocalPlayerQueueIfNeeded];
 }
 - (NSInteger)wrappedLocalIndex:(NSInteger)index {
     NSInteger n = (NSInteger)_localURLs.count;
@@ -7195,6 +7303,11 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     _localIndex = next;
     _playbackKnown = YES;
     _playbackPlaying = YES;
+    [self maintainLocalPlayerQueue];
+    if (!_localPlayer.currentItem && _localQueueEnd < (NSInteger)_localURLs.count) {
+        [self extendLocalPlayerQueueIfNeeded];
+        [_localPlayer play];
+    }
     [self applyLocalItemURL:_localURLs[_localIndex]];
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
@@ -7227,6 +7340,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     _localEmpty = NO;
     _playbackKnown = YES;
     _playbackPlaying = YES;
+    [self maintainLocalPlayerQueue];
     [self applyLocalItemURL:_localURLs[index]];
     [self enableRemoteCommands];
     [_localPlayer play];
@@ -7291,7 +7405,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     if (!_musicProbesEnabled) return;
     _mixPlayingKey = nil;
     [self disableRemoteCommands];
-    NSArray<NSString *> *paths = [self offlineTrackPaths];
+    NSArray<NSString *> *paths = [self offlineTrackPathsBlockingRefresh];
     if (!paths.count) {
         [self tearDownLocalPlayer];
         _localMode = NO;
@@ -8293,7 +8407,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [line addSubview:output];
     CGFloat sliderX = NSMaxX(output.frame) + 4;
     CGFloat sliderW = kW - kPad - levelW - 4 - sliderX;
-    BOOL known = _outputVolume >= 0 && [choice[@"effectiveUID"] length];
+    BOOL known = [choice[@"volumeControllable"] boolValue] && _outputVolume >= 0 && [choice[@"effectiveUID"] length];
     BOOL showMute = _musicSilentQA || (known && _outputMuted);
     NSImageView *speaker = [NSImageView imageViewWithImage:[[NSImage imageWithSystemSymbolName:showMute ? @"speaker.slash" : @"speaker.wave.2" accessibilityDescription:nil]
         imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular]]];
@@ -8371,9 +8485,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     button.alignment = NSTextAlignmentLeft;
     button.imageScaling = NSImageScaleProportionallyDown;
     button.contentTintColor = NSColor.secondaryLabelColor;
-    NSString *title = [choice[@"system"] boolValue] || !_playerOutputUID.length
-        ? [NSString stringWithFormat:@" System → %@", choice[@"name"]]
-        : [NSString stringWithFormat:@" %@", choice[@"name"]];
+    NSString *title = [NSString stringWithFormat:@" %@", choice[@"name"]];
     button.attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
         NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
     ((NSButtonCell *)button.cell).wraps = NO;
@@ -8382,10 +8494,19 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     button.accessibilityIdentifier = @"popover.sound";
     NSString *label = _playerOutputUID.length
         ? [NSString stringWithFormat:@"Player output, %@", choice[@"name"]]
-        : [NSString stringWithFormat:@"Player output, System, %@", choice[@"name"]];
+        : [NSString stringWithFormat:@"Player output, %@", choice[@"name"]];
     button.accessibilityLabel = label;
-    button.accessibilityHelp = [choice[@"note"] length] ? choice[@"note"]
-        : @"Choose where Glancebar's player plays. Other apps stay on the Mac's output.";
+    NSString *help = [choice[@"note"] length] ? choice[@"note"] : @"";
+    if ([choice[@"diverged"] boolValue] && [choice[@"systemDefaultName"] length]) {
+        NSString *tip = [NSString stringWithFormat:@"Mac output is %@ (no volume control)",
+                         choice[@"systemDefaultName"]];
+        help = help.length ? [NSString stringWithFormat:@"%@\n%@", help, tip] : tip;
+    } else if (!help.length) {
+        help = @"Choose where Glancebar's player plays. Other apps stay on the Mac's output.";
+    }
+    button.toolTip = [choice[@"diverged"] boolValue] && [choice[@"systemDefaultName"] length]
+        ? [NSString stringWithFormat:@"Mac output is %@ (no volume control)", choice[@"systemDefaultName"]] : nil;
+    button.accessibilityHelp = help;
     return button;
 }
 - (IBAction)cycleOutput:(id)sender {
