@@ -6408,19 +6408,25 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             [GBHomeDirectory() stringByAppendingPathComponent:@"Music"], verifyHash);
     }
     NSString *cacheKey = [self offlineCoverageCacheKey:key];
-    NSDictionary *cached = _offlineCoverageCache[cacheKey];
-    if (cached) return cached;
     NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
     NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSDictionary *cached = _offlineCoverageCache[cacheKey];
+    if (cached) {
+        NSArray *disk = OfflinePlaylistDiskFingerprints(request, manifest, root);
+        if ([disk isEqual:cached[@"fingerprints"]]) return cached[@"coverage"];
+    }
     __block NSDictionary *computed = nil;
+    __block NSArray *fingerprints = nil;
     dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         computed = OfflinePlaylistCoverage(request, manifest, root, NO);
+        fingerprints = OfflinePlaylistDiskFingerprints(request, manifest, root);
     });
     if (!computed) {
         computed = @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
+        fingerprints = @[];
     }
     if (!_offlineCoverageCache) _offlineCoverageCache = [NSMutableDictionary dictionary];
-    _offlineCoverageCache[cacheKey] = computed;
+    _offlineCoverageCache[cacheKey] = @{@"coverage": computed, @"fingerprints": fingerprints ?: @[]};
     return computed;
 }
 - (NSString *)offlineStatus:(NSDictionary *)coverage {

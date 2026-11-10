@@ -96,6 +96,40 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
             @"complete": @(complete), @"paths": paths};
 }
 
+static NSDictionary *OfflineManifestEntry(NSDictionary *request, NSDictionary *manifest) {
+    NSString *key = [request[@"key"] isKindOfClass:NSString.class] ? request[@"key"] : @"";
+    if (!key.length || ![manifest[@"schemaVersion"] isEqual:@1] ||
+        ![manifest[@"playlists"] isKindOfClass:NSArray.class])
+        return nil;
+    for (id candidate in manifest[@"playlists"])
+        if ([candidate isKindOfClass:NSDictionary.class] && [candidate[@"key"] isEqual:key]) return candidate;
+    return nil;
+}
+
+NSArray *OfflinePlaylistDiskFingerprints(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot) {
+    NSDictionary *entry = OfflineManifestEntry(request, manifest);
+    NSArray *records = [entry[@"tracks"] isKindOfClass:NSArray.class] ? entry[@"tracks"] : @[];
+    NSMutableArray *fingerprints = [NSMutableArray arrayWithCapacity:records.count];
+    for (id record in records) {
+        if (![record isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = [record[@"path"] isKindOfClass:NSString.class] ? record[@"path"] : @"";
+        if (!path.length) continue;
+        struct stat st;
+        if (!OfflineStat(path, musicRoot, &st)) {
+            [fingerprints addObject:@{@"path": path, @"missing": @YES}];
+            continue;
+        }
+        [fingerprints addObject:@{
+            @"path": path,
+            @"inode": [NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino],
+            @"sizeBytes": @(st.st_size),
+            @"mtimeNs": [NSString stringWithFormat:@"%lld",
+                (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec],
+        }];
+    }
+    return fingerprints;
+}
+
 BOOL MusicSilentQAEnabled(void) {
     const char *env = getenv("GLANCEBAR_SILENT_QA");
     if (env && env[0] && strcmp(env, "0") != 0) return YES;

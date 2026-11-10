@@ -906,6 +906,8 @@ NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *pat
 // complete is YES when every requested track is present in order. Fast UI checks validate identity, size, inode and
 // nanosecond mtime; playback uses verifyHash.
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash);
+// Current size, inode and nanosecond mtime for each manifest record path; used to invalidate UI coverage cache.
+NSArray *OfflinePlaylistDiskFingerprints(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot);
 NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);
 // Seed / New music tiles: wait for fetch unless sync reports it cannot continue; then partial play is allowed.
 NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch);
