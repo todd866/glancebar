@@ -362,6 +362,18 @@ None of this runs while the display is asleep: with the lid shut, the window lis
 none of the app's own windows, which is indistinguishable from having been evicted, so
 Glancebar holds its width and re-measures when the display comes back.
 
+## The rest of the setup
+
+Glancebar is one piece of a larger setup for running several Macs and several AI subscriptions
+side by side. The other public piece:
+
+- [Energybar](https://github.com/todd866/energybar): a native menu-bar monitor for solar,
+  grid, EV charging and vehicle state. It shares Glancebar's visual language.
+
+The machine-sharing tools Glancebar reads from and feeds (slot limiting, cross-Mac agent mail,
+disk maps, the morning check) are being prepared for release as a separate repository; it
+will be linked here when it is public.
+
 ## Credits
 
 Built by Claude (Anthropic) and Codex (OpenAI), working from Ian Todd's brief and
