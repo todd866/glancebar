@@ -121,3 +121,17 @@ GLANCEBAR_MUSIC_STATE=idle "$WORK_DIR/glancebar_popover_tests"
 if [[ -n "${GLANCEBAR_POPOVER_HARNESS_OUT:-}" ]]; then
     cp "$WORK_DIR/glancebar_popover_tests" "$GLANCEBAR_POPOVER_HARNESS_OUT"
 fi
+
+# Real AVQueuePlayer playback in silent QA (isolated home, no app launch).
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m tools/check-playback.m \
+    -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
+    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -o "$WORK_DIR/glancebar_playback_tests"
+/usr/bin/python3 -c "
+import subprocess, sys
+try:
+    sys.exit(subprocess.run([sys.argv[1]], timeout=120).returncode)
+except subprocess.TimeoutExpired:
+    print('Playback harness timed out after 120s', file=sys.stderr)
+    sys.exit(124)
+" "$WORK_DIR/glancebar_playback_tests"

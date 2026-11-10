@@ -1347,7 +1347,7 @@ int main(int argc, const char **argv) {
             [c rebuildContent];
             root = p.contentViewController.view;
             NSView *playingOut = FindIdentifier(root, @"popover.sound");
-            if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+            if (!SoundRow(root, @"Midnight City", @"M83", YES) || !FitsChildren(root) ||
                 ![playingOut.accessibilityHelp containsString:@"Glancebar's player"] ||
                 ![playingOut.accessibilityLabel isEqual:@"Player output, MacBook Air Speakers"] ||
                 !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
@@ -1444,7 +1444,7 @@ int main(int argc, const char **argv) {
             NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
             NSButton *thumb = (NSButton *)FindIdentifier(root, @"popover.music.thumbsup");
             NSView *title = FindIdentifier(root, @"popover.music.title");
-            if (!SoundRow(root, @"Kiss from a Rose", @"Tame Impala · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+            if (!SoundRow(root, @"Kiss from a Rose", @"Tame Impala", YES) || !FitsChildren(root) ||
                 ![heart isKindOfClass:NSButton.class] || ![thumb isKindOfClass:NSButton.class] ||
                 ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
                 ![thumb.accessibilityLabel isEqual:@"Thumbs-up: mixes should play more like this"] ||

@@ -5586,6 +5586,10 @@ static int RunAppleScriptBlocking(NSString *source, int seconds, BOOL hardKill,
 }
 static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status));
 static void RunAppleScript(NSString *source, void (^done)(NSString *output, NSString *errorText, int status)) {
+    if (getenv("GLANCEBAR_STUB_APPLESCRIPT")) {
+        if (done) dispatch_async(dispatch_get_main_queue(), ^{ done(@"", @"", 0); });
+        return;
+    }
     RunAppleScriptTimed(source, kVolumeScriptSec, done);
 }
 static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSString *output, NSString *errorText, int status)) {
@@ -6027,6 +6031,7 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
     _musicSilentQA = MusicSilentQAEnabled();
     if (_musicSilentQA) GBLog("music: silent QA mode — player volume forced to 0");
+    if (getenv("GLANCEBAR_MIX_FROZEN")) _mixFrozen = YES;
     _outputVolume = -1;
     _mixPrepared = [NSMutableDictionary dictionary];
     _mixPreparing = [NSMutableSet set];
@@ -6153,11 +6158,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSDictionary *choice = [self playerOutputChoice];
     NSString *uid = [choice[@"system"] boolValue] ? nil : choice[@"effectiveUID"];
     if (!uid.length) uid = nil;
-    for (AVQueuePlayer *player in @[_localPlayer, _localOutgoing])
-        if (player) {
-            player.audioOutputDeviceUniqueID = uid;
-            player.muted = _musicSilentQA;
-        }
+    AVQueuePlayer *lp = _localPlayer, *out = _localOutgoing;
+    for (AVQueuePlayer *player in (lp && out ? @[lp, out] : lp ? @[lp] : out ? @[out] : @[])) {
+        player.audioOutputDeviceUniqueID = uid;
+        player.muted = _musicSilentQA;
+    }
 }
 - (NSDictionary *)playerOutputChoice {
     [self ensureAudioDisplay];
@@ -6711,7 +6716,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             for (NSDictionary *seed in self->_mixSeeds) if ([seed[@"key"] isEqual:key]) current = YES;
             NSArray *paths = verified[@"paths"];
             if (self->_musicProbesEnabled && !self->_musicOff && current && paths.count &&
-                [self->_offlineRequests[key] isEqual:request] && manifest == self->_offlineManifest) {
+                [self->_offlineRequests[key] isEqual:request] && [manifest isEqual:self->_offlineManifest]) {
                 self->_musicNote = nil;
                 self->_mixPlayingKey = key;
                 [self playLocalPaths:paths];
@@ -7507,9 +7512,14 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
             slider.doubleValue = MIN(MAX(elapsed, 0), _trackDuration);
     }
     if (!_localMode) return;
+    NSString *artist = _localArtist;
+    if (_trackDuration > 0) {
+        subtitle.stringValue = artist.length ? artist : @"";
+        subtitle.accessibilityLabel = subtitle.stringValue;
+        return;
+    }
     NSString *time = FormatTrackTime(elapsed, _trackDuration);
     if (!time.length) return;
-    NSString *artist = _localArtist;
     subtitle.stringValue = artist.length ? [NSString stringWithFormat:@"%@ · %@", artist, time] : time;
     subtitle.accessibilityLabel = subtitle.stringValue;   // VoiceOver reads the label, not the text
 }
@@ -7637,6 +7647,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     } else if (!loaded) {
         NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
         subtitleText = [self offlineStatus:coverage];
+    } else if (_trackDuration > 0) {
+        subtitleText = trackArtist.length ? trackArtist : @"";
     } else if (trackArtist.length && time.length) {
         subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
     } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
