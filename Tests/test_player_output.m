@@ -7,28 +7,50 @@ static void Check(BOOL yes, NSString *message) {
     if (!yes) { fprintf(stderr, "FAIL: %s\n", message.UTF8String); exit(1); }
 }
 
-static NSDictionary *Dev(NSString *uid, NSString *name) {
-    return @{@"uid": uid, @"name": name, @"transport": @(GlanceAudioTransportBluetooth),
-             @"outputChannels": @2, @"deviceID": @(42)};
+static NSDictionary *Dev(NSString *uid, NSString *name, GlanceAudioTransport transport, BOOL volumeControllable) {
+    return @{@"uid": uid, @"name": name, @"transport": @(transport),
+             @"outputChannels": @2, @"deviceID": @(42), @"volumeControllable": @(volumeControllable)};
 }
 
 int main(void) { @autoreleasepool {
-    NSDictionary *builtin = Dev(@"BuiltInSpeakerDevice", @"MacBook Air Speakers");
-    NSDictionary *bose = Dev(@"bose", @"Bose Flex SoundLink");
+    NSDictionary *builtin = Dev(@"BuiltInSpeakerDevice", @"MacBook Air Speakers", GlanceAudioTransportBuiltIn, YES);
+    NSDictionary *bose = Dev(@"bose", @"Bose Flex SoundLink", GlanceAudioTransportBluetooth, YES);
+    NSDictionary *display = Dev(@"dell", @"DELL U2424HE", GlanceAudioTransportDisplay, NO);
+
+    Check(AudioOutputKind(builtin) == GlanceAudioOutputKindAudibleControllable, @"built-in is controllable");
+    Check(AudioOutputKind(bose) == GlanceAudioOutputKindAudibleControllable, @"Bluetooth is controllable");
+    Check(AudioOutputKind(display) == GlanceAudioOutputKindUncontrolled, @"display without volume is uncontrolled");
 
     NSDictionary *system = PlayerOutputChoice(@"", @"", @[builtin, bose], builtin[@"uid"]);
     Check([system[@"system"] boolValue] && [system[@"effectiveUID"] isEqual:builtin[@"uid"]],
           @"empty choice follows the system default");
-    Check([system[@"choiceUID"] isEqual:@""], @"system choice uid stays empty");
+    Check([system[@"followsSystemDefault"] boolValue], @"controllable default follows system");
+    Check(![system[@"diverged"] boolValue], @"no divergence on built-in default");
+
+    NSDictionary *silentDefault = PlayerOutputChoice(@"", @"", @[builtin, display], display[@"uid"]);
+    Check([silentDefault[@"effectiveUID"] isEqual:builtin[@"uid"]],
+          @"System skips an uncontrolled default to built-in speakers");
+    Check(![silentDefault[@"followsSystemDefault"] boolValue], @"must pin built-in when default is silent");
+    Check([silentDefault[@"diverged"] boolValue], @"diverged from silent default");
 
     NSDictionary *pinned = PlayerOutputChoice(bose[@"uid"], bose[@"name"], @[builtin, bose], builtin[@"uid"]);
     Check(![pinned[@"system"] boolValue] && [pinned[@"effectiveUID"] isEqual:bose[@"uid"]],
           @"a connected device is used directly");
 
+    NSDictionary *pinnedDisplay = PlayerOutputChoice(display[@"uid"], display[@"name"],
+                                                     @[builtin, display], builtin[@"uid"]);
+    Check(![pinnedDisplay[@"volumeControllable"] boolValue], @"explicit display shows em dash volume");
+
     NSDictionary *missing = PlayerOutputChoice(bose[@"uid"], bose[@"name"], @[builtin], builtin[@"uid"]);
     Check([missing[@"system"] boolValue] && [missing[@"choiceUID"] isEqual:bose[@"uid"]],
           @"missing device falls back to system but remembers the choice");
     Check([missing[@"note"] containsString:@"Bose Flex"], @"absent device names the remembered speaker");
+
+    NSDictionary *displayDev = @{@"uid": @"hdmi", @"name": @"Living Room TV", @"transport": @(GlanceAudioTransportDisplay),
+                                 @"outputChannels": @2};
+    NSDictionary *mac = Dev(@"mac", @"MacBook Air Speakers", GlanceAudioTransportBuiltIn, YES);
+    Check(ChooseNewOutputDevice(@[mac], @[mac, displayDev], YES) == nil,
+          @"switch to new outputs never adopts an uncontrolled device");
 
     NSArray *choices = PlayerOutputMenuChoices(@[builtin, bose], builtin[@"uid"]);
     Check(choices.count == 3, @"menu is System plus each output");

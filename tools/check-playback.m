@@ -12,6 +12,7 @@
 #import <math.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/stat.h>
+#import <unistd.h>
 #import <signal.h>
 
 static NSString *gFixtureHome;
@@ -198,6 +199,30 @@ static NSSlider *SeekSlider(double seconds) {
     slider.doubleValue = seconds;
     return slider;
 }
+@interface StallWatch : NSObject
+@property double worstMs;
+@property NSTimer *timer;
+@property CFAbsoluteTime nextFire;
+@end
+@implementation StallWatch
+- (void)tick:(NSTimer *)t {
+    (void)t;
+    double lateMs = (CFAbsoluteTimeGetCurrent() - self.nextFire) * 1000.0;
+    if (lateMs > self.worstMs) self.worstMs = lateMs;
+    self.nextFire = CFAbsoluteTimeGetCurrent() + 0.05;
+}
+- (void)start {
+    self.worstMs = 0;
+    self.nextFire = CFAbsoluteTimeGetCurrent() + 0.05;
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:self selector:@selector(tick:)
+                                                userInfo:nil repeats:YES];
+}
+- (void)stop {
+    [self.timer invalidate];
+    self.timer = nil;
+}
+@end
+
 static NSArray<NSString *> *GenerateTracks(NSString *musicRoot, NSArray<NSDictionary *> *specs) {
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
     [NSFileManager.defaultManager createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
@@ -356,10 +381,12 @@ int main(void) {
 
         // --- output device fallback ---
         [c setValue:@[@{@"uid": @"builtin", @"name": @"Built-in", @"transport": @(GlanceAudioTransportBuiltIn),
-                        @"outputChannels": @2, @"dataSource": @""}] forKey:@"audioDevices"];
+                        @"outputChannels": @2, @"volumeControllable": @YES, @"dataSource": @""}]
+              forKey:@"audioDevices"];
         [c setValue:@"builtin" forKey:@"defaultOutputUID"];
         [c setPlayerOutputChoiceUID:@"missing-output-uid" name:@"Missing"];
         if (LocalPlayer(c).audioOutputDeviceUniqueID.length) Fail(__LINE__);
+        if (LocalPlayer(c).rate <= 0) [LocalPlayer(c) play];
         if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
@@ -407,6 +434,67 @@ int main(void) {
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
         if (((PlaybackController *)c).loveLaunches != 1) Fail(__LINE__);
+
+        // --- silent system default: player pins built-in, not the display ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        NSDictionary *builtinOut = @{@"uid": @"builtin", @"name": @"MacBook Air Speakers",
+                                     @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2,
+                                     @"deviceID": @1, @"volumeControllable": @YES, @"dataSource": @""};
+        NSDictionary *dellOut = @{@"uid": @"dell", @"name": @"DELL U2424HE",
+                                  @"transport": @(GlanceAudioTransportDisplay), @"outputChannels": @2,
+                                  @"deviceID": @99, @"volumeControllable": @NO, @"dataSource": @""};
+        [c setValue:@[builtinOut, dellOut] forKey:@"audioDevices"];
+        [c setValue:@"dell" forKey:@"defaultOutputUID"];
+        [c setPlayerOutputChoiceUID:@"" name:@""];
+        if (![[c playerOutputChoice][@"effectiveUID"] isEqual:@"builtin"]) Fail(__LINE__);
+        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
+        [c playOfflinePlaylist:@"song:playback"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 8)) Fail(__LINE__);
+        NSString *playerUID = LocalPlayer(c).audioOutputDeviceUniqueID;
+        if (![playerUID isEqual:@"builtin"]) Fail(__LINE__);
+
+        // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        NSDictionary *bulkSpec = @{@"id": @"T0", @"title": @"Bulk Zero", @"artist": @"Bulk", @"album": @""};
+        NSArray *bulkPaths = GenerateTracks(musicRoot, @[bulkSpec]);
+        if (bulkPaths.count != 1) Fail(__LINE__);
+        NSString *seedPath = bulkPaths[0];
+        // 2,000 queue slots (one on-disk file); exercises queue-window arithmetic without
+        // materializing 2,000 distinct paths (hard links / clonefile are flaky on some volumes).
+        NSMutableArray<NSString *> *massPaths = [NSMutableArray arrayWithCapacity:2000];
+        for (NSInteger i = 0; i < 2000; i++) [massPaths addObject:seedPath];
+
+        CFAbsoluteTime playT0 = CFAbsoluteTimeGetCurrent();
+        [c playLocalPaths:massPaths];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 1.5)) Fail(__LINE__);
+        double startMs = (CFAbsoluteTimeGetCurrent() - playT0) * 1000.0;
+        AVQueuePlayer *massPlayer = LocalPlayer(c);
+        if (massPlayer.items.count > 16) Fail(__LINE__);
+        [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:@YES forKey:@"musicOff"];
+        StallWatch *stalls = [StallWatch new];
+        [stalls start];
+        for (int tick = 0; tick < 5; tick++) {
+            [c rebuildContent];
+            PumpUntil([NSDate dateWithTimeIntervalSinceNow:1.0]);
+        }
+        [stalls stop];
+        [c musicNext:nil];
+        [c musicNext:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        [c musicPlay:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        if (startMs > 1500.0) {
+            fprintf(stderr, "Scale play start took %.0f ms (limit 1500)\n", startMs);
+            Fail(__LINE__);
+        }
+        if (stalls.worstMs > 250.0) {
+            fprintf(stderr, "Main-thread stall %.1f ms (limit 250)\n", stalls.worstMs);
+            Fail(__LINE__);
+        }
+        fprintf(stderr, "Scale: play start %.0f ms, worst main-thread stall %.1f ms\n", startMs, stalls.worstMs);
 
         fprintf(stderr, "OK: playback harness scenarios passed\n");
         CleanupFixture();

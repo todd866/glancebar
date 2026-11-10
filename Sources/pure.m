@@ -96,6 +96,40 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
             @"complete": @(complete), @"paths": paths};
 }
 
+static NSDictionary *OfflineManifestEntry(NSDictionary *request, NSDictionary *manifest) {
+    NSString *key = [request[@"key"] isKindOfClass:NSString.class] ? request[@"key"] : @"";
+    if (!key.length || ![manifest[@"schemaVersion"] isEqual:@1] ||
+        ![manifest[@"playlists"] isKindOfClass:NSArray.class])
+        return nil;
+    for (id candidate in manifest[@"playlists"])
+        if ([candidate isKindOfClass:NSDictionary.class] && [candidate[@"key"] isEqual:key]) return candidate;
+    return nil;
+}
+
+NSArray *OfflinePlaylistDiskFingerprints(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot) {
+    NSDictionary *entry = OfflineManifestEntry(request, manifest);
+    NSArray *records = [entry[@"tracks"] isKindOfClass:NSArray.class] ? entry[@"tracks"] : @[];
+    NSMutableArray *fingerprints = [NSMutableArray arrayWithCapacity:records.count];
+    for (id record in records) {
+        if (![record isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = [record[@"path"] isKindOfClass:NSString.class] ? record[@"path"] : @"";
+        if (!path.length) continue;
+        struct stat st;
+        if (!OfflineStat(path, musicRoot, &st)) {
+            [fingerprints addObject:@{@"path": path, @"missing": @YES}];
+            continue;
+        }
+        [fingerprints addObject:@{
+            @"path": path,
+            @"inode": [NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino],
+            @"sizeBytes": @(st.st_size),
+            @"mtimeNs": [NSString stringWithFormat:@"%lld",
+                (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec],
+        }];
+    }
+    return fingerprints;
+}
+
 BOOL MusicSilentQAEnabled(void) {
     const char *env = getenv("GLANCEBAR_SILENT_QA");
     if (env && env[0] && strcmp(env, "0") != 0) return YES;
@@ -1976,6 +2010,31 @@ static BOOL AudioIsVirtualOutput(NSDictionary *device) {
     return transport == GlanceAudioTransportAggregate || transport == GlanceAudioTransportVirtual;
 }
 
+GlanceAudioOutputKind AudioOutputKind(NSDictionary *device) {
+    if (![device isKindOfClass:NSDictionary.class] || AudioChannels(device) <= 0 || !AudioUID(device))
+        return GlanceAudioOutputKindUncontrolled;
+    NSInteger transport = [device[@"transport"] integerValue];
+    if (transport == GlanceAudioTransportVirtual || transport == GlanceAudioTransportAggregate)
+        return GlanceAudioOutputKindUncontrolled;
+    if (transport == GlanceAudioTransportBuiltIn || transport == GlanceAudioTransportBluetooth ||
+        transport == GlanceAudioTransportUSB)
+        return GlanceAudioOutputKindAudibleControllable;
+    if (transport == GlanceAudioTransportDisplay)
+        return GlanceAudioOutputKindUncontrolled;
+    if ([device[@"volumeControllable"] boolValue]) return GlanceAudioOutputKindAudibleControllable;
+    return GlanceAudioOutputKindUncontrolled;
+}
+
+NSDictionary *BuiltInSpeakerDevice(NSArray<NSDictionary *> *devices) {
+    if (![devices isKindOfClass:NSArray.class]) return nil;
+    for (id row in devices) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        if ([row[@"transport"] integerValue] == GlanceAudioTransportBuiltIn && AudioChannels(row) > 0)
+            return row;
+    }
+    return nil;
+}
+
 NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
                                 NSArray<NSDictionary *> *current,
                                 BOOL switchToNewOutputs) {
@@ -1988,6 +2047,7 @@ NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
     for (NSDictionary *device in current) {
         NSString *uid = AudioUID(device);
         if (!AudioIsExternalOutput(device) || [alreadyOutput containsObject:uid]) continue;
+        if (AudioOutputKind(device) != GlanceAudioOutputKindAudibleControllable) continue;
         return uid;
     }
     return nil;
@@ -2018,27 +2078,61 @@ static NSDictionary *PlayerOutputDevice(NSArray<NSDictionary *> *devices, NSStri
     return nil;
 }
 
+static NSDictionary *PlayerOutputResolved(NSString *effectiveUID, NSDictionary *device, NSDictionary *defaultDevice,
+                                          BOOL systemChoice, BOOL followsSystem, BOOL diverged) {
+    NSString *name = device[@"name"] ?: @"No output device";
+    BOOL volumeControllable = AudioOutputKind(device) == GlanceAudioOutputKindAudibleControllable;
+    NSString *defaultName = defaultDevice[@"name"] ?: @"";
+    return @{@"effectiveUID": effectiveUID ?: @"", @"system": @(systemChoice), @"followsSystemDefault": @(followsSystem),
+             @"volumeControllable": @(volumeControllable), @"diverged": @(diverged),
+             @"systemDefaultName": defaultName, @"device": device ?: @{}, @"name": name};
+}
+
 NSDictionary *PlayerOutputChoice(NSString *chosenUID, NSString *chosenName,
                                    NSArray<NSDictionary *> *devices, NSString *defaultUID) {
     if (![devices isKindOfClass:NSArray.class]) devices = @[];
     if (![chosenUID isKindOfClass:NSString.class]) chosenUID = @"";
     if (![defaultUID isKindOfClass:NSString.class]) defaultUID = @"";
     NSDictionary *defaultDevice = PlayerOutputDevice(devices, defaultUID);
-    NSString *defaultName = defaultDevice[@"name"] ?: @"No output device";
-    if (!chosenUID.length) {
-        return @{@"choiceUID": @"", @"effectiveUID": defaultUID ?: @"", @"system": @YES,
-                 @"device": defaultDevice ?: @{}, @"name": defaultName, @"note": @""};
+    NSDictionary *builtin = BuiltInSpeakerDevice(devices);
+    NSString *builtinUID = builtin[@"uid"];
+    BOOL defaultControllable = AudioOutputKind(defaultDevice) == GlanceAudioOutputKindAudibleControllable;
+
+    NSString *rememberedUID = chosenUID;
+    if (chosenUID.length) {
+        NSDictionary *chosen = PlayerOutputDevice(devices, chosenUID);
+        if (chosen) {
+            NSMutableDictionary *out = [PlayerOutputResolved(chosenUID, chosen, defaultDevice, NO, NO, NO) mutableCopy];
+            out[@"choiceUID"] = chosenUID;
+            out[@"note"] = @"";
+            return out;
+        }
     }
-    NSDictionary *chosen = PlayerOutputDevice(devices, chosenUID);
-    if (chosen) {
-        return @{@"choiceUID": chosenUID, @"effectiveUID": chosenUID, @"system": @NO,
-                 @"device": chosen, @"name": chosen[@"name"] ?: @"Output", @"note": @""};
+
+    BOOL diverged = NO;
+    NSString *effectiveUID = defaultUID;
+    NSDictionary *device = defaultDevice;
+    BOOL follows = defaultControllable;
+    if (!defaultControllable) {
+        if (builtinUID.length) {
+            effectiveUID = builtinUID;
+            device = builtin;
+            follows = NO;
+            diverged = defaultUID.length > 0;
+        } else {
+            follows = NO;
+        }
     }
-    if (![chosenName isKindOfClass:NSString.class]) chosenName = @"";
-    NSString *note = chosenName.length ? [NSString stringWithFormat:@"%@ is not connected; using System.", chosenName]
-                                       : @"Selected output is not connected; using System.";
-    return @{@"choiceUID": chosenUID, @"effectiveUID": defaultUID ?: @"", @"system": @YES,
-             @"device": defaultDevice ?: @{}, @"name": defaultName, @"note": note};
+    NSMutableDictionary *out = [PlayerOutputResolved(effectiveUID, device, defaultDevice, YES, follows, diverged) mutableCopy];
+    out[@"choiceUID"] = rememberedUID;
+    if (rememberedUID.length) {
+        if (![chosenName isKindOfClass:NSString.class]) chosenName = @"";
+        out[@"note"] = chosenName.length ? [NSString stringWithFormat:@"%@ is not connected; using System.", chosenName]
+                                         : @"Selected output is not connected; using System.";
+    } else {
+        out[@"note"] = @"";
+    }
+    return out;
 }
 
 NSArray<NSDictionary *> *PlayerOutputMenuChoices(NSArray<NSDictionary *> *devices,

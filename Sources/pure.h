@@ -513,6 +513,14 @@ typedef NS_ENUM(NSInteger, GlanceAudioTransport) {
     GlanceAudioTransportAggregate,
     GlanceAudioTransportVirtual,
 };
+// Audible-controllable: built-in/Bluetooth/USB, or any device with a software volume control.
+// Uncontrolled: displays without volume, aggregates, virtual devices, and unknown outputs.
+typedef NS_ENUM(NSInteger, GlanceAudioOutputKind) {
+    GlanceAudioOutputKindUncontrolled = 0,
+    GlanceAudioOutputKindAudibleControllable,
+};
+GlanceAudioOutputKind AudioOutputKind(NSDictionary *device);
+NSDictionary *BuiltInSpeakerDevice(NSArray<NSDictionary *> *devices);
 NSString *ChooseNewOutputDevice(NSArray<NSDictionary *> *previous,
                                 NSArray<NSDictionary *> *current,
                                 BOOL switchToNewOutputs);
@@ -726,10 +734,11 @@ NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes);
 // opens the menu instead of cycling).
 NSString *NextOutputUID(NSArray<NSDictionary *> *menuDevices, NSString *currentUID);
 
-// Glancebar's local player output. chosenUID empty = System (follow defaultUID).
-// Returns @{@"choiceUID", @"effectiveUID", @"system" (BOOL), @"device", @"name",
-//   @"note" (optional absent-device copy)}. Never swaps a missing choice to another
-// external device — it falls back to the system default while keeping choiceUID.
+// Glancebar's local player output. chosenUID empty = System: the system default when it is
+// audible-controllable, otherwise the Mac's built-in speakers (never an uncontrolled default).
+// Returns @{@"choiceUID", @"effectiveUID", @"system" (BOOL), @"followsSystemDefault" (BOOL),
+//   @"volumeControllable" (BOOL), @"diverged" (BOOL), @"systemDefaultName", @"device", @"name",
+//   @"note" (optional)}. A missing explicit choice keeps choiceUID and falls back like System.
 NSDictionary *PlayerOutputChoice(NSString *chosenUID, NSString *chosenName,
                                    NSArray<NSDictionary *> *devices, NSString *defaultUID);
 // System first, then AudioOutputMenuDevices. Each row @{@"uid", @"name", @"system"}.
@@ -897,6 +906,8 @@ NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *pat
 // complete is YES when every requested track is present in order. Fast UI checks validate identity, size, inode and
 // nanosecond mtime; playback uses verifyHash.
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash);
+// Current size, inode and nanosecond mtime for each manifest record path; used to invalidate UI coverage cache.
+NSArray *OfflinePlaylistDiskFingerprints(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot);
 NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);
 // Seed / New music tiles: wait for fetch unless sync reports it cannot continue; then partial play is allowed.
 NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch);
