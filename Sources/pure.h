@@ -901,11 +901,18 @@ NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);
 // Seed / New music tiles: wait for fetch unless sync reports it cannot continue; then partial play is allowed.
 NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch);
 BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow);
+BOOL MusicLibraryCannotFetchForPlaylist(NSDictionary *status, NSString *key, BOOL networkOnline, BOOL metered);
 BOOL MusicLibraryStatusIncomplete(NSDictionary *status);
 double MusicLibrarySyncRetryInterval(NSUInteger consecutiveFailures);
+BOOL MusicLibrarySyncFailureTerminal(NSString *errorMessage);
+BOOL MusicLibraryMayStartSync(CFAbsoluteTime now, CFAbsoluteTime lastAttemptAt, NSUInteger consecutiveFailures,
+    NSUInteger requestGeneration, NSUInteger generationLastAttempted, NSUInteger generationLastSynced, BOOL busy,
+    BOOL online, BOOL metered, BOOL terminalFailureForAttemptedGeneration, BOOL bypassBackoff);
 BOOL MusicLibraryShouldRetrySync(NSDictionary *status, BOOL networkOnline, BOOL metered, BOOL unmatched,
     BOOL overflow, BOOL syncBusy, CFAbsoluteTime now, CFAbsoluteTime lastAttemptAt, NSUInteger consecutiveFailures,
     NSUInteger requestsGeneration, NSUInteger lastSuccessfulAttemptGeneration);
+BOOL MusicLibraryHelperLaunchPermitted(CFAbsoluteTime now, NSMutableArray<NSNumber *> *launchTimes, NSUInteger maxLaunches,
+    NSTimeInterval windowSec, BOOL *shouldLogOnce);
 BOOL MixPrepareStillValid(NSString *key, NSArray *visible, NSArray *pending, NSUInteger preparePendingGen,
     NSUInteger currentPendingGen);
 NSArray *MixSeedsNextPromotion(NSArray *pending, NSDictionary *tileStatesByKey, BOOL allReady, double pendingAgeSec,

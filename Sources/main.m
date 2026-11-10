@@ -5823,6 +5823,12 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     BOOL _musiclibBusy, _musiclibAgain;
     CFAbsoluteTime _musiclibLastSyncAttemptAt;
     NSUInteger _musiclibSyncFailures, _offlineRequestsGeneration, _musiclibSyncedRequestGeneration;
+    NSUInteger _musiclibLastAttemptGeneration;
+    BOOL _musiclibLastAttemptTerminal, _musiclibSyncBypassBackoff;
+    NSUInteger _libraryRefreshPhase;
+    BOOL _libraryRefreshWantsCache, _libraryRefreshWantsStatus, _libraryRefreshWantsSync;
+    NSMutableArray<NSNumber *> *_musiclibHelperLaunchTimes;
+    BOOL _musiclibHelperLaunchLogged;
     BOOL _meteredLinkWasActive;
     NSDictionary *_musicLibraryStatus;
     NSString *_musicLibraryLastError, *_musicLibraryHotDir;
@@ -6414,6 +6420,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     return MusicLibraryCannotFetch(_networkKnown ? _networkOnline : YES, [self meteredLinkActive],
                                    _musicLibraryLastError, _musicLibraryUnmatched, _musicLibraryOverflow);
 }
+- (BOOL)musicLibraryCannotFetchForKey:(NSString *)key {
+    return MusicLibraryCannotFetchForPlaylist(_musicLibraryStatus, key,
+        _networkKnown ? _networkOnline : YES, [self meteredLinkActive]);
+}
+- (BOOL)noteMusicLibraryHelperLaunch {
+    BOOL shouldLog = NO;
+    if (!_musiclibHelperLaunchTimes) _musiclibHelperLaunchTimes = [NSMutableArray array];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL ok = MusicLibraryHelperLaunchPermitted(now, _musiclibHelperLaunchTimes, 6, 300, &shouldLog);
+    if (ok) [_musiclibHelperLaunchTimes addObject:@(now)];
+    else if (shouldLog && !_musiclibHelperLaunchLogged) {
+        _musiclibHelperLaunchLogged = YES;
+        NSLog(@"Glancebar: music-library helper launches rate-limited (6 per 5 min)");
+    }
+    return ok;
+}
 - (BOOL)isMixPlaylistKey:(NSString *)key {
     if (!key.length) return NO;
     if ([key isEqual:@"station:triplej"]) return YES;
@@ -6426,15 +6448,61 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (NSDictionary *)mixTileStateForKey:(NSString *)key {
     NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
     if (![self isMixPlaylistKey:key]) return coverage;
-    return OfflineMixTileState(coverage, _musiclibBusy, [self musicLibraryCannotFetch]);
+    return OfflineMixTileState(coverage, _musiclibBusy, [self musicLibraryCannotFetchForKey:key]);
+}
+// Library refresh coalescer (one leg at a time; completion handlers never force a storm):
+//   idle --maybeScheduleMusicLibrarySync--> syncing
+//   syncing --done--> idle + queue cache + queue status
+//   idle --libraryRefreshPump--> preparing --done--> idle + (status at most once, 30 s apart)
+//   idle --libraryRefreshPump--> reading-status --done--> idle + maybeScheduleMusicLibrarySync (never cache)
+// Tile clicks may bypass sync backoff once; busy and the helper rate limit still apply.
+static const NSUInteger kLibraryRefreshIdle = 0;
+static const NSUInteger kLibraryRefreshSyncing = 1;
+static const NSUInteger kLibraryRefreshPreparingCache = 2;
+static const NSUInteger kLibraryRefreshReadingStatus = 3;
+- (void)libraryRefreshPump {
+    if (_libraryRefreshPhase != kLibraryRefreshIdle) return;
+    if (_libraryRefreshWantsCache && !_offlineCacheBusy) {
+        _libraryRefreshWantsCache = NO;
+        [self prepareOfflineCache];
+        return;
+    }
+    if (_libraryRefreshWantsStatus) {
+        _libraryRefreshWantsStatus = NO;
+        [self reloadMusicLibraryStatus];
+        return;
+    }
+    if (_libraryRefreshWantsSync) {
+        _libraryRefreshWantsSync = NO;
+        [self maybeScheduleMusicLibrarySync];
+    }
+}
+- (void)libraryRefreshScheduleAfterRequestSave {
+    _libraryRefreshWantsCache = YES;
+    _libraryRefreshWantsSync = YES;
+    [self libraryRefreshPump];
 }
 - (void)reloadMusicLibraryStatus {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (_musicLibraryStatusAt > 0 && now - _musicLibraryStatusAt < 30) return;
+    if (_musicLibraryStatusAt > 0 && now - _musicLibraryStatusAt < 30) {
+        _libraryRefreshPhase = kLibraryRefreshIdle;
+        [self libraryRefreshPump];
+        return;
+    }
+    if (!_libraryRefreshPhase) _libraryRefreshPhase = kLibraryRefreshReadingStatus;
+    if (![self noteMusicLibraryHelperLaunch]) {
+        _libraryRefreshPhase = kLibraryRefreshIdle;
+        [self libraryRefreshPump];
+        return;
+    }
     _musicLibraryStatusAt = now;
     NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
-    if (!script.length) return;
+    if (!script.length) {
+        _libraryRefreshPhase = kLibraryRefreshIdle;
+        [self libraryRefreshPump];
+        return;
+    }
     NSString *dir = MixDirectory(nil);
     NSString *requests = [dir stringByAppendingPathComponent:@"offline-requests.json"];
     NSString *stateErr = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/glancebar-music-library/last-status.json"];
@@ -6465,26 +6533,41 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         dispatch_async(dispatch_get_main_queue(), ^{
             if (status) self->_musicLibraryStatus = status;
             [self maybeSwapMixSeedsNext];
+            self->_libraryRefreshPhase = kLibraryRefreshIdle;
             [self maybeScheduleMusicLibrarySync];
+            [self libraryRefreshPump];
             if (self->_popover.isShown) [self rebuildContent];
         });
     });
 }
 - (void)maybeScheduleMusicLibrarySync {
+    [self maybeScheduleMusicLibrarySyncBypassingBackoff:NO];
+}
+- (void)maybeScheduleMusicLibrarySyncBypassingBackoff:(BOOL)bypass {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    if (!MusicLibraryStatusIncomplete(_musicLibraryStatus)) return;
     BOOL metered = [self meteredLinkActive];
-    if (MusicLibraryShouldRetrySync(_musicLibraryStatus, _networkKnown ? _networkOnline : YES, metered,
-            _musicLibraryUnmatched, _musicLibraryOverflow, _musiclibBusy, CFAbsoluteTimeGetCurrent(),
-            _musiclibLastSyncAttemptAt, _musiclibSyncFailures, _offlineRequestsGeneration,
-            _musiclibSyncedRequestGeneration))
-        [self prepareMusicLibrarySync];
+    BOOL may = MusicLibraryMayStartSync(CFAbsoluteTimeGetCurrent(), _musiclibLastSyncAttemptAt, _musiclibSyncFailures,
+        _offlineRequestsGeneration, _musiclibLastAttemptGeneration, _musiclibSyncedRequestGeneration,
+        _musiclibBusy || _libraryRefreshPhase == kLibraryRefreshSyncing, _networkKnown ? _networkOnline : YES, metered,
+        _musiclibLastAttemptTerminal, bypass || _musiclibSyncBypassBackoff);
+    _musiclibSyncBypassBackoff = NO;
+    if (!may) return;
+    if (_libraryRefreshPhase != kLibraryRefreshIdle) {
+        _libraryRefreshWantsSync = YES;
+        return;
+    }
+    [self prepareMusicLibrarySync];
 }
 - (void)prepareMusicLibrarySync {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
     if (_musiclibBusy) { _musiclibAgain = YES; return; }
+    if (![self noteMusicLibraryHelperLaunch]) return;
     NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
     if (!script.length) return;
+    _libraryRefreshPhase = kLibraryRefreshSyncing;
     _musiclibLastSyncAttemptAt = CFAbsoluteTimeGetCurrent();
+    _musiclibLastAttemptGeneration = _offlineRequestsGeneration;
     _musiclibBusy = YES;
     NSString *dir = MixDirectory(nil);
     NSString *requests = [dir stringByAppendingPathComponent:@"offline-requests.json"];
@@ -6503,12 +6586,29 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             if (status == 0) {
                 self->_musiclibSyncFailures = 0;
                 self->_musiclibSyncedRequestGeneration = self->_offlineRequestsGeneration;
-            } else if (launched) self->_musiclibSyncFailures++;
-            self->_musicLibraryStatusAt = 0;
-            [self reloadMusicLibraryStatus];
-            [self prepareOfflineCache];
+                self->_musiclibLastAttemptTerminal = NO;
+                self->_musicLibraryLastError = @"";
+                self->_musicLibraryUnmatched = NO;
+                self->_musicLibraryOverflow = NO;
+            } else if (launched) {
+                self->_musiclibSyncFailures++;
+                NSString *stateErr = [GBHomeDirectory() stringByAppendingPathComponent:
+                    @".local/state/glancebar-music-library/last-status.json"];
+                NSData *errData = [NSData dataWithContentsOfFile:stateErr];
+                id errDoc = errData ? [NSJSONSerialization JSONObjectWithData:errData options:0 error:nil] : nil;
+                if ([errDoc isKindOfClass:NSDictionary.class]) {
+                    id err = errDoc[@"lastError"];
+                    self->_musicLibraryLastError = [err isKindOfClass:NSString.class] ? err :
+                        (err == [NSNull null] ? @"" : self->_musicLibraryLastError);
+                }
+                self->_musiclibLastAttemptTerminal = MusicLibrarySyncFailureTerminal(self->_musicLibraryLastError);
+            }
+            self->_libraryRefreshPhase = kLibraryRefreshIdle;
+            self->_libraryRefreshWantsCache = YES;
+            self->_libraryRefreshWantsStatus = YES;
+            [self libraryRefreshPump];
             if (self->_popover.isShown) [self rebuildContent];
-            if (self->_musiclibAgain) { self->_musiclibAgain = NO; [self prepareMusicLibrarySync]; }
+            if (self->_musiclibAgain) { self->_musiclibAgain = NO; [self maybeScheduleMusicLibrarySync]; }
         });
     });
 }
@@ -6518,6 +6618,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!hot.length || ![path hasPrefix:hot]) return;
     NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
     if (!script.length) return;
+    if (![self noteMusicLibraryHelperLaunch]) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSTask *task = [NSTask new];
         task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
@@ -6557,6 +6658,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_offlineCacheBusy) { _offlineCacheAgain = YES; return; }
     NSString *script = [NSBundle.mainBundle pathForResource:@"offline_cache" ofType:@"py"];
     if (!script.length) return;  // Test executables have no helper and must never scan a real music pool.
+    if (![self noteMusicLibraryHelperLaunch]) return;
+    if (_libraryRefreshPhase == kLibraryRefreshIdle) _libraryRefreshPhase = kLibraryRefreshPreparingCache;
     _offlineCacheBusy = YES;
     _offlinePreparedAt = CFAbsoluteTimeGetCurrent();
     NSString *dir = MixDirectory(nil);
@@ -6586,9 +6689,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                 [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
                 [self retryUnpreparedMixSeeds];
                 [self maybeSwapMixSeedsNext];
-                self->_musicLibraryStatusAt = 0;
-                [self reloadMusicLibraryStatus];
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                if (self->_musicLibraryStatusAt <= 0 || now - self->_musicLibraryStatusAt >= 30)
+                    self->_libraryRefreshWantsStatus = YES;
             }
+            self->_libraryRefreshPhase = kLibraryRefreshIdle;
+            [self libraryRefreshPump];
             if (self->_popover.isShown) [self rebuildContent];
             if (self->_offlineCacheAgain) { self->_offlineCacheAgain = NO; [self prepareOfflineCache]; }
         });
@@ -6605,8 +6711,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
     if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
         _offlineRequestsGeneration++;
-        [self prepareOfflineCache];
-        [self prepareMusicLibrarySync];
+        [self libraryRefreshScheduleAfterRequestSave];
     }
 }
 - (void)setOfflineRequest:(NSString *)key title:(NSString *)title tracks:(NSArray *)tracks {
@@ -6658,9 +6763,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     // The existing exporter provides a named playlist snapshot without launching Music,
     // acquiring a playback lease, or consulting the stale download inventory.
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) [self prepareOfflineCache];
-    if (now - _musicLibraryStatusAt >= 30) [self reloadMusicLibraryStatus];
+    if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) _libraryRefreshWantsCache = YES;
+    if (now - _musicLibraryStatusAt >= 30) _libraryRefreshWantsStatus = YES;
     [self maybeScheduleMusicLibrarySync];
+    [self libraryRefreshPump];
     if (_offlineExportChecked > 0 && now - _offlineExportChecked < 60) return;
     _offlineExportChecked = now;
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Library-export/playlists.json"];
@@ -6728,16 +6834,18 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         NSString *state = tile[@"state"];
         if ([state isEqual:@"fetching"]) {
             _musicNote = tile[@"tooltip"];
-            [self prepareMusicLibrarySync];
-            [self prepareOfflineCache];
+            [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+            _libraryRefreshWantsCache = YES;
+            [self libraryRefreshPump];
             if (_popover.isShown) [self rebuildContent];
             return;
         }
         if (![tile[@"enabled"] boolValue]) {
             // Nothing playable on disk: a click asks for the tracks rather than doing nothing.
             _musicNote = tile[@"tooltip"];
-            [self prepareMusicLibrarySync];
-            [self prepareOfflineCache];
+            [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+            _libraryRefreshWantsCache = YES;
+            [self libraryRefreshPump];
             if (_popover.isShown) [self rebuildContent];
             return;
         }

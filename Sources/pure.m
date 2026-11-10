@@ -105,14 +105,60 @@ BOOL MusicSilentQAEnabled(void) {
 float MusicPlayerOutputVolume(BOOL silentQA) { return silentQA ? 0.f : 1.f; }
 
 BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow) {
-    if (!networkOnline || metered || lastError.length || unmatched || overflow) return YES;
+    if (!networkOnline || metered) return YES;
+    if (unmatched || overflow) return YES;
+    if (lastError.length) return YES;
+    return NO;
+}
+
+static BOOL MusicLibraryPlaylistIsLibrary(NSDictionary *playlist) {
+    if (![playlist isKindOfClass:NSDictionary.class]) return NO;
+    return [playlist[@"library"] boolValue];
+}
+
+static BOOL MusicLibraryPlaylistKeyInList(NSString *key, NSArray *list) {
+    if (!key.length || ![list isKindOfClass:NSArray.class]) return NO;
+    for (id item in list) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        if ([item[@"key"] isEqual:key]) return YES;
+    }
+    return NO;
+}
+
+BOOL MusicLibraryCannotFetchForPlaylist(NSDictionary *status, NSString *key, BOOL networkOnline, BOOL metered) {
+    if (!networkOnline || metered) return YES;
+    if (!key.length) return NO;
+    if (MusicLibraryPlaylistKeyInList(key, [status[@"library"] isKindOfClass:NSArray.class] ? status[@"library"] : @[]))
+        return NO;
+    if (MusicLibraryPlaylistKeyInList(key, [status[@"skipped"] isKindOfClass:NSArray.class] ? status[@"skipped"] : @[]))
+        return NO;
+    for (id playlist in [status[@"playlists"] isKindOfClass:NSArray.class] ? status[@"playlists"] : @[]) {
+        if (![playlist isKindOfClass:NSDictionary.class] || ![playlist[@"key"] isEqual:key]) continue;
+        if (MusicLibraryPlaylistIsLibrary(playlist)) return NO;
+        if ([playlist[@"unmatched"] unsignedIntegerValue] > 0) return YES;
+        if ([playlist[@"failed"] boolValue]) return YES;
+        return NO;
+    }
     return NO;
 }
 
 BOOL MusicLibraryStatusIncomplete(NSDictionary *status) {
     if (![status isKindOfClass:NSDictionary.class]) return NO;
+    NSSet *skipped = nil;
+    NSArray *skippedList = [status[@"skipped"] isKindOfClass:NSArray.class] ? status[@"skipped"] : @[];
+    if (skippedList.count) {
+        NSMutableSet *keys = [NSMutableSet set];
+        for (id item in skippedList) {
+            if ([item isKindOfClass:NSDictionary.class] && [item[@"key"] isKindOfClass:NSString.class])
+                [keys addObject:item[@"key"]];
+        }
+        skipped = keys;
+    }
     for (id playlist in [status[@"playlists"] isKindOfClass:NSArray.class] ? status[@"playlists"] : @[]) {
         if (![playlist isKindOfClass:NSDictionary.class]) continue;
+        if (MusicLibraryPlaylistIsLibrary(playlist)) continue;
+        NSString *key = [playlist[@"key"] isKindOfClass:NSString.class] ? playlist[@"key"] : @"";
+        if (skipped && [skipped containsObject:key]) continue;
         if ([playlist[@"missing"] unsignedIntegerValue] > 0) return YES;
     }
     return NO;
@@ -121,19 +167,60 @@ BOOL MusicLibraryStatusIncomplete(NSDictionary *status) {
 double MusicLibrarySyncRetryInterval(NSUInteger consecutiveFailures) {
     double base = 30 * 60;
     if (!consecutiveFailures) return base;
-    NSUInteger shift = consecutiveFailures < 4 ? consecutiveFailures : 4;
-    double interval = base * (double)(1u << shift);
-    return interval > 4 * 3600 ? 4 * 3600 : interval;
+    NSUInteger shift = consecutiveFailures - 1;
+    if (shift > 16) shift = 16;
+    double interval = base * pow(2.0, (double)shift);
+    return interval > 6 * 3600 ? 6 * 3600 : interval;
+}
+
+BOOL MusicLibrarySyncFailureTerminal(NSString *errorMessage) {
+    if (!errorMessage.length) return NO;
+    NSString *low = errorMessage.lowercaseString;
+    if ([low containsString:@"unmatched"] || [low containsString:@"ambiguous"]) return YES;
+    if ([low containsString:@"does not fit"] || [low containsString:@"cap exceeded"] ||
+        [low containsString:@"overflow"] || [low containsString:@"may not fit"])
+        return YES;
+    return NO;
+}
+
+BOOL MusicLibraryMayStartSync(CFAbsoluteTime now, CFAbsoluteTime lastAttemptAt, NSUInteger consecutiveFailures,
+    NSUInteger requestGeneration, NSUInteger generationLastAttempted, NSUInteger generationLastSynced, BOOL busy,
+    BOOL online, BOOL metered, BOOL terminalFailureForAttemptedGeneration, BOOL bypassBackoff) {
+    if (busy || !online || metered) return NO;
+    if (bypassBackoff) return YES;
+    if (requestGeneration > generationLastSynced) {
+        if (requestGeneration > generationLastAttempted) return YES;
+        if (terminalFailureForAttemptedGeneration && requestGeneration == generationLastAttempted) return NO;
+        if (!consecutiveFailures) return NO;
+        return lastAttemptAt > 0 &&
+            now - lastAttemptAt >= MusicLibrarySyncRetryInterval(consecutiveFailures);
+    }
+    if (terminalFailureForAttemptedGeneration && requestGeneration == generationLastAttempted) return NO;
+    if (lastAttemptAt <= 0) return YES;
+  return now - lastAttemptAt >= MusicLibrarySyncRetryInterval(consecutiveFailures);
 }
 
 BOOL MusicLibraryShouldRetrySync(NSDictionary *status, BOOL networkOnline, BOOL metered, BOOL unmatched,
     BOOL overflow, BOOL syncBusy, CFAbsoluteTime now, CFAbsoluteTime lastAttemptAt, NSUInteger consecutiveFailures,
     NSUInteger requestsGeneration, NSUInteger lastSuccessfulAttemptGeneration) {
-    if (syncBusy || !networkOnline || metered || unmatched || overflow) return NO;
+    (void)unmatched;
+    (void)overflow;
     if (!MusicLibraryStatusIncomplete(status)) return NO;
-    if (requestsGeneration > lastSuccessfulAttemptGeneration) return YES;
-    if (lastAttemptAt <= 0) return YES;
-    return now - lastAttemptAt >= MusicLibrarySyncRetryInterval(consecutiveFailures);
+    return MusicLibraryMayStartSync(now, lastAttemptAt, consecutiveFailures, requestsGeneration,
+        lastSuccessfulAttemptGeneration, lastSuccessfulAttemptGeneration, syncBusy, networkOnline, metered, NO, NO);
+}
+
+BOOL MusicLibraryHelperLaunchPermitted(CFAbsoluteTime now, NSMutableArray<NSNumber *> *launchTimes, NSUInteger maxLaunches,
+    NSTimeInterval windowSec, BOOL *shouldLogOnce) {
+    if (![launchTimes isKindOfClass:NSMutableArray.class]) return YES;
+    while (launchTimes.count) {
+        CFAbsoluteTime t = launchTimes.firstObject.doubleValue;
+        if (now - t <= windowSec) break;
+        [launchTimes removeObjectAtIndex:0];
+    }
+    if (launchTimes.count < maxLaunches) return YES;
+    if (shouldLogOnce) *shouldLogOnce = YES;
+    return NO;
 }
 
 BOOL MixPrepareStillValid(NSString *key, NSArray *visible, NSArray *pending, NSUInteger preparePendingGen,

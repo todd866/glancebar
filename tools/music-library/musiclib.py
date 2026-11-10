@@ -68,8 +68,13 @@ def load_config(path=None):
         'cap_gb': float(raw['cap_gb']),
         'keep_days': int(raw['keep_days']),
         'min_free_gb': float(raw.get('min_free_gb', 20)),
+        'max_playlist_tracks': int(raw.get('max_playlist_tracks', 120)),
         'config_path': p,
     }
+
+
+def max_playlist_tracks(cfg):
+    return int(cfg.get('max_playlist_tracks', 120))
 
 
 def cap_bytes_from_config(cfg):
@@ -482,16 +487,26 @@ def refresh_catalogue_cache(remote, state):
     return json.loads(dest.read_text())
 
 
-def wanted_entries_from_requests(requests_doc, catalogue):
+def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120):
     entries = index_catalogue(catalogue)
     playlists = []
+    library_playlists = []
     unmatched = []
     wanted_by_rel = {}
     for playlist in requests_doc['playlists']:
         key = playlist.get('key', '')
         title = playlist.get('title', key)
+        track_rows = playlist.get('tracks') or []
+        if len(track_rows) > max_tracks:
+            library_playlists.append({
+                'key': key,
+                'title': title,
+                'wanted': len(track_rows),
+                'library': True,
+            })
+            continue
         pl_wanted = []
-        for track in playlist.get('tracks') or []:
+        for track in track_rows:
             matches, reason = match_track(track, entries)
             item = {
                 'playlistKey': key,
@@ -506,7 +521,28 @@ def wanted_entries_from_requests(requests_doc, catalogue):
             pl_wanted.append(row)
             wanted_by_rel[entry['relativePath']] = row
         playlists.append({'key': key, 'title': title, 'tracks': pl_wanted})
-    return playlists, list(wanted_by_rel.values()), unmatched
+    return playlists, list(wanted_by_rel.values()), unmatched, library_playlists
+
+
+def playlist_fetch_order(to_fetch, playlist_first=None):
+    order = []
+    seen = set()
+    if playlist_first:
+        order.append(playlist_first)
+        seen.add(playlist_first)
+    for row in to_fetch:
+        key = row.get('playlistKey')
+        if key and key not in seen:
+            order.append(key)
+            seen.add(key)
+    return order
+
+
+def group_to_fetch_by_playlist(to_fetch):
+    grouped = {}
+    for row in to_fetch:
+        grouped.setdefault(row.get('playlistKey'), []).append(row)
+    return grouped
 
 
 def bytes_in_hot(hot_map):
@@ -662,9 +698,10 @@ def plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, 
 
 
 def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels, cap_bytes, keep_days,
-                 now=None, verified_state=None, trash_cmd=None, playlist_first=None):
+                 now=None, verified_state=None, trash_cmd=None, playlist_first=None, max_tracks=120):
     now = now if now is not None else time.time()
-    playlists, wanted_entries, unmatched = wanted_entries_from_requests(requests_doc, catalogue)
+    playlists, wanted_entries, unmatched, library_playlists = wanted_entries_from_requests(
+        requests_doc, catalogue, max_tracks=max_tracks)
     wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
     hot_map = hot_file_state(hot_dir)
     verified_state = verified_state if verified_state is not None else {}
@@ -688,6 +725,7 @@ def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels,
         'schemaVersion': PLAN_SCHEMA,
         'generatedAt': int(now),
         'playlists': playlists,
+        'library': library_playlists,
         'wantedCount': len(wanted_entries),
         'local': local,
         'toFetch': to_fetch,
@@ -746,11 +784,6 @@ def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_fla
     state_p = state_dir(state)
     if metered_active(metered_flag) and not allow_metered:
         raise ValueError('metered link; refuse fetch (use --allow-metered)')
-    if plan['overflow']:
-        missing_fit = [pl['title'] for pl in plan['playlists']
-                       if any(t['catalogue']['relativePath'] not in {x['catalogue']['relativePath'] for x in plan['local']}
-                              for t in pl['tracks'])]
-        raise ValueError(f'cap exceeded after eviction; playlists may not fit: {", ".join(missing_fit) or "unknown"}')
     hot_dir = Path(cfg['hot_dir']).expanduser().resolve()
     cap_bytes = int(plan['capBytes'])
     min_free = min_free_bytes_from_config(cfg)
@@ -783,32 +816,44 @@ def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_fla
         hot_map.pop(rel, None)
         hot_bytes -= row['sizeBytes']
     to_fetch = prioritize_to_fetch(plan['toFetch'], playlist_first)
+    by_playlist = group_to_fetch_by_playlist(to_fetch)
+    skipped_playlists = []
     fetched_count = 0
-    for item in to_fetch:
-        entry = item['catalogue']
-        rel = entry['relativePath']
-        size = int(entry['sizeBytes'])
-        if hot_bytes + size > cap_bytes:
-            raise ValueError(f'cap {cap_bytes} GiB-byte would be exceeded fetching {rel!r}')
-        free_disk = physical_free_bytes(hot_dir)
-        if free_disk - size < min_free:
-            raise ValueError(f'free disk would fall below min_free_gb fetching {rel!r}')
-        dest = inside(hot_dir, rel) if safe_relpath(rel) else None
-        if dest is None:
-            raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
-        part = dest.with_suffix(dest.suffix + '.part')
-        part.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            remote_fetch_file(cfg['remote'], rel, part)
-            verify_and_install(part, dest, entry['sha256'], entry['sizeBytes'])
-        except (OSError, ValueError, RuntimeError):
-            part.unlink(missing_ok=True)
-            raise
-        fetched[rel] = now
-        st = dest.stat()
-        verified_hot[rel] = {'stamp': [st.st_size, str(st.st_mtime_ns)], 'sha256': entry['sha256']}
-        hot_bytes += size
-        fetched_count += 1
+    for key in playlist_fetch_order(to_fetch, playlist_first):
+        items = by_playlist.get(key, [])
+        if not items:
+            continue
+        need_bytes = sum(int(item['catalogue']['sizeBytes']) for item in items)
+        title = items[0].get('playlistTitle', key)
+        if hot_bytes + need_bytes > cap_bytes:
+            skipped_playlists.append({'key': key, 'title': title, 'reason': 'cap', 'needBytes': need_bytes})
+            continue
+        for item in items:
+            entry = item['catalogue']
+            rel = entry['relativePath']
+            size = int(entry['sizeBytes'])
+            if hot_bytes + size > cap_bytes:
+                skipped_playlists.append({'key': key, 'title': title, 'reason': 'cap', 'needBytes': need_bytes})
+                break
+            free_disk = physical_free_bytes(hot_dir)
+            if free_disk - size < min_free:
+                raise ValueError(f'free disk would fall below min_free_gb fetching {rel!r}')
+            dest = inside(hot_dir, rel) if safe_relpath(rel) else None
+            if dest is None:
+                raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
+            part = dest.with_suffix(dest.suffix + '.part')
+            part.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                remote_fetch_file(cfg['remote'], rel, part)
+                verify_and_install(part, dest, entry['sha256'], entry['sizeBytes'])
+            except (OSError, ValueError, RuntimeError):
+                part.unlink(missing_ok=True)
+                raise
+            fetched[rel] = now
+            st = dest.stat()
+            verified_hot[rel] = {'stamp': [st.st_size, str(st.st_mtime_ns)], 'sha256': entry['sha256']}
+            hot_bytes += size
+            fetched_count += 1
     save_fetched(state, fetched)
     save_verified_hot(state, verified_hot)
     status = {
@@ -816,6 +861,8 @@ def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_fla
         'lastError': None,
         'fetched': fetched_count,
         'evictionSkipped': eviction_skipped,
+        'skipped': skipped_playlists,
+        'library': plan.get('library') or [],
         'plan': {k: plan.get(k) for k in ('wantedCount', 'hotBytes', 'capBytes', 'afterSyncBytes')},
     }
     atomic_write_json(state_p / 'last-status.json', status)
@@ -841,42 +888,76 @@ def touch_played(path, state, config=None, now=None):
 
 
 def build_status(requests_doc, catalogue, cfg, state, last_status):
-    _, wanted_entries, _ = wanted_entries_from_requests(requests_doc, catalogue)
+    limit = max_playlist_tracks(cfg)
+    _, wanted_entries, _, library_from_requests = wanted_entries_from_requests(
+        requests_doc, catalogue, max_tracks=limit)
     wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
     hot_map = hot_file_state(cfg['hot_dir'])
     local_rels = set(hot_map) & wanted_rels
+    skipped = []
+    library = []
+    if isinstance(last_status, dict):
+        skipped = last_status.get('skipped') or []
+        library = last_status.get('library') or []
+    skipped_keys = {row.get('key') for row in skipped if isinstance(row, dict) and row.get('key')}
+    library_keys = {row.get('key') for row in library_from_requests if isinstance(row, dict) and row.get('key')}
+    for row in library:
+        if isinstance(row, dict) and row.get('key'):
+            library_keys.add(row['key'])
     per_playlist = []
     any_missing = False
+    entries = index_catalogue(catalogue)
+
+    def playlist_counts(tracks):
+        wanted = len(tracks)
+        local_count = 0
+        unmatched = 0
+        for track in tracks:
+            matches, reason = match_track(track, entries)
+            if not matches:
+                if reason:
+                    unmatched += 1
+                continue
+            if matches[0]['relativePath'] in hot_map:
+                local_count += 1
+        missing = wanted - local_count - unmatched
+        return wanted, local_count, max(0, missing), unmatched
+
     for playlist in requests_doc['playlists']:
         key = playlist.get('key', '')
         title = playlist.get('title', key)
         tracks = playlist.get('tracks') or []
-        wanted = len(tracks)
-        local_count = 0
-        entries = index_catalogue(catalogue)
-        for track in tracks:
-            matches, _ = match_track(track, entries)
-            if matches and matches[0]['relativePath'] in hot_map:
-                local_count += 1
-        missing = wanted - local_count
-        if wanted and local_count < wanted:
-            any_missing = True
-        per_playlist.append({
+        is_library = key in library_keys or len(tracks) > limit
+        wanted, local_count, missing, unmatched = playlist_counts(tracks)
+        row = {
             'name': title,
             'key': key,
             'wanted': wanted,
             'local': local_count,
-            'missing': max(0, missing),
-        })
+            'missing': missing,
+            'unmatched': unmatched,
+            'library': is_library,
+        }
+        per_playlist.append(row)
+        if is_library or key in skipped_keys:
+            continue
+        if missing > 0:
+            any_missing = True
     last_err = None
     last_sync = None
     if isinstance(last_status, dict):
         last_err = last_status.get('lastError')
         last_sync = last_status.get('lastSyncAt')
     failed = bool(last_err)
+    library_rows = list(library_from_requests)
+    for row in library:
+        if isinstance(row, dict) and row not in library_rows:
+            library_rows.append(row)
     return {
         'schemaVersion': STATUS_SCHEMA,
         'playlists': per_playlist,
+        'library': library_rows,
+        'skipped': skipped,
         'hotBytes': bytes_in_hot(hot_map),
         'capBytes': cap_bytes_from_config(cfg),
         'wantedLocal': len(local_rels),
@@ -975,7 +1056,8 @@ def main(argv=None):
             verified = load_verified_hot(state)
             plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
                                 remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
-                                playlist_first=getattr(args, 'playlist_key', None))
+                                playlist_first=getattr(args, 'playlist_key', None),
+                                max_tracks=max_playlist_tracks(cfg))
             if cached_catalogue_note:
                 plan['catalogueSource'] = 'cache'
                 plan['metered'] = True
@@ -1009,7 +1091,8 @@ def main(argv=None):
                 verified = load_verified_hot(state)
                 plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
                                     remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
-                                    playlist_first=getattr(args, 'playlist_key', None))
+                                    playlist_first=getattr(args, 'playlist_key', None),
+                                    max_tracks=max_playlist_tracks(cfg))
                 status = sync_execute(plan, cfg, state, remote_rels, allow_metered=allow_metered,
                                       playlist_first=getattr(args, 'playlist_key', None))
                 print(json.dumps({
