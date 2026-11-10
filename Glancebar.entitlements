@@ -2,13 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Sound row: osascript drives Music and Chrome on Glancebar's behalf. Under the hardened
+	<!-- Sound row: osascript drives Music on Glancebar's behalf. Under the hardened
 	     runtime, Apple events without this are refused with no prompt. -->
 	<key>com.apple.security.automation.apple-events</key>
-	<true/>
-	<!-- Audio routing (audio_route.m) reads a process tap. Under the hardened runtime, audio
-	     input of any kind is refused without this; the user still grants it once (TCC). -->
-	<key>com.apple.security.device.audio-input</key>
 	<true/>
 </dict>
 </plist>

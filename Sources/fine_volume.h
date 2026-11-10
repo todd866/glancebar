@@ -8,9 +8,8 @@
 
 void GBFineVolumeStart(void);
 
-// While a routed app is playing (audio_route.h), the volume keys turn that app's speaker,
-// not the system default the rest of the Mac is held on. The provider returns that device,
-// or kAudioObjectUnknown for the default output.
+// While Glancebar's player is on a pinned output, the volume keys turn that speaker;
+// otherwise they follow the system default output.
 #import <CoreAudio/CoreAudio.h>
 void GBFineVolumeSetTargetProvider(AudioObjectID (^provider)(void));
 

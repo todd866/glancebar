@@ -1,0 +1,2084 @@
+// Render the real popover offscreen; never launch the app, status item, or samplers.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullability-completeness"
+#pragma clang diagnostic ignored "-Watomic-property-with-user-defined-accessor"
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#define main GlancebarApplicationMain
+#import "../Sources/main.m"
+#undef main
+#pragma clang diagnostic pop
+#import "../Tests/offline_fixture.h"
+static NSString *gOfflineFixtureHome;
+static void CleanupOfflineFixture(void) { if (gOfflineFixtureHome) [NSFileManager.defaultManager removeItemAtPath:gOfflineFixtureHome error:nil]; }
+
+static void PrimeBatteryForecast(Controller *controller, BatteryState battery, BOOL limit80) {
+    BatteryForecastTracker *tracker = [BatteryForecastTracker new];
+    double now = NSDate.date.timeIntervalSince1970;
+    for (int sec=60; sec>=0; sec-=15) [tracker update:battery limit80:limit80 at:now-sec];
+    [controller setValue:tracker forKey:@"batteryForecastTracker"];
+}
+static BOOL ForecastFits(BatteryForecastView *view) {
+    if (![view isKindOfClass:BatteryForecastView.class]) return NO;
+    NSRect a = [view labelRect:YES], b = [view labelRect:NO];
+    NSDictionary *attrs = [view labelAttributes];
+    CGFloat gaugeWidth = NSWidth(view.bounds) - 2 * kBatteryForecastSideRoom;
+    CGFloat expectedA = kBatteryForecastSideRoom + gaugeWidth * view.forecast.thresholdPercent / 100.0;
+    CGFloat expectedB = kBatteryForecastSideRoom + gaugeWidth * view.forecast.endpointPercent / 100.0;
+    CGFloat gap = view.forecast.endpointPercent == 0 ? NSMinX(a)-NSMaxX(b) : NSMinX(b)-NSMaxX(a);
+    if ([view.thresholdText sizeWithAttributes:attrs].width > NSWidth(a) + 0.01 ||
+        [view.endpointText sizeWithAttributes:attrs].width > NSWidth(b) + 0.01 ||
+        !NSContainsRect(view.bounds,a) || !NSContainsRect(view.bounds,b) || gap < 1 ||
+        fabs(NSMidX(a)-expectedA)>0.01 || fabs(NSMidX(b)-expectedB)>0.01 ||
+        view.forecast.thresholdPercent != (view.forecast.endpointPercent == 0 ? 20 : 80)) return NO;
+    // Compare with the production gauge, independently of overlay padding and width.
+    for (NSView *sibling in view.superview.subviews) {
+        if ([sibling isKindOfClass:Gauge.class]) {
+            CGFloat origin=NSMinX(sibling.frame), width=NSWidth(sibling.frame);
+            if (fabs(NSMinX(view.frame)+NSMidX(a)-(origin+width*view.forecast.thresholdPercent/100.0))>0.01 ||
+                fabs(NSMinX(view.frame)+NSMidX(b)-(origin+width*view.forecast.endpointPercent/100.0))>0.01) return NO;
+        }
+        if ([sibling isKindOfClass:NSTextField.class]) {
+            NSTextField *field=(NSTextField *)sibling;
+            if (![field.accessibilityIdentifier hasSuffix:@".value"] && ![field.accessibilityIdentifier hasSuffix:@".name"]) continue;
+            CGFloat width=[field.stringValue sizeWithAttributes:@{NSFontAttributeName:field.font}].width+4;
+            NSRect ink=field.frame;
+            if (field.alignment==NSTextAlignmentRight) ink.origin.x=NSMaxX(ink)-width;
+            ink.size.width=width;
+            if ((view.thresholdText.length && NSIntersectsRect([view convertRect:a toView:view.superview],ink)) ||
+                (view.endpointText.length && NSIntersectsRect([view convertRect:b toView:view.superview],ink))) return NO;
+        }
+    }
+    return YES;
+}
+// The Heat datum as text, each symbol shown as [cpu] / [battery], and the colour of its nth reading.
+static NSString *HeatDatumText(NSTextField *field) {
+    NSAttributedString *a = field.attributedStringValue;
+    NSMutableString *out = [NSMutableString string];
+    NSArray *names = @[@"[cpu]", @"[battery]"];
+    __block NSUInteger marks = 0;
+    [a enumerateAttributesInRange:NSMakeRange(0, a.length) options:0 usingBlock:^(NSDictionary *attrs, NSRange r, __unused BOOL *stop) {
+        if (attrs[NSAttachmentAttributeName]) [out appendString:marks < names.count ? names[marks++] : @"[?]"];
+        else [out appendString:[a.string substringWithRange:r]];
+    }];
+    return [out stringByReplacingOccurrencesOfString:@"\u2009" withString:@" "];
+}
+static NSColor *HeatDatumColor(NSTextField *field, NSUInteger index) {
+    NSAttributedString *a = field.attributedStringValue;
+    __block NSUInteger seen = 0; __block NSColor *found = nil;
+    [a enumerateAttribute:NSForegroundColorAttributeName inRange:NSMakeRange(0, a.length) options:0
+               usingBlock:^(id value, NSRange r, BOOL *stop) {
+        if (!value || ![[a.string substringWithRange:r] containsString:@"°"]) return;
+        if (seen++ == index) { found = value; *stop = YES; }
+    }];
+    return found;
+}
+
+static NSUInteger CountGauges(NSView *view) {
+    NSUInteger count = ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) ? 1 : 0;
+    for (NSView *child in view.subviews) count += CountGauges(child);
+    return count;
+}
+static QuotaPairGauge *FindClaudeMeter(NSView *view) {
+    if ([view isKindOfClass:QuotaPairGauge.class]) return (QuotaPairGauge *)view;
+    for (NSView *child in view.subviews) { QuotaPairGauge *m = FindClaudeMeter(child); if (m) return m; }
+    return nil;
+}
+static BOOL HasText(NSView *view, NSString *text) {
+    if ([view isKindOfClass:NSTextField.class] && [((NSTextField *)view).stringValue containsString:text]) return YES;
+    for (NSView *child in view.subviews) if (HasText(child, text)) return YES;
+    return NO;
+}
+// Recovery of clipped text is required; unsolicited explanatory popups stay off.
+// The height a wrapping field's text needs at its width (its own paragraph style truncates).
+static CGFloat WrappedHeight(NSTextField *field) {
+    return NSHeight([field.stringValue boundingRectWithSize:NSMakeSize(NSWidth(field.bounds) - 4, 1000)
+                                                    options:NSStringDrawingUsesLineFragmentOrigin
+                                                 attributes:@{NSFontAttributeName: field.font}]);
+}
+// The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
+// A container row that cannot show every volume name, and a host disk that has a
+// disk image on it, keep the full names in the row tooltip.
+static BOOL VolumeNamesTip(NSView *view) {
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    if (!view.toolTip.length || ![view.toolTip isEqual:view.accessibilityHelp]) return NO;
+    if ([ident hasPrefix:@"popover.row.storage."]) return YES;
+    if ([ident hasPrefix:@"details.overview.row.storage."]) return YES;
+    return [ident hasPrefix:@"popover.remote."] && [ident containsString:@".volume."];
+}
+static BOOL IntendedControlTip(NSView *view) {
+    if (![view.accessibilityIdentifier isEqual:@"popover.music.next"]) return NO;
+    NSString *tip = view.toolTip ?: @"";
+    if ([tip isEqual:kMusicNextTip]) return YES;
+    // Deck mode keeps this gesture tip and appends the upcoming title.
+    NSString *prefix = [kMusicNextTip stringByAppendingString:@" — "];
+    return [tip hasPrefix:prefix] && tip.length > prefix.length;
+}
+static BOOL RecoveryTip(NSView *view) {
+    if (![view isKindOfClass:NSTextField.class]) return NO;
+    NSTextField *field = (NSTextField *)view;
+    if (field.maximumNumberOfLines > 1)   // a wrapping caption that two lines can't hold
+        return [view.toolTip isEqual:field.stringValue] &&
+            WrappedHeight(field) > NSHeight(field.bounds);
+    return [view.toolTip isEqual:field.stringValue] &&
+        field.attributedStringValue.size.width + 4 > NSWidth(field.bounds);
+}
+static NSView *WordyTip(NSView *view) {
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) return view;
+    for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
+    return nil;
+}
+static BOOL HasTip(NSView *view, NSString *text) {
+    if ([view.accessibilityHelp containsString:text]) return YES;
+    if ([view.accessibilityLabel containsString:text]) return YES;
+    for (NSView *child in view.subviews) if (HasTip(child, text)) return YES;
+    return NO;
+}
+static NSUInteger CountIdentifier(NSView *view, NSString *identifier) {
+    NSUInteger count = [view.accessibilityIdentifier isEqual:identifier] ? 1 : 0;
+    for (NSView *child in view.subviews) count += CountIdentifier(child, identifier);
+    return count;
+}
+static BOOL InstrumentRowsFit(NSView *view) {
+    if ([view.accessibilityIdentifier hasPrefix:@"popover.row."] && view.frame.size.height > kRowH + 2) return NO;
+    for (NSView *child in view.subviews) if (!InstrumentRowsFit(child)) return NO;
+    return YES;
+}
+static BOOL SameColumn(NSView *a, NSView *b) {
+    return a && b && fabs(a.frame.origin.x - b.frame.origin.x) < 0.5;
+}
+static BOOL SameSize(NSView *a, NSView *b) {
+    return a && b && fabs(a.frame.size.width - b.frame.size.width) < 0.5 &&
+        fabs(a.frame.size.height - b.frame.size.height) < 0.5;
+}
+// Separators and section headers are not actionable. A submenu item (Settings) is.
+static BOOL ActionableMenuImages(NSMenu *menu) {
+    if (!menu) return NO;
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.toolTip.length) return NO;
+        if (item.isSeparatorItem) continue;
+        BOOL actionable = item.action != NULL || item.submenu != nil;
+        if (actionable && !item.image) {
+            fprintf(stderr, "menu item missing image: %s\n", item.title.UTF8String ?: "");
+            return NO;
+        }
+        if (item.submenu && !ActionableMenuImages(item.submenu)) return NO;
+    }
+    return YES;
+}
+static BOOL gStationRender = NO;
+static BOOL RenderOffscreen(NSView *view, NSString *path, NSAppearanceName appearance) {
+    if (!view || view.bounds.size.width < 1 || view.bounds.size.height < 1 || !path.length) return NO;
+    // A detail document does not paint its own window background. On a clear bitmap that
+    // leaves light-mode text black-on-black, so composite onto the same fill the window uses.
+    NSAppearance *chrome = [NSAppearance appearanceNamed:appearance];
+    PopoverRootView *host = [[PopoverRootView alloc] initWithFrame:
+        NSMakeRect(0, 0, view.bounds.size.width, view.bounds.size.height)];
+    host.appearance = chrome;
+    view.appearance = chrome;
+    view.frame = host.bounds;
+    [host addSubview:view];
+    NSBitmapImageRep *rep = getenv("GLANCEBAR_RENDER_1X") ? [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)NSWidth(host.bounds) pixelsHigh:(NSInteger)NSHeight(host.bounds)
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0]
+        : [host bitmapImageRepForCachingDisplayInRect:host.bounds];
+    if (!rep) return NO;
+    [host cacheDisplayInRect:host.bounds toBitmapImageRep:rep];
+    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    return [png writeToFile:path atomically:YES];
+}
+static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
+    if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
+        NSTextField *f = (NSTextField *)view;
+        fprintf(stderr, "caption %.0f/%.0fpt: %s\n",
+                [f.stringValue sizeWithAttributes:@{NSFontAttributeName:f.font}].width, f.bounds.size.width - 4,
+                f.stringValue.UTF8String);
+    }
+    for (NSView *child in view.subviews) DumpClaudeCaption(child);
+}
+static NSView *FindIdentifier(NSView *view, NSString *identifier) {
+    if ([view.accessibilityIdentifier isEqual:identifier]) return view;
+    for (NSView *child in view.subviews) { NSView *hit = FindIdentifier(child, identifier); if (hit) return hit; }
+    return nil;
+}
+static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL transportOn) {
+    NSTextField *titleField = (NSTextField *)FindIdentifier(root, @"popover.music.title");
+    NSTextField *subtitleField = (NSTextField *)FindIdentifier(root, @"popover.music.subtitle");
+    NSButton *prev = (NSButton *)FindIdentifier(root, @"popover.music.previous");
+    NSButton *play = (NSButton *)FindIdentifier(root, @"popover.music.play");
+    NSButton *next = (NSButton *)FindIdentifier(root, @"popover.music.next");
+    NSView *output = FindIdentifier(root, @"popover.sound");
+    NSView *row = FindIdentifier(root, @"popover.sound.row");
+    if (![titleField isKindOfClass:NSTextField.class] || ![titleField.stringValue isEqual:title]) return NO;
+    if (![subtitleField isKindOfClass:NSTextField.class] || ![subtitleField.stringValue isEqual:subtitle]) return NO;
+    if (![prev isKindOfClass:NSButton.class] || ![play isKindOfClass:NSButton.class] ||
+        ![next isKindOfClass:NSButton.class] || !output || !row) return NO;
+    if (row.frame.size.height > kSoundH + 2 || CountIdentifier(root, @"popover.sound.row") != 1) return NO;
+    if (prev.superview != row || play.superview != row || next.superview != row ||
+        titleField.superview != row || subtitleField.superview != row) return NO;
+    // The output device has its own line under the track: symbol + name, volume, level.
+    NSView *line = FindIdentifier(root, @"popover.sound.line");
+    if (!line || output.superview != line || !FindIdentifier(line, @"popover.sound.volume") ||
+        !FindIdentifier(line, @"popover.sound.level") || NSMinY(line.frame) < NSMaxY(row.frame) - 0.5) return NO;
+    if (prev.enabled != transportOn || next.enabled != transportOn) return NO;
+    return FindIdentifier(root, @"popover.sound.chevron") == nil &&
+           FindIdentifier(root, @"popover.sound.name") == nil;
+}
+static BOOL FitsChildren(NSView *view) {
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view)) {
+        fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
+        return NO;
+    }
+    for (NSView *child in view.subviews) {
+        // AppKit's segmented control has an empty private hosting view before
+        // window layout. It paints no content and NSContainsRect rejects empty rects.
+        if (NSIsEmptyRect(child.frame)) continue;
+        if (!NSContainsRect(view.bounds, child.frame)) {
+            fprintf(stderr, "outside %s (%s) in %s: %s / %s\n", child.accessibilityIdentifier.UTF8String,
+                NSStringFromClass(child.class).UTF8String, NSStringFromClass(view.class).UTF8String,
+                NSStringFromRect(child.frame).UTF8String, NSStringFromRect(view.bounds).UTF8String);
+            return NO;
+        }
+        if (!FitsChildren(child)) return NO;
+        // No cut-off text anywhere: every label's whole string fits its frame.
+        if ([child isKindOfClass:NSTextField.class] && !child.hidden && ((NSTextField *)child).maximumNumberOfLines > 1) {
+            // A wrapping caption fits if its lines fit its height, or it carries the full text as a tip.
+            NSTextField *field = (NSTextField *)child;
+            CGFloat need = WrappedHeight(field);
+            if (need > NSHeight(field.bounds) + 0.5 && ![field.toolTip isEqual:field.stringValue]) {
+                fprintf(stderr, "truncated %s: \"%s\" needs %.1f high of %.1f\n", field.accessibilityIdentifier.UTF8String,
+                        field.stringValue.UTF8String, need, NSHeight(field.bounds));
+                return NO;
+            }
+        } else if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
+            NSTextField *field = (NSTextField *)child;
+            CGFloat need = field.attributedStringValue.length
+                ? field.attributedStringValue.size.width
+                : [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
+            // A one-line label clipped at the tail is recoverable only when it carries the full text as a tip.
+            BOOL recoverable = [field.toolTip isEqual:field.stringValue] && field.lineBreakMode == NSLineBreakByTruncatingTail;
+            if (need > field.bounds.size.width - 4 && !recoverable) {
+                fprintf(stderr, "truncated %s: \"%s\" needs %.1f of %.1f\n", field.accessibilityIdentifier.UTF8String,
+                        field.stringValue.UTF8String, need, field.bounds.size.width - 4);
+                return NO;
+            }
+        }
+    }
+    return YES;
+}
+static NSColor *MeterPixel(QuotaPairGauge *meter, CGFloat x, CGFloat y) {
+    meter.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    NSBitmapImageRep *rep = [meter bitmapImageRepForCachingDisplayInRect:meter.bounds];
+    [meter cacheDisplayInRect:meter.bounds toBitmapImageRep:rep];
+    return [[rep colorAtX:(NSInteger)(x*rep.pixelsWide/meter.bounds.size.width)
+                       y:(NSInteger)(y*rep.pixelsHigh/meter.bounds.size.height)] colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
+}
+static BOOL Red(NSColor *c) { return c && c.redComponent > c.greenComponent + 0.2; }
+static BOOL Green(NSColor *c) { return c && c.greenComponent > c.redComponent + 0.2; }
+static int Fail(int line) { fprintf(stderr, "Popover check failed at line %d\n", line); return 1; }
+static BOOL RenderedImagesDiffer(NSImage *a, NSImage *b) {
+    if (!a || !b || a.size.width < 1 || b.size.width < 1) return NO;
+    NSInteger w = (NSInteger)llround(MAX(a.size.width, b.size.width) * 2.0);
+    NSInteger h = (NSInteger)llround(MAX(a.size.height, b.size.height) * 2.0);
+    if (w < 1 || h < 1) return NO;
+    if (fabs(a.size.width - b.size.width) > 0.5 || fabs(a.size.height - b.size.height) > 0.5) return YES;
+    NSBitmapImageRep *(^rep)(NSImage *) = ^NSBitmapImageRep *(NSImage *image) {
+        NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+            pixelsWide:w pixelsHigh:h bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+            colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:ctx];
+        [[NSColor blackColor] setFill];
+        NSRectFill(NSMakeRect(0, 0, w, h));
+        [image drawInRect:NSMakeRect(0, 0, w, h) fromRect:NSZeroRect
+                operation:NSCompositingOperationSourceOver fraction:1];
+        [NSGraphicsContext restoreGraphicsState];
+        return bitmap;
+    };
+    NSBitmapImageRep *ra = rep(a), *rb = rep(b);
+    if (!ra.bitmapData || !rb.bitmapData || ra.bytesPerRow != rb.bytesPerRow) return YES;
+    return memcmp(ra.bitmapData, rb.bitmapData, (size_t)ra.bytesPerRow * (size_t)h) != 0;
+}
+static NSView *FirstGauge(NSView *view) {
+    if ([view isKindOfClass:Gauge.class] || [view isKindOfClass:QuotaPairGauge.class]) return view;
+    for (NSView *child in view.subviews) { NSView *g = FirstGauge(child); if (g) return g; }
+    return nil;
+}
+static BOOL DetailFiller(NSView *view) {
+    NSArray *bad = @[@"Not provided", @"Limit status available", @"unknown", @"No local usage"];
+    if ([view isKindOfClass:NSTextField.class]) {
+        NSString *s = ((NSTextField *)view).stringValue ?: @"";
+        for (NSString *phrase in bad) if ([s containsString:phrase]) {
+            fprintf(stderr, "detail filler \"%s\" in \"%s\"\n", phrase.UTF8String, s.UTF8String);
+            return YES;
+        }
+    }
+    for (NSView *child in view.subviews) if (DetailFiller(child)) return YES;
+    return NO;
+}
+static NSView *FindInDocs(NSArray<NSView *> *docs, NSString *identifier) {
+    for (NSView *doc in docs) {
+        NSView *hit = FindIdentifier(doc, identifier);
+        if (hit) return hit;
+    }
+    return nil;
+}
+static BOOL DetailColumnsMatch(NSArray<NSView *> *docs) {
+    NSArray *values = @[
+        @"details.overview.storage.value",
+        @"details.overview.battery.value",
+        @"details.overview.ai.claude.value",
+        @"details.storage.row.0.value",
+        @"details.battery.charge.value",
+        @"details.battery.health.value",
+        @"details.system.cpu.value",
+        @"details.system.memory.value",
+        @"details.system.swap.value",
+        @"details.ai.claude.value",
+        @"details.ai.codex.value",
+        @"details.ai.history.claude.value",
+    ];
+        NSView *anchor = nil;
+        for (NSString *ident in values) {
+            NSView *field = FindInDocs(docs, ident);
+            if (!field) { fprintf(stderr, "missing value column %s\n", ident.UTF8String); return NO; }
+        if (!anchor) anchor = field;
+        else if (!SameColumn(anchor, field)) {
+            fprintf(stderr, "value x %.1f vs %.1f (%s)\n", anchor.frame.origin.x, field.frame.origin.x, ident.UTF8String);
+            return NO;
+        }
+    }
+    NSArray *gauges = @[
+        @"details.overview.storage.gauge",
+        @"details.overview.battery.gauge",
+        @"details.overview.ai.claude.gauge",
+        @"details.battery.charge.gauge",
+        @"details.battery.health.gauge",
+        @"details.system.cpu.gauge",
+        @"details.system.memory.gauge",
+        @"details.ai.claude.gauge",
+        @"details.ai.codex.gauge",
+    ];
+        NSView *gaugeAnchor = nil;
+        for (NSString *ident in gauges) {
+            NSView *gauge = FindInDocs(docs, ident);
+            if (!gauge) { fprintf(stderr, "missing gauge %s\n", ident.UTF8String); return NO; }
+        if (!gaugeAnchor) gaugeAnchor = gauge;
+        else if (!SameColumn(gaugeAnchor, gauge) || !SameSize(gaugeAnchor, gauge)) {
+            fprintf(stderr, "gauge %.1f,%.1f vs %.1f,%.1f (%s)\n",
+                    gaugeAnchor.frame.origin.x, gaugeAnchor.frame.size.width,
+                    gauge.frame.origin.x, gauge.frame.size.width, ident.UTF8String);
+            return NO;
+        }
+    }
+    return YES;
+}
+int main(int argc, const char **argv) {
+    @autoreleasepool {
+        NSMutableDictionary *arguments = [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain] mutableCopy];
+        arguments[@"starlinkCapGB"] = @100;
+        arguments[@"starlinkResetDay"] = @13;
+        arguments[@"telstraCapGB"] = @180;
+        arguments[@"telstraResetDay"] = @7;
+        [NSUserDefaults.standardUserDefaults setVolatileDomain:arguments forName:NSArgumentDomain];
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+        QuotaPairGauge *probe = [[QuotaPairGauge alloc] initWithFrame:NSMakeRect(0,0,100,8)];
+        probe.firstFraction = 0.06; probe.secondFraction = 0.8;
+        if (!Red(MeterPixel(probe,3,1)) || !Green(MeterPixel(probe,40,1)) ||
+            !Green(MeterPixel(probe,40,6))) return Fail(__LINE__);
+        probe.firstFraction = 0.8; probe.secondFraction = 0.06;
+        if (!Green(MeterPixel(probe,40,4)) || !Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
+        probe.firstFraction = 0;
+        if (!Red(MeterPixel(probe,3,4))) return Fail(__LINE__);
+        // A full reset and near-ties use lanes, with each endpoint independently visible.
+        probe.firstFraction = probe.secondFraction = 1;
+        if (!Green(MeterPixel(probe,90,1)) || !Green(MeterPixel(probe,90,6))) return Fail(__LINE__);
+        if (!QuotaFractionsClose(.30,.33) || QuotaFractionsClose(.30,.34) || QuotaFractionsClose(-1,0)) return Fail(__LINE__);
+        probe.firstFraction = .30; probe.secondFraction = .32;
+        if (!Red(MeterPixel(probe,20,1)) || !Red(MeterPixel(probe,20,6))) return Fail(__LINE__);
+        // Two healthy quotas: solid green to the shorter (50%), a lighter green to 71%.
+        probe.firstFraction = .50; probe.secondFraction = .71;
+        {
+            NSColor *solid = MeterPixel(probe,30,4), *tint = MeterPixel(probe,62,4), *track = MeterPixel(probe,90,4);
+            if (!Green(solid) || !Green(tint) || Green(track)) return Fail(__LINE__);
+            // The offscreen bitmap has no backdrop, so "lighter" shows up as lower alpha
+            // (on screen it composites to a paler green over the track and window).
+            if (tint.alphaComponent > solid.alphaComponent - 0.3 &&
+                fabs(tint.greenComponent - solid.greenComponent) < 0.08 && fabs(tint.redComponent - solid.redComponent) < 0.08)
+                return Fail(__LINE__);   // the extension must be visibly lighter than the solid fill
+        }
+        // User example: full-height amber to 30%, green from there to 60%.
+        probe.firstFraction = .30; probe.secondFraction = .60;
+        if (!Green(MeterPixel(probe,45,1)) || !Green(MeterPixel(probe,45,6))) return Fail(__LINE__);
+        NSColor *lowOpus = MeterPixel(probe,20,4);
+        __block NSColor *amber;
+        [probe.appearance performAsCurrentDrawingAppearance:^{
+            amber = [NSColor.systemOrangeColor colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
+        }];
+        if (fabs(lowOpus.redComponent-amber.redComponent)>0.03 ||
+            fabs(lowOpus.greenComponent-amber.greenComponent)>0.03 ||
+            fabs(lowOpus.blueComponent-amber.blueComponent)>0.03) return Fail(__LINE__);
+        NSString *fixtureHome = [NSHomeDirectory() stringByAppendingPathComponent:[@".glancebar-offline-test-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        gOfflineFixtureHome = fixtureHome; atexit(CleanupOfflineFixture);
+        NSString *fixtureMusic = [fixtureHome stringByAppendingPathComponent:@"Music"];
+        [NSFileManager.defaultManager createDirectoryAtPath:fixtureMusic withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *stationFixture = [fixtureMusic stringByAppendingPathComponent:@"station.m4a"];
+        [@"synthetic silent fixture" writeToFile:stationFixture atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        setenv("GLANCEBAR_HOME", fixtureHome.UTF8String, 1);
+        Controller *c = [Controller new];
+        NSDictionary *offline = OfflineFixture(stationFixture, @"station:triplej");
+        [c setValue:[@{@"station:triplej": offline[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:offline[@"manifest"] forKey:@"offlineManifest"];
+        // Seed tiles from a fixture: the harness never reads the real Music library.
+        [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:@YES forKey:@"audioFrozen"];   // never read this Mac's live volume mid-check
+        [c setValue:@[@{@"key": @"song:A1", @"kind": @"song", @"title": @"Muse (feat. Kate Morgan)", @"subtitle": @"Rezident", @"trackID": @"A1", @"artist": @"Rezident", @"album": @"Only For A Moment EP", @"family": @"dance"},
+                      @{@"key": @"song:B1", @"kind": @"song", @"title": @"Kota", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
+                      @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},
+                      @{@"key": @"song:D1", @"kind": @"song", @"title": @"So Long, See You Tomorrow Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
+              forKey:@"mixSeeds"];
+        [c setValue:@YES forKey:@"stationLoaded"];
+        [c setValue:@YES forKey:@"stationAvailable"];
+        [c setValue:@[stationFixture] forKey:@"stationFiles"];
+        [c setValue:@[
+            @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": stationFixture},
+            @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
+            @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
+        ] forKey:@"stationPicks"];
+        [c setValue:@"limit80" forKey:@"chargeMode"];
+        [c setValue:@YES forKey:@"chargeModeLoaded"];
+        NSPopover *p = [NSPopover new];
+        p.contentViewController = [NSViewController new];
+        [c setValue:p forKey:@"popover"];
+        Volume *v = [Volume new]; v.name = @"Macintosh HD"; v.path = @"/";
+        v.total = 1000000000000; v.available = 250000000000; v.isInternal = YES;
+        NSMutableArray *volumes = [NSMutableArray arrayWithObject:v];
+        for (int i=0; i<7; i++) {
+            Volume *extra = [Volume new]; extra.name = [NSString stringWithFormat:@"External %d", i];
+            extra.path = [@"/Volumes/" stringByAppendingString:extra.name];
+            extra.total = v.total; extra.available = 500000000000;
+            [volumes addObject:extra];
+        }
+        [c setValue:volumes forKey:@"vols"];
+        [c setValue:@YES forKey:@"volumesUnavailable"];
+        [c setValue:[NSDate dateWithTimeIntervalSinceNow:-3600] forKey:@"lastVolumeSuccess"];
+        SystemState sys = {.cpuValid=YES, .memValid=YES, .swapValid=YES, .cpu=0.24,
+            .memTotal=34359738368, .memUsed=17179869184, .memAvailable=17179869184, .kernPressure=1,
+            .tempValid=YES, .cpuTempC=101.4, .thermalValid=YES, .thermalPressure=2,
+            .clocks={.valid=YES, .pMHz=2321, .pMaxMHz=4464, .pBusy=0.9, .eMHz=2100, .eMaxMHz=3048, .eBusy=0.95}};
+        [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
+        [c setValue:@0.52 forKey:@"heatSpeed"];
+        BatteryState b = {.valid=YES, .percent=61, .acConnected=YES, .isCharging=YES,
+            .rawCurrent_mAh=2745, .rawMax_mAh=4500, .designCap_mAh=5000, .voltage_mV=12000, .amperage_mA=1000,
+            .cycleCount=120, .systemPowerIn_mW=18800, .systemLoad_mW=6800, .adapterWatts=20};
+        [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
+        [c setValue:@YES forKey:@"showWatts"]; [c setValue:@YES forKey:@"showHealth"];
+        NSMutableArray *usage = [NSMutableArray array];
+        for (NSString *name in @[@"Claude", @"Codex", @"Cursor"]) {
+            AIUsage *u = [AIUsage new]; u.name = name; u.available = YES;
+            u.limitStatusAvailable = YES; u.remainingFraction = [name isEqual:@"Codex"] ? 0.06 : 0.73;
+            u.resetAt = [NSDate dateWithTimeIntervalSinceNow:3*86400];
+            u.limitWindows = @[@{@"remainingFraction":@0.06, @"window":@"weekly", @"bucket":@"codex"},
+                @{@"remainingFraction":@1, @"window":@"5-hour", @"bucket":@"codex_bengalfox"},
+                @{@"remainingFraction":@1, @"window":@"weekly", @"bucket":@"codex_bengalfox"}];
+            if ([name isEqual:@"Claude"]) u.limitWindows = @[
+                @{@"remainingFraction":@0.57, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 7200)},
+                @{@"remainingFraction":@0.33, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
+                @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
+            if ([name isEqual:@"Codex"]) { u.limitStale = YES; u.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-3600]; }
+            [usage addObject:u];
+        }
+        [c setValue:usage forKey:@"aiUsage"];
+        [c setValue:NSDate.date forKey:@"lastMachineRefresh"];
+        [c setValue:NSDate.date forKey:@"lastAIRefresh"];
+        [c setValue:@[@{@"uid": @"bose", @"name": @"Bose Flex SoundLink",
+                        @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2,
+                        @"dataSource": @""}] forKey:@"audioDevices"];
+        [c setValue:@"bose" forKey:@"defaultOutputUID"];
+        // This binary keeps NSUserDefaults under its own name. A failure inside the M2
+        // block used to return before removing remoteMachines, so the next run grew an
+        // extra fleet gauge (popover.remote.<host>.gauge).
+        NSUserDefaults *fixtureDefaults = NSUserDefaults.standardUserDefaults;
+        [fixtureDefaults removeObjectForKey:@"remoteMachines"];
+        [fixtureDefaults removeObjectForKey:@"remoteOpen.m2"];
+        [c rebuildContent];
+        NSView *root = p.contentViewController.view;
+        printf("Popover: %.0f × %.0f; gauges: %lu; scroll: %s\n",root.frame.size.width, root.frame.size.height,
+               (unsigned long)CountGauges(root), FirstScrollView(root) ? "yes" : "no");
+        if (FirstScrollView(root) || root.frame.size.height > 564 || CountGauges(root) != 6 ||   // + Heat, under pressure
+            HasText(root,@"bengalfox") || !HasText(root,@"stale 1h")) return Fail(__LINE__);
+        if (FindIdentifier(root,@"popover.ai.codex.gauge") ||
+            ![((NSTextField *)FindIdentifier(root,@"popover.ai.codex.value")).stringValue isEqual:@"—"]) return Fail(__LINE__);
+        if (argc>1) {
+            NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-codex-stale.png"];
+            if (!RenderOffscreen(root,path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        // The remaining geometry checks exercise current, fully populated rows.
+        AIUsage *currentCodex=usage[1];currentCodex.limitStale=NO;currentCodex.limitUpdatedAt=NSDate.date;
+        [c rebuildContent];root=p.contentViewController.view;
+        // Token indexing is internal machinery: it never reaches an instrument (2026-10-06).
+        [c setValue:@YES forKey:@"_aiTotalsIncomplete"];
+        [c setValue:@"Indexing 96% · totals incomplete" forKey:@"_aiCatchUpStatus"];
+        [c rebuildContent];
+        if (HasText(root, @"ndexing")) return Fail(__LINE__);
+        [c setValue:@NO forKey:@"_aiTotalsIncomplete"];
+        [c rebuildContent];
+        if (HasText(root, @"STORAGE") || HasText(root, @"BATTERY") || HasText(root, @"SYSTEM") ||
+            HasText(root, @"SOUND") || HasText(root, @"AI STATUS") ||
+            FindIdentifier(root, @"popover.heading.storage") || FindIdentifier(root, @"popover.storage.details") ||
+            HasText(root, @"drives")) return Fail(__LINE__);
+        if (!InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+        NSView *storageGauge = FindIdentifier(root, @"popover.storage.gauge");
+        NSView *batteryGauge = FindIdentifier(root, @"popover.battery.gauge");
+        NSView *codexGauge = FindIdentifier(root, @"popover.ai.codex.gauge");
+        NSView *cursorGauge = FindIdentifier(root, @"popover.ai.cursor.gauge");
+        QuotaPairGauge *meter = FindClaudeMeter(root);
+        if (!SameColumn(storageGauge, batteryGauge) || !SameColumn(storageGauge, meter) ||
+            !SameColumn(storageGauge, codexGauge) || !SameColumn(storageGauge, cursorGauge)) return Fail(__LINE__);
+        if (fabs(storageGauge.frame.size.width - batteryGauge.frame.size.width) > 0.5 ||
+            fabs(storageGauge.frame.size.width - meter.frame.size.width) > 0.5 ||
+            fabs(storageGauge.frame.origin.x - kGaugeX) > 0.5 ||
+            fabs(storageGauge.frame.size.width - kGaugeW) > 0.5) return Fail(__LINE__);
+        if (!SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.battery.value")) ||
+            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.claude.value")) ||
+            !SameColumn(FindIdentifier(root, @"popover.storage.value"), FindIdentifier(root, @"popover.ai.codex.value")) ||
+            fabs(FindIdentifier(root, @"popover.storage.value").frame.origin.x - kValueX) > 0.5 ||
+            fabs(FindIdentifier(root, @"popover.storage.datum").frame.origin.x - kDatumX) > 0.5)
+            return Fail(__LINE__);
+        // Machine rows stay symbol-only. AI rows add the provider name beside the logo,
+        // and every symbol still shares the lead column.
+        NSView *storageSymbol = FindIdentifier(root, @"popover.storage.symbol");
+        NSButton *batterySymbol = (NSButton *)FindIdentifier(root, @"popover.battery.symbol");
+        NSArray *symbols = @[
+            storageSymbol,
+            batterySymbol,
+            FindIdentifier(root, @"popover.system.symbol"),
+            FindIdentifier(root, @"popover.ai.claude.symbol"),
+            FindIdentifier(root, @"popover.ai.codex.symbol"),
+            FindIdentifier(root, @"popover.ai.cursor.symbol"),
+        ];
+        for (NSView *lead in symbols) {
+            if (!lead || !SameColumn(storageSymbol, lead) || !SameSize(storageSymbol, lead)) return Fail(__LINE__);
+        }
+        if (![storageSymbol isKindOfClass:NSImageView.class]) return Fail(__LINE__);
+        if (![batterySymbol isKindOfClass:NSButton.class] || batterySymbol.action == NULL) return Fail(__LINE__);
+        // Quantity plus flow: a trend arrow above the charge bar from the level toward where it
+        // is heading (stopping at the 80% limit), and the signed rate as the datum.
+        NSTextField *batteryDatum = (NSTextField *)FindIdentifier(root, @"popover.battery.datum");
+        TrendArrow *trend = (TrendArrow *)FindIdentifier(root, @"popover.battery.trend");
+        NSView *chargeGauge = FindIdentifier(root, @"popover.battery.gauge");
+        if (![batteryDatum.stringValue isEqual:@"+12 W"] || ![batteryDatum.textColor isEqual:NSColor.systemGreenColor] ||
+            ![trend isKindOfClass:TrendArrow.class] || trend.hidden || trend.to <= trend.from || trend.to > 0.8001 ||
+            fabs(NSMidY(trend.frame) - NSMidY(chargeGauge.frame)) > 0.5) return Fail(__LINE__);   // in line with the bar
+        NSString *levelName = BatterySymbolName(b.percent, NO);
+        CGFloat levelPt = FittedSymbolPointSize(levelName, kLeadSymbol, kLeadW);
+        NSImageSymbolConfiguration *plainCfg = [NSImageSymbolConfiguration configurationWithPointSize:levelPt
+                                                                                               weight:NSFontWeightRegular];
+        NSImage *plainGlyph = [[NSImage imageWithSystemSymbolName:levelName accessibilityDescription:nil]
+                               imageWithSymbolConfiguration:plainCfg];
+        NSColor *ink = PowerFlowColor(b, NSColor.secondaryLabelColor);
+        NSImage *plainTinted = [NSImage imageWithSize:plainGlyph.size flipped:NO drawingHandler:^BOOL(NSRect dst) {
+            [plainGlyph drawInRect:dst];
+            [ink set];
+            NSRectFillUsingOperation(dst, NSCompositingOperationSourceAtop);
+            return YES;
+        }];
+        // Charging bakes a non-template image. Same colour, no badge, must still differ.
+        if (batterySymbol.image.template || !RenderedImagesDiffer(batterySymbol.image, plainTinted))
+            return Fail(__LINE__);
+        int etaMin = [c chargeForecastMinutes];
+        NSString *etaPhrase = [NSString stringWithFormat:@"80%% ~%@", BatteryForecastClock([c batteryForecast].thresholdTime, nil)];
+        NSView *batteryRow = FindIdentifier(root, @"popover.row.battery");
+        if (etaMin < 0 || ![batteryRow.accessibilityHelp containsString:etaPhrase]) return Fail(__LINE__);
+        NSPoint symbolMid = [batterySymbol convertPoint:NSMakePoint(NSMidX(batterySymbol.bounds),
+                                                                     NSMidY(batterySymbol.bounds))
+                                                  toView:batterySymbol.superview.superview];
+        NSView *symbolHit = [batterySymbol.superview hitTest:symbolMid];
+        if (symbolHit != batterySymbol) return Fail(__LINE__);
+        Gauge *batteryMeter = (Gauge *)batteryGauge;
+        if (![batteryMeter isKindOfClass:Gauge.class] || !ForecastFits((BatteryForecastView *)FindIdentifier(root, @"popover.battery.forecast")))
+            return Fail(__LINE__);
+        if (fabs(storageSymbol.frame.origin.x - kPad) > 0.5 ||
+            fabs(storageSymbol.frame.size.width - kLeadW) > 0.5 ||
+            fabs(storageSymbol.frame.size.height - kLeadSymbol) > 0.5) return Fail(__LINE__);
+        NSTextField *claudeName = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.name");
+        NSTextField *codexName = (NSTextField *)FindIdentifier(root, @"popover.ai.codex.name");
+        NSTextField *cursorName = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.name");
+        if (![claudeName isKindOfClass:NSTextField.class] || ![claudeName.stringValue isEqual:@"Claude"] ||
+            ![codexName.stringValue isEqual:@"Codex"] || ![cursorName.stringValue isEqual:@"Cursor"] ||
+            !SameColumn(claudeName, codexName) || !SameColumn(claudeName, cursorName) ||
+            fabs(claudeName.frame.origin.x - kAINameX) > 0.5)
+            return Fail(__LINE__);
+        // Every row names itself, in one column with the AI names.
+        NSTextField *popStorageName = (NSTextField *)FindIdentifier(root, @"popover.storage.name");
+        NSTextField *popBatteryName = (NSTextField *)FindIdentifier(root, @"popover.battery.name");
+        NSTextField *popSystemName = (NSTextField *)FindIdentifier(root, @"popover.system.name");
+        if (![popStorageName.stringValue isEqual:@"Storage"] || ![popBatteryName.stringValue isEqual:@"Battery"] ||
+            ![popSystemName.stringValue isEqual:@"System"] || !SameColumn(popStorageName, claudeName) ||
+            !SameColumn(popBatteryName, claudeName) || !SameColumn(popSystemName, claudeName))
+            return Fail(__LINE__);
+        // Under pressure a Heat row follows System: fast-core speed, then chip · cells.
+        NSTextField *heatValue = (NSTextField *)FindIdentifier(root, @"popover.heat.value");
+        NSTextField *heatDatum = (NSTextField *)FindIdentifier(root, @"popover.heat.datum");
+        NSTextField *heatName = (NSTextField *)FindIdentifier(root, @"popover.heat.name");
+        if (!FindIdentifier(root, @"popover.row.heat") || ![heatName.stringValue isEqual:@"Speed"] ||
+            !((Gauge *)FindIdentifier(root, @"popover.heat.gauge")).lossColor ||
+            ![heatValue.stringValue isEqual:@"52%"] || ![heatValue.textColor isEqual:NSColor.systemRedColor] ||
+            ![HeatDatumText(heatDatum) isEqual:@"[cpu]101°"] || ![HeatDatumColor(heatDatum, 0) isEqual:NSColor.systemRedColor] ||
+            !SameColumn(heatDatum, batteryDatum) || !SameColumn(heatName, popSystemName) ||
+            FindIdentifier(root, @"popover.system.heat") || !HasTip(root, @"Fast cores at 52% of top speed"))
+            return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-heat.png"];
+            if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        {   // The Thermal tab: pressure lamps, both clusters against their top clocks, chip.
+            NSView *thermal = [c thermalDetailsView].documentView;
+            NSTextField *(^field)(NSString *) = ^NSTextField *(NSString *ident) {
+                return (NSTextField *)FindIdentifier(thermal, [@"details.thermal." stringByAppendingString:ident]);
+            };
+            if (![field(@"pressure.value").stringValue isEqual:@"heavy"] || !FindIdentifier(thermal, @"details.thermal.pressure.lamps") ||
+                ![field(@"fast.value").stringValue isEqual:@"2.3"] || ![field(@"fast.datum").stringValue isEqual:@"of 4.5 GHz"] ||
+                ![field(@"efficient.value").stringValue isEqual:@"2.1"] || ![field(@"efficient.datum").stringValue isEqual:@"of 3.0 GHz"] ||
+                ![field(@"chip.value").stringValue isEqual:@"101°"] || ![field(@"fast.value").textColor isEqual:NSColor.systemRedColor] ||
+                !SameColumn(field(@"fast.value"), field(@"chip.value")) || FindIdentifier([c systemDetailsView].documentView, @"details.system.row.heat") ||
+                !FitsChildren(thermal)) return Fail(__LINE__);
+            const char *thermalOut = getenv("GLANCEBAR_RENDER_THERMAL");
+            if (thermalOut && thermalOut[0] && !RenderOffscreen(thermal, [NSString stringWithUTF8String:thermalOut],
+                                                               argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        {   // Cells join the chip in the Heat datum; the Battery datum keeps its watts.
+            BatteryState warm = b; warm.tempC = 31.3;
+            [c setValue:[NSValue valueWithBytes:&warm objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            NSView *warmRoot = p.contentViewController.view;
+            NSTextField *pair = (NSTextField *)FindIdentifier(warmRoot, @"popover.heat.datum");
+            NSTextField *watts = (NSTextField *)FindIdentifier(warmRoot, @"popover.battery.datum");
+            if (![HeatDatumText(pair) isEqual:@"[cpu]101° [battery]31°"] || ![HeatDatumColor(pair, 1) isEqual:NSColor.secondaryLabelColor] ||
+                ![watts.stringValue isEqual:@"+12 W"] || !FitsChildren(warmRoot) ||
+                ![watts.textColor isEqual:NSColor.systemGreenColor]) return Fail(__LINE__);
+        }
+        {   // Hot cells with a cool chip still bring the row; the cells set its colour.
+            SystemState cool = sys; cool.thermalPressure = 0; cool.cpuTempC = 61;
+            [c setValue:[NSValue valueWithBytes:&cool objCType:@encode(SystemState)] forKey:@"sys"];
+            BatteryState hot = b; hot.tempC = 41.6;
+            [c setValue:[NSValue valueWithBytes:&hot objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:@1.0 forKey:@"heatSpeed"];
+            [c rebuildContent];
+            NSView *hotRoot = p.contentViewController.view;
+            NSTextField *hotDatum = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.datum");
+            NSTextField *hotValue = (NSTextField *)FindIdentifier(hotRoot, @"popover.heat.value");
+            if (![HeatDatumText(hotDatum) isEqual:@"[cpu]61° [battery]42°"] || ![HeatDatumColor(hotDatum, 0) isEqual:NSColor.secondaryLabelColor] ||
+                ![HeatDatumColor(hotDatum, 1) isEqual:NSColor.systemRedColor] || hotDatum.intrinsicContentSize.width > NSWidth(hotDatum.frame) ||
+                ![hotValue.stringValue isEqual:@"100%"] || ![hotValue.textColor isEqual:NSColor.systemGreenColor] ||
+                !HasTip(hotRoot, @"cells 42 °C") || !FitsChildren(hotRoot)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-battery-hot.png"];
+                if (!RenderOffscreen(hotRoot, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            [c setValue:[NSValue valueWithBytes:&sys objCType:@encode(SystemState)] forKey:@"sys"];
+            [c setValue:@0.52 forKey:@"heatSpeed"];
+        }
+        {   // Both cool: no Heat row.
+            SystemState cool = sys; cool.thermalPressure = 0; cool.cpuTempC = 55;
+            BatteryState mild = b; mild.tempC = 30;
+            [c setValue:[NSValue valueWithBytes:&cool objCType:@encode(SystemState)] forKey:@"sys"];
+            [c setValue:[NSValue valueWithBytes:&mild objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.heat")) return Fail(__LINE__);
+            // Speed row always: the same row stays up while cool, 100% green with the temperatures.
+            [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"speedAlways"];
+            [c setValue:@1.0 forKey:@"heatSpeed"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *coolValue = (NSTextField *)FindIdentifier(root, @"popover.heat.value");
+            NSTextField *coolDatum = (NSTextField *)FindIdentifier(root, @"popover.heat.datum");
+            if (!FindIdentifier(root, @"popover.row.heat") || ![coolValue.stringValue isEqual:@"100%"] ||
+                ![coolValue.textColor isEqual:NSColor.systemGreenColor] ||
+                ![HeatDatumText(coolDatum) isEqual:@"[cpu]55° [battery]30°"] ||
+                ((Gauge *)FindIdentifier(root, @"popover.heat.gauge")).lossColor ||
+                !FindIdentifier([c overviewDetailsView].documentView, @"details.overview.row.heat") ||
+                !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-speed-always.png"];
+                if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"speedAlways"];
+            [c setValue:@0.52 forKey:@"heatSpeed"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.heat")) return Fail(__LINE__);
+            // The rest of the checks run cool, without the Heat row.
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+        }
+        if (!HasTip(root, @"Claude —") || !HasTip(root, @"Codex —") || !HasTip(root, @"Cursor —"))
+            return Fail(__LINE__);
+        NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");
+        if (![claudeDatum.stringValue hasPrefix:@"resets "]) return Fail(__LINE__);
+        [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:[NSMutableDictionary dictionary] forKey:@"offlineRequests"];
+        [c rebuildContent];
+        root = p.contentViewController.view;
+        NSView *output = FindIdentifier(root, @"popover.sound");
+        NSTextField *musicSubtitle = (NSTextField *)FindIdentifier(root, @"popover.music.subtitle");
+        if (!SoundRow(root, @"Liked Music", musicSubtitle.stringValue, NO) ||
+            ![musicSubtitle.stringValue hasSuffix:@"on this Mac"] ||
+            FindIdentifier(root, @"popover.music.open") ||
+            FindIdentifier(root, @"popover.music.shuffle") ||
+            ![output.accessibilityLabel isEqual:@"Mac output, Bose Flex SoundLink"] ||
+            ![output.accessibilityHelp containsString:@"Choose output"]) return Fail(__LINE__);
+        {   // Where it will play and how loud: name beside the symbol, level coloured when loud or muted.
+            NSButton *outputButton = (NSButton *)output;
+            NSSlider *volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
+            NSTextField *level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
+            if (![outputButton.title containsString:@"Bose Flex SoundLink"] || fabs(volume.doubleValue - 0.55) > 0.001 ||
+                !volume.enabled || ![level.stringValue isEqual:@"55%"] || ![level.textColor isEqual:NSColor.secondaryLabelColor] ||
+                outputButton.attributedTitle.size.width + 22 > NSWidth(outputButton.frame) || !FitsChildren(root)) return Fail(__LINE__);
+            [c setValue:@0.85 forKey:@"outputVolume"]; [c rebuildContent]; root = p.contentViewController.view;
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            if (![level.stringValue isEqual:@"85%"] || ![level.textColor isEqual:NSColor.systemOrangeColor]) return Fail(__LINE__);
+            [c setValue:@YES forKey:@"outputMuted"]; [c rebuildContent]; root = p.contentViewController.view;
+            level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
+            outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
+            NSImageView *volSymbol = (NSImageView *)FindIdentifier(root, @"popover.sound.volume.symbol");
+            if (![level.stringValue isEqual:@"mute"] || ![level.textColor isEqual:NSColor.systemRedColor] ||
+                ![volSymbol isKindOfClass:NSImageView.class] ||
+                ![volSymbol.contentTintColor isEqual:NSColor.systemRedColor]) return Fail(__LINE__);
+            [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
+        {   // Per-app routing: one line per routed app under the output line — app, arrow, speaker, switch.
+            [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @YES}]
+                 forKey:@"_routeRules"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            BOOL musicInstalled = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.apple.Music"] != nil;
+            NSView *route = FindIdentifier(root, @"popover.route.com.apple.Music");
+            NSView *line = FindIdentifier(root, @"popover.sound.line");
+            NSButton *target = (NSButton *)FindIdentifier(root, @"popover.route.target.com.apple.Music");
+            NSSwitch *toggle = (NSSwitch *)FindIdentifier(root, @"popover.route.toggle.com.apple.Music");
+            NSView *state = FindIdentifier(root, @"popover.route.state.com.apple.Music");
+            if (musicInstalled) {
+                if (!route || !target || !toggle || !state || NSHeight(route.frame) > 24.5 ||
+                    NSMinY(route.frame) < NSMaxY(line.frame) - 0.5 ||
+                    ![target.title containsString:@"Bose Flex SoundLink"] || toggle.state != NSControlStateValueOn ||
+                    NSMaxX(toggle.frame) > kW - kPad + 0.5 || NSMaxX(target.frame) > NSMinX(toggle.frame) ||
+                    ![state.accessibilityLabel isEqual:@"waiting for Music"] || !FitsChildren(root)) return Fail(__LINE__);
+                const char *routePNG = getenv("GLANCEBAR_ROUTE_PNG");
+                if (routePNG && routePNG[0]) {
+                    NSString *dir = [NSString stringWithUTF8String:routePNG];
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-light.png"], NSAppearanceNameAqua) ||
+                        !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-dark.png"], NSAppearanceNameDarkAqua))
+                        return Fail(__LINE__);
+                }
+                [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @NO}]
+                     forKey:@"_routeRules"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                toggle = (NSSwitch *)FindIdentifier(root, @"popover.route.toggle.com.apple.Music");
+                state = FindIdentifier(root, @"popover.route.state.com.apple.Music");
+                if (toggle.state != NSControlStateValueOff || ![state.accessibilityLabel isEqual:@"off"]) return Fail(__LINE__);
+                if (routePNG && routePNG[0]) {
+                    NSString *dir = [NSString stringWithUTF8String:routePNG];
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-off-dark.png"], NSAppearanceNameDarkAqua))
+                        return Fail(__LINE__);
+                }
+            } else if (route) return Fail(__LINE__);
+            [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @YES}]
+                 forKey:@"_routeRules"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
+        {   // Seed tiles, the triple j station, and a round New picks button. Title over artist, one line each.
+            NSView *mix = FindIdentifier(root, @"popover.mix");
+            NSView *line = FindIdentifier(root, @"popover.sound.line");
+            NSTextField *c0 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.0");
+            NSTextField *a0 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.0");
+            NSTextField *c3 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.3");
+            NSTextField *a3 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.3");
+            NSButton *s0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
+            NSButton *s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            NSButton *s3 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.3");
+            NSButton *station = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+            NSButton *picks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
+            NSTextField *stCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
+            NSTextField *stArt = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.4");
+            NSView *badge = FindIdentifier(root, @"popover.mix.station.badge");
+            CGFloat gapSeeds = NSMinX(s1.frame) - NSMaxX(s0.frame);
+            CGFloat gapStation = NSMinX(station.frame) - NSMaxX(s3.frame);
+            CGFloat gapButton = NSMinX(picks.frame) - NSMaxX(station.frame);
+            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !picks || !station || !s3 ||
+                FindIdentifier(root, @"popover.mix.seed.4") ||
+                ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
+                ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] || s1.enabled || s1.alphaValue > 0.45 ||
+                ![s1.accessibilityHelp containsString:@"Offline playlist not prepared"] ||
+                ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
+                c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
+                fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || fabs(NSMinY(a0.frame) - NSMinY(stArt.frame)) > 0.5 ||
+                NSHeight(c0.frame) < ceil(c0.font.ascender - c0.font.descender) ||
+                ![c0.textColor isEqual:NSColor.labelColor] || ![a0.textColor isEqual:NSColor.secondaryLabelColor] ||
+                ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail ||
+                ![picks.accessibilityLabel isEqual:@"New picks"] || picks.action != @selector(newMixPicks:) ||
+                fabs(NSWidth(picks.frame) - 22) > 0.5 || fabs(NSHeight(picks.frame) - 22) > 0.5 ||
+                fabs(picks.layer.cornerRadius - 11) > 0.5 ||
+                fabs(NSWidth(station.frame) - 54) > 0.5 || fabs(NSHeight(station.frame) - 54) > 0.5 ||
+                fabs(NSMidY(picks.frame) - NSMidY(station.frame)) > 0.5 ||
+                fabs(NSMinX(s0.frame) - kPad) > 0.6 || fabs(NSMaxX(picks.frame) - (kW - kPad)) > 0.6 ||
+                fabs(gapSeeds - gapStation) > 0.6 || fabs(gapSeeds - gapButton) > 0.6 || gapSeeds < 2 ||
+                ![stCap.stringValue isEqual:@"New music"] || ![stArt.stringValue isEqual:@"for you"] ||
+                !badge || ![badge.accessibilityLabel isEqual:@"3 new picks"] || station.alphaValue < 0.95)
+                return Fail(__LINE__);
+            {   // A cover tile carries its image for the large hover view.
+                NSImage *art = [NSImage imageWithSize:NSMakeSize(60, 60) flipped:NO drawingHandler:^BOOL(NSRect r) { [NSColor.systemRedColor setFill]; NSRectFill(r); return YES; }];
+                [c setValue:[@{@"A1": art} mutableCopy] forKey:@"mixArt"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                GBSeedTile *t0 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.0"), *t2 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.2");
+                if (![t0 isKindOfClass:GBSeedTile.class] || t0.cover != art || t2.cover) return Fail(__LINE__);
+                // The hover card names the song in full: the zone spans tile and captions, clicks pass through.
+                GBSeedHover *h3 = (GBSeedHover *)FindIdentifier(root, @"popover.mix.hover.3");
+                GBSeedTile *t3 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.3");
+                if (![h3 isKindOfClass:GBSeedHover.class] || h3.tile != t3 || [h3 hitTest:NSMakePoint(NSMidX(h3.frame), NSMidY(h3.frame))] ||
+                    ![t3.songTitle isEqual:@"So Long, See You Tomorrow Anniversary"] || ![t3.songArtist isEqual:@"Bombay Bicycle Club"] ||
+                    NSMaxY(h3.frame) < NSMaxY(t3.frame) - 0.5 || NSMinY(h3.frame) > 0.5) return Fail(__LINE__);
+                [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
+                [c rebuildContent]; root = p.contentViewController.view;
+            }
+            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            NSTextField *c1 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.1");
+            if (s1.layer.borderWidth < 1.9 || ![c1.textColor isEqual:NSColor.controlAccentColor]) return Fail(__LINE__);
+            [c setValue:@NO forKey:@"localMode"]; [c setValue:nil forKey:@"mixPlayingKey"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            // Seed tiles stay visible whenever music is enabled; network state no longer hides them.
+            [c setValue:@NO forKey:@"localMode"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks"))
+                return Fail(__LINE__);
+            [c setValue:@YES forKey:@"musicProbesEnabled"];
+            [c setValue:@YES forKey:@"networkKnown"];
+            [c setValue:@NO forKey:@"networkOnline"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.mix.seed.0")) return Fail(__LINE__);
+            [c setValue:@NO forKey:@"musicProbesEnabled"];
+            [c setValue:@NO forKey:@"networkKnown"];
+            [c setValue:@YES forKey:@"networkOnline"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            {   // Saved seeds show when the library cannot be read (Music closed, or offline).
+                NSArray *liveSeeds = [c valueForKey:@"mixSeeds"];
+                [c setValue:nil forKey:@"mixSeeds"];
+                [c setValue:@NO forKey:@"mixFrozen"];
+                [c setValue:@NO forKey:@"musicOff"];
+                NSMutableDictionary *args = [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain] mutableCopy] ?: [NSMutableDictionary dictionary];
+                args[@"mixSeeds"] = @[@{@"key": @"song:Z", @"kind": @"song", @"title": @"Saved Seed",
+                                        @"subtitle": @"Saved Artist", @"trackID": @"Z", @"artist": @"Saved Artist",
+                                        @"album": @"", @"family": @"other"}];
+                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
+                [c ensureMixSeeds];
+                NSArray *restored = [c valueForKey:@"mixSeeds"];
+                BOOL savedOK = restored.count == 1 && [restored[0][@"title"] isEqual:@"Saved Seed"];
+                [c setValue:@YES forKey:@"mixFrozen"];
+                [c setValue:liveSeeds forKey:@"mixSeeds"];
+                [args removeObjectForKey:@"mixSeeds"];
+                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
+                [c rebuildContent]; root = p.contentViewController.view;
+                if (!savedOK) return Fail(__LINE__);
+            }
+            {   // Missing station.json dims the tile and hides the count. It must not remove the row.
+                [c setValue:@NO forKey:@"stationAvailable"];
+                [c setValue:@[] forKey:@"stationPicks"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSButton *dimmed = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+                GBStationTile *cardTile = (GBStationTile *)dimmed;
+                if (!dimmed || dimmed.alphaValue > 0.5 || FindIdentifier(root, @"popover.mix.station.badge") ||
+                    !FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks") ||
+                    ![cardTile isKindOfClass:GBStationTile.class]) return Fail(__LINE__);
+                [c setValue:@YES forKey:@"stationAvailable"];
+                [c setValue:@[
+                    @{@"title": @"Kiss from a Rose", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": stationFixture},
+                    @{@"title": @"Danielle", @"artist": @"Fred again..", @"reason": @"like Fred again..", @"file": @""},
+                    @{@"title": @"A Girl Like You", @"artist": @"Tame Impala", @"reason": @"like Tame Impala", @"file": @""}
+                ] forKey:@"stationPicks"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                GBStationTile *stationTile = (GBStationTile *)FindIdentifier(root, @"popover.mix.station");
+                NSView *card = [stationTile largeCard];
+                NSTextField *reason = (NSTextField *)FindIdentifier(card, @"popover.mix.station.pick.reason.0");
+                NSTextField *pickTitle = (NSTextField *)FindIdentifier(card, @"popover.mix.station.pick.title.0");
+                GBSeedHover *hover = (GBSeedHover *)FindIdentifier(root, @"popover.mix.hover.station");
+                if (![stationTile isKindOfClass:GBStationTile.class] || ![reason.stringValue isEqual:@"like Tame Impala"] ||
+                    ![pickTitle.stringValue isEqual:@"Kiss from a Rose"] || hover.tile != stationTile ||
+                    [hover hitTest:NSMakePoint(NSMidX(hover.frame), NSMidY(hover.frame))] ||
+                    !FindIdentifier(root, @"popover.mix.station.badge")) return Fail(__LINE__);
+            }
+            const char *tilesPNG = getenv("GLANCEBAR_TILES_PNG");
+            if (tilesPNG && tilesPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:tilesPNG];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"tiles-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"tiles-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+                [c rebuildContent]; root = p.contentViewController.view;
+            }
+        }
+        {   // A local external disk is its own instrument. Disk images and network mounts stay in Details.
+            Volume *docs = [Volume new];
+            docs.name = @"Documents"; docs.path = @"/Volumes/Documents";
+            docs.total = 300000000000LL; docs.available = 61500000000LL; docs.physicalAvailable = docs.available;
+            docs.isLocal = YES;
+            Volume *research = [Volume new];
+            research.name = @"Research"; research.path = @"/Volumes/Research";
+            research.total = 700000000000LL; research.available = 170000000000LL; research.physicalAvailable = research.available;
+            research.isLocal = YES;
+            Volume *image = [Volume new];
+            image.name = @"Installer"; image.path = @"/Volumes/Installer";
+            image.total = docs.total; image.available = docs.available; image.physicalAvailable = image.available;
+            image.isLocal = YES; image.isDiskImage = YES;
+            Volume *share = [Volume new];
+            share.name = @"Share"; share.path = @"/Volumes/Share";
+            share.total = docs.total; share.available = docs.available; share.physicalAvailable = share.available;
+            NSMutableArray *withExternal = [volumes mutableCopy];
+            [withExternal addObject:docs]; [withExternal addObject:research];
+            [withExternal addObject:image]; [withExternal addObject:share];
+            [c setValue:withExternal forKey:@"vols"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *extName = (NSTextField *)FindIdentifier(root, @"popover.storage.1.name");
+            NSTextField *extValue = (NSTextField *)FindIdentifier(root, @"popover.storage.1.value");
+            NSTextField *extDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.1.datum");
+            NSTextField *researchName = (NSTextField *)FindIdentifier(root, @"popover.storage.2.name");
+            NSTextField *researchValue = (NSTextField *)FindIdentifier(root, @"popover.storage.2.value");
+            NSTextField *researchDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.2.datum");
+            if (![extName.stringValue isEqual:@"Documents"] || ![extValue.stringValue isEqual:@"80%"] ||
+                ![extDatum.stringValue isEqual:@"61.5 GB free"] ||
+                ![researchName.stringValue isEqual:@"Research"] || ![researchValue.stringValue isEqual:@"76%"] ||
+                ![researchDatum.stringValue isEqual:@"170 GB free"] ||
+                FindIdentifier(root, @"popover.storage.3.name") ||
+                !SameColumn(extName, FindIdentifier(root, @"popover.storage.name")) ||
+                !SameColumn(researchName, extName) ||
+                !SameColumn(FindIdentifier(root, @"popover.storage.1.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                !SameColumn(extValue, FindIdentifier(root, @"popover.storage.value")) ||
+                !SameColumn(extDatum, FindIdentifier(root, @"popover.storage.datum")) ||
+                !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+            NSScrollView *externalOverview = [c overviewDetailsView];
+            NSTextField *overviewName = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.1.name");
+            NSTextField *overviewValue = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.1.value");
+            NSTextField *overviewResearch = (NSTextField *)FindIdentifier(externalOverview.documentView, @"details.overview.storage.2.name");
+            if (![overviewName.stringValue isEqual:@"Documents"] || ![overviewValue.stringValue isEqual:@"80%"] ||
+                ![overviewResearch.stringValue isEqual:@"Research"] ||
+                FindIdentifier(externalOverview.documentView, @"details.overview.storage.3.name") ||
+                !SameColumn(overviewName, FindIdentifier(externalOverview.documentView, @"details.overview.storage.name")) ||
+                overviewName.toolTip.length)
+                return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                if (!RenderOffscreen(root, [base stringByAppendingString:@"-external.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                if (!RenderOffscreen(root, [base stringByAppendingString:@"-external-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+            }
+            {   // Two APFS volumes in one container are one disk. A disk image on another disk is only in that disk's tooltip.
+                Volume *otv = [Volume new];
+                otv.name = @"OTV Mirror"; otv.path = @"/Volumes/OTV Mirror";
+                otv.total = 2000000000000LL; otv.available = 1800000000000LL; otv.physicalAvailable = otv.available;
+                otv.isLocal = YES; otv.container = @"disk5"; otv.containerBytes = otv.total;
+                otv.hasVolumeUsed = YES; otv.volumeUsed = 200000000000LL;
+                Volume *vault = [Volume new];
+                vault.name = @"Vault-T"; vault.path = @"/Volumes/Vault-T";
+                vault.total = otv.total; vault.available = otv.available; vault.physicalAvailable = vault.available;
+                vault.isLocal = YES; vault.container = @"disk5"; vault.containerBytes = otv.total;
+                vault.hasVolumeUsed = YES; vault.volumeUsed = 300000000000LL;
+                Volume *stash = [Volume new];
+                stash.name = @"Stash"; stash.path = @"/Volumes/Stash";
+                stash.total = 4000000000000LL; stash.available = 1000000000000LL; stash.physicalAvailable = stash.available;
+                stash.isLocal = YES; stash.container = @"disk4";
+                Volume *image = [Volume new];
+                image.name = @"Archive_Encrypted2"; image.path = @"/Volumes/Archive_Encrypted2";
+                image.total = 2000000000000LL; image.available = 500000000000LL; image.physicalAvailable = image.available;
+                image.isLocal = YES; image.isDiskImage = YES; image.container = @"disk9";
+                image.backingPath = @"/Volumes/Stash/Archive_Encrypted2.sparsebundle";
+                image.hasVolumeUsed = YES; image.volumeUsed = 1500000000000LL;
+                NSMutableArray *grouped = [volumes mutableCopy];
+                [grouped addObject:otv]; [grouped addObject:vault];
+                [grouped addObject:stash]; [grouped addObject:image];
+                [c setValue:grouped forKey:@"vols"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSTextField *groupName = (NSTextField *)FindIdentifier(root, @"popover.storage.1.name");
+                NSTextField *groupValue = (NSTextField *)FindIdentifier(root, @"popover.storage.1.value");
+                NSTextField *groupDatum = (NSTextField *)FindIdentifier(root, @"popover.storage.1.datum");
+                NSView *groupRow = FindIdentifier(root, @"popover.row.storage.1");
+                NSTextField *stashName = (NSTextField *)FindIdentifier(root, @"popover.storage.2.name");
+                NSView *stashRow = FindIdentifier(root, @"popover.row.storage.2");
+                if (![groupName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![groupName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    ![groupValue.stringValue isEqual:@"25%"] || ![groupDatum.stringValue isEqual:@"1.8 TB free"] ||
+                    !HasTip(groupRow, @"OTV Mirror · Vault-T") || !HasTip(groupRow, @"Vault-T") ||
+                    ![stashName.stringValue isEqual:@"Stash"] || !HasTip(stashRow, @"Archive_Encrypted2") ||
+                    FindIdentifier(root, @"popover.storage.3.name") ||
+                    !SameColumn(FindIdentifier(root, @"popover.storage.1.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                    !SameColumn(FindIdentifier(root, @"popover.storage.2.gauge"), FindIdentifier(root, @"popover.storage.gauge")) ||
+                    !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+                NSScrollView *groupedOverview = [c overviewDetailsView];
+                NSTextField *groupedOverviewName = (NSTextField *)FindIdentifier(groupedOverview.documentView, @"details.overview.storage.1.name");
+                if (![groupedOverviewName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![groupedOverviewName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    FindIdentifier(groupedOverview.documentView, @"details.overview.storage.3.name") ||
+                    groupedOverviewName.toolTip.length) return Fail(__LINE__);
+                if (argc > 1) {
+                    NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+                }
+            }
+            [c setValue:volumes forKey:@"vols"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
+        {   // Other Macs: one readiness row each (name, chevron, bar, score, what limits it); a click opens its four rows.
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            [ud setObject:@[@{@"name": @"M2", @"host": @"m2"}] forKey:@"remoteMachines"];
+            [ud setBool:NO forKey:@"remoteOpen.m2"];
+            [c setValue:@(CFAbsoluteTimeGetCurrent()) forKey:@"remotePolledAt"];   // no real ssh from the harness
+            NSDictionary *sample = @{@"cpu": @91, @"thermal": @"heavy", @"pMHz": @1188, @"pTopMHz": @3504, @"pBusy": @0.8, @"memPressure": @"Low",
+                                     @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES, @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37,
+                                     @"volumes": @[@{@"name": @"Archive", @"path": @"/Volumes/Archive",
+                                                     @"totalBytes": @2000000000000LL, @"freeBytes": @500000000000LL,
+                                                     @"internal": @NO, @"local": @YES, @"diskImage": @NO, @"boot": @NO}]};
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSMutableDictionary *badSample = [sample mutableCopy];
+            badSample[@"cpu"] = NSNull.null;
+            badSample[@"chipC"] = @"hot";
+            [c setValue:[@{@"m2": @{@"sample": badSample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.row.remote.m2") || !FindIdentifier(root, @"popover.remote.m2.datum") || !FitsChildren(root))
+                return Fail(__LINE__);
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *rv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.value");
+            NSTextField *rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+            NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");
+            if (!FindIdentifier(root, @"popover.row.remote.m2") || ![rn.stringValue isEqual:@"M2"] || !FindIdentifier(root, @"popover.remote.m2.chevron") ||
+                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue hasSuffix:@"CPU busy"] || ([rd.stringValue containsString:@"°"] ? ![[rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:rd.stringValue.length - 1 effectiveRange:NULL] isEqual:NSColor.systemRedColor] : ![rd.textColor isEqual:NSColor.systemRedColor]) ||
+                FindIdentifier(root, @"popover.remote.m2.storage") || FindIdentifier(root, @"popover.remote.m2.volume.0") ||
+                !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
+                !FitsChildren(root)) return Fail(__LINE__);
+            [ud setBool:YES forKey:@"remoteOpen.m2"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *sv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.value");
+            NSTextField *sd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.storage.datum");
+            NSTextField *pv = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.speed.value");
+            NSTextField *pd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.speed.datum");
+            // The other Mac's Speed datum carries the same chip and battery glyphs as this Mac's.
+            if (![HeatDatumText(pd) isEqual:@"[cpu]76° [battery]37°"] || ![HeatDatumColor(pd, 0) isEqual:NSColor.systemRedColor] ||
+                ![HeatDatumColor(pd, 1) isEqual:NSColor.secondaryLabelColor]) return Fail(__LINE__);
+            NSTextField *ev = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.value");
+            NSTextField *en = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.name");
+            NSTextField *ed = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.datum");
+            if (![sv.stringValue isEqual:@"56%"] || ![sd.stringValue isEqual:@"218 GB free"] || ![pv.stringValue isEqual:@"34%"] ||
+                ![en.stringValue isEqual:@"Archive"] || ![ev.stringValue isEqual:@"75%"] || ![ed.stringValue isEqual:@"500 GB free"] ||
+                !SameColumn(en, FindIdentifier(root, @"popover.remote.m2.storage.name")) ||
+                !FindIdentifier(root, @"popover.remote.m2.battery") || !FindIdentifier(root, @"popover.remote.m2.system") ||
+                !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-remote.png"];
+                if (!RenderOffscreen(root, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            {   // The worker's two APFS volumes share disk5, so the drawer has one external row.
+                NSDictionary *pair = @{@"cpu": @91, @"thermal": @"heavy", @"pMHz": @1188, @"pTopMHz": @3504, @"pBusy": @0.8,
+                                       @"memPressure": @"Low", @"diskFreeGB": @218, @"diskTotalGB": @494, @"ac": @YES,
+                                       @"batt": @76, @"battW": @3.1, @"chipC": @76, @"cellsC": @37,
+                                       @"volumes": @[
+                                           @{@"name": @"OTV Mirror", @"path": @"/Volumes/OTV Mirror", @"container": @"disk5",
+                                             @"containerBytes": @2000000000000LL, @"containerFreeBytes": @1800000000000LL,
+                                             @"totalBytes": @2000000000000LL, @"freeBytes": @1800000000000LL,
+                                             @"usedBytes": @200000000000LL, @"internal": @NO, @"local": @YES,
+                                             @"diskImage": @NO, @"boot": @NO},
+                                           @{@"name": @"Vault-T", @"path": @"/Volumes/Vault-T", @"container": @"disk5",
+                                             @"containerBytes": @2000000000000LL, @"containerFreeBytes": @1800000000000LL,
+                                             @"totalBytes": @2000000000000LL, @"freeBytes": @1800000000000LL,
+                                             @"usedBytes": @300000000000LL, @"internal": @NO, @"local": @YES,
+                                             @"diskImage": @NO, @"boot": @NO}]};
+                [c setValue:[@{@"m2": @{@"sample": pair, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent())}} mutableCopy] forKey:@"remote"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                NSTextField *pairName = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.name");
+                NSTextField *pairValue = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.value");
+                NSTextField *pairDatum = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.volume.0.datum");
+                NSView *pairRow = FindIdentifier(root, @"popover.remote.m2.volume.0");
+                if (![pairName.stringValue isEqual:@"OTV Mirror +1"] ||
+                    ![pairName.accessibilityLabel isEqual:@"OTV Mirror · Vault-T"] ||
+                    ![pairValue.stringValue isEqual:@"25%"] || ![pairDatum.stringValue isEqual:@"1.8 TB free"] ||
+                    !HasTip(pairRow, @"OTV Mirror · Vault-T") || FindIdentifier(root, @"popover.remote.m2.volume.1") ||
+                    !SameColumn(pairName, FindIdentifier(root, @"popover.remote.m2.storage.name")) ||
+                    !SameColumn(FindIdentifier(root, @"popover.remote.m2.volume.0.gauge"), FindIdentifier(root, @"popover.remote.m2.storage.gauge")) ||
+                    !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
+                if (argc > 1) {
+                    NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-remote.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-containers-remote-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+                }
+            }
+            [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3, @"at": @(CFAbsoluteTimeGetCurrent() - 600)}} mutableCopy] forKey:@"remote"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+            if (![rd.stringValue isEqual:@"away 10m"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
+                FindIdentifier(root, @"popover.remote.m2.volume.0")) return Fail(__LINE__);
+            {   // A worker behind this Mac keeps the same row: temperature, then one orange word.
+                NSString *status = @"{\"state\":\"ok\",\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                    "\"origin\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"behind\":3,"
+                    "\"detail\":\"3 commits behind origin/main\"}";
+                [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3,
+                                        @"at": @(CFAbsoluteTimeGetCurrent()), @"glancebar": status,
+                                        @"localSHA": @"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}} mutableCopy] forKey:@"remote"];
+                [ud setBool:NO forKey:@"remoteOpen.m2"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+                NSView *remoteRow = FindIdentifier(root, @"popover.row.remote.m2");
+                NSRange word = [rd.stringValue rangeOfString:@"3 behind"];
+                NSColor *wordColor = word.location == NSNotFound ? nil : [rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:word.location effectiveRange:NULL];
+                if (word.location == NSNotFound || ![wordColor isEqual:NSColor.systemOrangeColor] ||
+                    ![rd.stringValue hasSuffix:@"CPU busy"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
+                    !HasTip(remoteRow, @"3 commits behind origin/main") || !FitsChildren(root) || !InstrumentRowsFit(root))
+                    return Fail(__LINE__);
+                status = @"{\"state\":\"no-release\",\"installed\":\"aaa\",\"origin\":\"bbb\",\"behind\":3,"
+                    "\"detail\":\"matching signed release unavailable\"}";
+                [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3,
+                                        @"at": @(CFAbsoluteTimeGetCurrent()), @"glancebar": status,
+                                        @"localSHA": @"bbb"}} mutableCopy] forKey:@"remote"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+                remoteRow = FindIdentifier(root, @"popover.row.remote.m2");
+                word = [rd.stringValue rangeOfString:@"no release"];
+                wordColor = word.location == NSNotFound ? nil : [rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:word.location effectiveRange:NULL];
+                if (word.location == NSNotFound || ![wordColor isEqual:NSColor.systemOrangeColor] ||
+                    FindIdentifier(root, @"popover.remote.m2.storage") ||
+                    !HasTip(remoteRow, @"matching signed release unavailable") || !InstrumentRowsFit(root))
+                    return Fail(__LINE__);
+            }
+            [ud removeObjectForKey:@"remoteMachines"]; [ud removeObjectForKey:@"remoteOpen.m2"];
+            [c rebuildContent]; root = p.contentViewController.view;
+        }
+        // The footer carries exactly two controls plus the ⋯ menu, side by side, none clipped.
+        NSView *keep = FindIdentifier(p.contentViewController.view, @"popover.keepAwake");
+        NSView *low = FindIdentifier(p.contentViewController.view, @"popover.lowPower");
+        NSView *more = FindIdentifier(p.contentViewController.view, @"popover.more");
+        // The charge limit is a visible footer toggle, not a hidden click on the battery glyph.
+        NSButton *chargeToggle = (NSButton *)FindIdentifier(p.contentViewController.view, @"popover.chargeLimit");
+        if (![chargeToggle isKindOfClass:NSButton.class] || !chargeToggle.image ||
+            ![chargeToggle.title isEqual:@"Limit 80%"] ||
+            NSMaxX(chargeToggle.frame) + 4 > more.frame.origin.x) return Fail(__LINE__);
+        NSButton *keepButton = (NSButton *)keep, *lowButton = (NSButton *)low, *moreButton = (NSButton *)more;
+        if (![keepButton isKindOfClass:NSButton.class] || ![lowButton isKindOfClass:NSButton.class] ||
+            ![moreButton isKindOfClass:NSButton.class]) return Fail(__LINE__);
+        if (![keepButton.title isEqual:@"Keep Awake"] || ![lowButton.title isEqual:@"Low Power"] ||
+            moreButton.title.length || !keepButton.image || !lowButton.image || !moreButton.image)
+            return Fail(__LINE__);
+        if (fabs(keepButton.frame.origin.x - kPad) > 0.5 ||
+            fabs(NSMinX(lowButton.frame) - NSMaxX(keepButton.frame) - kToggleGap) > 0.5 ||
+            fabs(NSMaxX(moreButton.frame) - (kW - kPad)) > 0.5 ||
+            fabs(keepButton.frame.size.width - kKeepW) > 0.5 ||
+            fabs(lowButton.frame.size.width - kLowW) > 0.5 ||
+            fabs(keepButton.frame.size.height - kToggleH) > 0.5) return Fail(__LINE__);
+        if (!keep || !low || !more || NSMaxX(keep.frame) > NSMinX(low.frame) || NSMaxX(low.frame) > NSMinX(more.frame) ||
+            !FitsChildren(keep.superview)) return Fail(__LINE__);
+        // One figure: the account weekly across all models (33%). No Fable figure, and the
+        // 5-hour window never caps it. The weekly reset is on the tooltip, not a caption.
+        if (!meter || meter.firstFraction >= 0 || fabs(meter.secondFraction-0.33)>0.001 || !HasText(root,@"33%") ||
+            HasText(root,@"Fable") || HasText(root, @"5-hour") || HasText(root, @" left")) return Fail(__LINE__);
+        if (!HasTip(root, @"week resets tomorrow")) return Fail(__LINE__);
+        NSView *wordy = WordyTip(root);
+        if (wordy) { fprintf(stderr, "unexpected hover tooltip on %s: %s\n", wordy.accessibilityIdentifier.UTF8String, wordy.toolTip.UTF8String); return Fail(__LINE__); }
+        // The longest caption the row can produce must still fit: near-equal quotas (arrows),
+        // a weekly reset named by weekday and date, and a cache-age note.
+        AIUsage *longest = usage[0];
+        longest.limitStale = YES; longest.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-10*3600];
+        longest.limitWindows = @[
+            @{@"remainingFraction":@1, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 4*3600)},
+            @{@"remainingFraction":@1, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 6.5*86400)},
+            @{@"remainingFraction":@1, @"window":@"weekly Fable"}];
+        [c rebuildContent];
+        if (!HasText(p.contentViewController.view, @"stale 10h") || !FitsChildren(p.contentViewController.view)) {
+            DumpClaudeCaption(p.contentViewController.view); return Fail(__LINE__);
+        }
+        longest.limitStale = NO; longest.limitUpdatedAt = nil;
+        longest.limitWindows = @[
+            @{@"remainingFraction":@0.57, @"window":@"5-hour", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 7200)},
+            @{@"remainingFraction":@0.33, @"window":@"weekly", @"resetsAt":@(NSDate.date.timeIntervalSince1970 + 86400)},
+            @{@"remainingFraction":@0.06, @"window":@"weekly Fable"}];
+        [c rebuildContent];
+        if (!HasTip(root, @"Macintosh HD")) return Fail(__LINE__);
+        AIUsage *history = usage[0];
+        history.todayTokens = 268000;
+        history.weekTokens = 11200000;
+        AIUsage *codexHistory = usage[1];
+        codexHistory.todayTokens = 20800000;
+        codexHistory.weekTokens = 52800000;
+        // Real multi-million readings and the largest stored total must fit in
+        // one row, with no ellipsis and no overlap between label/value columns.
+        for (NSNumber *count in @[@0, @999, @999499, @20800000, @999499999, @999499999999LL, @(LLONG_MAX)]) {
+            AIUsage *sample = [AIUsage new]; sample.name = @"Codex";
+            sample.todayTokens = count.longLongValue; sample.weekTokens = MAX(1, count.longLongValue);
+            NSView *doc = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kDetailW,32)];
+            [c addDetailHistory:sample to:doc y:0 cols:DetailLayout(kDetailW)];
+            if (!FitsChildren(doc)) return Fail(__LINE__);
+            NSArray *columns = @[@"metric", @"today", @"todayLabel", @"value", @"weekLabel"];
+            CGFloat previousRight = 0;
+            for (NSString *column in columns) {
+                NSView *field = FindIdentifier(doc, [@"details.ai.history.codex." stringByAppendingString:column]);
+                if (!field || NSMinX(field.frame) < previousRight || field.toolTip.length) return Fail(__LINE__);
+                previousRight = NSMaxX(field.frame);
+            }
+        }
+        history.todaySessions = 2;
+        history.weekSessions = 9;
+        NSArray *sampleApps = @[
+            @{@"name": @"WindowServer", @"impact": @50, @"cpu": @120, @"bytes": @(6ULL << 30)},
+            @{@"name": @"kernel_task", @"impact": @30, @"cpu": @80, @"bytes": @(4ULL << 30)},
+            @{@"name": @"nsurlsessiond", @"impact": @20, @"cpu": @40, @"bytes": @(2ULL << 30)},
+        ];
+        [c setValue:sampleApps forKey:@"hogs"];
+        [c setValue:sampleApps forKey:@"topCPU"];
+        [c setValue:sampleApps forKey:@"topMem"];
+        NSScrollView *overview = [c overviewDetailsView];
+        NSScrollView *storage = [c storageDetailsView];
+        NSScrollView *battery = [c batteryDetailsView];
+        NSScrollView *system = [c systemDetailsView];
+        NSScrollView *ai = [c aiDetailsView];
+        if (!HasText(storage.documentView, @"External 6")) return Fail(__LINE__);
+        if (!HasText(ai.documentView, @"week") || !HasText(ai.documentView, @"5h") ||
+            !HasText(ai.documentView, @"Fable") || !HasTip(ai.documentView, @"weekly")) return Fail(__LINE__);
+        if (HasText(ai.documentView, @"weekly")) return Fail(__LINE__);
+        NSArray *docs = @[overview.documentView, storage.documentView, battery.documentView,
+                          system.documentView, ai.documentView];
+        for (NSView *doc in docs) if (DetailFiller(doc)) return Fail(__LINE__);
+        if (HasText(storage.documentView, @"Volume scan unavailable")) return Fail(__LINE__);
+        if (!HasTip(storage.documentView, @"Volume scan unavailable")) return Fail(__LINE__);
+        NSUInteger volumeCount = [[c valueForKey:@"vols"] count];
+        NSUInteger storageRows = 0;
+        for (NSUInteger i = 0; i < volumeCount; i++) {
+            NSString *ident = [NSString stringWithFormat:@"details.storage.row.%lu", (unsigned long)i];
+            NSView *row = FindIdentifier(storage.documentView, ident);
+            if (CountIdentifier(storage.documentView, ident) != 1 || !row || row.frame.size.height > 36)
+                return Fail(__LINE__);
+            storageRows++;
+        }
+        if (storageRows != volumeCount) return Fail(__LINE__);
+        NSView *stored = FindIdentifier(storage.documentView, @"details.storage.row.0");
+        NSButton *reveal = nil;
+        for (NSView *sub in stored.subviews) if ([sub isKindOfClass:NSButton.class]) reveal = (NSButton *)sub;
+        if (!reveal || reveal.title.length || !reveal.image || ![reveal.accessibilityHelp isEqualToString:@"Reveal in Finder"])
+            return Fail(__LINE__);
+        NSView *provider = FindIdentifier(ai.documentView, @"details.ai.row.claude");
+        NSView *windowRow = FindIdentifier(ai.documentView, @"details.ai.window.claude.0");
+        NSView *providerGauge = FirstGauge(provider);
+        NSView *windowGauge = FirstGauge(windowRow);
+        if (!providerGauge || !windowGauge ||
+            fabs(providerGauge.frame.origin.x - windowGauge.frame.origin.x) > 0.5) return Fail(__LINE__);
+        for (NSString *slug in @[@"codex", @"cursor"]) {
+            NSView *prow = FindIdentifier(ai.documentView, [@"details.ai.row." stringByAppendingString:slug]);
+            NSView *wrow = FindIdentifier(ai.documentView, [NSString stringWithFormat:@"details.ai.window.%@.0", slug]);
+            if (!prow || !wrow || fabs(FirstGauge(prow).frame.origin.x - FirstGauge(wrow).frame.origin.x) > 0.5)
+                return Fail(__LINE__);
+        }
+        if (!DetailColumnsMatch(docs)) return Fail(__LINE__);
+        NSTextField *etaName = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.name");
+        NSTextField *etaValue = (NSTextField *)FindIdentifier(battery.documentView, @"details.battery.eta.arrivals");
+        // The charge wattage is said once, on the Charge row: no "at +12 W" echo here, and
+        // the Mac's draw and charge share one flow bar instead of three text rows.
+        BatteryForecast detailsForecast = [c batteryForecast];
+        NSString *expectedArrivals = BatteryForecastDetail(detailsForecast, NSDate.date.timeIntervalSince1970, nil);
+        if (detailsForecast.hypotheticalFull) expectedArrivals = [expectedArrivals stringByAppendingString:@" · 100% if limit off"];
+        if (![etaName.stringValue isEqual:@"Forecast"] || ![etaValue.stringValue isEqual:expectedArrivals] ||
+            FindIdentifier(battery.documentView, @"details.battery.eta.datum") ||
+            FindIdentifier(battery.documentView, @"details.battery.row.power") ||
+            FindIdentifier(battery.documentView, @"details.battery.row.load"))
+            return Fail(__LINE__);
+        PowerFlowGauge *flowBar = (PowerFlowGauge *)FindIdentifier(battery.documentView, @"details.battery.input.gauge");
+        if (flowBar && (![flowBar isKindOfClass:PowerFlowGauge.class] || !flowBar.accessibilityHelp.length)) return Fail(__LINE__);
+        // System: CPU is the bar; memory in use is the thin line inside it (Cursor's language).
+        // No words or unexplained glyphs beside it.
+        for (NSView *doc in @[root, overview.documentView]) {
+            NSString *stem = doc == root ? @"popover.system" : @"details.overview.system";
+            Gauge *cpuBar = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+            if (![cpuBar isKindOfClass:Gauge.class] || cpuBar.innerFraction >= 0 ||
+                FindIdentifier(doc, [stem stringByAppendingString:@".datum"]) ||
+                FindIdentifier(doc, [stem stringByAppendingString:@".memory.symbol"])) return Fail(__LINE__);
+        }
+        NSArray *etaFields = @[etaName, etaValue];
+        for (NSTextField *field in etaFields) {
+            if (![field isKindOfClass:NSTextField.class]) return Fail(__LINE__);
+            CGFloat textW = [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
+            if (textW > field.bounds.size.width - 2) {
+                fprintf(stderr, "truncated %s (%.1f > %.1f)\n", field.accessibilityIdentifier.UTF8String,
+                        textW, field.bounds.size.width);
+                return Fail(__LINE__);
+            }
+        }
+        NSTextField *volumeName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.storage.name");
+        NSTextField *batteryName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.battery.name");
+        NSTextField *systemName = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.system.name");
+        if (![volumeName.stringValue isEqual:@"Macintosh HD"] || ![batteryName.stringValue isEqual:@"Battery"] ||
+            ![systemName.stringValue isEqual:@"System"] || !SameColumn(volumeName, batteryName) ||
+            !SameColumn(volumeName, systemName)) return Fail(__LINE__);
+        NSTextField *detailClaude = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.claude.name");
+        NSTextField *overviewClaude = (NSTextField *)FindIdentifier(overview.documentView, @"details.overview.ai.claude.name");
+        if (![detailClaude.stringValue isEqual:@"Claude"] || ![overviewClaude.stringValue isEqual:@"Claude"] ||
+            !SameColumn(volumeName, detailClaude) || !SameColumn(volumeName, overviewClaude))
+            return Fail(__LINE__);
+        NSTextField *windowDatum = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.window.claude.0.datum");
+        NSTextField *providerDatum = (NSTextField *)FindIdentifier(ai.documentView, @"details.ai.claude.datum");
+        if (![windowDatum.stringValue hasPrefix:@"resets "] || ![providerDatum.stringValue hasPrefix:@"resets "])
+            return Fail(__LINE__);
+        Gauge *fullWindow = (Gauge *)FindIdentifier(ai.documentView, @"details.ai.window.codex.1.gauge");
+        Gauge *lowWindow = (Gauge *)FindIdentifier(ai.documentView, @"details.ai.window.codex.0.gauge");
+        Gauge *overviewCharge = (Gauge *)FindIdentifier(overview.documentView, @"details.overview.battery.gauge");
+        if (![fullWindow isKindOfClass:Gauge.class] || ![lowWindow isKindOfClass:Gauge.class] ||
+            !ForecastFits((BatteryForecastView *)FindIdentifier(overview.documentView, @"details.overview.battery.forecast")) ||
+            overviewCharge.markerFraction != -1) return Fail(__LINE__);
+        __block BOOL fullGreen = NO, lowRed = NO;
+        [[NSAppearance appearanceNamed:NSAppearanceNameAqua] performAsCurrentDrawingAppearance:^{
+            fullGreen = Green([fullWindow.color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace]);
+            lowRed = Red([lowWindow.color colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace]);
+        }];
+        if (!fullGreen || !lowRed) return Fail(__LINE__);
+        for (NSString *ident in @[@"details.overview.row.storage", @"details.overview.row.battery",
+                                  @"details.overview.row.system", @"details.overview.row.ai.claude",
+                                  @"details.overview.row.ai.codex", @"details.overview.row.ai.cursor"])
+            if (!FindIdentifier(overview.documentView, ident)) return Fail(__LINE__);
+        NSView *cpuGauge = FindIdentifier(system.documentView, @"details.system.cpu.gauge");
+        NSView *cpuBar = FindIdentifier(system.documentView, @"details.system.bar.cpu.0.bar");
+        if (!cpuBar || cpuBar.frame.size.height > 6 ||
+            fabs(NSMaxX(cpuBar.frame) - NSMaxX(cpuGauge.frame)) > 0.5) return Fail(__LINE__);
+        const char *musicState = getenv("GLANCEBAR_MUSIC_STATE");
+        if (musicState && strcmp(musicState, "playing") == 0) {
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Midnight City" forKey:@"localTitle"];
+            [c setValue:@"M83" forKey:@"localArtist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@243 forKey:@"trackDuration"];
+            [c setValue:@[
+                @{@"uid": @"speakers", @"name": @"MacBook Air Speakers",
+                  @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2, @"dataSource": @""},
+                @{@"uid": @"bose", @"name": @"Bose Flex SoundLink",
+                  @"transport": @(GlanceAudioTransportBluetooth), @"outputChannels": @2, @"dataSource": @""}
+            ] forKey:@"audioDevices"];
+            [c setValue:@"speakers" forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSView *playingOut = FindIdentifier(root, @"popover.sound");
+            if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+                ![playingOut.accessibilityHelp containsString:@"click for"] ||
+                ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"] ||
+                !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
+                return Fail(__LINE__);
+        } else if (musicState && strcmp(musicState, "idle") == 0) {
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (!SoundRow(root, @"Liked Music", @"0 of 0 on this Mac", NO) || !FitsChildren(root))
+                return Fail(__LINE__);
+        } else if (musicState && strcmp(musicState, "apple") == 0) {
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Lightning Crashes" forKey:@"localTitle"];
+            [c setValue:@"LIVE" forKey:@"localArtist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@324 forKey:@"trackDuration"];
+            const char *art = getenv("GLANCEBAR_MUSIC_ART");
+            if (art) {
+                NSImage *cover = [[NSImage alloc] initWithContentsOfFile:@(art)];
+                cover.size = NSMakeSize(32, 32);
+                [c setValue:cover forKey:@"amArt"];
+            }
+            // Render-only: real seed tiles from a JSON list of {trackID,title,artist,art} (see GLANCEBAR_MUSIC_ART).
+            const char *mixRender = getenv("GLANCEBAR_MIX_SEEDS");
+            NSArray *frozenSeeds = [c valueForKey:@"mixSeeds"];
+            if (mixRender) {
+                NSArray *list = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@(mixRender)] options:0 error:nil];
+                NSMutableArray *seeds = [NSMutableArray array]; NSMutableDictionary *covers = [NSMutableDictionary dictionary];
+                for (NSDictionary *s in list) {
+                    [seeds addObject:@{@"key": [@"song:" stringByAppendingString:s[@"trackID"]], @"kind": @"song", @"title": s[@"title"],
+                                       @"subtitle": s[@"artist"], @"trackID": s[@"trackID"], @"artist": s[@"artist"], @"album": @"", @"family": @"other"}];
+                    NSImage *img = [[NSImage alloc] initWithContentsOfFile:s[@"art"]];
+                    if (img) covers[s[@"trackID"]] = img;
+                }
+                [c setValue:seeds forKey:@"mixSeeds"]; [c setValue:covers forKey:@"mixArt"];
+            }
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSSlider *position = (NSSlider *)FindIdentifier(root, @"popover.music.position");
+            NSTextField *elapsed = (NSTextField *)FindIdentifier(root, @"popover.music.elapsed");
+            NSTextField *length = (NSTextField *)FindIdentifier(root, @"popover.music.duration");
+            NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            if (!SoundRow(root, @"Lightning Crashes", @"LIVE", YES) || !FitsChildren(root) ||
+                ![position isKindOfClass:NSSlider.class] || fabs(position.doubleValue - 83) > 1 ||
+                ![elapsed.stringValue isEqual:@"1:23"] || ![length.stringValue isEqual:@"5:24"] ||
+                ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
+                FindIdentifier(root, @"popover.music.shuffle") ||
+                FindIdentifier(root, @"popover.music.open"))
+                return Fail(__LINE__);
+            {   // 👍 sits just left of ♥ and doesn't crowd the title.
+                NSView *thumb = FindIdentifier(root, @"popover.music.thumbsup");
+                NSView *title = FindIdentifier(root, @"popover.music.title");
+                if (!thumb || NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame) ||
+                    ![thumb.accessibilityLabel hasPrefix:@"Thumbs-up"]) return Fail(__LINE__);
+            }
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(root, [stem stringByAppendingString:@"-music.png"], look)) return Fail(__LINE__);
+            }
+            if (mixRender && argc > 1) {   // and the hover card for the last seed, full names under the cover
+                GBSeedTile *last = nil;
+                for (NSUInteger i = 0; i < 4; i++) { NSView *v = FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i]); if (v) last = (GBSeedTile *)v; }
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                if (last && !RenderOffscreen([last largeCard], [stem stringByAppendingString:@"-card.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            }
+            if (mixRender) { [c setValue:frozenSeeds forKey:@"mixSeeds"]; [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"]; [c rebuildContent]; root = p.contentViewController.view; }
+            // The scrubber line is the only extra height; later fixtures measure the idle panel.
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:nil forKey:@"mixPlayingKey"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
+        } else if (musicState && strcmp(musicState, "station") == 0) {
+            id oldDevices = [c valueForKey:@"audioDevices"];
+            id oldUID = [c valueForKey:@"defaultOutputUID"];
+            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@NO forKey:@"amLoaded"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Kiss from a Rose" forKey:@"localTitle"];
+            [c setValue:@"Tame Impala" forKey:@"localArtist"];
+            [c setValue:@83 forKey:@"trackElapsed"];
+            [c setValue:@243 forKey:@"trackDuration"];
+            [c setValue:@0 forKey:@"localIndex"];
+            [c setValue:@[[NSURL fileURLWithPath:stationFixture]] forKey:@"localURLs"];
+            [c setValue:@[@{@"file": stationFixture, @"artist": @"Tame Impala",
+                            @"title": @"Kiss from a Rose", @"key": @"tame impala|kiss from a rose"}] forKey:@"stationTracks"];
+            [c setValue:@[
+                @{@"uid": @"speakers", @"name": @"MacBook Air Speakers",
+                  @"transport": @(GlanceAudioTransportBuiltIn), @"outputChannels": @2, @"dataSource": @""}
+            ] forKey:@"audioDevices"];
+            [c setValue:@"speakers" forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            NSButton *thumb = (NSButton *)FindIdentifier(root, @"popover.music.thumbsup");
+            NSView *title = FindIdentifier(root, @"popover.music.title");
+            if (!SoundRow(root, @"Kiss from a Rose", @"Tame Impala · 1:23 / 4:03", YES) || !FitsChildren(root) ||
+                ![heart isKindOfClass:NSButton.class] || ![thumb isKindOfClass:NSButton.class] ||
+                ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
+                ![thumb.accessibilityLabel isEqual:@"Thumbs-up: mixes should play more like this"] ||
+                fabs(NSWidth(heart.frame) - 22) > 0.5 || fabs(NSHeight(heart.frame) - 22) > 0.5 ||
+                fabs(NSWidth(thumb.frame) - 22) > 0.5 || fabs(NSHeight(thumb.frame) - 22) > 0.5 ||
+                NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame))
+                return Fail(__LINE__);
+            [c setValue:[NSMutableSet setWithObject:@"tame impala|kiss from a rose"] forKey:@"heartedKeys"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
+            if (![heart.accessibilityLabel isEqual:@"Remove from Favourites"]) return Fail(__LINE__);
+            [c setValue:[NSMutableSet set] forKey:@"heartedKeys"];
+            [c setValue:@"song:SEED" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
+                return Fail(__LINE__);
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:@"" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+                return Fail(__LINE__);
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (argc > 1) {
+                gStationRender = YES;
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(root, [NSString stringWithUTF8String:argv[1]], look)) return Fail(__LINE__);
+            }
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:nil forKey:@"mixPlayingKey"];
+            [c setValue:@NO forKey:@"playbackKnown"];
+            [c setValue:@NO forKey:@"playbackPlaying"];
+            [c setValue:nil forKey:@"localTitle"];
+            [c setValue:nil forKey:@"localArtist"];
+            [c setValue:nil forKey:@"localURLs"];
+            [c setValue:nil forKey:@"stationTracks"];
+            [c setValue:nil forKey:@"heartedKeys"];
+            [c setValue:oldDevices forKey:@"audioDevices"];
+            [c setValue:oldUID forKey:@"defaultOutputUID"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+        }
+        if (!ActionableMenuImages([c moreMenu])) return Fail(__LINE__);
+        // Toolbar tabs, built but not ordered front. Every tab keeps its identifier and a symbol.
+        NSWindow *details = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 520)
+                                                        styleMask:(NSWindowStyleMaskTitled |
+                                                                   NSWindowStyleMaskClosable |
+                                                                   NSWindowStyleMaskResizable)
+                                                          backing:NSBackingStoreBuffered defer:YES];
+        details.releasedWhenClosed = NO;
+        [c setValue:details forKey:@"detailsWindow"];
+        [c rebuildDetails];
+        NSTabViewController *tabs = (NSTabViewController *)details.contentViewController;
+        if (![tabs isKindOfClass:NSTabViewController.class] ||
+            tabs.tabStyle != NSTabViewControllerTabStyleToolbar || tabs.tabViewItems.count != 7)
+            return Fail(__LINE__);
+        [c rebuildDetails];   // in-place refresh must keep the symbols and the documents
+        if (tabs.tabViewItems.count != 7) return Fail(__LINE__);
+        NSSet *idents = [NSSet setWithArray:@[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]];
+        for (NSTabViewItem *item in tabs.tabViewItems) {
+            if (!item.image || ![item.identifier isKindOfClass:NSString.class] ||
+                ![idents containsObject:item.identifier]) return Fail(__LINE__);
+            if ([item.identifier isEqual:@"overview"]) {
+                NSView *doc = [item.view isKindOfClass:NSScrollView.class]
+                    ? ((NSScrollView *)item.view).documentView : item.view;
+                if (!HasText(doc, @"OVERVIEW") || !HasTip(doc, @"Macintosh HD") ||
+                    !FindIdentifier(doc, @"details.overview.row.storage") ||
+                    !FindIdentifier(doc, @"details.overview.row.battery") ||
+                    !FindIdentifier(doc, @"details.overview.row.system")) return Fail(__LINE__);
+                // viewController forwards -view. A structural refresh assigns item.view and
+                // must actually replace the document the tab shows.
+                NSView *marker = [[NSView alloc] initWithFrame:item.view.frame];
+                marker.accessibilityIdentifier = @"details.replace-probe";
+                item.view = marker;
+                if (item.view != marker && item.viewController.view != marker) return Fail(__LINE__);
+                item.view = [c detailViewForIdentifier:@"overview"];
+            }
+        }
+        NSTabViewItem *aiTab=nil,*batteryTab=nil;
+        for(NSTabViewItem *item in tabs.tabViewItems){
+            if([item.identifier isEqual:@"ai"])aiTab=item;
+            if([item.identifier isEqual:@"battery"])batteryTab=item;
+        }
+        NSView *unselectedAI=aiTab.view;
+        if(((NSScrollView *)unselectedAI).documentView) return Fail(__LINE__);
+        [tabs.tabView selectTabViewItemWithIdentifier:@"battery"];
+        if(![((NSScrollView *)batteryTab.view).documentView.accessibilityIdentifier isEqual:@"details.battery"] || aiTab.view!=unselectedAI)
+            return Fail(__LINE__);
+        [c rebuildDetails];
+        if(aiTab.view!=unselectedAI) return Fail(__LINE__);
+        [tabs.tabView selectTabViewItemWithIdentifier:@"overview"];
+        [c stopPowerTick];
+        if (getenv("GLANCEBAR_DUMP_TIPS")) {
+            for (NSString *rid in @[@"popover.row.storage", @"popover.row.battery", @"popover.row.system",
+                                    @"popover.row.ai.claude", @"popover.row.ai.codex", @"popover.row.ai.cursor"])
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).accessibilityHelp.UTF8String);
+            for (NSString *rid in @[@"popover.battery.symbol", @"popover.ai.claude.gauge"])
+                printf("--- %s\n%s\n", rid.UTF8String, FindIdentifier(p.contentViewController.view, rid).accessibilityHelp.UTF8String);
+        }
+        // Cursor is an ordinary one-bar row showing Grok + Composer (Cursor's own models);
+        // the API pool is on the tooltip and gets its own window row on the AI tab.
+        AIUsage *cursor = usage.lastObject;
+        NSArray *legacyWindows = cursor.limitWindows;
+        cursor.limitWindows = CursorLimitWindows(@{
+            @"billingCycleEnd": @(NSDate.date.timeIntervalSince1970 + 27*86400),
+            @"planUsage": @{@"apiPercentUsed": @83, @"autoPercentUsed": @59}}, NSDate.date.timeIntervalSince1970);
+        [c rebuildContent];
+        root = p.contentViewController.view;
+        if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
+            root.bounds.size.height > 470 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row), +24 Music route line
+        NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
+        NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
+        for (NSUInteger i = 0; i < compactDocs.count; i++) {
+            NSView *doc = compactDocs[i]; NSString *stem = compactStems[i];
+            Gauge *bar = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".gauge"]);
+            NSTextField *value = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".value"]);
+            NSTextField *datum = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".datum"]);
+            NSView *reference = FindIdentifier(doc, [[stem stringByReplacingOccurrencesOfString:@"cursor" withString:@"codex"] stringByAppendingString:@".gauge"]);
+            // Cursor = Grok row; the API pool is its own plain row beneath (popover and Overview),
+            // and a window row on the AI tab.
+            Gauge *api = (Gauge *)FindIdentifier(doc, [stem stringByAppendingString:@".api.gauge"]);
+            NSTextField *apiValue = (NSTextField *)FindIdentifier(doc, [stem stringByAppendingString:@".api.value"]);
+            if (![bar isKindOfClass:Gauge.class] || fabs(bar.fraction - .41) > .001 || bar.innerFraction >= 0 ||
+                ![value.stringValue isEqual:@"41%"] ||
+                !SameColumn(bar, reference) || fabs(NSHeight(bar.frame) - NSHeight(reference.frame)) > .5 ||
+                ![datum.stringValue hasPrefix:@"resets "] ||
+                (i < 2 && (![api isKindOfClass:Gauge.class] || fabs(api.fraction - .17) > .001 ||
+                           ![apiValue.stringValue isEqual:@"17%"] || !SameColumn(api, bar))) ||
+                !HasText(doc, @"17%")) return Fail(__LINE__);
+        }
+        NSView *aiDoc = [c aiDetailsView].documentView;
+        if (![((NSTextField *)FindIdentifier(aiDoc, @"details.ai.window.cursor.0.label")).stringValue isEqual:@"Grok"] ||
+            ![((NSTextField *)FindIdentifier(aiDoc, @"details.ai.window.cursor.1.label")).stringValue isEqual:@"API"]) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-cursor.png"], look) ||
+                !RenderOffscreen([c aiDetailsView].documentView, [stem stringByAppendingString:@"-cursor-ai.png"], look)) return Fail(__LINE__);
+        }
+        // Starlink adds exactly one aligned instrument, only while detected.
+        if (FindIdentifier(root, @"popover.row.starlink")) return Fail(__LINE__);
+        NSDictionary *starlink = @{@"cycleStart": @(MeteredCycleStartInZone(NSDate.date, MeteredResetDay(@"starlink"), MeteredZone(@"starlink")).timeIntervalSince1970),
+            @"downloadBytes": @10100000000ULL, @"uploadBytes": @2300000000ULL,
+            @"bytesPerSecond": @1400000, @"onLink": @YES, @"link": @"starlink"};
+        [c setValue:starlink forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        for (NSString *part in @[@"symbol", @"name", @"gauge", @"value", @"datum"])
+            if (CountIdentifier(root, [@"popover.starlink." stringByAppendingString:part]) != 1) return Fail(__LINE__);
+        Gauge *starlinkGauge = (Gauge *)FindIdentifier(root, @"popover.starlink.gauge");
+        NSView *starlinkRow = FindIdentifier(root, @"popover.row.starlink");
+        NSView *systemRow = FindIdentifier(root, @"popover.row.system");
+        if (![starlinkGauge isKindOfClass:Gauge.class] || fabs(starlinkGauge.fraction - 0.876) > 0.001 ||
+            starlinkGauge.markerFraction != -1 ||
+            !SameColumn(starlinkGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            !SameSize(starlinkGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            fabs(NSMinY(starlinkRow.frame) - NSMaxY(systemRow.frame)) > 0.5 ||
+            !HasText(starlinkRow, @"88%") || !HasTip(starlinkRow, @"Mac 12.4 GB of 100 GB") ||
+            !HasTip(starlinkRow, @"↓ 10.1 GB  ↑ 2.3 GB") || !HasTip(starlinkRow, @"now 1.4 MB/s") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(starlinkRow) ||
+            [starlinkRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 3) return Fail(__LINE__);
+        NSView *starlinkDetails = [c overviewDetailsView].documentView;
+        if (!FindIdentifier(starlinkDetails, @"details.overview.starlink.gauge") ||
+            !HasTip(starlinkDetails, @"Mac 12.4 GB of 100 GB") || !FitsChildren(starlinkDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink.png"], look) ||
+                !RenderOffscreen(starlinkDetails, [stem stringByAppendingString:@"-starlink-overview.png"], look)) return Fail(__LINE__);
+        }
+        NSMutableDictionary *fast = [starlink mutableCopy];
+        fast[@"recentBytesPerSecond"] = @(87.6e9 / (5 * 3600 + 20 * 60));
+        [c setValue:fast forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSTextField *lasts = (NSTextField *)FindIdentifier(root, @"popover.starlink.datum");
+        NSView *fastRow = FindIdentifier(root, @"popover.row.starlink");
+        NSView *fastDetails = [c overviewDetailsView].documentView;
+        NSTextField *detailLasts = (NSTextField *)FindIdentifier(fastDetails, @"details.overview.starlink.datum");
+        if (![lasts.stringValue isEqual:@"lasts 5:20"] || ![lasts.textColor isEqual:NSColor.systemYellowColor] ||
+            ![lasts.stringValue isEqual:detailLasts.stringValue] || ![lasts.textColor isEqual:detailLasts.textColor] ||
+            [fastRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 4 || !HasTip(fastRow, @"resets ") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || WordyTip(fastRow) || !FitsChildren(fastDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink-lasts.png"], look) ||
+                !RenderOffscreen(fastDetails, [stem stringByAppendingString:@"-starlink-lasts-overview.png"], look)) return Fail(__LINE__);
+        }
+        // The account total (every device) leads; Mac bytes since the read keep it live.
+        NSMutableDictionary *withAccount = [starlink mutableCopy];
+        double nowEpoch = NSDate.date.timeIntervalSince1970;
+        withAccount[@"account"] = @{@"usedGB": @70.4, @"cycleStart": @(nowEpoch - 86400), @"cycleEnd": @(nowEpoch + 86400 * 20),
+            @"fetchedAt": @(nowEpoch - 240), @"macCycleStart": starlink[@"cycleStart"], @"macBytes": @12100000000ULL};
+        [c setValue:withAccount forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSView *accountRow = FindIdentifier(root, @"popover.row.starlink");
+        Gauge *accountGauge = (Gauge *)FindIdentifier(root, @"popover.starlink.gauge");
+        NSView *accountDetails = [c overviewDetailsView].documentView;
+        if (fabs(accountGauge.fraction - 0.293) > 0.001 || !HasText(accountRow, @"29%") ||
+            !HasTip(accountRow, @"Starlink 70.7 GB of 100 GB · read 4 min ago + Mac 0.3") ||
+            !HasTip(accountRow, @"Mac ↓ 10.1 GB  ↑ 2.3 GB") || HasTip(accountRow, @"account:") ||
+            [accountRow.accessibilityHelp componentsSeparatedByString:@"\n"].count != 3 ||
+            ![accountGauge.metricLabel isEqual:@"Starlink data remaining"] ||
+            !HasTip(accountDetails, @"Starlink 70.7 GB") || !FitsChildren(root) || !InstrumentRowsFit(root) ||
+            WordyTip(accountRow) || !FitsChildren(accountDetails)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-starlink-account.png"], look)) return Fail(__LINE__);
+        }
+        // A failed read keeps the last figure and says why; no figure at all falls back to the Mac.
+        NSMutableDictionary *stale = [withAccount mutableCopy];
+        NSMutableDictionary *staleAccount = [withAccount[@"account"] mutableCopy];
+        staleAccount[@"problem"] = @"sign in at starlink.com in Chrome";
+        stale[@"account"] = staleAccount;
+        [c setValue:stale forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (!HasText(FindIdentifier(root, @"popover.row.starlink"), @"29%") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"account: sign in at starlink.com in Chrome")) return Fail(__LINE__);
+        stale[@"account"] = @{@"problem": @"Keychain access refused"};
+        [c setValue:stale forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (!HasText(FindIdentifier(root, @"popover.row.starlink"), @"88%") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"Mac 12.4 GB of 100 GB") ||
+            !HasTip(FindIdentifier(root, @"popover.row.starlink"), @"account: Keychain access refused")) return Fail(__LINE__);
+        NSMutableDictionary *telstra = [starlink mutableCopy];
+        telstra[@"link"] = @"telstra";
+        telstra[@"cycleStart"] = @(MeteredCycleStart(NSDate.date, MeteredResetDay(@"telstra")).timeIntervalSince1970);
+        [c setValue:telstra forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        NSView *telstraRow = FindIdentifier(root, @"popover.row.telstra");
+        Gauge *telstraGauge = (Gauge *)FindIdentifier(root, @"popover.telstra.gauge");
+        NSView *telstraDetails = [c overviewDetailsView].documentView;
+        if (!telstraRow || FindIdentifier(root, @"popover.row.starlink") || !HasText(telstraRow, @"Telstra") ||
+            !HasText(telstraRow, @"93%") || !HasTip(telstraRow, @"Mac 12.4 GB of 180 GB") ||
+            telstraGauge.markerFraction != -1 || !SameColumn(telstraGauge, FindIdentifier(root, @"popover.battery.gauge")) ||
+            !FindIdentifier(telstraDetails, @"details.overview.telstra.gauge") ||
+            FindIdentifier(telstraDetails, @"details.overview.starlink.gauge") ||
+            !FitsChildren(root) || !InstrumentRowsFit(root) || !FitsChildren(telstraDetails) || WordyTip(telstraRow)) return Fail(__LINE__);
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-telstra.png"], look) ||
+                !RenderOffscreen(telstraDetails, [stem stringByAppendingString:@"-telstra-overview.png"], look)) return Fail(__LINE__);
+        }
+        [c setValue:@{@"onLink": @NO} forKey:@"metered"];
+        [c rebuildContent]; root = p.contentViewController.view;
+        if (FindIdentifier(root, @"popover.row.starlink") || FindIdentifier(root, @"popover.row.telstra") ||
+            FindIdentifier([c overviewDetailsView].documentView, @"details.overview.telstra.gauge") ||
+            FindIdentifier([c overviewDetailsView].documentView, @"details.overview.starlink.gauge")) return Fail(__LINE__);
+
+        if (argc > 1) {
+            NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+            if (!RenderOffscreen(root, [stem stringByAppendingString:@"-metered-none.png"],
+                                 argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+
+        // Every battery state renders without cut-off text: charging fast, held at the limit,
+        // plugged but draining (the 2026-10-08 "−7.9 W plug…" bug), no power in, and on battery.
+        {
+            struct { BOOL ac, charging; int pct; long amps, in, load; } states[] = {
+                {YES, YES, 42, 2400, 60000, 9000},   // fast charge, time to target
+                {YES, NO, 80, 0, 9000, 9000},        // held at 80%
+                {YES, NO, 78, -660, 4000, 11900},    // plugged, battery still carrying load
+                {YES, NO, 78, -900, 0, 11000},       // charger recognised, nothing arriving
+                {NO, NO, 63, -1100, 0, 13200},       // on battery
+                {NO, NO, 12, -2400, 0, 28800},       // low and heavy
+            };
+            for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+                BatteryState sb = b;
+                sb.acConnected = states[i].ac; sb.isCharging = states[i].charging; sb.percent = states[i].pct;
+                sb.minutesToEmpty = states[i].ac ? -1 : 120;
+                sb.minutesToFull = states[i].charging ? 95 : -1;
+                sb.amperage_mA = states[i].amps; sb.systemPowerIn_mW = states[i].in; sb.systemLoad_mW = states[i].load;
+                [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
+                PrimeBatteryForecast(c, sb, YES);
+                [c rebuildContent];
+                NSView *pop = p.contentViewController.view;
+                BatteryForecastView *fv = (BatteryForecastView *)FindIdentifier(pop, @"popover.battery.forecast");
+                // Times sit on the winning side: a charger short of the load forecasts 20%/empty.
+                BOOL filling = sb.acConnected && !ChargerFallsShort(sb);
+                if (!ForecastFits(fv) || fv.forecast.thresholdPercent != (filling ? 80 : 20) ||
+                    fv.forecast.endpointPercent != (filling ? 100 : 0)) return Fail(__LINE__);
+                if ((FindIdentifier(pop, @"popover.row.charger") != nil) != ChargerFallsShort(sb)) return Fail(__LINE__);
+                if (!sb.acConnected && !([fv.endpointText hasSuffix:@"m"] || [fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
+                if (sb.percent <= 20 && !sb.acConnected && fv.thresholdText.length) return Fail(__LINE__);
+                if (sb.acConnected && sb.isCharging && sb.percent<80 &&
+                    (fv.forecast.endpointTime<=0 || !fv.forecast.hypotheticalFull ||
+                     ![fv.accessibilityHelp containsString:@"assumes the 80% limit is cancelled"])) return Fail(__LINE__);
+                if (sb.acConnected && sb.percent>=80 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
+                NSTextField *bd = (NSTextField *)FindIdentifier(pop, @"popover.battery.datum");
+                TrendArrow *ta = (TrendArrow *)FindIdentifier(pop, @"popover.battery.trend");
+                BOOL moving = fabs(BatteryWatts(sb)) >= 0.3;
+                if (!FitsChildren(pop) || ![bd.stringValue hasSuffix:@" W"] || ![ta isKindOfClass:TrendArrow.class] ||
+                    (moving && sb.percent > 0 && ta.hidden && !(BatteryWatts(sb) > 0 && sb.percent >= 80)) ||
+                    // Charging shows the green in-vector; draining shows the orange draw-vector.
+                    (moving && !ta.hidden && (BatteryWatts(sb) > 0 ? !(ta.to > ta.from)
+                                                                  : !(isfinite(ta.drawTo) && ta.drawTo < ta.from)))) {
+                    fprintf(stderr, "battery state %zu: \"%s\"\n", i, bd.stringValue.UTF8String);
+                    return Fail(__LINE__);
+                }
+                if (argc > 1 &&
+                    !RenderOffscreen(pop, [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
+                        stringByAppendingFormat:@"-battery%zu.png", i], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua))
+                    return Fail(__LINE__);
+            }
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
+            [c rebuildContent];
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]) {
+                NSView *doc = ((NSScrollView *)[c detailViewForIdentifier:tab]).documentView;
+                if (!FitsChildren(doc)) { fprintf(stderr, "details tab %s\n", tab.UTF8String); return Fail(__LINE__); }
+            }
+        }
+        {
+            struct { BOOL ac, charging, full; int pct; long amps, empty, fullMinutes; const char *name; } cases[] = {
+                {NO,NO,NO,63,-1100,120,-1,"discharge"},
+                {YES,YES,NO,42,2400,-1,90,"charge"},
+                {YES,YES,NO,95,200,-1,70,"taper"},
+                {YES,NO,NO,80,0,-1,70,"paused"},
+                {YES,NO,YES,100,0,-1,70,"full"},
+                {NO,NO,NO,63,-1100,-1,-1,"startup"},
+                {YES,YES,NO,65,3200,-1,64,"limit-charge"},
+                {YES,NO,NO,80,0,-1,55,"limit-held"},
+            };
+            [c setValue:@"full" forKey:@"chargeMode"];
+            [c setValue:NSDate.date forKey:@"chargeModeAt"];
+            for (size_t i=0;i<sizeof cases / sizeof cases[0];i++) {
+                BOOL limit = i>=6;
+                [c setValue:limit ? @"limit80" : @"full" forKey:@"chargeMode"];
+                BatteryState sb=b; sb.acConnected=cases[i].ac; sb.isCharging=cases[i].charging;
+                sb.fullyCharged=cases[i].full; sb.percent=cases[i].pct; sb.amperage_mA=cases[i].amps;
+                sb.minutesToEmpty=cases[i].empty; sb.minutesToFull=cases[i].fullMinutes;
+                [c setValue:[NSValue valueWithBytes:&sb objCType:@encode(BatteryState)] forKey:@"bat"];
+                if (i==5) [c setValue:[BatteryForecastTracker new] forKey:@"batteryForecastTracker"];
+                else PrimeBatteryForecast(c,sb,limit);
+                [c rebuildContent];
+                NSView *pop=p.contentViewController.view;
+                BatteryForecastView *fv=(BatteryForecastView *)FindIdentifier(pop,@"popover.battery.forecast");
+                if (!ForecastFits(fv) || !FitsChildren(pop)) return Fail(__LINE__);
+                if (i==1 && (![fv.thresholdText isEqual:@"45m"] || ![fv.endpointText isEqual:@"1.5h"])) return Fail(__LINE__);
+                if (i==2 && (fv.thresholdText.length || ![fv.endpointText hasSuffix:@"h"])) return Fail(__LINE__);
+                if (i==3 && (fv.forecast.endpointTime || fv.forecast.thresholdTime)) return Fail(__LINE__);
+                if (i==4 && (fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
+                if (i==5 && (![fv.thresholdText isEqual:@"—"] || ![fv.endpointText isEqual:@"—"])) return Fail(__LINE__);
+                if (i==6 && (fv.forecast.thresholdTime<=0 || fv.forecast.endpointTime<=0 || !fv.forecast.hypotheticalFull)) return Fail(__LINE__);
+                if (i==7 && (!fv.forecast.hideLabels || fv.thresholdText.length || fv.endpointText.length)) return Fail(__LINE__);
+                NSArray *surfaces=@[pop, [c overviewDetailsView].documentView, [c batteryDetailsView].documentView];
+                NSArray *names=@[@"popover", @"overview", @"details"];
+                NSArray *idents=@[@"popover.battery.forecast", @"details.overview.battery.forecast", @"details.battery.charge.forecast"];
+                for (NSUInteger j=0;j<surfaces.count;j++) {
+                    BatteryForecastView *other=(BatteryForecastView *)FindIdentifier(surfaces[j],idents[j]);
+                    if (!ForecastFits(other) || !FitsChildren(surfaces[j])) {
+                        fprintf(stderr,"forecast case=%zu surface=%s bounds=%s a=%s b=%s attrs=%s\n",i,[names[j] UTF8String],
+                            NSStringFromRect(other.bounds).UTF8String,NSStringFromRect([other labelRect:YES]).UTF8String,
+                            NSStringFromRect([other labelRect:NO]).UTF8String,[[other labelAttributes] description].UTF8String);
+                        return Fail(__LINE__);
+                    }
+                    if (i>=6 && (![other.thresholdText isEqual:fv.thresholdText] || ![other.endpointText isEqual:fv.endpointText])) return Fail(__LINE__);
+                    if (argc>1) {
+                        NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension]
+                            stringByAppendingFormat:@"-forecast-%s-%@.png",cases[i].name,names[j]];
+                        if (!RenderOffscreen(surfaces[j],path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+                    }
+                }
+            }
+            [c setValue:@"limit80" forKey:@"chargeMode"];
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+            PrimeBatteryForecast(c,b,YES);
+        }
+
+        {
+            BatteryForecastView *probe=[[BatteryForecastView alloc] initWithFrame:NSZeroRect];
+            NSArray *labels=@[@"<5m",@"5m",@"45m",@"55m",@"1h",@"1.5h",@"9.9h",@"10h",@"24h",@"—"];
+            for (NSNumber *gaugeWidth in @[@94,@102,@222]) {
+                probe.frame=NSMakeRect(0,0,gaugeWidth.doubleValue+2*kBatteryForecastSideRoom,30);
+                for (int endpoint=0;endpoint<=100;endpoint+=100) {
+                    probe.forecast=(BatteryForecast){.thresholdPercent=endpoint ? 80 : 20,.endpointPercent=endpoint};
+                    for (NSString *text in labels) for (NSString *other in labels) {
+                        probe.thresholdText=text; probe.endpointText=other;
+                        if (!ForecastFits(probe)) return Fail(__LINE__);
+                    }
+                }
+            }
+            fprintf(stderr,"Forecast geometry: 600 text/width/direction combinations passed\n");
+        }
+
+        // On battery: Burn appears only for actionable quit gains; the Battery
+        // tab lists each app's watts and Wh since unplug, the screen + system rest, and the total.
+        {
+            id savedAmpHistory = [c valueForKey:@"ampHistory"];
+            BatteryState onBattery = b;
+            onBattery.acConnected = NO; onBattery.isCharging = NO; onBattery.amperage_mA = -780;
+            onBattery.systemPowerIn_mW = 0; onBattery.systemLoad_mW = 9400; onBattery.adapterWatts = 0;
+            [c setValue:[NSValue valueWithBytes:&onBattery objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[NSMutableArray arrayWithObject:@(onBattery.amperage_mA)] forKey:@"ampHistory"];
+            [c setValue:@[@{@"name": @"Google Chrome", @"watts": @2.1, @"wh": @1.4},
+                          @{@"name": @"node", @"watts": @1.3, @"wh": @0.9},
+                          @{@"name": @"Codex", @"watts": @0.6, @"wh": @0.4},
+                          @{@"name": @"Mail", @"watts": @0.2, @"wh": @0.1}] forKey:@"burnRows"];
+            [c setValue:[NSDate dateWithTimeIntervalSinceNow:-102 * 60] forKey:@"energyBaselineAt"];
+            [c setValue:@YES forKey:@"energyBaselineAtUnplug"];
+            [c setValue:@(BatteryWattHours(onBattery.rawCurrent_mAh, onBattery.voltage_mV) + 6.1) forKey:@"energyBaselineWh"];
+            [c rebuildContent];
+            NSView *pop = p.contentViewController.view;
+            NSTextField *burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
+            NSTextField *burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
+            Gauge *burnBar = (Gauge *)FindIdentifier(pop, @"popover.burn.gauge");
+            // Quitting Chrome stretches the Battery row's time to 20% by T * A / (D - A).
+            double gain = MinutesTo20(onBattery, onBattery.amperage_mA) * 2.1 / (9.4 - 2.1);
+            BOOL expected = gain >= 30;
+            if ((FindIdentifier(pop, @"popover.row.burn") != nil) != expected) return Fail(__LINE__);
+            if (expected && (![burnValue.stringValue isEqual:@"2.1 W"] ||
+                ![burnDatum.stringValue isEqual:[@"quit +" stringByAppendingString:FmtDuration((int)lround(gain))]] ||
+                ![burnBar isKindOfClass:Gauge.class] || fabs(burnBar.fraction - 2.1 / 9.4) > 1e-6 ||
+                !SameColumn(burnBar, FindIdentifier(pop, @"popover.battery.gauge")) ||
+                !HasTip(pop, @"Since unplug: 6.1 Wh over 1:42") ||
+                !HasTip(pop, @"Chrome 2.1 W · 1.4 Wh") || !HasTip(pop, @"Screen + system 5.2 W") ||
+                ![((NSTextField *)FindIdentifier(pop, @"popover.burn.name")).stringValue isEqual:@"Chrome"] ||
+                [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds))) return Fail(__LINE__);
+            if (!FitsChildren(pop) || FirstScrollView(pop)) return Fail(__LINE__);
+            NSView *batteryDoc = [c batteryDetailsView].documentView;
+            NSTextField *since = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.since.value");
+            NSTextField *chromeWh = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.0.datum");
+            NSTextField *rest = (NSTextField *)FindIdentifier(batteryDoc, @"details.battery.burn.system.value");
+            if (![since.stringValue isEqual:@"6.1 Wh"] || ![chromeWh.stringValue isEqual:@"1.4 Wh"] ||
+                ![rest.stringValue isEqual:@"5.2 W"] || FindIdentifier(batteryDoc, @"details.battery.bar.energy.0")) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(pop, [stem stringByAppendingString:@"-burn.png"], look) ||
+                    !RenderOffscreen(batteryDoc, [stem stringByAppendingString:@"-burn-details.png"], look)) return Fail(__LINE__);
+            }
+            onBattery.systemLoad_mW = 21000; onBattery.amperage_mA = -1750;
+            [c setValue:[NSValue valueWithBytes:&onBattery objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[NSMutableArray arrayWithObject:@(onBattery.amperage_mA)] forKey:@"ampHistory"];
+            [c setValue:@[@{@"name": @"node", @"watts": @14, @"wh": @2}] forKey:@"burnRows"];
+            [c rebuildContent];
+            pop = p.contentViewController.view;
+            burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
+            burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
+            burnBar = (Gauge *)FindIdentifier(pop, @"popover.burn.gauge");
+            if (!FindIdentifier(pop, @"popover.row.burn") || ![burnValue.stringValue isEqual:@"14 W"] ||
+                ![burnValue.textColor isEqual:NSColor.systemRedColor] || ![burnDatum.stringValue hasPrefix:@"quit +"] ||
+                fabs(burnBar.fraction - 14.0 / 21) > 1e-6 ||
+                !SameColumn(burnBar, FindIdentifier(pop, @"popover.battery.gauge")) ||
+                [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds) ||
+                !FitsChildren(pop) || FirstScrollView(pop)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(pop, [stem stringByAppendingString:@"-burn-runaway.png"], look)) return Fail(__LINE__);
+            }
+            onBattery.systemLoad_mW = 4100; onBattery.amperage_mA = -342;
+            [c setValue:[NSValue valueWithBytes:&onBattery objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[NSMutableArray arrayWithObject:@(onBattery.amperage_mA)] forKey:@"ampHistory"];
+            [c setValue:@[@{@"name": @"Finder", @"watts": @0.2, @"wh": @0.1}] forKey:@"burnRows"];
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.burn")) return Fail(__LINE__);
+            {
+                // A plane's USB port: 6 W in, the Mac using 16 W, IDrive's root daemon estimated.
+                BatteryState shortCharger = onBattery;
+                shortCharger.acConnected = YES; shortCharger.percent = 68; shortCharger.minutesToEmpty = -1;
+                shortCharger.systemPowerIn_mW = 6000; shortCharger.systemLoad_mW = 16000;
+                shortCharger.amperage_mA = -(long)lround(10.0e6 / shortCharger.voltage_mV);
+                [c setValue:[NSValue valueWithBytes:&shortCharger objCType:@encode(BatteryState)] forKey:@"bat"];
+                for (NSNumber *appW in @[@9, @11]) {
+                    [c setValue:@[@{@"name": @"IDrive", @"watts": appW, @"wh": @0, @"estimated": @YES}] forKey:@"burnRows"];
+                    [c rebuildContent];
+                    pop = p.contentViewController.view;
+                    burnValue = (NSTextField *)FindIdentifier(pop, @"popover.burn.value");
+                    burnDatum = (NSTextField *)FindIdentifier(pop, @"popover.burn.datum");
+                    BOOL charges = appW.doubleValue >= 10;
+                    if (!FindIdentifier(pop, @"popover.row.burn") || !FindIdentifier(pop, @"popover.row.charger") ||
+                        ![burnValue.stringValue hasSuffix:@" W"] ||
+                        (charges ? ![burnDatum.stringValue isEqual:@"quit \u2192 charges"] : ![burnDatum.stringValue hasPrefix:@"quit +"]) ||
+                        [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width > NSWidth(burnDatum.bounds) ||
+                        !FitsChildren(pop)) {
+                        fprintf(stderr, "short charger burn: \"%s\" \"%s\" row %d charger %d width %.1f/%.1f fits %d\n", burnValue.stringValue.UTF8String, burnDatum.stringValue.UTF8String,
+                            FindIdentifier(pop, @"popover.row.burn") != nil, FindIdentifier(pop, @"popover.row.charger") != nil,
+                            [burnDatum.stringValue sizeWithAttributes:@{NSFontAttributeName: burnDatum.font}].width, NSWidth(burnDatum.bounds), FitsChildren(pop));
+                        return Fail(__LINE__);
+                    }
+                    if (argc > 1) {
+                        NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                        NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                        if (!RenderOffscreen(pop, [stem stringByAppendingFormat:@"-burn-short-%@.png", appW], look)) return Fail(__LINE__);
+                    }
+                }
+            }
+            // Keep an actionable sample on AC to prove power source alone hides it.
+            [c setValue:@[@{@"name": @"node", @"watts": @14, @"wh": @2}] forKey:@"burnRows"];
+            [c setValue:nil forKey:@"energyBaselineAt"];
+            [c setValue:savedAmpHistory forKey:@"ampHistory"];
+            [c setValue:[NSValue valueWithBytes:&b objCType:@encode(BatteryState)] forKey:@"bat"];
+        PrimeBatteryForecast(c, b, YES);
+            [c rebuildContent];
+            if (FindIdentifier(p.contentViewController.view, @"popover.row.burn")) return Fail(__LINE__);   // plugged in: gone
+        }
+        cursor.limitStale = YES; cursor.limitUpdatedAt = [NSDate dateWithTimeIntervalSinceNow:-7200];
+        cursor.limitRefreshError = @"Signed out — sign in to Cursor";
+        [c rebuildContent];
+        for (NSString *scope in @[@"popover.ai", @"details.ai", @"details.overview.ai"]) {
+            NSView *doc = [scope isEqual:@"popover.ai"] ? p.contentViewController.view
+                : [scope isEqual:@"details.ai"] ? [c aiDetailsView].documentView : [c overviewDetailsView].documentView;
+            NSTextField *datum = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.datum"]);
+            NSTextField *grok = (NSTextField *)FindIdentifier(doc, [scope stringByAppendingString:@".cursor.value"]);
+            if (![datum.stringValue isEqual:@"signed out"] || ![grok.stringValue isEqual:@"41%"] ||
+                FindIdentifier(doc, [scope stringByAppendingString:@".cursor.status"]) || !FitsChildren(doc)) return Fail(__LINE__);
+        }
+        if (argc > 1) {
+            NSString *path = [[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-signed-out.png"];
+            if (!RenderOffscreen(p.contentViewController.view, path, argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+        }
+        cursor.limitRefreshError = nil;
+        [c rebuildContent];
+        NSTextField *staleDatum = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.datum");
+        if (![staleDatum.stringValue hasPrefix:@"stale"]) return Fail(__LINE__);
+        cursor.limitStale = NO; cursor.limitUpdatedAt = NSDate.date;
+        NSArray *bothPools = cursor.limitWindows;
+        // 100% fits the ordinary value column.
+        cursor.limitWindows = CursorLimitWindows(@{@"planUsage": @{@"apiPercentUsed": @0, @"autoPercentUsed": @0}}, NSDate.date.timeIntervalSince1970);
+        [c rebuildContent];
+        NSTextField *full = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value");
+        if (![full.stringValue isEqual:@"100%"] || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        // One pool missing: the bar shows what is reported (Grok, else API) and never invents the other.
+        for (NSUInteger missing = 0; missing < 2; missing++) {
+            cursor.limitWindows = @[bothPools[missing]];
+            [c rebuildContent];
+            NSTextField *shown = (NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.ai.cursor.value");
+            if (![shown.stringValue isEqual:(missing == 0 ? @"17%" : @"41%")] ||
+                FindIdentifier(p.contentViewController.view, @"popover.row.ai.cursor.api")) return Fail(__LINE__);
+        }
+        cursor.limitWindows = bothPools;
+        [c rebuildContent];
+        root = p.contentViewController.view;
+        const char *detailsPrefix = getenv("GLANCEBAR_RENDER_DETAILS");
+        if (detailsPrefix && detailsPrefix[0]) {
+            NSAppearanceName appearance = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+            for (NSString *tab in @[@"overview", @"storage", @"battery", @"system", @"thermal", @"activity", @"ai"]) {
+                NSScrollView *scroll = [c detailViewForIdentifier:tab];
+                NSView *doc = [scroll isKindOfClass:NSScrollView.class] ? scroll.documentView : scroll;
+                NSString *path = [NSString stringWithFormat:@"%s-%@.png", detailsPrefix, tab];
+                if (!RenderOffscreen(doc, path, appearance)) return Fail(__LINE__);
+            }
+        }
+        [c setValue:nil forKey:@"detailsWindow"];
+        if (argc > 1 && !gStationRender) {
+            root.appearance = [NSAppearance appearanceNamed:(argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)];
+            NSBitmapImageRep *rep = [root bitmapImageRepForCachingDisplayInRect:root.bounds];
+            [root cacheDisplayInRect:root.bounds toBitmapImageRep:rep];
+            [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}]
+                writeToFile:[NSString stringWithUTF8String:argv[1]] atomically:YES];
+        }
+        cursor.limitWindows = legacyWindows;
+        // Rebuild in place must keep navigation reachable and not accumulate rows.
+        [c rebuildContent];
+        if (CountGauges(p.contentViewController.view) != 6) return Fail(__LINE__);
+        AIUsage *codex = usage[1]; codex.billingNote = @"Requests now bill to credits · balance 20";
+        [c rebuildContent];
+        if (!HasTip(p.contentViewController.view, @"Using credits")) return Fail(__LINE__);
+        // Missing and stale provider data must stay compact without faking a healthy bar.
+        AIUsage *missing = usage.lastObject; missing.limitStatusAvailable = NO;
+        missing.remainingFraction = -1; missing.resetAt = nil; missing.statusReason = @"Account unavailable";
+        [c rebuildContent];
+        if (CountGauges(p.contentViewController.view) != 5 ||
+            !HasTip(p.contentViewController.view, @"Account unavailable") ||
+            !HasText(p.contentViewController.view, @"unavailable")) return Fail(__LINE__);
+        meter = FindClaudeMeter(p.contentViewController.view);
+        AIUsage *claude = usage[0];
+        claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
+        [c rebuildContent];
+        QuotaPairGauge *updated = FindClaudeMeter(p.contentViewController.view);
+        // Only a Fable window reported: no all-models weekly figure, so no fill at all (never Fable's).
+        if (updated != meter || updated.firstFraction >= 0 || updated.secondFraction != -1) return Fail(__LINE__);
+        claude.limitWindows = @[];
+        [c rebuildContent];
+        if (HasText(p.contentViewController.view, @"Fable") || CountGauges(p.contentViewController.view) != 5 ||
+            !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        claude.limitWindows = @[@{@"remainingFraction":@0.82, @"window":@"weekly Fable"}];
+        claude.limitWindows = @[@{@"remainingFraction":@1, @"window":@"weekly Fable"},
+                               @{@"remainingFraction":@1, @"window":@"weekly Opus"}];
+        [c rebuildContent];
+        if (!HasText(p.contentViewController.view,@"100%") || HasText(p.contentViewController.view,@"/100") ||
+            !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        claude.overageActive = YES;
+        [c rebuildContent];
+        if (HasText(p.contentViewController.view, @"Fable") || !FitsChildren(p.contentViewController.view)) return Fail(__LINE__);
+        if (getenv("GLANCEBAR_RENDER_LIVE_BATTERY") && argc > 1) {
+            BatteryState live=ReadBattery();
+            [c setValue:[NSValue valueWithBytes:&live objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[BatteryForecastTracker new] forKey:@"batteryForecastTracker"];
+            [c rebuildContent];
+            NSString *path=[[[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension] stringByAppendingString:@"-live-battery.png"];
+            if (!RenderOffscreen(p.contentViewController.view,path,argc>2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
+            BatteryForecast forecast=[c batteryForecast];
+            fprintf(stderr,"Live battery: %d%% AC=%d charging=%d empty=%ld full=%ld telemetryAge=%.0fs; 20/80=%s 0/100=%s\n",
+                live.percent,live.acConnected,live.isCharging,live.minutesToEmpty,live.minutesToFull,
+                NSDate.date.timeIntervalSince1970-live.telemetryTimestamp,
+                BatteryForecastClock(forecast.thresholdTime,nil).UTF8String,BatteryForecastClock(forecast.endpointTime,nil).UTF8String);
+        }
+        return 0;
+    }
+}

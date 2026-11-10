@@ -1815,6 +1815,97 @@ NSArray<NSDictionary *> *AudioOutputMenuDevices(NSArray<NSDictionary *> *devices
     return shown;
 }
 
+static NSDictionary *PlayerOutputDevice(NSArray<NSDictionary *> *devices, NSString *uid) {
+    if (![devices isKindOfClass:NSArray.class] || ![uid isKindOfClass:NSString.class] || !uid.length) return nil;
+    for (id row in devices) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        if ([row[@"uid"] isEqual:uid] && AudioChannels(row) > 0) return row;
+    }
+    return nil;
+}
+
+NSDictionary *PlayerOutputChoice(NSString *chosenUID, NSString *chosenName,
+                                   NSArray<NSDictionary *> *devices, NSString *defaultUID) {
+    if (![devices isKindOfClass:NSArray.class]) devices = @[];
+    if (![chosenUID isKindOfClass:NSString.class]) chosenUID = @"";
+    if (![defaultUID isKindOfClass:NSString.class]) defaultUID = @"";
+    NSDictionary *defaultDevice = PlayerOutputDevice(devices, defaultUID);
+    NSString *defaultName = defaultDevice[@"name"] ?: @"No output device";
+    if (!chosenUID.length) {
+        return @{@"choiceUID": @"", @"effectiveUID": defaultUID ?: @"", @"system": @YES,
+                 @"device": defaultDevice ?: @{}, @"name": defaultName, @"note": @""};
+    }
+    NSDictionary *chosen = PlayerOutputDevice(devices, chosenUID);
+    if (chosen) {
+        return @{@"choiceUID": chosenUID, @"effectiveUID": chosenUID, @"system": @NO,
+                 @"device": chosen, @"name": chosen[@"name"] ?: @"Output", @"note": @""};
+    }
+    if (![chosenName isKindOfClass:NSString.class]) chosenName = @"";
+    NSString *note = chosenName.length ? [NSString stringWithFormat:@"%@ is not connected; using System.", chosenName]
+                                       : @"Selected output is not connected; using System.";
+    return @{@"choiceUID": chosenUID, @"effectiveUID": defaultUID ?: @"", @"system": @YES,
+             @"device": defaultDevice ?: @{}, @"name": defaultName, @"note": note};
+}
+
+NSArray<NSDictionary *> *PlayerOutputMenuChoices(NSArray<NSDictionary *> *devices,
+                                                 NSString *defaultUID) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSDictionary *defaultDevice = PlayerOutputDevice(devices, defaultUID);
+    NSString *detail = defaultDevice[@"name"] ?: @"";
+    NSString *systemTitle = detail.length ? [NSString stringWithFormat:@"System (%@)", detail] : @"System";
+    [out addObject:@{@"uid": @"", @"name": systemTitle, @"system": @YES}];
+    for (NSDictionary *device in AudioOutputMenuDevices(devices, defaultUID))
+        [out addObject:@{@"uid": device[@"uid"] ?: @"", @"name": device[@"name"] ?: @"Output", @"system": @NO}];
+    return out;
+}
+
+NSString *PlayerOutputCycleNext(NSArray<NSDictionary *> *choices, NSString *currentUID) {
+    if (![choices isKindOfClass:NSArray.class] || choices.count < 2) return nil;
+    if (![currentUID isKindOfClass:NSString.class]) currentUID = @"";
+    NSMutableArray<NSString *> *uids = [NSMutableArray array];
+    for (id row in choices) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        id uid = row[@"uid"];
+        if ([uid isKindOfClass:NSString.class]) [uids addObject:uid];
+        else [uids addObject:@""];
+    }
+    if (uids.count < 2) return nil;
+    NSUInteger index = [uids indexOfObject:currentUID];
+    if (index == NSNotFound) index = [currentUID length] ? NSNotFound : 0;
+    if (index == NSNotFound) return uids[0];
+    return uids[(index + 1) % uids.count];
+}
+
+static NSString *ExternalPlaybackString(NSDictionary *userInfo, NSArray<NSString *> *keys) {
+    for (NSString *key in keys) {
+        id value = userInfo[key];
+        if ([value isKindOfClass:NSString.class] && [(NSString *)value length]) return value;
+    }
+    return @"";
+}
+
+static BOOL ExternalPlaybackPlaying(NSString *state) {
+    if (!state.length) return NO;
+    NSString *s = state.lowercaseString;
+    return [s isEqual:@"playing"] || [s isEqual:@"play"] || [s containsString:@"playing"];
+}
+
+NSDictionary *ParseExternalPlayback(NSDictionary *userInfo, NSString *source) {
+    NSMutableDictionary *out = [@{@"source": @"", @"title": @"", @"artist": @"", @"playing": @NO, @"valid": @NO} mutableCopy];
+    if (![userInfo isKindOfClass:NSDictionary.class]) return out;
+    if ([source isEqual:@"music"] || [source isEqual:@"spotify"]) out[@"source"] = source;
+    NSString *state = ExternalPlaybackString(userInfo, @[@"Player State", @"PlayerState", @"PlaybackState"]);
+    NSString *title = ExternalPlaybackString(userInfo, @[@"Name", @"Track Name", @"Album"]);
+    NSString *artist = ExternalPlaybackString(userInfo, @[@"Artist", @"Artist Name"]);
+    BOOL playing = ExternalPlaybackPlaying(state);
+    if (!title.length && !artist.length && !state.length) return out;
+    out[@"title"] = title;
+    out[@"artist"] = artist;
+    out[@"playing"] = @(playing);
+    out[@"valid"] = @(playing && (title.length || artist.length));
+    return out;
+}
+
 static BOOL AudioTextIsHeadphones(NSString *text) {
     if (![text isKindOfClass:NSString.class] || !text.length) return NO;
     NSString *s = text.lowercaseString;

@@ -726,6 +726,22 @@ NSDictionary *StorageSecondaryNotice(NSArray<NSDictionary *> *volumes);
 // opens the menu instead of cycling).
 NSString *NextOutputUID(NSArray<NSDictionary *> *menuDevices, NSString *currentUID);
 
+// Glancebar's local player output. chosenUID empty = System (follow defaultUID).
+// Returns @{@"choiceUID", @"effectiveUID", @"system" (BOOL), @"device", @"name",
+//   @"note" (optional absent-device copy)}. Never swaps a missing choice to another
+// external device — it falls back to the system default while keeping choiceUID.
+NSDictionary *PlayerOutputChoice(NSString *chosenUID, NSString *chosenName,
+                                   NSArray<NSDictionary *> *devices, NSString *defaultUID);
+// System first, then AudioOutputMenuDevices. Each row @{@"uid", @"name", @"system"}.
+NSArray<NSDictionary *> *PlayerOutputMenuChoices(NSArray<NSDictionary *> *devices,
+                                                 NSString *defaultUID);
+// Cycles remembered choice uid (empty = System). Nil when fewer than two choices.
+NSString *PlayerOutputCycleNext(NSArray<NSDictionary *> *choices, NSString *currentUID);
+
+// Distributed notifications from Music or Spotify: @{@"source" (@"music"/@"spotify"),
+//   @"title", @"artist", @"playing" (BOOL), @"valid" (BOOL)}.
+NSDictionary *ParseExternalPlayback(NSDictionary *userInfo, NSString *source);
+
 // Fixed-width instrument copy. 24-hour, English abbreviations, so the column never
 // changes width with the locale: "21:00" today, "Sat" at midnight or "Sat 07:02"
 // within six days, "3 Nov" after that. Nil when resetAt is nil.

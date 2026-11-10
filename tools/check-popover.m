@@ -727,8 +727,8 @@ int main(int argc, const char **argv) {
             ![musicSubtitle.stringValue hasSuffix:@"on this Mac"] ||
             FindIdentifier(root, @"popover.music.open") ||
             FindIdentifier(root, @"popover.music.shuffle") ||
-            ![output.accessibilityLabel isEqual:@"Mac output, Bose Flex SoundLink"] ||
-            ![output.accessibilityHelp containsString:@"Choose output"]) return Fail(__LINE__);
+            ![output.accessibilityLabel isEqual:@"Player output, System, Bose Flex SoundLink"] ||
+            ![output.accessibilityHelp containsString:@"Glancebar's player"]) return Fail(__LINE__);
         {   // Where it will play and how loud: name beside the symbol, level coloured when loud or muted.
             NSButton *outputButton = (NSButton *)output;
             NSSlider *volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
@@ -754,45 +754,20 @@ int main(int argc, const char **argv) {
             [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
-        {   // Per-app routing: one line per routed app under the output line — app, arrow, speaker, switch.
-            [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @YES}]
-                 forKey:@"_routeRules"];
+        if (FindIdentifier(root, @"popover.route.com.apple.Music")) return Fail(__LINE__);
+        {   // Playing elsewhere while idle.
+            NSDictionary *ext = ParseExternalPlayback(@{@"Name": @"Jubel", @"Artist": @"Klingande",
+                                                        @"Player State": @"Playing"}, @"music");
+            [c setValue:ext forKey:@"_externalPlayback"];
             [c rebuildContent]; root = p.contentViewController.view;
-            BOOL musicInstalled = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.apple.Music"] != nil;
-            NSView *route = FindIdentifier(root, @"popover.route.com.apple.Music");
-            NSView *line = FindIdentifier(root, @"popover.sound.line");
-            NSButton *target = (NSButton *)FindIdentifier(root, @"popover.route.target.com.apple.Music");
-            NSSwitch *toggle = (NSSwitch *)FindIdentifier(root, @"popover.route.toggle.com.apple.Music");
-            NSView *state = FindIdentifier(root, @"popover.route.state.com.apple.Music");
-            if (musicInstalled) {
-                if (!route || !target || !toggle || !state || NSHeight(route.frame) > 24.5 ||
-                    NSMinY(route.frame) < NSMaxY(line.frame) - 0.5 ||
-                    ![target.title containsString:@"Bose Flex SoundLink"] || toggle.state != NSControlStateValueOn ||
-                    NSMaxX(toggle.frame) > kW - kPad + 0.5 || NSMaxX(target.frame) > NSMinX(toggle.frame) ||
-                    ![state.accessibilityLabel isEqual:@"waiting for Music"] || !FitsChildren(root)) return Fail(__LINE__);
-                const char *routePNG = getenv("GLANCEBAR_ROUTE_PNG");
-                if (routePNG && routePNG[0]) {
-                    NSString *dir = [NSString stringWithUTF8String:routePNG];
-                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-light.png"], NSAppearanceNameAqua) ||
-                        !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-dark.png"], NSAppearanceNameDarkAqua))
-                        return Fail(__LINE__);
-                }
-                [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @NO}]
-                     forKey:@"_routeRules"];
-                [c rebuildContent]; root = p.contentViewController.view;
-                toggle = (NSSwitch *)FindIdentifier(root, @"popover.route.toggle.com.apple.Music");
-                state = FindIdentifier(root, @"popover.route.state.com.apple.Music");
-                if (toggle.state != NSControlStateValueOff || ![state.accessibilityLabel isEqual:@"off"]) return Fail(__LINE__);
-                if (routePNG && routePNG[0]) {
-                    NSString *dir = [NSString stringWithUTF8String:routePNG];
-                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"route-off-dark.png"], NSAppearanceNameDarkAqua))
-                        return Fail(__LINE__);
-                }
-            } else if (route) return Fail(__LINE__);
-            [c setValue:@[@{@"bundleID": @"com.apple.Music", @"target": @"", @"targetName": @"", @"enabled": @YES}]
-                 forKey:@"_routeRules"];
+            if (![[(NSTextField *)FindIdentifier(root, @"popover.music.title") stringValue] isEqual:@"Jubel"] ||
+                !FindIdentifier(root, @"popover.music.external") ||
+                FindIdentifier(root, @"popover.music.favorite")) return Fail(__LINE__);
+            [c setValue:nil forKey:@"_externalPlayback"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
+        [c ensureOfflinePlaylists];
+        [c rebuildContent]; root = p.contentViewController.view;
         {   // Seed tiles, the triple j station, and a round New picks button. Title over artist, one line each.
             NSView *mix = FindIdentifier(root, @"popover.mix");
             NSView *line = FindIdentifier(root, @"popover.sound.line");
@@ -1588,7 +1563,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 470 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row), +24 Music route line
+            root.bounds.size.height > 446 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row)
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {
