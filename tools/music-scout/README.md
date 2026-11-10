@@ -1,0 +1,94 @@
+# music-scout
+
+Nightly pipeline to surface interesting new lossless music and acquire a small
+weekly budget via mixpool's existing `amdl` path. State is local JSON; each
+stage is idempotent and safe to rerun.
+
+## Configuration
+
+`~/.config/glancebar/music-scout.json` (every field optional):
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `tracks_per_week` | 20 | Max acquisitions per rolling 7 days |
+| `gb_per_week` | 1.5 | Max estimated download volume (uses `avg_track_mb`) |
+| `fresh_days` | 14 | `publish` window for the New music tile |
+| `exploration_share` | 0.30 | Minimum share reserved for taste-expansion rows in `rank` |
+| `max_per_artist_week` | 2 | Per-artist cap including recent ledger offers |
+| `new_release_days` | 60 | iTunes new-release lookback |
+| `llm_suggestions` | 15 | Tracks requested from the taste LLM prompt |
+| `new_music_path` | state dir | Output playlist JSON for the app tile |
+
+## State (`~/.local/state/glancebar-music-scout/`)
+
+| File | Purpose |
+|------|---------|
+| `candidates.json` | Last `candidates` output |
+| `queue.json` | Ranked queue after `rank` |
+| `ledger.jsonl` | Append-only offered / acquired / failed history |
+| `new-music.json` | Playlist for the Glancebar **New music** tile |
+| `source-stats.json` | Per-source counts; flags sources empty ≥3 nights |
+| `last-run.json` | Last `run` summary for `status` |
+| `run.lock` | Exclusive lock for `run` |
+
+## Commands
+
+```bash
+python3 tools/music-scout/scout.py candidates
+python3 tools/music-scout/scout.py rank
+python3 tools/music-scout/scout.py acquire          # dry-run (default)
+python3 tools/music-scout/scout.py acquire --go       # real amdl on M5
+python3 tools/music-scout/scout.py publish
+python3 tools/music-scout/scout.py status           # exit 1 if unhealthy
+python3 tools/music-scout/scout.py run [--go]
+```
+
+### Sources (`candidates`)
+
+1. **triple j** — reads `picks` from `~/.local/state/selector/station.json`
+   (output of `triplej.py queue`; no ABC re-fetch).
+2. **new-release** — iTunes Search/Lookup via mixpool helpers for albums in the
+   last `new_release_days` from artists in the library export, Apple favourites
+   (`music-sync/inventory.json`), and hearts.
+3. **taste-expansion** — `ai-pick --engines claude,codex,cursor --min 20`
+   (exit **75** = skip tonight). Each suggestion is confirmed on the iTunes
+   Search API before it counts.
+
+### Acquire guards
+
+Exit **75** (defer) when not on Apple **M5**, when
+`~/.local/state/METERED_LINK` exists, or on battery power. Real pulls call
+mixpool's `_run_amdl` on resolved Apple Music song URLs.
+
+### External assumptions (read-only)
+
+| Tool | Paths used |
+|------|------------|
+| triplej | `~/.local/state/selector/station.json` |
+| mixpool | `itunes_*`, `_run_amdl`; `~/.local/state/glancebar-mix/` |
+| music-library | `catalogue.json` under its state dir |
+| music-sync | `inventory.json` (`am_fav`) |
+| Glancebar | `mix/feedback.jsonl`, `selector/hearts.json`, YouTube Liked names |
+
+This tool never deletes or moves audio files.
+
+## Expected launchd job (not installed here)
+
+On the **M5**, once per night (after triple j `queue` and mixpool inventory):
+
+```bash
+#!/bin/sh
+cd /path/to/glancebar
+python3 tools/music-scout/scout.py run --go || test $? -eq 75
+```
+
+Morning check can run `scout.py status` (nonzero when nothing acquired in 7
+days or the last `run` failed).
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tools/music-scout -v
+```
+
+No network; mixpool, iTunes, `ai-pick`, and `amdl` are stubbed.
