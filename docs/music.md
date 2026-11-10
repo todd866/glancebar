@@ -67,9 +67,10 @@ muted for verification.
 
 `offline_cache.catalogue_match_keys` (used by `musiclib.match_track`) applies matching-only
 normalisation: punctuation and `&`→`and`, primary artist before `feat.`/`ft.`, stripped
-`(Remastered …)` / `- Single` / clean|explicit suffixes, `The` prefix variants, and a few
-censored-title aliases. Ambiguous catalogue rows (two paths) still fail closed; duration must
-agree within 2 s when both sides know it.
+`(Remastered …)` / `- Single` / clean|explicit suffixes and `The` prefix variants. Suffixes
+that name a different recording (`Remix`, `Live`, `Edit`, `Acoustic Version`) are never
+stripped. An exact artist+title match behaves as before; a loose match is trusted only when
+both sides know the duration and agree within 2 s. Two candidate paths still fail closed.
 
 `mixpool.py retry-unmatched` (dry-run by default) re-walks `liked-pulled.json` `no_match` and
 `failed` rows against the cached catalogue, then tries album-less and suffix-stripped iTunes
