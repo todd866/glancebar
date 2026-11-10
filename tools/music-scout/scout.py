@@ -206,19 +206,36 @@ def _default_itunes_song_best(artist: str, title: str, album: str = "", *, sleep
     return mixpool.itunes_song_best(artist, title, album)
 
 
+ENGINE_COMMANDS = {
+    # Each takes the prompt on stdin and prints the model's reply. All read-only, no tools.
+    "claude": [str(Path.home() / ".local/bin/claude"), "-p", "--tools", "", "--model", "haiku"],
+    "codex": ["codex", "exec", "-s", "read-only"],
+    "cursor": ["cursor-opinion"],
+}
+
+
 def _default_ai_pick(prompt: str, cmd: str) -> tuple[int, str]:
+    """Ask whichever engine has capacity. `ai-pick` only NAMES the engine (exit 75 = defer);
+    the prompt is then run through that engine's own read-only command."""
     try:
-        proc = subprocess.run(
-            [cmd, "--engines", "claude,codex,cursor", "--min", "20"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        text = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode, text
-    except FileNotFoundError:
-        return 75, "ai-pick missing"
+        pick = subprocess.run([cmd, "--engines", ",".join(ENGINE_COMMANDS), "--min", "20"],
+                              capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 75, "ai-pick unavailable"
+    if pick.returncode != 0:
+        return (75 if pick.returncode == 75 else pick.returncode), (pick.stderr or "")
+    engine = (pick.stdout or "").strip().splitlines()[-1].strip() if (pick.stdout or "").strip() else ""
+    argv = ENGINE_COMMANDS.get(engine)
+    if not argv:
+        return 75, f"ai-pick named an engine this tool cannot run: {engine!r}"
+    try:
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=600,
+                              cwd=str(Path(__file__).resolve().parent))
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return 1, f"{engine}: {exc}"
+    if proc.returncode != 0:
+        return proc.returncode, f"{engine}: {(proc.stderr or proc.stdout or '')[-400:]}"
+    return 0, proc.stdout or ""
 
 
 def _default_run_amdl(url: str) -> tuple[bool, bool, str]:
