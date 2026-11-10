@@ -157,6 +157,111 @@ int main(void) {
                 check(retry.mixPrepareStarts > tried && [prepared[@"song:fixture"] count],
                     @"manifest arrival retries unprepared seed");
             }
+            {   // Pending New picks seeds install offline requests before promotion.
+                OfflineController *pending = [OfflineController new];
+                [pending setValue:@YES forKey:@"musicProbesEnabled"];
+                [pending setValue:dispatch_queue_create("test.mix.next", DISPATCH_QUEUE_SERIAL) forKey:@"_mixQueue"];
+                [pending setValue:[NSMutableSet set] forKey:@"_mixPreparing"];
+                [pending setValue:[NSMutableDictionary dictionary] forKey:@"_offlineRequests"];
+                [pending setValue:[NSMutableDictionary dictionary] forKey:@"_mixPrepared"];
+                [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"mixWithClaude"];
+                NSMutableArray *library = [NSMutableArray array];
+                for (NSUInteger i = 0; i < 30; i++) {
+                    [library addObject:@{@"id": [NSString stringWithFormat:@"next-%lu", (unsigned long)i], @"artist": @"A",
+                                         @"title": [NSString stringWithFormat:@"T %lu", (unsigned long)i], @"album": @"Al",
+                                         @"kind": @"song", @"family": @"other"}];
+                }
+                [library addObject:@{@"id": @"fixture-id", @"artist": @"Test Artist", @"title": @"Fixture", @"album": @"Test Album",
+                                     @"kind": @"song", @"family": @"other"}];
+                [pending setValue:library forKey:@"_mixLibrary"];
+                NSDictionary *visible = @{@"key": @"song:old", @"kind": @"song", @"title": @"Old", @"subtitle": @"Test Artist",
+                                        @"trackID": @"fixture-id", @"artist": @"Test Artist", @"album": @"Test Album", @"family": @"other"};
+                NSDictionary *next = @{@"key": @"song:next", @"kind": @"song", @"title": @"Next", @"subtitle": @"Test Artist",
+                                       @"trackID": @"fixture-id", @"artist": @"Test Artist", @"album": @"Test Album", @"family": @"other"};
+                NSDictionary *fixture = OfflineFixture(path, @"song:old");
+                [pending setValue:fixture[@"manifest"] forKey:@"_offlineManifest"];
+                [pending setValue:@[visible] forKey:@"mixSeeds"];
+                [pending setValue:@[next] forKey:@"mixSeedsNext"];
+                [pending setValue:@1 forKey:@"mixSeedsNextGen"];
+                [pending prepareMix:next then:nil];
+                settle();
+                check([[pending valueForKey:@"offlineRequests"][@"song:next"] count] > 0,
+                      @"pending New picks seed persists an offline request before swap");
+            }
+            {   // Scout publish bindings flow through to offline playback.
+                OfflineController *scout = [OfflineController new];
+                [scout setValue:@YES forKey:@"musicProbesEnabled"];
+                NSString *scoutDir = [home stringByAppendingPathComponent:@".local/state/glancebar-music-scout"];
+                NSString *hot = [home stringByAppendingPathComponent:@"Music/Glancebar Lossless"];
+                [fm createDirectoryAtPath:scoutDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [fm createDirectoryAtPath:hot withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *audio = [hot stringByAppendingPathComponent:@"scout-bound.m4a"];
+                NSString *py = [NSString stringWithFormat:
+                    @"import struct, pathlib, sys\n"
+                    "def atom(k,b): return struct.pack('>I4s', len(b)+8, k)+b\n"
+                    "tags=b''.join(atom(k,atom(b'data',b'\\0\\0\\0\\1\\0\\0\\0\\0'+v.encode()))\n"
+                    "    for k,v in [(b'\\xa9nam','Scout'),(b'\\xa9ART','Artist'),(b'\\xa9alb','Published Album')])\n"
+                    "sample=atom(b'mp4a',b'\\0'*28)\n"
+                    "table=atom(b'stsd',b'\\0'*4+struct.pack('>I',1)+sample)\n"
+                    "for p in (b'stbl',b'minf',b'mdia',b'trak'): table=atom(p,table)\n"
+                    "body=(atom(b'ftyp',b'M4A '+b'\\0'*4)+atom(b'moov',table+atom(b'udta',atom(b'meta',b'\\0'*4+atom(b'ilst',tags))))\n"
+                    "      +atom(b'mdat',b'scout-bytes'))\n"
+                    "pathlib.Path(sys.argv[1]).write_bytes(body)\n"];
+                NSTask *maker = [NSTask new];
+                maker.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+                maker.arguments = @[@"-c", py, audio];
+                [maker launch];
+                [maker waitUntilExit];
+                NSData *bytes = [NSData dataWithContentsOfFile:audio];
+                uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+                CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+                NSMutableString *hash = [NSMutableString string];
+                for (NSUInteger i = 0; i < sizeof(digest); i++) [hash appendFormat:@"%02x", digest[i]];
+                NSDictionary *doc = @{@"tracks": @[@{@"track_key": @"scout:1", @"title": @"Scout", @"artist": @"Artist",
+                                                    @"album": @"Published Album", @"duration": @200,
+                                                    @"catalogue_relative_path": @"scout-bound.m4a", @"sha256": hash}]};
+                NSData *scoutJSON = [NSJSONSerialization dataWithJSONObject:doc options:0 error:nil];
+                [scoutJSON writeToFile:[scoutDir stringByAppendingPathComponent:@"new-music.json"] atomically:YES];
+                NSString *mixDir = [home stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix"];
+                [fm createDirectoryAtPath:mixDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [scout setValue:@NO forKey:@"_stationLoaded"];
+                [scout ensureStation];
+                NSDictionary *req = [scout valueForKey:@"offlineRequests"][@"station:triplej"];
+                NSDictionary *track = req[@"tracks"][0];
+                check([track[@"catalogue_relative_path"] isEqual:@"scout-bound.m4a"] && [track[@"sha256"] isEqual:hash],
+                      @"scout new-music bindings reach the offline request");
+                NSString *requestsPath = [mixDir stringByAppendingPathComponent:@"offline-requests.json"];
+                NSString *manifestPath = [mixDir stringByAppendingPathComponent:@"offline-manifest.json"];
+                NSData *reqDoc = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": @[req]} options:0 error:nil];
+                [reqDoc writeToFile:requestsPath atomically:YES];
+                NSTask *task = [NSTask new];
+                task.currentDirectoryURL = [NSURL fileURLWithPath:[[NSBundle mainBundle] bundlePath]];
+                NSString *repo = [[NSFileManager.defaultManager currentDirectoryPath] stringByStandardizingPath];
+                if (![NSFileManager.defaultManager fileExistsAtPath:[repo stringByAppendingPathComponent:@"tools/offline-cache/offline_cache.py"]])
+                    repo = [[[NSString stringWithUTF8String:__FILE__] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+                task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+                task.arguments = @[[repo stringByAppendingPathComponent:@"tools/offline-cache/offline_cache.py"], @"prepare",
+                                   @"--requests", requestsPath, @"--manifest", manifestPath, @"--root", hot];
+                NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy];
+                env[@"GLANCEBAR_HOME"] = home;
+                env[@"HOME"] = home;
+                task.environment = env;
+                [task setStandardOutput:[NSPipe pipe]];
+                [task setStandardError:[NSPipe pipe]];
+                check([task launchAndReturnError:nil], @"offline-cache prepare launches");
+                [task waitUntilExit];
+                check(task.terminationStatus == 0 || task.terminationStatus == 2,
+                      @"offline-cache prepares scout trusted binding");
+                NSData *manifestData = [NSData dataWithContentsOfFile:manifestPath];
+                if (!manifestData.length) {
+                    check(NO, @"offline-cache wrote a manifest for scout trusted binding");
+                } else {
+                    NSDictionary *manifest = [NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil];
+                    [scout setValue:manifest forKey:@"offlineManifest"];
+                    check([OfflinePlaylistCoverage(req, manifest, [home stringByAppendingPathComponent:@"Music"], YES)[@"ready"] boolValue],
+                          @"downloaded scout track is playable via trusted binding");
+                }
+            }
         } @finally { [fm removeItemAtPath:home error:nil]; }
         return failures ? 1 : 0;
     }

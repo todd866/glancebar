@@ -12,16 +12,28 @@
 #import <math.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/stat.h>
+#import <signal.h>
 
 static NSString *gFixtureHome;
 static void CleanupFixture(void) {
-    if (gFixtureHome) [NSFileManager.defaultManager removeItemAtPath:gFixtureHome error:nil];
+    if (gFixtureHome) {
+        [NSFileManager.defaultManager removeItemAtPath:gFixtureHome error:nil];
+        gFixtureHome = nil;
+    }
 }
-
-static int Fail(int line) {
+static void PlaybackExit(int code) {
+    CleanupFixture();
+    exit(code);
+}
+static void PlaybackSignal(int sig) {
+    fprintf(stderr, "Playback check interrupted (%d)\n", sig);
+    PlaybackExit(128 + sig);
+}
+static void FailAt(int line) {
     fprintf(stderr, "Playback check failed at line %d\n", line);
-    return 1;
+    PlaybackExit(1);
 }
+#define Fail(line) FailAt(line)
 
 static void PumpUntil(NSDate *deadline) {
     while (deadline.timeIntervalSinceNow > 0)
@@ -49,10 +61,10 @@ static NSInteger LocalIndex(Controller *c) {
 
 static void AssertSilentQA(Controller *c, int line) {
     (void)c;
-    if (!MusicSilentQAEnabled()) exit(Fail(line));
+    if (!MusicSilentQAEnabled()) Fail(line);
     AVQueuePlayer *lp = LocalPlayer(c), *out = OutgoingPlayer(c);
     for (AVQueuePlayer *player in (lp && out ? @[lp, out] : lp ? @[lp] : out ? @[out] : @[])) {
-        if (!player.muted || player.volume > 0.001f) exit(Fail(line));
+        if (!player.muted || player.volume > 0.001f) Fail(line);
     }
 }
 
@@ -207,11 +219,13 @@ static NSArray<NSString *> *GenerateTracks(NSString *musicRoot, NSArray<NSDictio
 
 int main(void) {
     @autoreleasepool {
+        signal(SIGINT, PlaybackSignal);
+        signal(SIGTERM, PlaybackSignal);
         setenv("GLANCEBAR_SILENT_QA", "1", 1);
         setenv("GLANCEBAR_STUB_APPLESCRIPT", "1", 1);
         setenv("GLANCEBAR_SKIP_WELCOME", "1", 1);
         setenv("GLANCEBAR_MIX_FROZEN", "1", 1);
-        if (!MusicSilentQAEnabled()) return Fail(__LINE__);
+        if (!MusicSilentQAEnabled()) Fail(__LINE__);
 
         gFixtureHome = [NSHomeDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@".glancebar-playback-%@", NSUUID.UUID.UUIDString]];
@@ -232,15 +246,15 @@ int main(void) {
             @{@"id": @"T4", @"title": @"Track Four", @"artist": @"Artist Four", @"album": @""},
         ];
         NSArray<NSString *> *paths = GenerateTracks(musicRoot, specs);
-        if (paths.count != 4) return Fail(__LINE__);
+        if (paths.count != 4) Fail(__LINE__);
 
         NSDictionary *fixture = PlaylistFixture(specs, paths, @"song:playback");
-        if (!fixture) return Fail(__LINE__);
+        if (!fixture) Fail(__LINE__);
 
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
         PlaybackController *c = [PlaybackController new];
-        if (!MusicSilentQAEnabled()) return Fail(__LINE__);
+        if (!MusicSilentQAEnabled()) Fail(__LINE__);
         [c setValue:@YES forKey:@"musicSilentQA"];
         [c setValue:@YES forKey:@"musicProbesEnabled"];
         AssertSilentQA(c, __LINE__);
@@ -254,40 +268,40 @@ int main(void) {
               forKey:@"mixSeeds"];
 
         // --- seed tile: 4-track queue starts and time advances ---
-        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) return Fail(__LINE__);
+        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
         [c playOfflinePlaylist:@"song:playback"];
-        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 8)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 8)) Fail(__LINE__);
         AVQueuePlayer *player = LocalPlayer(c);
         if (!WaitUntil(^BOOL { return player.rate > 0; }, 5)) {
             fprintf(stderr, "AVPlayer did not start (rate stayed 0). "
                     "No playable audio output or headless environment cannot decode m4a.\n");
-            return Fail(__LINE__);
+            Fail(__LINE__);
         }
         AssertSilentQA(c, __LINE__);
-        if (!PlayerAdvancing(c, 1.0, 5.0)) return Fail(__LINE__);
+        if (!PlayerAdvancing(c, 1.0, 5.0)) Fail(__LINE__);
 
         // --- pause / resume via musicPlay: ---
         double moving = PlayerSeconds(player);
         [c musicPlay:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.5]);
-        if (player.rate > 0) return Fail(__LINE__);
+        if (player.rate > 0) Fail(__LINE__);
         double pausedAt = PlayerSeconds(player);
         [c musicPlay:nil];
-        if (!WaitUntil(^BOOL { return player.rate > 0; }, 3)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return player.rate > 0; }, 3)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
-        if (!PlayerAdvancing(c, 0.4, 3.0)) return Fail(__LINE__);
+        if (!PlayerAdvancing(c, 0.4, 3.0)) Fail(__LINE__);
         (void)moving; (void)pausedAt;
 
         // --- seek to 6 s ---
         [c musicSeek:SeekSlider(6.0)];
-        if (!WaitUntil(^BOOL { return fabs(PlayerSeconds(player) - 6.0) < 0.5; }, 8)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return fabs(PlayerSeconds(player) - 6.0) < 0.5; }, 8)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- musicNext double-tap cut ---
         NSInteger cutFrom = LocalIndex(c);
         [c musicNext:nil];
         [c musicNext:nil];
-        if (!WaitUntil(^BOOL { return LocalIndex(c) != cutFrom; }, 1.0)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalIndex(c) != cutFrom; }, 1.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- musicNext single tap blend ---
@@ -296,48 +310,48 @@ int main(void) {
         [c musicNext:nil];
         if (!WaitUntil(^BOOL {
             return OutgoingPlayer(c) != nil || [c valueForKey:@"localBlendTimer"] != nil;
-        }, 2.0)) return Fail(__LINE__);
+        }, 2.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
-        if (OutgoingPlayer(c) && (!OutgoingPlayer(c).muted || OutgoingPlayer(c).volume != 0.f)) return Fail(__LINE__);
-        if (!WaitUntil(^BOOL { return !OutgoingPlayer(c) && ![c valueForKey:@"localBlendTimer"]; }, 8.0)) return Fail(__LINE__);
+        if (OutgoingPlayer(c) && (!OutgoingPlayer(c).muted || OutgoingPlayer(c).volume != 0.f)) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return !OutgoingPlayer(c) && ![c valueForKey:@"localBlendTimer"]; }, 8.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- natural end advances and wraps ---
         if (LocalPlayer(c).rate > 0) [c musicPlay:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.4]);
-        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) return Fail(__LINE__);
+        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
         [c playOfflinePlaylist:@"song:playback"];
-        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 10)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 10)) Fail(__LINE__);
         player = LocalPlayer(c);
         NSInteger at = LocalIndex(c);
         double dur = TrackDuration(player);
         if (dur < 1.0) dur = 12.5;
-        if (!WaitUntil(^BOOL { return LocalIndex(c) == at + 1; }, dur + 3.0)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalIndex(c) == at + 1; }, dur + 3.0)) Fail(__LINE__);
         while (LocalIndex(c) < 3) {
             at = LocalIndex(c);
             player = LocalPlayer(c);
             dur = TrackDuration(player);
             if (dur < 1.0) dur = 12.5;
-            if (!WaitUntil(^BOOL { return LocalIndex(c) > at; }, dur + 3.0)) return Fail(__LINE__);
+            if (!WaitUntil(^BOOL { return LocalIndex(c) > at; }, dur + 3.0)) Fail(__LINE__);
         }
         at = LocalIndex(c);
         player = LocalPlayer(c);
         dur = TrackDuration(player);
         if (dur < 1.0) dur = 12.5;
-        if (!WaitUntil(^BOOL { return LocalIndex(c) == 0; }, dur + 3.0)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalIndex(c) == 0; }, dur + 3.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- musicPrevious restart vs skip back ---
         [c musicSeek:SeekSlider(5.0)];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
         [c musicPrevious:nil];
-        if (!WaitUntil(^BOOL { return PlayerSeconds(player) < 0.6; }, 2.0)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return PlayerSeconds(player) < 0.6; }, 2.0)) Fail(__LINE__);
         [c musicSeek:SeekSlider(2.0)];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
         NSInteger prevFrom = LocalIndex(c);
         [c musicPrevious:nil];
         if (!WaitUntil(^BOOL { return LocalIndex(c) == prevFrom - 1 || (prevFrom == 0 && LocalIndex(c) > 0); }, 2.0))
-            return Fail(__LINE__);
+            Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- output device fallback ---
@@ -345,15 +359,15 @@ int main(void) {
                         @"outputChannels": @2, @"dataSource": @""}] forKey:@"audioDevices"];
         [c setValue:@"builtin" forKey:@"defaultOutputUID"];
         [c setPlayerOutputChoiceUID:@"missing-output-uid" name:@"Missing"];
-        if (LocalPlayer(c).audioOutputDeviceUniqueID.length) return Fail(__LINE__);
-        if (!PlayerAdvancing(c, 0.3, 3.0)) return Fail(__LINE__);
+        if (LocalPlayer(c).audioOutputDeviceUniqueID.length) Fail(__LINE__);
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- Now Playing + remote commands while playing; cleared on stop ---
         NSDictionary *np = MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo;
         if (![np[MPMediaItemPropertyTitle] isKindOfClass:NSString.class] || ![(NSString *)np[MPMediaItemPropertyTitle] length])
-            return Fail(__LINE__);
-        if (![[c valueForKey:@"remoteCommandsOn"] boolValue]) return Fail(__LINE__);
+            Fail(__LINE__);
+        if (![[c valueForKey:@"remoteCommandsOn"] boolValue]) Fail(__LINE__);
         [c musicPlay:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
         [c setValue:@YES forKey:@"networkKnown"];
@@ -361,8 +375,8 @@ int main(void) {
         [c tearDownLocalPlayer];
         [c setValue:@NO forKey:@"localMode"];
         [c disableRemoteCommands];
-        if (!WaitUntil(^BOOL { return !MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo; }, 3)) return Fail(__LINE__);
-        if ([[c valueForKey:@"remoteCommandsOn"] boolValue]) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return !MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo; }, 3)) Fail(__LINE__);
+        if ([[c valueForKey:@"remoteCommandsOn"] boolValue]) Fail(__LINE__);
 
         // --- idle Play skips symlink and empty m4a ---
         NSString *good = paths[0];
@@ -376,25 +390,26 @@ int main(void) {
         [c setValue:@NO forKey:@"offlineTracksReady"];
         [c setValue:@YES forKey:@"offlineTracksEntering"];
         [c musicPlay:nil];
-        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 5)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 5)) Fail(__LINE__);
         NSArray *urls = [c valueForKey:@"localURLs"];
-        if (urls.count != 1) return Fail(__LINE__);
+        if (urls.count != 1) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
 
         // --- heart on playing track: like path once, no python ---
-        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) return Fail(__LINE__);
+        if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
         [c playOfflinePlaylist:@"song:playback"];
-        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 5)) return Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 5)) Fail(__LINE__);
         AssertSilentQA(c, __LINE__);
-        if (((PlaybackController *)c).loveLaunches) return Fail(__LINE__);
+        if (((PlaybackController *)c).loveLaunches) Fail(__LINE__);
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.5]);
-        if (((PlaybackController *)c).loveLaunches != 1) return Fail(__LINE__);
+        if (((PlaybackController *)c).loveLaunches != 1) Fail(__LINE__);
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
-        if (((PlaybackController *)c).loveLaunches != 1) return Fail(__LINE__);
+        if (((PlaybackController *)c).loveLaunches != 1) Fail(__LINE__);
 
         fprintf(stderr, "OK: playback harness scenarios passed\n");
+        CleanupFixture();
         return 0;
     }
 }

@@ -5821,11 +5821,16 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     NSDictionary *_offlineManifest;
     BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain, _offlineVerifyBusy;
     BOOL _musiclibBusy, _musiclibAgain;
+    CFAbsoluteTime _musiclibLastSyncAttemptAt;
+    NSUInteger _musiclibSyncFailures, _offlineRequestsGeneration, _musiclibSyncedRequestGeneration;
+    BOOL _meteredLinkWasActive;
     NSDictionary *_musicLibraryStatus;
     NSString *_musicLibraryLastError, *_musicLibraryHotDir;
     BOOL _musicLibraryUnmatched, _musicLibraryOverflow;
     CFAbsoluteTime _musicLibraryStatusAt;
     NSArray<NSDictionary *> *_mixSeedsNext;
+    NSUInteger _mixSeedsNextGen;
+    CFAbsoluteTime _mixSeedsNextSince;
     BOOL _musicSilentQA;
     CFAbsoluteTime _offlineExportChecked, _offlinePreparedAt;
     NSDate *_offlineExportDate;
@@ -5986,11 +5991,15 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     _popover.contentViewController.view = [[FlippedView alloc] initWithFrame:NSMakeRect(0,0,kW,10)];
 
     _meteredMonitor = [MeteredMonitor new];
+    _meteredLinkWasActive = [self meteredLinkActive];
     __weak Controller *weakSelf = self;
     _meteredMonitor.updated = ^(NSDictionary *state) {
         Controller *owner = weakSelf;
         if (!owner || owner->_terminating) return;
         owner->_metered = state;
+        BOOL metered = [owner meteredLinkActive];
+        if (owner->_meteredLinkWasActive && !metered) [owner maybeScheduleMusicLibrarySync];
+        owner->_meteredLinkWasActive = metered;
         [owner refreshVisibleSurfaces];
     };
     NSNotificationCenter *workspaceNotifications = NSWorkspace.sharedWorkspace.notificationCenter;
@@ -6287,6 +6296,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [ud setObject:keep forKey:@"mixRecentSeeds"];
         [ud setInteger:day forKey:@"mixSeedsDay"];
         if (fresh) {
+            _mixSeedsNextGen++;
+            _mixSeedsNextSince = CFAbsoluteTimeGetCurrent();
             _mixSeedsNext = seeds;
             for (NSDictionary *seed in seeds) {
                 [self loadMixArt:seed];
@@ -6361,6 +6372,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)retryUnpreparedMixSeeds {
     _onDiskLibraryIDs = nil;
     for (NSDictionary *seed in _mixSeeds)
+        if (!_mixPrepared[seed[@"key"]] && ![_mixPreparing containsObject:seed[@"key"]]) [self prepareMix:seed then:nil];
+    for (NSDictionary *seed in _mixSeedsNext)
         if (!_mixPrepared[seed[@"key"]] && ![_mixPreparing containsObject:seed[@"key"]]) [self prepareMix:seed then:nil];
 }
 - (NSSet<NSString *> *)onDiskLibraryTrackIDs {
@@ -6452,15 +6465,26 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         dispatch_async(dispatch_get_main_queue(), ^{
             if (status) self->_musicLibraryStatus = status;
             [self maybeSwapMixSeedsNext];
+            [self maybeScheduleMusicLibrarySync];
             if (self->_popover.isShown) [self rebuildContent];
         });
     });
+}
+- (void)maybeScheduleMusicLibrarySync {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
+    BOOL metered = [self meteredLinkActive];
+    if (MusicLibraryShouldRetrySync(_musicLibraryStatus, _networkKnown ? _networkOnline : YES, metered,
+            _musicLibraryUnmatched, _musicLibraryOverflow, _musiclibBusy, CFAbsoluteTimeGetCurrent(),
+            _musiclibLastSyncAttemptAt, _musiclibSyncFailures, _offlineRequestsGeneration,
+            _musiclibSyncedRequestGeneration))
+        [self prepareMusicLibrarySync];
 }
 - (void)prepareMusicLibrarySync {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
     if (_musiclibBusy) { _musiclibAgain = YES; return; }
     NSString *script = [NSBundle.mainBundle pathForResource:@"musiclib" ofType:@"py"];
     if (!script.length) return;
+    _musiclibLastSyncAttemptAt = CFAbsoluteTimeGetCurrent();
     _musiclibBusy = YES;
     NSString *dir = MixDirectory(nil);
     NSString *requests = [dir stringByAppendingPathComponent:@"offline-requests.json"];
@@ -6473,8 +6497,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         task.standardError = [NSFileHandle fileHandleWithNullDevice];
         BOOL launched = [task launchAndReturnError:nil];
         if (launched) [task waitUntilExit];
+        int status = launched ? (int)task.terminationStatus : -1;
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_musiclibBusy = NO;
+            if (status == 0) {
+                self->_musiclibSyncFailures = 0;
+                self->_musiclibSyncedRequestGeneration = self->_offlineRequestsGeneration;
+            } else if (launched) self->_musiclibSyncFailures++;
             self->_musicLibraryStatusAt = 0;
             [self reloadMusicLibraryStatus];
             [self prepareOfflineCache];
@@ -6499,19 +6528,29 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [task launchAndReturnError:nil];
     });
 }
-- (void)maybeSwapMixSeedsNext {
-    if (!_mixSeedsNext.count) return;
-    for (NSDictionary *seed in _mixSeedsNext) {
-        NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
-        if (![tile[@"state"] isEqual:@"ready"]) return;
-    }
+- (void)applyPromotedMixSeeds:(NSArray *)promoted {
+    if (!promoted.count) return;
     for (NSDictionary *old in _mixSeeds) [_offlineRequests removeObjectForKey:old[@"key"]];
-    _mixSeeds = _mixSeedsNext;
+    _mixSeeds = promoted;
     _mixSeedsNext = nil;
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    [ud setObject:_mixSeeds forKey:@"mixSeeds"];
+    [NSUserDefaults.standardUserDefaults setObject:_mixSeeds forKey:@"mixSeeds"];
     [self saveOfflineRequests];
     if (_popover.isShown) [self rebuildContent];
+}
+- (void)maybeSwapMixSeedsNext {
+    if (!_mixSeedsNext.count) return;
+    BOOL allReady = YES;
+    NSMutableDictionary *tiles = [NSMutableDictionary dictionary];
+    for (NSDictionary *seed in _mixSeedsNext) {
+        NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
+        tiles[seed[@"key"]] = tile;
+        if (![tile[@"state"] isEqual:@"ready"]) allReady = NO;
+    }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSArray *promoted = MixSeedsNextPromotion(_mixSeedsNext, tiles, allReady, now - _mixSeedsNextSince, _musiclibBusy, 600);
+    if (!promoted) return;
+    if (!promoted.count) { _mixSeedsNext = nil; if (_popover.isShown) [self rebuildContent]; return; }
+    [self applyPromotedMixSeeds:promoted];
 }
 - (void)prepareOfflineCache {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
@@ -6565,6 +6604,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
     if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
+        _offlineRequestsGeneration++;
         [self prepareOfflineCache];
         [self prepareMusicLibrarySync];
     }
@@ -6576,6 +6616,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         NSMutableDictionary *identity = [NSMutableDictionary dictionary];
         for (NSString *field in @[@"id", @"title", @"artist", @"album"])
             identity[field] = [track[field] isKindOfClass:NSString.class] ? track[field] : @"";
+        if ([track[@"local_path"] isKindOfClass:NSString.class] && [track[@"local_path"] length])
+            identity[@"local_path"] = track[@"local_path"];
+        if ([track[@"catalogue_relative_path"] isKindOfClass:NSString.class] && [track[@"catalogue_relative_path"] length])
+            identity[@"catalogue_relative_path"] = track[@"catalogue_relative_path"];
+        if ([track[@"sha256"] isKindOfClass:NSString.class] && [track[@"sha256"] length])
+            identity[@"sha256"] = track[@"sha256"];
+        if ([track[@"duration"] isKindOfClass:NSNumber.class]) identity[@"duration"] = track[@"duration"];
         [identities addObject:identity];
     }
     if (!_offlineRequests) _offlineRequests = [NSMutableDictionary dictionary];
@@ -6613,6 +6660,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (!_offlineCacheBusy && now - _offlinePreparedAt >= 300) [self prepareOfflineCache];
     if (now - _musicLibraryStatusAt >= 30) [self reloadMusicLibraryStatus];
+    [self maybeScheduleMusicLibrarySync];
     if (_offlineExportChecked > 0 && now - _offlineExportChecked < 60) return;
     _offlineExportChecked = now;
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Library-export/playlists.json"];
@@ -6645,11 +6693,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     BOOL claude = [NSUserDefaults.standardUserDefaults objectForKey:@"mixWithClaude"]
         ? [NSUserDefaults.standardUserDefaults boolForKey:@"mixWithClaude"] : YES;
     uint64_t salt = (uint64_t)[NSUserDefaults.standardUserDefaults integerForKey:@"mixPickCount"] * 31 + key.hash;
+    NSUInteger pendingGen = _mixSeedsNextGen;
     dispatch_async(_mixQueue, ^{
         NSArray *ids = BuildSeedMix(tracks, seed, claude, salt);
         dispatch_async(dispatch_get_main_queue(), ^{
             [self->_mixPreparing removeObject:key];
-            if (![self->_mixSeeds containsObject:seed]) return;
+            if (!MixPrepareStillValid(key, self->_mixSeeds, self->_mixSeedsNext, pendingGen, self->_mixSeedsNextGen)) return;
             NSMutableArray *selected = [NSMutableArray array];
             for (NSString *trackID in ids) for (NSDictionary *track in tracks)
                 if ([track[@"id"] isEqual:trackID]) { [selected addObject:track]; break; }
@@ -6759,7 +6808,18 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
             NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
             if (!trackKey.length || !title.length) continue;
-            NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObjectsAndKeys:trackKey, @"id", title, @"title", artist, @"artist", @"", @"album", nil];
+            NSString *album = [row[@"album"] isKindOfClass:NSString.class] ? row[@"album"] : @"";
+            NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObjectsAndKeys:trackKey, @"id", title, @"title",
+                                          artist, @"artist", album, @"album", nil];
+            if ([row[@"duration"] isKindOfClass:NSNumber.class]) track[@"duration"] = row[@"duration"];
+            else if ([row[@"duration"] isKindOfClass:NSString.class] && [(NSString *)row[@"duration"] length])
+                track[@"duration"] = @([(NSString *)row[@"duration"] doubleValue]);
+            if ([row[@"local_path"] isKindOfClass:NSString.class] && [(NSString *)row[@"local_path"] length])
+                track[@"local_path"] = row[@"local_path"];
+            if ([row[@"catalogue_relative_path"] isKindOfClass:NSString.class] && [(NSString *)row[@"catalogue_relative_path"] length])
+                track[@"catalogue_relative_path"] = row[@"catalogue_relative_path"];
+            if ([row[@"sha256"] isKindOfClass:NSString.class] && [(NSString *)row[@"sha256"] length])
+                track[@"sha256"] = row[@"sha256"];
             [tracks addObject:track];
             NSString *why = [row[@"why"] isKindOfClass:NSString.class] ? row[@"why"] : @"";
             [picks addObject:@{@"title": title, @"artist": artist, @"reason": why}];
@@ -6849,7 +6909,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         // Coming back online while the offline player is paused (or finished) has to
         // leave local mode now, or the next Play press is stuck toggling silence.
         if (changed && !online) self->_offlineTracksEntering = YES;
-        if (changed && online) [self yieldLocalMusicIfIdle];
+        if (changed && online) {
+            [self yieldLocalMusicIfIdle];
+            [self maybeScheduleMusicLibrarySync];
+        }
         if (changed && self->_popover.isShown) [self rebuildContent];
     });
     nw_path_monitor_start(monitor);

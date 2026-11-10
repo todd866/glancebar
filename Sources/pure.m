@@ -28,6 +28,23 @@ NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot) {
     return @{@"total": @(total), @"available": @(available), @"ready": @(ready), @"paths": ready ? paths : @[]};
 }
 
+static NSDictionary *OfflineTrackIdentity(id track) {
+    if (![track isKindOfClass:NSDictionary.class]) return nil;
+    return @{@"id": [track[@"id"] isKindOfClass:NSString.class] ? track[@"id"] : @"",
+             @"title": [track[@"title"] isKindOfClass:NSString.class] ? track[@"title"] : @"",
+             @"artist": [track[@"artist"] isKindOfClass:NSString.class] ? track[@"artist"] : @"",
+             @"album": [track[@"album"] isKindOfClass:NSString.class] ? track[@"album"] : @""};
+}
+
+static BOOL OfflineRequestTracksMatch(NSArray *wanted, NSArray *manifestTracks) {
+    if (wanted.count != manifestTracks.count) return NO;
+    for (NSUInteger i = 0; i < wanted.count; i++) {
+        NSDictionary *a = OfflineTrackIdentity(wanted[i]), *b = OfflineTrackIdentity(manifestTracks[i]);
+        if (!a || !b || ![a isEqual:b]) return NO;
+    }
+    return YES;
+}
+
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash) {
     NSArray *wanted = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
     NSDictionary *entry = nil;
@@ -36,7 +53,8 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
             if ([candidate isKindOfClass:NSDictionary.class] && [candidate[@"key"] isEqual:request[@"key"]]) { entry = candidate; break; }
     }
     NSMutableArray *paths = [NSMutableArray array];
-    BOOL current = wanted.count && [entry[@"requestedTracks"] isEqual:wanted];
+    NSArray *manifestWanted = [entry[@"requestedTracks"] isKindOfClass:NSArray.class] ? entry[@"requestedTracks"] : @[];
+    BOOL current = wanted.count && OfflineRequestTracksMatch(wanted, manifestWanted);
     NSArray *records = current && [entry[@"tracks"] isKindOfClass:NSArray.class] ? entry[@"tracks"] : @[];
     NSUInteger cursor = 0;
     BOOL inOrder = YES;
@@ -44,7 +62,7 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
         if (![record isKindOfClass:NSDictionary.class]) { inOrder = NO; continue; }
         NSDictionary *identity = @{@"id": record[@"id"] ?: @"", @"title": record[@"title"] ?: @"",
             @"artist": record[@"artist"] ?: @"", @"album": record[@"album"] ?: @""};
-        while (cursor < wanted.count && ![wanted[cursor] isEqual:identity]) cursor++;
+        while (cursor < wanted.count && ![OfflineTrackIdentity(wanted[cursor]) isEqual:identity]) cursor++;
         if (cursor == wanted.count) { inOrder = NO; continue; }
         cursor++;
         struct stat st;
@@ -89,6 +107,56 @@ float MusicPlayerOutputVolume(BOOL silentQA) { return silentQA ? 0.f : 1.f; }
 BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow) {
     if (!networkOnline || metered || lastError.length || unmatched || overflow) return YES;
     return NO;
+}
+
+BOOL MusicLibraryStatusIncomplete(NSDictionary *status) {
+    if (![status isKindOfClass:NSDictionary.class]) return NO;
+    for (id playlist in [status[@"playlists"] isKindOfClass:NSArray.class] ? status[@"playlists"] : @[]) {
+        if (![playlist isKindOfClass:NSDictionary.class]) continue;
+        if ([playlist[@"missing"] unsignedIntegerValue] > 0) return YES;
+    }
+    return NO;
+}
+
+double MusicLibrarySyncRetryInterval(NSUInteger consecutiveFailures) {
+    double base = 30 * 60;
+    if (!consecutiveFailures) return base;
+    NSUInteger shift = consecutiveFailures < 4 ? consecutiveFailures : 4;
+    double interval = base * (double)(1u << shift);
+    return interval > 4 * 3600 ? 4 * 3600 : interval;
+}
+
+BOOL MusicLibraryShouldRetrySync(NSDictionary *status, BOOL networkOnline, BOOL metered, BOOL unmatched,
+    BOOL overflow, BOOL syncBusy, CFAbsoluteTime now, CFAbsoluteTime lastAttemptAt, NSUInteger consecutiveFailures,
+    NSUInteger requestsGeneration, NSUInteger lastSuccessfulAttemptGeneration) {
+    if (syncBusy || !networkOnline || metered || unmatched || overflow) return NO;
+    if (!MusicLibraryStatusIncomplete(status)) return NO;
+    if (requestsGeneration > lastSuccessfulAttemptGeneration) return YES;
+    if (lastAttemptAt <= 0) return YES;
+    return now - lastAttemptAt >= MusicLibrarySyncRetryInterval(consecutiveFailures);
+}
+
+BOOL MixPrepareStillValid(NSString *key, NSArray *visible, NSArray *pending, NSUInteger preparePendingGen,
+    NSUInteger currentPendingGen) {
+    if (!key.length) return NO;
+    for (NSDictionary *seed in visible)
+        if ([seed[@"key"] isEqual:key]) return YES;
+    for (NSDictionary *seed in pending)
+        if ([seed[@"key"] isEqual:key]) return preparePendingGen == currentPendingGen;
+    return NO;
+}
+
+NSArray *MixSeedsNextPromotion(NSArray *pending, NSDictionary *tileStatesByKey, BOOL allReady, double pendingAgeSec,
+    BOOL syncBusy, double timeoutSec) {
+    if (![pending isKindOfClass:NSArray.class] || !pending.count) return nil;
+    if (allReady) return pending;
+    if (syncBusy || pendingAgeSec < timeoutSec) return nil;
+    NSMutableArray *promoted = [NSMutableArray array];
+    for (NSDictionary *seed in pending) {
+        NSDictionary *tile = [tileStatesByKey[seed[@"key"]] isKindOfClass:NSDictionary.class] ? tileStatesByKey[seed[@"key"]] : nil;
+        if ([tile[@"enabled"] boolValue]) [promoted addObject:seed];
+    }
+    return promoted;
 }
 
 NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL cannotFetch) {

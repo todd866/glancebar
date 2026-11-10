@@ -2037,6 +2037,26 @@ int main(void) {
             check(OfflineTrackListStale(NO, NO, 0) && OfflineTrackListStale(YES, YES, 1) &&
                   OfflineTrackListStale(YES, NO, 60) && !OfflineTrackListStale(YES, NO, 59),
                   @"music: the offline list refreshes on entry and after 60 seconds");
+            NSDictionary *incomplete = @{@"healthy": @NO, @"playlists": @[@{@"missing": @2}]};
+            check(MusicLibraryStatusIncomplete(incomplete) && !MusicLibraryStatusIncomplete(@{@"healthy": @YES, @"playlists": @[]}),
+                  @"music-library: status is incomplete when any playlist still has missing tracks");
+            NSDictionary *now = @{@"healthy": @NO, @"playlists": @[@{@"missing": @1}]};
+            check(MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 4000, 0, 0, 3, 1),
+                  @"music-library: a new request generation may sync immediately");
+            check(!MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 4000, 3990, 0, 1, 1),
+                  @"music-library: the same generation waits for the retry interval");
+            check(!MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 5000, 1000, 2, 1, 1) &&
+                  MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 9000, 1000, 2, 1, 1),
+                  @"music-library: failures back off before another sync");
+            check(MixPrepareStillValid(@"k", @[@{@"key": @"k"}], @[], 1, 2),
+                  @"music-library: visible seeds accept mix results regardless of generation");
+            check(MixPrepareStillValid(@"p", @[], @[@{@"key": @"p"}], 2, 2) &&
+                  !MixPrepareStillValid(@"p", @[], @[@{@"key": @"p"}], 1, 2),
+                  @"music-library: pending seeds reject superseded mix generations");
+            NSDictionary *tiles = @{@"a": @{@"enabled": @YES, @"state": @"partial"},
+                                    @"b": @{@"enabled": @NO, @"state": @"unavailable"}};
+            check([MixSeedsNextPromotion(@[@{@"key": @"a"}, @{@"key": @"b"}], tiles, NO, 700, NO, 600) isEqual:@[@{@"key": @"a"}]],
+                  @"mix: after the timeout only playable pending seeds promote");
         }
 
         // --- Power-source refresh coalescing ---
