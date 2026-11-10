@@ -385,13 +385,20 @@ def match_track(track, catalogue_entries):
     if not req_keys:
         return [], 'missing title or artist'
     req_dur = track_duration_seconds(track)
+    exact_key = match_key(track.get('artist', ''), track.get('title', ''))
     hits = []
     for entry in catalogue_entries:
         tags = entry.get('tags') or {}
         ekeys = oc.catalogue_match_keys(tags.get('artist', ''), tags.get('title', ''))
         if not req_keys & ekeys:
             continue
-        if not duration_ok(req_dur, entry.get('durationSeconds')):
+        entry_dur = entry.get('durationSeconds')
+        if not duration_ok(req_dur, entry_dur):
+            continue
+        exact = match_key(tags.get('artist', ''), tags.get('title', '')) == exact_key
+        if not exact and (req_dur is None or entry_dur is None):
+            # A loose match (suffix, "feat.", primary artist) is only trusted when the
+            # durations confirm it is the same recording.
             continue
         hits.append(entry)
     if not hits:

@@ -736,7 +736,7 @@ def _build_taste_prompt(
         "task": "suggest_tracks",
         "count": n,
         "loved_artists": artists[:20],
-        "owned_artists_to_exclude": exclude[:120],
+        "owned_artists_to_exclude": exclude[:1500],
         "recent_likes": likes[:30],
         "recent_skips": skips[:30],
         "rules": [

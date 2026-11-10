@@ -51,8 +51,10 @@ def normal(value):
 
 
 _MATCH_PUNCT = re.compile(r'[^\w\s]+', re.UNICODE)
+# Only suffixes that name the SAME recording. "(… Remix)", "(Live)", "(Radio Edit)", "(Acoustic
+# Version)" are different recordings and must never be stripped.
 _MATCH_SUFFIX = re.compile(
-    r'\s*(?:[\(\[].*?(?:remaster(?:ed)?|single|edit|version|mix|radio|clean|explicit).*?[\)\]]'
+    r'\s*(?:[\(\[][^\)\]]*\b(?:remaster(?:ed)?|clean|explicit|album version|single version)\b[^\)\]]*[\)\]]'
     r'|-\s*single)\s*$',
     re.IGNORECASE,
 )
@@ -104,11 +106,6 @@ def title_match_variants(title):
     no_feat = _MATCH_FEAT_IN_TITLE.sub('', base).strip()
     variants.add(no_feat)
     variants.add(strip_match_suffixes(no_feat))
-    low = base.lower()
-    if 'modelz' in low and 'role' not in low:
-        variants.add(re.sub(r'modelz', 'role modelz', base, flags=re.IGNORECASE))
-    if 'moth to a flame' in low:
-        variants.add(base.replace('Moth', 'Moth To A Flame'))
     out = []
     seen = set()
     for item in variants:

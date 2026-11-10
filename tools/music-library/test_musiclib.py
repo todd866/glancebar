@@ -99,6 +99,25 @@ class MusicLibLogicTests(unittest.TestCase):
             self.assertIsNone(m.inside(hot, 'link/x.m4a'))
             self.assertIsNotNone(m.inside(hot, 'Artist/x.m4a'))
 
+    def test_loose_match_never_binds_a_different_recording(self):
+        entries = [
+            {'relativePath': 'A/B/01 Song (Someone Remix).m4a', 'sizeBytes': 1, 'sha256': 'd' * 64,
+             'tags': {'title': 'Song (Someone Remix)', 'artist': 'Artist'}, 'durationSeconds': 200.0},
+            {'relativePath': 'A/B/02 Other (Live).m4a', 'sizeBytes': 1, 'sha256': 'e' * 64,
+             'tags': {'title': 'Other (Live)', 'artist': 'Artist'}, 'durationSeconds': 200.0},
+            {'relativePath': 'A/B/03 Third.m4a', 'sizeBytes': 1, 'sha256': 'f' * 64,
+             'tags': {'title': 'Third (Remastered 2011)', 'artist': 'Artist'}},
+        ]
+        for track in (
+            {'artist': 'Artist', 'title': 'Song', 'durationSeconds': 200.0},
+            {'artist': 'Artist', 'title': 'Other', 'durationSeconds': 200.0},
+            # loose match with no duration on the catalogue side: not trusted
+            {'artist': 'Artist', 'title': 'Third', 'durationSeconds': 180.0},
+        ):
+            hits, reason = m.match_track(track, entries)
+            self.assertEqual(hits, [], track)
+            self.assertEqual(reason, 'no catalogue match')
+
     def test_match_normalisation_rules(self):
         entries = [
             {
