@@ -244,6 +244,32 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'malformed'):
             c.mp4_tags(self.path)
 
+    def test_hot_lossless_preferred_over_lossy_ambiguity(self):
+        hot = self.root / 'hot'
+        hot.mkdir()
+        lossy = self.root / 'lossy.m4a'
+        lossy.write_bytes(audio())
+        hot_file = hot / 'song.m4a'
+        hot_file.write_bytes(audio() + atom(b'free', b'lossless extra'))
+        sources = [
+            dict(self.track, path=str(lossy)),
+            dict(self.track, path=str(hot_file)),
+        ]
+        picked, reason = c.select(self.track, sources, hot_dir=hot)
+        self.assertIsNone(reason)
+        self.assertEqual(picked['path'], str(hot_file))
+
+    def test_trusted_binding_without_metadata_match(self):
+        hot = self.root / 'hot'
+        hot.mkdir()
+        hot_file = hot / 'bound.m4a'
+        hot_file.write_bytes(audio(title='Different', artist='Names', album='X'))
+        info = c.verified(hot_file)
+        track = dict(self.track, album='Album', catalogue_relative_path='bound.m4a', sha256=info['sha256'])
+        picked, reason = c.select(track, [], hot_dir=hot, verification_cache={})
+        self.assertIsNone(reason)
+        self.assertEqual(picked['sha256'], info['sha256'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -205,21 +205,65 @@ def inventory(roots, index=None, cached=None):
     return result
 
 
-def select(track, sources, verification_cache=None, hot_dir=None):
-    hot_dir = Path(hot_dir).expanduser().resolve() if hot_dir else music_library_hot_dir().resolve()
+def _path_under_hot(path, hot_dir):
+    try:
+        return Path(path).expanduser().resolve().is_relative_to(hot_dir)
+    except (OSError, ValueError):
+        return False
+
+
+def trusted_binding_match(track, hot_dir, verification_cache=None):
+    """Match a publish/scout trusted file binding without metadata tuple equality."""
+    hot_dir = Path(hot_dir).expanduser().resolve()
+    local_path = track.get('local_path') or track.get('localPath') or track.get('absolutePath')
+    if local_path:
+        try:
+            info = verified(local_path, verification_cache)
+        except (OSError, ValueError):
+            return None
+        bound = track.get('sha256')
+        if bound and info['sha256'] != bound:
+            return None
+        return dict(track, path=info['path'], sizeBytes=info['sizeBytes'], sha256=info['sha256'],
+                    mtimeNs=info.get('mtimeNs'), inode=info.get('inode'), embeddedTags=info.get('embeddedTags', {}))
+    rel = track.get('catalogue_relative_path') or track.get('catalogueRelativePath')
+    bound = track.get('sha256')
+    if rel and bound:
+        candidate = (hot_dir / rel).resolve()
+        try:
+            local_file(candidate)
+        except ValueError:
+            return None
+        try:
+            info = verified(candidate, verification_cache)
+        except (OSError, ValueError):
+            return None
+        if info['sha256'] != bound:
+            return None
+        return dict(track, path=info['path'], sizeBytes=info['sizeBytes'], sha256=info['sha256'],
+                    mtimeNs=info.get('mtimeNs'), inode=info.get('inode'), embeddedTags=info.get('embeddedTags', {}))
+    return None
+
+
+def _metadata_candidates(track, sources):
     candidates = []
     for row in sources:
-        # Explicit persistent-ID binding, with no contradictory supplied metadata.
         exact_id = bool(row.get('id')) and row['id'] == track['id']
         mismatch = any(normal(row.get(k)) and normal(track.get(k)) and normal(row[k]) != normal(track[k])
                        for k in ('artist', 'title', 'album'))
         exact_tags = all(identity(track)) and identity(track) == identity(row)
         if (exact_id and not mismatch) or exact_tags:
             candidates.append(row)
-    paths = {str(row.get('path', '')) for row in candidates}
+    return candidates
+
+
+def _choose_from_candidates(candidates, hot_dir, verification_cache, *, restrict_hot=False):
+    if restrict_hot:
+        candidates = [row for row in candidates if _path_under_hot(row.get('path', ''), hot_dir)]
+    paths = {str(row.get('path', '')) for row in candidates if row.get('path')}
+    if not paths:
+        return None, 'no exact recording match'
     if len(paths) > 1:
-        # Only byte-identical, independently validated files can collapse. Never
-        # pick among different recordings merely because their text tags match.
         try:
             checks = [verified(path, verification_cache) for path in sorted(paths)]
         except (OSError, ValueError):
@@ -236,9 +280,22 @@ def select(track, sources, verification_cache=None, hot_dir=None):
 
         preferred = sorted(paths, key=rank)[0]
         return next(row for row in candidates if row.get('path') == preferred), None
-    if not paths:
-        return None, 'no exact recording match'
     return candidates[0], None
+
+
+def select(track, sources, verification_cache=None, hot_dir=None):
+    hot_dir = Path(hot_dir).expanduser().resolve() if hot_dir else music_library_hot_dir().resolve()
+    bound = trusted_binding_match(track, hot_dir, verification_cache)
+    if bound:
+        return bound, None
+    meta_candidates = _metadata_candidates(track, sources)
+    hot_pick, hot_reason = _choose_from_candidates(meta_candidates, hot_dir, verification_cache, restrict_hot=True)
+    if hot_pick:
+        return hot_pick, None
+    if hot_reason == 'ambiguous exact match':
+        return None, hot_reason
+    other = [row for row in meta_candidates if not _path_under_hot(row.get('path', ''), hot_dir)]
+    return _choose_from_candidates(other, hot_dir, verification_cache, restrict_hot=False)
 
 
 def physical_free(path):

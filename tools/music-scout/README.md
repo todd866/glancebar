@@ -11,7 +11,8 @@ stage is idempotent and safe to rerun.
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `tracks_per_week` | 20 | Max acquisitions per rolling 7 days |
-| `gb_per_week` | 1.5 | Max estimated download volume (uses `avg_track_mb`) |
+| `gb_per_week` | 1.5 | Max download volume per week (binary GiB, tracked from real bytes) |
+| `mb_per_minute` | 7 | Lossless size estimate from iTunes duration before acquire |
 | `fresh_days` | 14 | `publish` window for the New music tile |
 | `exploration_share` | 0.30 | Minimum share reserved for taste-expansion rows in `rank` |
 | `max_per_artist_week` | 2 | Per-artist cap including recent ledger offers |
@@ -29,7 +30,7 @@ stage is idempotent and safe to rerun.
 | `new-music.json` | Playlist for the Glancebar **New music** tile |
 | `source-stats.json` | Per-source counts; flags sources empty ≥3 nights |
 | `last-run.json` | Last `run` summary for `status` |
-| `run.lock` | Exclusive lock for `run` |
+| `scout.lock` | Exclusive lock for state-changing commands |
 
 ## Commands
 
@@ -92,3 +93,23 @@ python3 -m unittest discover -s tools/music-scout -v
 ```
 
 No network; mixpool, iTunes, `ai-pick`, and `amdl` are stubbed.
+
+## `new-music.json` track shape (for offline-cache)
+
+Each published track includes identity the offline helper can match:
+
+```json
+{
+  "track_key": "artist|title",
+  "artist": "…",
+  "title": "…",
+  "album": "…",
+  "duration_seconds": 245.5,
+  "acquired_at": "2026-11-10T00:00:00Z",
+  "local_path": "/absolute/when/on/this/Mac.m4a",
+  "catalogue_relative_path": "Artist/Album/track.m4a",
+  "sha256": "64 lowercase hex"
+}
+```
+
+`local_path` or (`catalogue_relative_path` + `sha256`) are set when known after acquire.

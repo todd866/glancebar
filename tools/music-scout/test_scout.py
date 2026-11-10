@@ -185,9 +185,9 @@ class ScoutLogicTests(unittest.TestCase):
                     "size_mb": 80,
                 },
             )
-        count, mb = scout.weekly_acquired_stats(self.paths.ledger, now)
+        count, total_bytes = scout.weekly_acquired_stats(self.paths.ledger, now)
         self.assertEqual(count, 18)
-        self.assertAlmostEqual(mb, 18 * 80, places=1)
+        self.assertEqual(total_bytes, 18 * 80 * 1024 * 1024)
 
         queue = {
             "tracks": [
@@ -196,13 +196,14 @@ class ScoutLogicTests(unittest.TestCase):
             ]
         }
         self.paths.queue.write_text(json.dumps(queue), encoding="utf-8")
-        cfg = dict(self.cfg, tracks_per_week=20, gb_per_week=1.5, avg_track_mb=75)
+        cfg = dict(self.cfg, tracks_per_week=20, gb_per_week=2.0, avg_track_mb=75)
         runners = scout.Runners(
             clock=lambda: "2026-11-10T12:00:00Z",
-            run_amdl=lambda url: (True, False, ""),
+            run_amdl=lambda url: (True, False, "", {"size_bytes": 80 * 1024 * 1024}),
             is_m5=lambda: True,
             is_metered=lambda: False,
             on_battery=lambda: False,
+            itunes_song_best=lambda *a, **k: {"trackId": 9, "trackTimeMillis": 600_000},
         )
         summary = scout.cmd_acquire(cfg, self.paths, runners, go=True)
         acquired = [r for r in summary["results"] if r.get("action") == "acquired"]
@@ -302,7 +303,105 @@ class ScoutLogicTests(unittest.TestCase):
         summary = scout.cmd_acquire(self.cfg, self.paths, runners, go=False)
         self.assertEqual(amdl_called, [])
         self.assertTrue(all(r.get("action") == "dry_run" for r in summary["results"]))
-        self.assertFalse(any(line.get("action") == "acquired" for line in scout.read_jsonl(self.paths.ledger)))
+        self.assertFalse(any(line.get("action") == "acquired" for line in scout.read_jsonl_rows(self.paths.ledger)))
+
+
+    def test_budget_skips_track_larger_than_remaining(self):
+        self.paths.queue.write_text(
+            json.dumps({
+                "tracks": [{
+                    "artist": "Big",
+                    "title": "Song",
+                    "track_key": "big|song",
+                    "track_id": 1,
+                }]
+            }),
+            encoding="utf-8",
+        )
+        cfg = dict(self.cfg, gb_per_week=0.001, mb_per_minute=7)
+        runners = scout.Runners(
+            clock=lambda: "2026-11-10T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+            itunes_song_best=lambda *a, **k: {
+                "trackId": 1,
+                "trackName": "Song",
+                "artistName": "Big",
+                "trackTimeMillis": 600_000,
+            },
+        )
+        summary = scout.cmd_acquire(cfg, self.paths, runners, go=False)
+        self.assertEqual(summary["results"][0]["action"], "skipped_budget")
+
+    def test_acquire_records_real_bytes(self):
+        self.paths.queue.write_text(
+            json.dumps({"tracks": [{"artist": "A", "title": "B", "track_key": "a|b", "track_id": 1}]}),
+            encoding="utf-8",
+        )
+        runners = scout.Runners(
+            clock=lambda: "2026-11-10T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+            itunes_song_best=lambda *a, **k: {"trackId": 1, "trackName": "B", "artistName": "A", "trackTimeMillis": 180_000},
+            run_amdl=lambda url: (True, False, "", {"size_bytes": 12_345_678}),
+        )
+        scout.cmd_acquire(self.cfg, self.paths, runners, go=True)
+        rows = scout.read_jsonl_rows(self.paths.ledger)
+        acquired = [r for r in rows if r.get("action") == "acquired"][-1]
+        self.assertEqual(acquired["size_bytes"], 12_345_678)
+
+    def test_music_sync_inventory_owned(self):
+        inv = self.root / "inventory.json"
+        inv.write_text(json.dumps({"am_fav": [{"artist": "Sync", "title": "Track"}]}))
+        owned = scout.owned_keys(self.cfg, self.paths)
+        self.assertIn(scout.track_key("Sync", "Track"), owned)
+
+    def test_stale_queue_skips_newly_owned(self):
+        track_dir = self.root / "export" / "Band" / "Al"
+        track_dir.mkdir(parents=True)
+        (track_dir / "Owned.m4a").write_bytes(b"x")
+        self.paths.queue.write_text(
+            json.dumps({"tracks": [{"artist": "Band", "title": "Owned", "track_key": "band|owned", "track_id": 1}]}),
+            encoding="utf-8",
+        )
+        runners = scout.Runners(
+            clock=lambda: "2026-11-10T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+        )
+        summary = scout.cmd_acquire(self.cfg, self.paths, runners, go=False)
+        self.assertEqual(summary["results"][0]["action"], "skipped_owned")
+
+    def test_publish_includes_offline_identity(self):
+        scout.append_jsonl(
+            self.paths.ledger,
+            {
+                "at": "2026-11-10T00:00:00Z",
+                "action": "acquired",
+                "artist": "Pub",
+                "title": "Lish",
+                "track_key": "pub|lish",
+                "album": "Al",
+                "duration_seconds": 200.0,
+                "catalogue_relative_path": "Pub/Al/track.m4a",
+                "sha256": "a" * 64,
+            },
+        )
+        runners = scout.Runners(clock=lambda: "2026-11-11T00:00:00Z")
+        doc = scout.cmd_publish(self.cfg, self.paths, runners)
+        row = doc["tracks"][0]
+        self.assertEqual(row["album"], "Al")
+        self.assertEqual(row["duration_seconds"], 200.0)
+        self.assertEqual(row["catalogue_relative_path"], "Pub/Al/track.m4a")
+
+    def test_status_reports_torn_ledger(self):
+        self.paths.ledger.write_text('{"action":"acquired"}\n{broken\n', encoding="utf-8")
+        doc, code = scout.cmd_status(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-10T12:00:00Z"))
+        self.assertEqual(code, 1)
+        self.assertIn("broken", doc["ledger_torn_line"])
 
 
 class LockTests(unittest.TestCase):

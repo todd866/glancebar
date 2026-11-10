@@ -37,6 +37,7 @@ AUDIO_SUFFIXES = {'.m4a', '.mp4', '.alac'}
 CATALOGUE_SCHEMA = 1
 PLAN_SCHEMA = 1
 STATUS_SCHEMA = 1
+GIB = 1024 ** 3
 
 
 def normal(value):
@@ -65,8 +66,25 @@ def load_config(path=None):
         'hot_dir': Path(raw['hot_dir']).expanduser(),
         'cap_gb': float(raw['cap_gb']),
         'keep_days': int(raw['keep_days']),
+        'min_free_gb': float(raw.get('min_free_gb', 20)),
         'config_path': p,
     }
+
+
+def cap_bytes_from_config(cfg):
+    return int(cfg['cap_gb'] * GIB)
+
+
+def min_free_bytes_from_config(cfg):
+    return int(cfg.get('min_free_gb', 20) * GIB)
+
+
+def physical_free_bytes(path):
+    p = Path(path).expanduser()
+    while not p.exists():
+        p = p.parent
+    s = os.statvfs(p)
+    return min(s.f_bavail, s.f_bfree) * s.f_frsize
 
 
 def state_dir(override=None):
@@ -179,6 +197,38 @@ def remote_list_files(remote):
 
 def remote_fetch_file(remote, relpath, dest_part):
     rclone_run(['copyto', f'{remote}/{relpath}', str(dest_part)])
+
+
+def remote_object_meta(remote, relpath):
+    """Return rclone lsjson metadata for one remote object, or None when absent."""
+    proc = rclone_run(['lsjson', f'{remote}/{relpath}', '--hash'], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        rows = json.loads(proc.stdout or '[]')
+    except json.JSONDecodeError:
+        return None
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    row = rows[0]
+    hashes = row.get('Hashes') or {}
+    sha = hashes.get('sha256') or hashes.get('SHA256') or row.get('sha256')
+    return {'sizeBytes': int(row.get('Size') or row.get('size') or 0), 'sha256': sha}
+
+
+def remote_confirms_catalogue(remote, relpath, entry, meta=None):
+    """True when the remote object matches catalogue size and hash when reported."""
+    meta = meta if meta is not None else remote_object_meta(remote, relpath)
+    if not meta:
+        return False, 'remote object missing'
+    expected_size = int(entry.get('sizeBytes') or 0)
+    if meta.get('sizeBytes') != expected_size:
+        return False, 'remote size mismatch'
+    remote_hash = meta.get('sha256')
+    catalogue_hash = entry.get('sha256')
+    if remote_hash and catalogue_hash and str(remote_hash).lower() != str(catalogue_hash).lower():
+        return False, 'remote hash mismatch'
+    return True, None
 
 
 def load_build_cache(state):
@@ -443,6 +493,109 @@ def bytes_in_hot(hot_map):
     return sum(row['sizeBytes'] for row in hot_map.values())
 
 
+def part_bytes_in_hot(hot_dir):
+    hot = Path(hot_dir).expanduser()
+    total = 0
+    if not hot.is_dir():
+        return total
+    for path in hot.rglob('*.part'):
+        if path.is_file():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def hot_byte_usage(hot_dir, hot_map=None):
+    hot_map = hot_map if hot_map is not None else hot_file_state(hot_dir)
+    return bytes_in_hot(hot_map) + part_bytes_in_hot(hot_dir)
+
+
+def sweep_stale_parts(hot_dir):
+    removed = []
+    hot = Path(hot_dir).expanduser()
+    if not hot.is_dir():
+        return removed
+    for path in hot.rglob('*.part'):
+        if path.is_file():
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except OSError:
+                pass
+    return removed
+
+
+def load_verified_hot(state):
+    p = state_dir(state) / 'verified-hot.json'
+    try:
+        doc = json.loads(p.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_verified_hot(state, verified):
+    atomic_write_json(state_dir(state) / 'verified-hot.json', verified)
+
+
+def verify_hot_track(path, entry, verified_state, rel):
+    """Return (ok, digest). Cheap when size+mtime match the last verified record."""
+    p = Path(path)
+    st = p.stat()
+    expected_size = int(entry['sizeBytes'])
+    if st.st_size != expected_size:
+        return False, None
+    stamp = [st.st_size, str(st.st_mtime_ns)]
+    prev = verified_state.get(rel, {})
+    if prev.get('stamp') == stamp and prev.get('sha256') == entry.get('sha256'):
+        return True, prev['sha256']
+    digest = sha256_file(p)
+    if digest != entry.get('sha256'):
+        return False, digest
+    verified_state[rel] = {'stamp': stamp, 'sha256': digest}
+    return True, digest
+
+
+def reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=None):
+    """Trash corrupt hot files; return (local_ok, refetch)."""
+    hot_map = hot_file_state(hot_dir)
+    local = []
+    refetch = []
+    hot_dir = Path(hot_dir).expanduser().resolve()
+    for item in wanted_entries:
+        rel = item['catalogue']['relativePath']
+        if rel not in hot_map:
+            refetch.append(item)
+            continue
+        row = hot_map[rel]
+        path = Path(row['path']).resolve()
+        if not path.is_relative_to(hot_dir):
+            refetch.append(item)
+            continue
+        ok, _ = verify_hot_track(path, item['catalogue'], verified_state, rel)
+        if ok:
+            local.append(dict(item, path=str(path)))
+            continue
+        trash_path(path, trash_cmd=trash_cmd)
+        verified_state.pop(rel, None)
+        refetch.append(item)
+    return local, refetch
+
+
+def prioritize_to_fetch(to_fetch, playlist_key=None):
+    if not playlist_key:
+        return list(to_fetch)
+    first = [row for row in to_fetch if row.get('playlistKey') == playlist_key]
+    rest = [row for row in to_fetch if row.get('playlistKey') != playlist_key]
+    return first + rest
+
+
+def catalogue_index(catalogue):
+    return {e['relativePath']: e for e in index_catalogue(catalogue)}
+
+
 def activity_timestamp(rel, played, fetched, hot_row, now):
     ts = [hot_row.get('mtime', 0)]
     if rel in played:
@@ -473,9 +626,9 @@ def evictable_files(hot_map, wanted_rels, played, fetched, remote_rels, keep_day
     return candidates
 
 
-def plan_evictions(hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
+def plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
                    extra_fetch_bytes=0):
-    hot_bytes = bytes_in_hot(hot_map)
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
     target = hot_bytes + extra_fetch_bytes - cap_bytes
     evict = []
     if target <= 0:
@@ -488,24 +641,29 @@ def plan_evictions(hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes
     return evict
 
 
-def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels, cap_bytes, keep_days, now=None):
+def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels, cap_bytes, keep_days,
+                 now=None, verified_state=None, trash_cmd=None, playlist_first=None):
     now = now if now is not None else time.time()
     playlists, wanted_entries, unmatched = wanted_entries_from_requests(requests_doc, catalogue)
     wanted_rels = {e['catalogue']['relativePath'] for e in wanted_entries}
     hot_map = hot_file_state(hot_dir)
-    local = []
-    to_fetch = []
-    for entry in wanted_entries:
-        rel = entry['catalogue']['relativePath']
-        if rel in hot_map:
-            local.append(dict(entry, path=hot_map[rel]['path']))
-        else:
-            to_fetch.append(entry)
+    verified_state = verified_state if verified_state is not None else {}
+    local, to_fetch = reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=trash_cmd)
+    to_fetch = prioritize_to_fetch(to_fetch, playlist_first)
     fetch_bytes = sum(e['catalogue']['sizeBytes'] for e in to_fetch)
-    evict = plan_evictions(hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
+    evict = plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, cap_bytes, keep_days, now,
                             extra_fetch_bytes=fetch_bytes)
-    after_evict = bytes_in_hot(hot_map) - sum(r['sizeBytes'] for r in evict) + fetch_bytes
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
+    after_evict = hot_bytes - sum(r['sizeBytes'] for r in evict) + fetch_bytes
     overflow = after_evict > cap_bytes
+    evict_rows = []
+    for row in evict:
+        entry = catalogue_index(catalogue).get(row['relativePath'], {})
+        evict_rows.append({
+            'relativePath': row['relativePath'],
+            'sizeBytes': row['sizeBytes'],
+            'catalogue': {k: entry.get(k) for k in ('relativePath', 'sizeBytes', 'sha256')},
+        })
     return {
         'schemaVersion': PLAN_SCHEMA,
         'generatedAt': int(now),
@@ -514,8 +672,8 @@ def compute_plan(requests_doc, catalogue, hot_dir, played, fetched, remote_rels,
         'local': local,
         'toFetch': to_fetch,
         'unmatched': unmatched,
-        'evict': [{'relativePath': r['relativePath'], 'sizeBytes': r['sizeBytes']} for r in evict],
-        'hotBytes': bytes_in_hot(hot_map),
+        'evict': evict_rows,
+        'hotBytes': hot_bytes,
         'capBytes': cap_bytes,
         'afterSyncBytes': after_evict,
         'overflow': overflow,
@@ -562,7 +720,8 @@ def trash_path(path, trash_cmd=None):
     subprocess.run([str(cmd), str(path)], check=True)
 
 
-def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_flag=None, trash_cmd=None, now=None):
+def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_flag=None, trash_cmd=None, now=None,
+                 remote_meta=None, playlist_first=None):
     now = now if now is not None else time.time()
     state_p = state_dir(state)
     if metered_active(metered_flag) and not allow_metered:
@@ -573,33 +732,70 @@ def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_fla
                               for t in pl['tracks'])]
         raise ValueError(f'cap exceeded after eviction; playlists may not fit: {", ".join(missing_fit) or "unknown"}')
     hot_dir = Path(cfg['hot_dir']).expanduser().resolve()
+    cap_bytes = int(plan['capBytes'])
+    min_free = min_free_bytes_from_config(cfg)
+    meta_lookup = remote_meta if remote_meta is not None else remote_object_meta
     fetched = load_fetched(state)
-    played = load_played(state)
+    verified_hot = load_verified_hot(state)
+    sweep_stale_parts(hot_dir)
     hot_map = hot_file_state(hot_dir)
-    for item in plan['toFetch']:
-        entry = item['catalogue']
-        rel = entry['relativePath']
-        dest = inside(hot_dir, rel) if safe_relpath(rel) else None
-        if dest is None:
-            raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
-        part = dest.with_suffix(dest.suffix + '.part')
-        part.parent.mkdir(parents=True, exist_ok=True)
-        remote_fetch_file(cfg['remote'], rel, part)
-        verify_and_install(part, dest, entry['sha256'], entry['sizeBytes'])
-        fetched[rel] = now
-    save_fetched(state, fetched)
+    hot_bytes = hot_byte_usage(hot_dir, hot_map)
+    eviction_skipped = []
     for ev in plan['evict']:
-        row = hot_map.get(ev['relativePath'])
+        rel = ev['relativePath']
+        row = hot_map.get(rel)
         if not row:
             continue
         path = Path(row['path']).resolve()
         if not path.is_relative_to(hot_dir):
             raise ValueError(f'refuse evict outside hot_dir: {path}')
+        entry = ev.get('catalogue') or {}
+        if not entry.get('sha256'):
+            eviction_skipped.append({'relativePath': rel, 'reason': 'missing catalogue entry'})
+            continue
+        ok, reason = remote_confirms_catalogue(cfg['remote'], rel, entry, meta=meta_lookup(cfg['remote'], rel))
+        if not ok:
+            eviction_skipped.append({'relativePath': rel, 'reason': reason})
+            continue
         trash_path(path, trash_cmd=trash_cmd)
-        fetched.pop(ev['relativePath'], None)
+        fetched.pop(rel, None)
+        verified_hot.pop(rel, None)
+        hot_map.pop(rel, None)
+        hot_bytes -= row['sizeBytes']
+    to_fetch = prioritize_to_fetch(plan['toFetch'], playlist_first)
+    fetched_count = 0
+    for item in to_fetch:
+        entry = item['catalogue']
+        rel = entry['relativePath']
+        size = int(entry['sizeBytes'])
+        if hot_bytes + size > cap_bytes:
+            raise ValueError(f'cap {cap_bytes} GiB-byte would be exceeded fetching {rel!r}')
+        free_disk = physical_free_bytes(hot_dir)
+        if free_disk - size < min_free:
+            raise ValueError(f'free disk would fall below min_free_gb fetching {rel!r}')
+        dest = inside(hot_dir, rel) if safe_relpath(rel) else None
+        if dest is None:
+            raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
+        part = dest.with_suffix(dest.suffix + '.part')
+        part.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            remote_fetch_file(cfg['remote'], rel, part)
+            verify_and_install(part, dest, entry['sha256'], entry['sizeBytes'])
+        except (OSError, ValueError, RuntimeError):
+            part.unlink(missing_ok=True)
+            raise
+        fetched[rel] = now
+        st = dest.stat()
+        verified_hot[rel] = {'stamp': [st.st_size, str(st.st_mtime_ns)], 'sha256': entry['sha256']}
+        hot_bytes += size
+        fetched_count += 1
+    save_fetched(state, fetched)
+    save_verified_hot(state, verified_hot)
     status = {
         'lastSyncAt': int(now),
         'lastError': None,
+        'fetched': fetched_count,
+        'evictionSkipped': eviction_skipped,
         'plan': {k: plan.get(k) for k in ('wantedCount', 'hotBytes', 'capBytes', 'afterSyncBytes')},
     }
     atomic_write_json(state_p / 'last-status.json', status)
@@ -662,7 +858,7 @@ def build_status(requests_doc, catalogue, cfg, state, last_status):
         'schemaVersion': STATUS_SCHEMA,
         'playlists': per_playlist,
         'hotBytes': bytes_in_hot(hot_map),
-        'capBytes': int(cfg['cap_gb'] * 1_000_000_000),
+        'capBytes': cap_bytes_from_config(cfg),
         'wantedLocal': len(local_rels),
         'wantedTotal': len(wanted_rels),
         'lastSyncAt': last_sync,
@@ -697,6 +893,7 @@ def main(argv=None):
     c_sync.add_argument('--state', type=Path)
     c_sync.add_argument('--allow-metered', action='store_true')
     c_sync.add_argument('--refresh-catalogue', action='store_true')
+    c_sync.add_argument('--playlist', dest='playlist_key', metavar='KEY', help='fetch this playlist first')
 
     c_status = sub.add_parser('status', help='JSON status for morning check')
     c_status.add_argument('--requests', type=Path, default=DEFAULT_REQUESTS)
@@ -726,11 +923,22 @@ def main(argv=None):
 
         cfg = load_config(getattr(args, 'config', None))
         state = args.state if hasattr(args, 'state') else None
-        cap_bytes = int(cfg['cap_gb'] * 1_000_000_000)
+        cap_bytes = cap_bytes_from_config(cfg)
         requests_doc = load_requests(args.requests)
+        metered = metered_active()
+        allow_metered = getattr(args, 'allow_metered', False)
+        cached_catalogue_note = False
+
+        if args.command == 'sync' and metered and not allow_metered:
+            raise ValueError('metered link; refuse sync before remote calls (use --allow-metered)')
 
         if args.command in ('plan', 'sync', 'status'):
-            if getattr(args, 'refresh_catalogue', False) or load_cached_catalogue(state) is None:
+            if metered and not allow_metered:
+                catalogue = load_cached_catalogue(state)
+                if catalogue is None:
+                    raise ValueError('metered link; no cached catalogue')
+                cached_catalogue_note = True
+            elif getattr(args, 'refresh_catalogue', False) or load_cached_catalogue(state) is None:
                 if not rclone_bin():
                     raise RuntimeError('rclone required to refresh catalogue')
                 catalogue = refresh_catalogue_cache(cfg['remote'], state)
@@ -738,9 +946,19 @@ def main(argv=None):
                 catalogue = load_cached_catalogue(state)
 
         if args.command == 'plan':
-            remote_rels = remote_list_files(cfg['remote']) if rclone_bin() else set(e['relativePath'] for e in index_catalogue(catalogue))
+            if metered and not allow_metered:
+                remote_rels = {e['relativePath'] for e in index_catalogue(catalogue)}
+            elif rclone_bin():
+                remote_rels = remote_list_files(cfg['remote'])
+            else:
+                remote_rels = {e['relativePath'] for e in index_catalogue(catalogue)}
+            verified = load_verified_hot(state)
             plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
-                                remote_rels, cap_bytes, cfg['keep_days'])
+                                remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
+                                playlist_first=getattr(args, 'playlist_key', None))
+            if cached_catalogue_note:
+                plan['catalogueSource'] = 'cache'
+                plan['metered'] = True
             print(json.dumps(plan, indent=2, ensure_ascii=False))
             return 2 if plan['unmatched'] or plan['overflow'] else 0
 
@@ -751,6 +969,9 @@ def main(argv=None):
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
             doc = build_status(requests_doc, catalogue, cfg, state, last_status)
+            if cached_catalogue_note:
+                doc['catalogueSource'] = 'cache'
+                doc['metered'] = True
             print(json.dumps(doc, indent=2, ensure_ascii=False))
             return 0 if doc['healthy'] else 1
 
@@ -758,15 +979,25 @@ def main(argv=None):
             lock = None
             try:
                 lock, _ = acquire_lock(state)
+                if metered and not allow_metered:
+                    raise ValueError('metered link; refuse sync before remote calls (use --allow-metered)')
                 if getattr(args, 'refresh_catalogue', False) or load_cached_catalogue(state) is None:
                     catalogue = refresh_catalogue_cache(cfg['remote'], state)
                 else:
                     catalogue = load_cached_catalogue(state)
                 remote_rels = remote_list_files(cfg['remote'])
+                verified = load_verified_hot(state)
                 plan = compute_plan(requests_doc, catalogue, cfg['hot_dir'], load_played(state), load_fetched(state),
-                                    remote_rels, cap_bytes, cfg['keep_days'])
-                sync_execute(plan, cfg, state, remote_rels, allow_metered=args.allow_metered)
-                print(json.dumps({'synced': True, 'fetched': len(plan['toFetch']), 'evicted': len(plan['evict'])}, indent=2))
+                                    remote_rels, cap_bytes, cfg['keep_days'], verified_state=verified,
+                                    playlist_first=getattr(args, 'playlist_key', None))
+                status = sync_execute(plan, cfg, state, remote_rels, allow_metered=allow_metered,
+                                      playlist_first=getattr(args, 'playlist_key', None))
+                print(json.dumps({
+                    'synced': True,
+                    'fetched': status.get('fetched', len(plan['toFetch'])),
+                    'evicted': len(plan['evict']) - len(status.get('evictionSkipped') or []),
+                    'evictionSkipped': status.get('evictionSkipped') or [],
+                }, indent=2))
                 return 0
             except BlockingIOError as exc:
                 p.exit(75, str(exc) + '\n')
