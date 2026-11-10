@@ -72,8 +72,8 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
         }
         [paths addObject:path];
     }
-    BOOL ready = current && inOrder && records.count == wanted.count && paths.count == wanted.count;
-    return @{@"total": @(wanted.count), @"available": @(paths.count), @"ready": @(ready), @"paths": ready ? paths : @[]};
+    BOOL ready = current && inOrder && paths.count > 0;
+    return @{@"total": @(wanted.count), @"available": @(paths.count), @"ready": @(ready), @"paths": paths};
 }
 
 static NSCalendar *MeteredCalendar(NSTimeZone *zone) {
@@ -2126,7 +2126,10 @@ NSString *FormatTrackClock(double seconds, double duration) {
 }
 
 BOOL YieldLocalMusic(BOOL localMode, BOOL networkOnline, BOOL playing) {
-    return localMode && networkOnline && !playing;
+    (void)localMode;
+    (void)networkOnline;
+    (void)playing;
+    return NO;
 }
 
 BOOL YouTubeNewTabAllowed(NSTimeInterval now, NSTimeInterval lastOpen) {

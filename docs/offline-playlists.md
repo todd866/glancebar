@@ -2,17 +2,17 @@
 
 ## Contract
 
-A visible playlist is a fixed, ordered snapshot. Its Play control is enabled only
-when every requested recording has a verified local file. Missing, stale,
-ambiguous, protected or contradictory files leave the whole playlist unavailable.
-There is no cloud-streaming fallback, same-artist substitution or partial queue.
+A visible playlist is a fixed, ordered snapshot. Its Play control is enabled when
+at least one requested recording is verified on this Mac; Glancebar plays only
+those tracks, in order, and skips the rest. Tiles dim when zero tracks are on disk.
+There is no cloud-streaming fallback, same-artist substitution, or silent gap-fill.
+Tooltips and large cards say how many tracks are present (`31 of 40 on this Mac`).
 
 Seed mixes are persisted after generation and restored across app restarts.
-`New picks` explicitly replaces them. The primary playlist is the named snapshot
-in the existing `Music/Library-export/playlists.json` export, not a live claim about
-an Apple Music playlist. The UI calls it a saved playlist. The station retains
-all raw queue entries, including entries without paths, and verifies the exact
-path bindings against embedded tags.
+`New picks` explicitly replaces them. The primary idle Play shuffles verified files
+in `~/Music/YouTube Liked/` through Glancebar's own `AVQueuePlayer`. Mix ordering
+still uses Claude or the rule-based draw, but only from library tracks that already
+have a verified local file in the offline manifest.
 
 Requests and manifests live under the app's Application Support `mix` directory.
 The bundled Python helper references existing pinned files by default and never
@@ -26,8 +26,8 @@ is used, using a stat-keyed metadata/hash cache. A user Play rehashes the select
 queue in the background, with one verification at a time, and revalidates the
 captured mapping before entering the local player. Pause, transport changes and
 New picks invalidate pending starts. Paused saved queues survive network return.
-An already loaded Music/Chrome/DJ source must be stopped first; it is not paused
-or displaced implicitly. Existing provider transport controls remain available.
+Starting local playback pauses Apple Music when it is already playing; Glancebar
+does not drive Music, Chrome, or the Selector deck as playback engines.
 
 ## Verification limits
 
@@ -89,3 +89,11 @@ recovery. The full test suite passed again on M2. No restart, playback action,
 Bluetooth change or installation occurred; active listening and the separate MD3
 release were left alone. Independent review of this small follow-up is pending
 an available reviewer; the larger offline patch was reviewed previously.
+
+## November 10 one-player phase
+
+Glancebar music playback is only the in-app `AVQueuePlayer`. Transport controls,
+seed tiles, the station tile, hearts, thumbs-up, and the scrubber all use that
+player. Partial playlists and partial stations play what is on disk. Idle Play
+shuffles liked local files. Apple Music is paused when local playback starts and
+is not otherwise controlled by Glancebar in this phase.

@@ -30,7 +30,6 @@
 #import <Security/Security.h>
 #import <sqlite3.h>
 #import "pure.h"
-#import "deck_client.h"
 #import "nowplaying.h"
 #import "activity.h"
 #import "storage_scan.h"
@@ -4635,7 +4634,7 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 }
 @end
 
-// Orange station tile. Hover lists this week's picks; a double-click opens Selector.
+// Orange station tile. Hover lists this week's picks.
 @interface GBStationTile : NSButton <GBTileHover>
 @property (nonatomic, copy) NSString *seedKey, *offlineStatus;
 @property (nonatomic, copy) NSArray<NSDictionary *> *picks;
@@ -4650,10 +4649,7 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     if ([gSeedLargeKey isEqual:self.seedKey]) [GBSeedTile closeLarge];
 }
 - (void)mouseDown:(NSEvent *)event {
-    if (event.clickCount >= 2) {
-        [self sendAction:@selector(openSelectorDJ:) to:self.target];
-        return;
-    }
+    (void)event;
     [super mouseDown:event];
 }
 - (NSView *)largeCard {
@@ -5553,118 +5549,11 @@ static NSString *AudioSymbolName(NSDictionary *device) {
     return AudioOutputSymbol((GlanceAudioTransport)[device[@"transport"] integerValue],
                              device[@"name"], device[@"dataSource"]);
 }
-static void PostSystemMediaKey(UInt32 keyCode) {
-    void (^post)(BOOL) = ^(BOOL up) {
-        NSEvent *event = [NSEvent otherEventWithType:NSEventTypeSystemDefined
-                                             location:NSZeroPoint
-                                        modifierFlags:up ? 0xb00 : 0xa00
-                                            timestamp:0
-                                         windowNumber:0
-                                              context:nil
-                                              subtype:8
-                                                data1:((keyCode << 16) | ((up ? 0xBu : 0xAu) << 8))
-                                                data2:-1];
-        if (event.CGEvent) CGEventPost(kCGHIDEventTap, event.CGEvent);
-    };
-    post(NO);
-    post(YES);
-}
-static BOOL ChromeIsRunning(void) {
-    return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].count > 0;
-}
 static NSString *const kAppleMusicBundleID = @"com.apple.Music";
 static BOOL AppleMusicIsRunning(void) {
     return [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID].count > 0;
 }
-// Runs command inside Music, then reads the player back in the same round trip, so a
-// button press answers with the state it produced. Fields: ParseAppleMusicStatus.
-// Clocks go out as whole milliseconds: a real would be written in the user's locale.
-static NSString *AppleMusicScript(NSString *command) {
-    return [NSString stringWithFormat:@"tell application \"Music\"\n%@\n"
-        "set sep to character id 31\n"
-        "set pstate to (player state as text)\n"
-        "set shuf to (shuffle enabled as text)\n"
-        "if pstate is \"stopped\" then return pstate & sep & shuf\n"
-        "try\n"
-        "set trk to current track\n"
-        "set fav to \"false\"\n"
-        "try\nset fav to (favorited of trk) as text\nend try\n"
-        "set plist to \"\"\n"
-        "try\nset plist to name of current playlist\nend try\n"
-        "set dur to 0\n"
-        "try\nset dur to ((duration of trk) * 1000) as integer\nend try\n"
-        "set ppos to 0\n"
-        "try\nset ppos to (player position * 1000) as integer\nend try\n"
-        "return pstate & sep & shuf & sep & (name of trk) & sep & (artist of trk) & sep & (album of trk) & sep & dur & sep & ppos & sep & fav & sep & (persistent ID of trk) & sep & plist\n"
-        "on error\nreturn pstate & sep & shuf\nend try\n"
-        "end tell", command ?: @""];
-}
-static NSString *const kAppleMusicAutomationNote = @"Allow Glancebar to control Music: System Settings ▸ Privacy & Security ▸ Automation";
-static NSString *const kAppleMusicUnresponsiveNote = @"Music did not respond. Playback status is unavailable.";
-static NSString *AppleMusicArtPath(void) {
-    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
-        ?: [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
-    NSString *dir = [caches stringByAppendingPathComponent:@"com.iantodd.glancebar"];
-    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
-    return [dir stringByAppendingPathComponent:@"now-playing-art"];
-}
-// 1200 px covers come back from Music. Keep a 96 px copy, not the decoded original.
-static NSImage *AppleMusicThumbnail(NSString *path, CGFloat side) {
-    NSImage *full = [[NSImage alloc] initWithContentsOfFile:path];
-    if (!full) return nil;
-    NSInteger px = (NSInteger)ceil(side * 3);
-    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:px pixelsHigh:px
-        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
-        bytesPerRow:0 bitsPerPixel:0];
-    if (!rep) return nil;
-    [NSGraphicsContext saveGraphicsState];
-    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
-    [full drawInRect:NSMakeRect(0, 0, px, px) fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1];
-    [NSGraphicsContext restoreGraphicsState];
-    NSImage *small = [[NSImage alloc] initWithSize:NSMakeSize(side, side)];
-    [small addRepresentation:rep];
-    return small;
-}
 static const int kVolumeScriptSec = 10;
-// Quit waits this long for each dipped target, then SIGKILLs the script. The
-// process is leaving; a longer wait would hang termination.
-static const int kBlendQuitRestoreSec = 1;
-
-// Music and Chrome each get one serial queue. Dip ticks and the restore used to
-// share the concurrent global queue, so a stale dip osascript could finish after
-// the restore and leave the volume down. Generation is the second gate: a script
-// already queued with an older stamp does not start once a restore has published
-// a newer one. The load/store is atomic because the check runs on the volume queue
-// and the bump runs on the main thread.
-static _Atomic uint64_t gMusicVolumeGeneration;
-static _Atomic uint64_t gChromeVolumeGeneration;
-
-static dispatch_queue_t BlendVolumeQueue(const char *label) {
-    dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
-        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
-    return dispatch_queue_create(label, attr);
-}
-static dispatch_queue_t MusicVolumeQueue(void) {
-    static dispatch_queue_t queue;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ queue = BlendVolumeQueue("com.iantodd.glancebar.music-volume"); });
-    return queue;
-}
-static dispatch_queue_t ChromeVolumeQueue(void) {
-    static dispatch_queue_t queue;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ queue = BlendVolumeQueue("com.iantodd.glancebar.chrome-volume"); });
-    return queue;
-}
-static uint64_t CurrentVolumeGeneration(_Atomic uint64_t *slot) {
-    return atomic_load_explicit(slot, memory_order_acquire);
-}
-static uint64_t BumpVolumeGeneration(_Atomic uint64_t *slot) {
-    return atomic_fetch_add_explicit(slot, 1, memory_order_acq_rel) + 1;
-}
-
-// Blocks the calling thread. hardKill SIGKILLs at `seconds` (quit). Otherwise the
-// watchdog SIGTERMs then, and SIGKILLs a second later, matching the old helper.
 static int RunAppleScriptBlocking(NSString *source, int seconds, BOOL hardKill,
                                  NSString **outOutput, NSString **outError) {
     NSTask *task = [NSTask new];
@@ -5712,49 +5601,7 @@ static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSSt
 // `setScript` one more time. A dropped apply still calls `done` — the caller's
 // busy flag has to clear — with dropped YES so it is not treated as a failed set.
 // `setOK` nil means status == 0. Callbacks are on the main queue. Not called on `queue`.
-static void RunGeneratedVolumeScript(dispatch_queue_t queue, _Atomic uint64_t *latest, uint64_t generation,
-                                    NSString *setScript, NSString *readScript,
-                                    BOOL (^setOK)(NSString *output, NSString *errorText, int status),
-                                    BOOL (^matchesRead)(NSString *output, NSString *errorText, int status),
-                                    void (^done)(BOOL ok, BOOL dropped)) {
-    dispatch_async(queue, ^{
-        if (!VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
-            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(NO, YES); });
-            return;
-        }
-        NSString *output = nil, *errorText = nil;
-        int status = RunAppleScriptBlocking(setScript, kVolumeScriptSec, NO, &output, &errorText);
-        BOOL ok = setOK ? setOK(output, errorText, status) : status == 0;
-        if (readScript.length && matchesRead &&
-            VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
-            NSString *readOut = nil, *readErr = nil;
-            int readStatus = RunAppleScriptBlocking(readScript, kVolumeScriptSec, NO, &readOut, &readErr);
-            if (!matchesRead(readOut, readErr, readStatus) &&
-                VolumeScriptShouldApply(generation, CurrentVolumeGeneration(latest))) {
-                output = nil;
-                errorText = nil;
-                status = RunAppleScriptBlocking(setScript, kVolumeScriptSec, NO, &output, &errorText);
-                ok = setOK ? setOK(output, errorText, status) : status == 0;
-            }
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(ok, NO); });
-    });
-}
-
-// Quit's restore. Bumps the generation so a dip still queued on `queue` does not
-// start, waits until that queue is idle, then sets the volume. Call from the main
-// thread only: dispatch_sync onto `queue` deadlocks if `queue` is already this thread.
-static void RestoreBlendedVolumeSync(dispatch_queue_t queue, _Atomic uint64_t *generation, NSString *script) {
-    if (!script.length) return;
-    uint64_t stamp = BumpVolumeGeneration(generation);
-    dispatch_sync(queue, ^{
-        if (!VolumeScriptShouldApply(stamp, CurrentVolumeGeneration(generation))) return;
-        (void)RunAppleScriptBlocking(script, kBlendQuitRestoreSec, YES, NULL, NULL);
-    });
-}
 #pragma mark - Seed mixes (Apple Music)
-
-static NSString *const kMixPlaylistName = @"Glancebar Mix";
 
 // One bulk read of the library: per track, id, title, artist, album, genre, year, plays,
 // days since played (-1 never), favourite, dislike; unit/record separators between.
@@ -5851,156 +5698,7 @@ static NSArray<NSString *> *BuildSeedMix(NSArray<NSDictionary *> *tracks, NSDict
     return mix;
 }
 
-// "vol0.40" .. "vol1.00". Digits and one dot only, so the token can sit inside the
-// single-quoted action in YouTubeControlScript without breaking the JS string.
-static BOOL YouTubeVolumeSetAction(NSString *action) {
-    if (![action hasPrefix:@"vol"] || action.length < 5 || action.length > 7) return NO;
-    NSString *num = [action substringFromIndex:3];
-    NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
-    if ([num rangeOfCharacterFromSet:[ok invertedSet]].location != NSNotFound) return NO;
-    NSArray *parts = [num componentsSeparatedByString:@"."];
-    return parts.count == 2 && [parts[0] length] >= 1 && [parts[1] length] == 2;
-}
-// Locale-independent. snprintf %f follows LC_NUMERIC and would emit "vol0,40".
-static NSString *YouTubeVolumeAction(double volume) {
-    int cents = 0;
-    if (isfinite(volume) && volume > 0) {
-        long rounded = llround(volume * 100.0);
-        if (rounded > 100) rounded = 100;
-        if (rounded > 0) cents = (int)rounded;
-    }
-    return [NSString stringWithFormat:@"vol%d.%02d", cents / 100, cents % 100];
-}
-// Music's `sound volume` is an integer 0..100. Nil / prose is not a volume.
-static BOOL MusicSoundVolume(NSString *output, int *outVolume) {
-    if (![output isKindOfClass:NSString.class] || !outVolume) return NO;
-    NSString *s = [output stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!s.length) return NO;
-    NSScanner *scanner = [NSScanner scannerWithString:s];
-    scanner.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    int value = 0;
-    if (![scanner scanInt:&value] || !scanner.isAtEnd) return NO;
-    if (value < 0) value = 0;
-    if (value > 100) value = 100;
-    *outVolume = value;
-    return YES;
-}
-
-// One round trip finds the music.youtube.com tab and runs the action there.
-// status only reads. start is the one place shuffle is forced on, and only when
-// Glancebar itself is starting playback. volget reads <video>.volume; vol0.40 sets it.
-// The JS stays inside one double-quoted AppleScript string, so it cannot contain a
-// double quote; fields come back separated by ASCII 31 (YouTubeStatusSeparator)
-// because titles contain '|'.
-// Fields: tab, state, title, artist, playlist count, elapsed seconds, duration seconds, volume.
-static NSString *YouTubeControlScript(NSString *action) {
-    if (![action isEqual:@"start"] && ![action isEqual:@"playpause"] &&
-        ![action isEqual:@"next"] && ![action isEqual:@"previous"] &&
-        ![action isEqual:@"status"] && ![action isEqual:@"volget"] &&
-        !YouTubeVolumeSetAction(action))
-        action = @"status";
-    NSString *js = [NSString stringWithFormat:
-        @"(function(){var action='%@';"
-        "function ws(c){return c===' '||c===String.fromCharCode(10)||c===String.fromCharCode(9)||c===String.fromCharCode(13);}"
-        "function trim(s){s=s||'';while(s.length&&ws(s.charAt(0)))s=s.substring(1);while(s.length&&ws(s.charAt(s.length-1)))s=s.substring(0,s.length-1);return s;}"
-        "function label(el){return ((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')).toLowerCase();}"
-        "var bar=document.querySelector('ytmusic-player-bar');"
-        "var video=document.querySelector('video');"
-        "if(action==='playpause'){"
-        "if(video){if(video.paused){var pr=video.play();if(pr&&pr.catch)pr.catch(function(){var fb=document.querySelector('#play-pause-button');if(fb)fb.click();});}else video.pause();}"
-        "else{var pb=document.querySelector('#play-pause-button');if(pb)pb.click();}"
-        "}else if(action==='next'){"
-        "var nx=bar&&bar.querySelector('.next-button');if(nx)nx.click();"
-        "}else if(action==='previous'){"
-        "var pv=bar&&bar.querySelector('.previous-button');if(pv)pv.click();"
-        "}else if(action.substring(0,3)==='vol'&&action!=='volget'){"
-        "var vset=document.querySelector('video');"
-        "if(vset){var nv=parseFloat(action.substring(3));if(isFinite(nv)){if(nv<0)nv=0;if(nv>1)nv=1;vset.volume=nv;}}"
-        "}else if(action==='start'){"
-        "var buttons=document.querySelectorAll('button,[role=button],[role=switch]');"
-        "var shuffle=null;"
-        "for(var i=0;i<buttons.length;i++){var l=label(buttons[i]);if(l.indexOf('shuffle')!==-1){shuffle=buttons[i];break;}}"
-        "if(shuffle){var sl=label(shuffle);var pressed=(shuffle.getAttribute('aria-pressed')||'').toLowerCase();var on=pressed==='true'||sl.indexOf('turn off shuffle')!==-1||sl.indexOf('shuffle on')!==-1||sl.indexOf('disable shuffle')!==-1;if(!on)shuffle.click();}"
-        "if(video){if(video.paused){var sp=video.play();if(sp&&sp.catch)sp.catch(function(){var fb=document.querySelector('#play-pause-button');if(fb)fb.click();});}}"
-        "else{var sb=document.querySelector('#play-pause-button');if(sb){var sbl=label(sb);if(sbl.indexOf('pause')===-1)sb.click();}}"
-        "}"
-        "var playing='unknown';"
-        "if(video)playing=video.paused?'paused':'playing';"
-        "var title='';var artist='';"
-        "var session=navigator.mediaSession;var md=session&&session.metadata;"
-        "if(md&&(md.title||md.artist)){title=md.title||'';artist=md.artist||'';}"
-        "else if(bar){var te=bar.querySelector('.title');var be=bar.querySelector('.byline');title=te?(te.textContent||''):'';artist=be?(be.textContent||''):'';}"
-        "var us=String.fromCharCode(31);"
-        "function scrub(s){return trim(s).split(us).join('');}"
-        "title=scrub(title);artist=scrub(artist);"
-        "function isCount(t){var low=t.toLowerCase();var sp=low.indexOf(' song');if(sp<1)return false;for(var ci=0;ci<sp;ci++){var ch=low.charAt(ci);if(!((ch>='0'&&ch<='9')||ch===','))return false;}var rest=low.substring(sp);return rest===' song'||rest===' songs';}"
-        "var countText='';"
-        "var nodes=action==='start'?document.querySelectorAll('yt-formatted-string, span'):[];"
-        "for(var j=0;j<nodes.length&&j<5000;j++){var ct=trim(nodes[j].textContent||'');if(isCount(ct)){countText=ct;break;}}"
-        "function num(v){return (typeof v==='number'&&isFinite(v))?(''+v):'';}"
-        "var elapsed=video?num(video.currentTime):'';"
-        "var duration=video?num(video.duration):'';"
-        "var vol=video?num(video.volume):'';"
-        "return 'yes'+us+playing+us+title+us+artist+us+countText+us+elapsed+us+duration+us+vol;})()",
-        action];
-    return [NSString stringWithFormat:
-        @"tell application \"Google Chrome\"\n"
-        "set js to \"%@\"\n"
-        "repeat with w in windows\n"
-        "repeat with t in tabs of w\n"
-        "if (URL of t) contains \"music.youtube.com\" then return execute javascript js in t\n"
-        "end repeat\n"
-        "end repeat\n"
-        "return \"\"\n"
-        "end tell", js];
-}
-static NSString *const kYouTubeJSNote = @"Enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events to control playback";
-static NSString *const kYouTubeAutomationNote = @"Allow Glancebar to control Chrome: System Settings ▸ Privacy & Security ▸ Automation";
-static NSString *const kYouTubeChromeNote = @"Chrome unavailable — playing offline music";
 static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap cuts";
-
-// Selector's CLI. defaults selectorPath overrides the installed script. The mode
-// for an offline play is selectorMode, or party.
-static NSString *SelectorExecutable(void) {
-    NSString *override = [NSUserDefaults.standardUserDefaults stringForKey:@"selectorPath"];
-    if ([override isKindOfClass:NSString.class] && override.length) return override;
-    return @"/Users/iantodd/Projects/selector/bin/selector";
-}
-static NSString *SelectorPlayMode(void) {
-    NSString *mode = [NSUserDefaults.standardUserDefaults stringForKey:@"selectorMode"];
-    if ([mode isEqual:@"work"] || [mode isEqual:@"dinner"] || [mode isEqual:@"party"] ||
-        [mode isEqual:@"wind-down"])
-        return mode;
-    return @"party";
-}
-static NSString *DeckSocketPath(void) {
-    return [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/deck.sock"];
-}
-static NSString *DeckNowPath(void) {
-    return [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/now.json"];
-}
-static NSString *DeckCommandJSON(NSString *cmd, NSString *mode) {
-    if (mode.length) return [NSString stringWithFormat:@"{\"cmd\":\"%@\",\"mode\":\"%@\"}", cmd ?: @"", mode];
-    return [NSString stringWithFormat:@"{\"cmd\":\"%@\"}", cmd ?: @""];
-}
-
-// A service blend dips one player: down, skip, up. Idle is "no dip".
-enum {
-    MusicDipIdle = 0,
-    MusicDipDown,
-    MusicDipSkip,
-    MusicDipUp,
-};
-
-// 1 at the original level, 0 at the bottom. *done once dipSec has elapsed.
-static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *done) {
-    BOOL finished = !(dipSec > 0) || !(elapsed < dipSec);
-    if (done) *done = finished;
-    double u = finished || !(dipSec > 0) ? 1.0 : elapsed / dipSec;
-    if (u < 0) u = 0;
-    if (u > 1) u = 1;
-    return rising ? u : (1.0 - u);
-}
 
 @implementation Controller {
     MeteredMonitor *_meteredMonitor;
@@ -6134,66 +5832,33 @@ static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *do
     BOOL _musicOff;                    // defaults musicEnabled = NO: no music polling (worker Macs); nothing else
     BOOL _networkKnown, _networkOnline;
     nw_path_monitor_t _pathMonitor;
-    BOOL _ytTabOpen, _playbackKnown, _playbackPlaying, _localMode, _localEmpty, _localTagsReady, _localLoveInFlight;
-    BOOL _ytJSDenied, _ytStartPending, _ytStatusInFlight, _offlineTracksEntering;
-    NSString *_localTitle, *_localArtist, *_ytTitle, *_ytArtist, *_musicNote, *_localHeartError;
+    BOOL _playbackKnown, _playbackPlaying, _localMode, _localEmpty, _localTagsReady, _localLoveInFlight;
+    BOOL _offlineTracksEntering;
+    NSString *_localTitle, *_localArtist, *_musicNote, *_localHeartError;
     NSUInteger _localHeartEpoch;
     NSMutableSet<NSString *> *_heartedKeys;
     AVQueuePlayer *_localPlayer;
     NSArray<NSURL *> *_localURLs;
     NSArray<AVPlayerItem *> *_localObservedItems;
     NSInteger _localIndex;
-    NSUInteger _musicGen;
     BOOL _remoteCommandsOn;
-    NSTimer *_ytProbeTimer;
     NSString *_chargePendingName, *_chargePendingMode;
     NSTimer *_powerTickTimer;   // 1s battery/power refresh while a surface is visible
     NSUInteger _powerTicks;
-    CFAbsoluteTime _ytTabOpenedAt;
     NSArray<NSString *> *_offlineTracks;
     CFAbsoluteTime _offlineTracksAt;
     BOOL _offlineTracksReady;
-    double _trackElapsed, _trackDuration;   // last probe; the tick interpolates from _trackSampledAt
+    double _trackElapsed, _trackDuration;
     CFAbsoluteTime _trackSampledAt;
     NSTimer *_trackTick;
-    // Apple Music is the play target online. Loaded = Music has a playing or paused track.
-    BOOL _amLoaded, _amFavorited, _amShuffle, _amStatusInFlight, _amStartPending;
     int _burnLatch;   // 0 undecided, 1 shown, 2 hidden: the burn row holds still while the popover is open
-    NSString *_amTitle, *_amArtist, *_amAlbum, *_amPlaylist, *_amTrackID, *_amArtTrackID;
-    NSImage *_amArt;
-    NSTimer *_amProbeTimer;
-    NSUInteger _amGen;
-    // First Next press waits out the double-tap window. 0 means nothing is armed.
     double _musicNextArmedAt;
     NSTimer *_musicNextArmTimer;
-    // Local crossfade: the player that was current keeps sounding while the next
-    // queue starts at volume 0. Only the timer writes those two volumes.
     AVQueuePlayer *_localOutgoing;
     NSTimer *_localBlendTimer;
     double _localBlendStarted, _localBlendDuration;
-    // Music.app and the YouTube tab have one output, so a blend dips it, skips,
-    // then brings the same number back. Known means we still owe that restore.
-    // SkipSent is set when next goes out and stays set while the restore runs:
-    // the phase is Idle for that whole script, and Idle is not "not skipped".
-    BOOL _amBlendActive, _amBlendBusy, _amBlendVolumeKnown, _amBlendSkipSent;
-    int _amBlendOriginal, _amBlendApplied, _amBlendPhase;
-    NSUInteger _amBlendToken;
-    NSTimer *_amBlendTimer;
-    double _amBlendPhaseStarted;
-    void (^_amBlendStopThen)(void);
-    BOOL _ytBlendActive, _ytBlendBusy, _ytBlendVolumeKnown, _ytBlendSkipSent;
-    int _ytBlendPhase;
-    double _ytBlendOriginal, _ytBlendApplied, _ytBlendPhaseStarted;
-    NSUInteger _ytBlendToken;
-    NSTimer *_ytBlendTimer;
-    void (^_ytBlendStopThen)(void);
-    // Selector's deck, a separate process. While it is playing or paused the row
-    // follows now.json and Glancebar does not register its own remote commands.
-    BOOL _deckMode, _deckSawLive, _deckStartPending, _deckPollInFlight;
-    NSUInteger _deckStartGen;
-    NSTimer *_deckPollTimer;
-    CFAbsoluteTime _deckSilentSince, _deckHoldOffUntil;
-    NSString *_deckTitle, *_deckArtist, *_deckPath, *_deckNextTitle;
+    NSSet<NSString *> *_onDiskLibraryIDs;
+    CFAbsoluteTime _onDiskLibraryAt;
 }
 
 // A catch-up pass may hold a coalesced state write. Land it before the process goes away,
@@ -6359,8 +6024,6 @@ static double MusicDipLevel(double elapsed, double dipSec, BOOL rising, BOOL *do
     _remote = [NSMutableDictionary dictionary];
     _remoteInFlight = [NSMutableSet set];
     [self startNetworkMonitor];
-    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(appleMusicChanged:)
-                                                          name:@"com.apple.Music.playerInfo" object:nil];
     [self startAudioOutputWatch];
     [NSTimer scheduledTimerWithTimeInterval:15 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     CFRunLoopSourceRef src = IOPSNotificationCreateRunLoopSource(PSChanged, (__bridge void *)self);
@@ -6448,7 +6111,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_popover.isShown) [self rebuildContent];
 }
 - (NSDictionary *)playerOutputChoice {
-    BOOL music = _amLoaded && !_localMode && !_deckMode && !_musicOff;
+    BOOL music = _localMode && _playbackPlaying && !_musicOff;
     NSString *uid = _defaultOutputUID;
     NSString *note = nil;
     BOOL separate = NO;
@@ -6528,7 +6191,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         if ([saved isKindOfClass:NSArray.class] && saved.count) _mixSeeds = saved;
     }
     [self ensureOfflinePlaylists];
-    if (!_musicProbesEnabled || [self musicOffline] || !AppleMusicIsRunning()) return;
+    if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;
     // Scripting Music launches it: read the library only while it is already open. On a Mac with an
     // empty library this retried and relaunched Music (1 Nov 2026).
     BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
@@ -6618,8 +6281,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         else { [NSFileManager.defaultManager removeItemAtPath:path error:nil]; fromCatalogue(); }
     });
 }
-// Requests are durable, fixed playlist snapshots. No regeneration on Play and no network
-// fallback: a displayed queue is playable only when every exact recording is on this Mac.
+// Requests are durable, fixed playlist snapshots. Play uses verified on-disk files in order;
+// missing entries are skipped. Tiles are unavailable only when nothing is on this Mac.
 - (NSString *)offlinePrimaryKey { return [@"playlist:" stringByAppendingString:[self appleMusicPlaylistName]]; }
 - (NSDictionary *)offlineCoverage:(NSString *)key verifyHash:(BOOL)verifyHash {
     return OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest,
@@ -6627,10 +6290,27 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (NSString *)offlineStatus:(NSDictionary *)coverage {
     NSUInteger total = [coverage[@"total"] unsignedIntegerValue], available = [coverage[@"available"] unsignedIntegerValue];
-    if (!total) return @"Offline playlist not prepared";
-    return [coverage[@"ready"] boolValue]
-        ? [NSString stringWithFormat:@"%lu tracks downloaded · saved offline playlist", (unsigned long)total]
-        : [NSString stringWithFormat:@"%lu of %lu downloaded · unavailable offline", (unsigned long)available, (unsigned long)total];
+    if (!total) return @"0 of 0 on this Mac";
+    return [NSString stringWithFormat:@"%lu of %lu on this Mac", (unsigned long)available, (unsigned long)total];
+}
+- (NSSet<NSString *> *)onDiskLibraryTrackIDs {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_onDiskLibraryIDs && now - _onDiskLibraryAt < 300) return _onDiskLibraryIDs;
+    NSMutableSet *ids = [NSMutableSet set];
+    NSDictionary *manifest = _offlineManifest;
+    if ([manifest[@"schemaVersion"] isEqual:@1] && [manifest[@"playlists"] isKindOfClass:NSArray.class]) {
+        for (id playlist in manifest[@"playlists"]) {
+            if (![playlist isKindOfClass:NSDictionary.class]) continue;
+            for (id record in [playlist[@"tracks"] isKindOfClass:NSArray.class] ? playlist[@"tracks"] : @[]) {
+                if (![record isKindOfClass:NSDictionary.class] || ![record[@"path"] length]) continue;
+                NSString *trackID = record[@"id"];
+                if ([trackID isKindOfClass:NSString.class] && trackID.length) [ids addObject:trackID];
+            }
+        }
+    }
+    _onDiskLibraryIDs = [ids copy];
+    _onDiskLibraryAt = now;
+    return _onDiskLibraryIDs;
 }
 - (void)prepareOfflineCache {
     if (!_musicProbesEnabled || _mixFrozen || _musicOff) return;
@@ -6745,7 +6425,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (_mixPrepared[key]) { if (done) done(_mixPrepared[key]); return; }
     if ([_mixPreparing containsObject:key] || !_mixLibrary.count) return;
     [_mixPreparing addObject:key];
-    NSArray *tracks = _mixLibrary;
+    NSSet *onDisk = [self onDiskLibraryTrackIDs];
+    NSMutableArray *tracks = [NSMutableArray array];
+    for (NSDictionary *track in _mixLibrary) if ([onDisk containsObject:track[@"id"]]) [tracks addObject:track];
     BOOL claude = [NSUserDefaults.standardUserDefaults objectForKey:@"mixWithClaude"]
         ? [NSUserDefaults.standardUserDefaults boolForKey:@"mixWithClaude"] : YES;
     uint64_t salt = (uint64_t)[NSUserDefaults.standardUserDefaults integerForKey:@"mixPickCount"] * 31 + key.hash;
@@ -6784,12 +6466,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         if (_popover.isShown) [self rebuildContent];
         return;
     }
-    // Never start a second source underneath Music, Chrome or the DJ process.
-    if (_amLoaded || _ytTabOpen || _deckMode) {
-        _musicNote = @"Stop the current player before starting the saved offline playlist.";
-        if (_popover.isShown) [self rebuildContent];
-        return;
-    }
     _mixStartingKey = key;
     _offlineVerifyBusy = YES;
     NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
@@ -6806,14 +6482,18 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             self->_mixStartingKey = nil;
             BOOL current = [key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"];
             for (NSDictionary *seed in self->_mixSeeds) if ([seed[@"key"] isEqual:key]) current = YES;
-            if (self->_musicProbesEnabled && !self->_musicOff && current && [verified[@"ready"] boolValue] && [self->_offlineRequests[key] isEqual:request] &&
-                !self->_amLoaded && !self->_ytTabOpen && !self->_deckMode &&
-                [OfflinePlaylistCoverage(request, manifest, root, NO)[@"ready"] boolValue] &&
-                [[self offlineCoverage:key verifyHash:NO][@"paths"] isEqual:verified[@"paths"]]) {
+            NSArray *paths = verified[@"paths"];
+            if (self->_musicProbesEnabled && !self->_musicOff && current && paths.count &&
+                [verified[@"ready"] boolValue] && [self->_offlineRequests[key] isEqual:request] &&
+                [[self offlineCoverage:key verifyHash:NO][@"paths"] isEqual:paths]) {
                 self->_musicNote = nil;
                 self->_mixPlayingKey = key;
-                [self playLocalPaths:verified[@"paths"]];
-            } else self->_musicNote = @"Offline playlist changed or is incomplete. Nothing was started.";
+                [self playLocalPaths:paths];
+            } else if (!paths.count) {
+                self->_musicNote = [self offlineStatus:verified];
+            } else {
+                self->_musicNote = @"Offline playlist changed. Nothing was started.";
+            }
             if (self->_popover.isShown) [self rebuildContent];
         });
     });
@@ -6858,279 +6538,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if ([index writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-source-index.json"] atomically:YES])
         [self setOfflineRequest:@"station:triplej" title:@"New music for you" tracks:tracks];
 }
-// selector play, off the main thread. Planning can take several seconds. A missing
-// binary, a non-zero exit or a dead socket runs fallback on the main thread — the
-// AVQueuePlayer path, unchanged. success also runs on the main thread.
-- (void)startSelectorPlay:(NSArray<NSString *> *)args label:(NSString *)label
-                  success:(void (^)(void))success
-                 fallback:(void (^)(void))fallback {
-    if (!_musicProbesEnabled || _terminating) { if (fallback) fallback(); return; }
-    NSString *bin = SelectorExecutable();
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:bin]) {
-        GBLog("selector: missing %{public}@ (%{public}@)", bin, label);
-        if (fallback) fallback();
-        return;
-    }
-    if (_deckStartPending) {
-        GBLog("selector: already starting (%{public}@)", label);
-        return;
-    }
-    // Drop Glancebar's player before the deck starts, or the two play at once and
-    // both answer the media keys. A failed launch puts the queue player back.
-    [self pauseAppleMusicForLocalSource];
-    [self tearDownLocalPlayer];
-    _localMode = NO;
-    [self disableRemoteCommands];
-    if (_popover.isShown && !_deckMode) [self rebuildContent];
-    _deckStartPending = YES;
-    NSUInteger gen = ++_deckStartGen;
-    NSArray *arguments = [args copy] ?: @[];
-    void (^onSuccess)(void) = [success copy];
-    void (^onFallback)(void) = [fallback copy];
-    __weak Controller *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSTask *task = [NSTask new];
-        task.executableURL = [NSURL fileURLWithPath:bin];
-        task.arguments = arguments;
-        NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy] ?: [NSMutableDictionary dictionary];
-        NSString *path = [env[@"PATH"] isKindOfClass:NSString.class] ? env[@"PATH"] : @"";
-        if (!path.length) path = @"/usr/bin:/bin:/usr/sbin:/sbin";
-        env[@"PATH"] = [NSString stringWithFormat:@"/opt/homebrew/bin:/usr/local/bin:%@/.local/bin:%@",
-                        GBHomeDirectory(), path];
-        task.environment = env;
-        NSPipe *errPipe = [NSPipe pipe];
-        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-        task.standardError = errPipe;
-        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
-        NSError *launchError = nil;
-        if (![task launchAndReturnError:&launchError]) {
-            NSString *why = launchError.localizedDescription ?: @"launch failed";
-            dispatch_async(dispatch_get_main_queue(), ^{
-                Controller *strongSelf = weakSelf;
-                if (!strongSelf || gen != strongSelf->_deckStartGen) return;
-                strongSelf->_deckStartPending = NO;
-                if (strongSelf->_terminating) return;
-                GBLog("selector: launch failed %{public}@ (%{public}@)", why, label);
-                if (onFallback) onFallback();
-            });
-            return;
-        }
-        GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:120];
-        NSData *errData = [errPipe.fileHandleForReading readDataToEndOfFile];
-        [task waitUntilExit];
-        [watchdog disarm];
-        int status = task.terminationReason == NSTaskTerminationReasonExit ? task.terminationStatus : 1;
-        NSString *errText = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
-        errText = [[errText stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
-                   stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (errText.length > 180u) errText = [errText substringToIndex:180];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            Controller *strongSelf = weakSelf;
-            if (!strongSelf || gen != strongSelf->_deckStartGen) return;
-            strongSelf->_deckStartPending = NO;
-            if (strongSelf->_terminating) return;
-            if (status != 0) {
-                GBLog("selector: exit %d (%{public}@) %{public}@", status, label, errText);
-                if (onFallback) onFallback();
-                return;
-            }
-            if (onSuccess) onSuccess();
-        });
-    });
-}
-- (void)sendDeckCommand:(NSString *)cmd mode:(NSString *)mode {
-    if (!_musicProbesEnabled || _terminating) return;
-    NSString *json = DeckCommandJSON(cmd, mode);
-    GBDeckSendCommand(DeckSocketPath(), json, ^(NSString *reply) {
-        GBDeckNow now = DeckNowFromJSON(reply.length ? [reply dataUsingEncoding:NSUTF8StringEncoding] : nil);
-        if (!reply.length || (now.valid && !now.ok))
-            GBLog("deck: %{public}@ failed %{public}@", cmd, reply ?: @"no reply");
-    });
-}
-- (void)stopDeckPollTimer {
-    [_deckPollTimer invalidate];
-    _deckPollTimer = nil;
-}
-- (void)ensureDeckPollTimer {
-    if (!_musicProbesEnabled || _musicOff || _terminating) return;
-    if (!_deckPollTimer) {
-        _deckPollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self
-                                                        selector:@selector(deckPollFired:)
-                                                        userInfo:nil repeats:YES];
-        _deckPollTimer.tolerance = 0.2;
-    }
-    [self pollDeckNow];
-}
-- (void)deckPollFired:(NSTimer *)timer {
-    (void)timer;
-    [self pollDeckNow];
-}
-- (void)pollDeckNow {
-    if (!_musicProbesEnabled || _musicOff || _terminating) return;
-    if (!_popover.isShown && !_deckMode) { [self stopDeckPollTimer]; return; }
-    if (_deckPollInFlight) return;
-    _deckPollInFlight = YES;
-    NSString *file = DeckNowPath();
-    NSString *sock = DeckSocketPath();
-    __weak Controller *weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSData *data = [NSData dataWithContentsOfFile:file];
-        GBDeckNow fileNow = DeckNowFromJSON(data);
-        GBDeckSendCommand(sock, @"{\"cmd\":\"status\"}", ^(NSString *reply) {
-            Controller *strongSelf = weakSelf;
-            if (!strongSelf) return;
-            strongSelf->_deckPollInFlight = NO;
-            if (strongSelf->_terminating) return;
-            [strongSelf noteDeckPoll:fileNow reply:reply];
-        });
-    });
-}
-- (void)enterDeckModeFromPoll:(BOOL)fromPoll {
-    if (_deckMode) { [self ensureDeckPollTimer]; return; }
-    if (fromPoll) _mixPlayingKey = nil;
-    _musicGen++;
-    [self tearDownLocalPlayer];
-    _localMode = NO;
-    _localEmpty = NO;
-    [self stopYouTubeProbeTimer];
-    [self stopAppleMusicProbeTimer];
-    [self invalidateMusicNextArmTimer];
-    [self disableRemoteCommands];
-    _deckMode = YES;
-    _deckSilentSince = 0;
-    _deckSawLive = NO;
-    GBLog("deck: on");
-    [self ensureDeckPollTimer];
-    if (_popover.isShown) [self rebuildContent];
-}
-- (void)leaveDeckModeStopDeck:(BOOL)stopDeck reason:(NSString *)reason {
-    if (stopDeck) {
-        // A stale "playing" line can arrive before the stop lands. Don't steal the
-        // row back for those few seconds.
-        _deckHoldOffUntil = CFAbsoluteTimeGetCurrent() + 3;
-        [self sendDeckCommand:@"stop" mode:nil];
-    }
-    BOOL was = _deckMode;
-    _deckMode = NO;
-    _deckSawLive = NO;
-    _deckSilentSince = 0;
-    _deckTitle = nil;
-    _deckArtist = nil;
-    _deckPath = nil;
-    _deckNextTitle = nil;
-    if (!was) {
-        if (!_popover.isShown) [self stopDeckPollTimer];
-        return;
-    }
-    GBLog("deck: off (%{public}@)", reason ?: @"");
-    _playbackKnown = NO;
-    _playbackPlaying = NO;
-    _trackElapsed = 0;
-    _trackDuration = 0;
-    _trackSampledAt = 0;
-    if (!stopDeck) _mixPlayingKey = nil;
-    if (!_popover.isShown) [self stopDeckPollTimer];
-    else {
-        [self rebuildContent];
-        [self refreshMusicSources];
-    }
-}
-- (void)applyDeckNow:(GBDeckNow)now {
-    NSString *title = [NSString stringWithUTF8String:now.title] ?: @"";
-    NSString *artist = [NSString stringWithUTF8String:now.artist] ?: @"";
-    NSString *path = [NSString stringWithUTF8String:now.path] ?: @"";
-    NSString *next = [NSString stringWithUTF8String:now.nextTitle] ?: @"";
-    NSString *oldTitle = _deckTitle ?: @"";
-    NSString *oldArtist = _deckArtist ?: @"";
-    NSString *oldPath = _deckPath ?: @"";
-    NSString *oldNext = _deckNextTitle ?: @"";
-    if (title.length) _deckTitle = title;
-    if (artist.length) _deckArtist = artist;
-    if (path.length) _deckPath = path;
-    _deckNextTitle = next;
-    BOOL metaChanged = (title.length && ![title isEqualToString:oldTitle]) ||
-                       (artist.length && ![artist isEqualToString:oldArtist]) ||
-                       (path.length && ![path isEqualToString:oldPath]) ||
-                       ![next isEqualToString:oldNext];
-    BOOL wasPlaying = _playbackPlaying;
-    if (now.playing || now.paused) {
-        _playbackKnown = YES;
-        _playbackPlaying = now.playing;
-    }
-    if (isfinite(now.position) && now.position >= 0) {
-        _trackElapsed = now.position;
-        _trackSampledAt = CFAbsoluteTimeGetCurrent();
-    }
-    if (isfinite(now.duration) && now.duration > 0) _trackDuration = now.duration;
-    [self disableRemoteCommands];
-    BOOL transportChanged = wasPlaying != _playbackPlaying;
-    if (_popover.isShown && (metaChanged || transportChanged)) [self rebuildContent];
-    else if (_popover.isShown) [self syncTrackTick];
-}
-- (void)noteDeckPoll:(GBDeckNow)fileNow reply:(NSString *)reply {
-    if (_terminating) return;
-    if (!_popover.isShown && !_deckMode) { [self stopDeckPollTimer]; return; }
-    BOOL answered = reply.length > 0;
-    GBDeckNow status = DeckNowFromJSON(answered ? [reply dataUsingEncoding:NSUTF8StringEncoding] : nil);
-    BOOL statusLive = status.valid && (status.playing || status.paused);
-    BOOL fileLive = fileNow.valid && (fileNow.playing || fileNow.paused);
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (answered) _deckSilentSince = 0;
-    else if (_deckMode) {
-        if (_deckSilentSince <= 0) _deckSilentSince = now;
-        if (now - _deckSilentSince > 5.0) {
-            [self leaveDeckModeStopDeck:NO reason:@"silent"];
-            return;
-        }
-    }
-    // A status reply is the deck's own publish. A stopped file alone can be the
-    // previous session, read before this play has landed, so it only ends a deck
-    // we have already seen playing.
-    BOOL stopped = status.valid && status.stopped;
-    if (!stopped && _deckSawLive && fileNow.valid && fileNow.stopped && !statusLive) stopped = YES;
-    if (_deckMode && stopped) {
-        [self leaveDeckModeStopDeck:NO reason:@"stopped"];
-        return;
-    }
-    BOOL live = answered && (fileLive || statusLive);
-    if (live && !_deckMode && now >= _deckHoldOffUntil) [self enterDeckModeFromPoll:YES];
-    if (!_deckMode) return;
-    if (statusLive || fileLive) {
-        _deckSawLive = YES;
-        [self applyDeckNow:statusLive ? status : fileNow];
-    }
-}
-- (void)toggleDeckPlayback {
-    NSString *cmd = _playbackPlaying ? @"pause" : @"resume";
-    _playbackPlaying = !_playbackPlaying;
-    _playbackKnown = YES;
-    if (_popover.isShown) [self rebuildContent];
-    [self sendDeckCommand:cmd mode:nil];
-}
 - (NSDictionary *)stationOfflineCoverage { return [self offlineCoverage:@"station:triplej" verifyHash:NO]; }
 - (IBAction)playStation:(id)sender {
     (void)sender;
     if (!_stationAvailable) return;
     [self playOfflinePlaylist:@"station:triplej"];
-}
-- (IBAction)openSelectorDJ:(id)sender {
-    (void)sender;
-    if (!_musicProbesEnabled) return;
-    NSString *build = [GBHomeDirectory() stringByAppendingPathComponent:@"Projects/selector/apps/SelectorApp/.build"];
-    NSString *path = SelectorDJPath(@"/Applications/Selector.app", build);
-    if (!path.length) return;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    if ([path.pathExtension isEqualToString:@"app"]) {
-        NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
-        config.activates = YES;
-        [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:config completionHandler:nil];
-        return;
-    }
-    NSTask *task = [NSTask new];
-    task.executableURL = url;
-    task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-    task.standardError = [NSFileHandle fileHandleWithNullDevice];
-    [task launchAndReturnError:nil];
 }
 - (IBAction)setOutputVolumeFromSlider:(NSSlider *)slider {
     NSDictionary *choice = [self playerOutputChoice];
@@ -7182,11 +6594,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
     nw_path_monitor_start(monitor);
 }
-- (BOOL)musicOffline {
-    if (!_musicProbesEnabled) return NO;
-    if (_localMode && !_ytTabOpen) return YES;
-    return _networkKnown && !_networkOnline;
-}
 - (NSArray<NSString *> *)offlineTrackPaths {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     BOOL entering = _offlineTracksEntering;
@@ -7213,7 +6620,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     GlanceNowPlayingSet(_localTitle, _localArtist, _localPlayer.rate > 0 ? 1 : 0, elapsed);
 }
 - (void)enableRemoteCommands {
-    if (_deckMode || _remoteCommandsOn) return;
+    if (_remoteCommandsOn) return;
     _remoteCommandsOn = YES;
     GlanceRemoteCommandsEnable(self);
 }
@@ -7229,7 +6636,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _localTagsReady = NO;
     _localHeartError = nil;
     _localHeartEpoch++;
-    NSUInteger gen = ++_musicGen;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
     [asset loadValuesAsynchronouslyForKeys:@[@"commonMetadata"] completionHandler:^{
         NSString *title = nil, *artist = nil;
@@ -7238,7 +6644,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) artist = item.stringValue;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (gen != self->_musicGen || !self->_localMode) return;
+            if (!self->_localMode || self->_localIndex < 0 || self->_localIndex >= (NSInteger)self->_localURLs.count) return;
+            if (![self->_localURLs[self->_localIndex] isEqual:url]) return;
             if (title.length) self->_localTitle = title;
             if (artist.length) self->_localArtist = artist;
             self->_localTagsReady = title.length && artist.length;
@@ -7323,35 +6730,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _musicNextArmedAt = 0;
     [_localBlendTimer invalidate];
     _localBlendTimer = nil;
-    [_deckPollTimer invalidate];
-    _deckPollTimer = nil;
-    [_amBlendTimer invalidate];
-    _amBlendTimer = nil;
-    [_ytBlendTimer invalidate];
-    _ytBlendTimer = nil;
-    _amBlendToken++;
-    _ytBlendToken++;
-    _amBlendActive = NO;
-    _ytBlendActive = NO;
-    // A late blend callback must not skip or start another restore after this.
-    _amBlendStopThen = nil;
-    _ytBlendStopThen = nil;
     if (_localOutgoing) {
         [_localOutgoing pause];
         _localOutgoing = nil;
     }
     if (_localPlayer) _localPlayer.volume = 1;
-    if (_amBlendVolumeKnown) {
-        int volume = _amBlendOriginal;
-        _amBlendVolumeKnown = NO;
-        NSString *script = [NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume];
-        RestoreBlendedVolumeSync(MusicVolumeQueue(), &gMusicVolumeGeneration, script);
-    }
-    if (_ytBlendVolumeKnown) {
-        NSString *script = YouTubeControlScript(YouTubeVolumeAction(_ytBlendOriginal));
-        _ytBlendVolumeKnown = NO;
-        RestoreBlendedVolumeSync(ChromeVolumeQueue(), &gChromeVolumeGeneration, script);
-    }
 }
 // The queue advances by itself and never updates the index, so Next would jump
 // backwards and the label would stay on the finished song. At the end, wrap the
@@ -7391,7 +6774,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     });
 }
 - (void)playLocalIndex:(NSInteger)index {
-    if (_deckMode) [self leaveDeckModeStopDeck:YES reason:@"local"];
     if (!_localURLs.count) return;
     if (!_localMode) [self pauseAppleMusicForLocalSource];
     index = [self wrappedLocalIndex:index];
@@ -7425,7 +6807,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 // Keeps the current player. The new queue is built the same way as playLocalIndex:,
 // at volume 0, and the row switches to it immediately.
 - (void)beginLocalBlend {
-    if (_deckMode) return;
     if (!_localURLs.count || !_localPlayer) {
         [self playLocalIndex:_localIndex + 1];
         return;
@@ -7459,20 +6840,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [NSRunLoop.mainRunLoop addTimer:_localBlendTimer forMode:NSRunLoopCommonModes];
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)startOfflinePlayback {
-    if (!_musicProbesEnabled || _deckMode) return;
-    _mixPlayingKey = nil;
-    [self startSelectorPlay:@[@"play", @"--mode", SelectorPlayMode()] label:@"offline" success:^{
-        self->_playbackKnown = YES;
-        self->_playbackPlaying = YES;
-        [self enterDeckModeFromPoll:NO];
-    } fallback:^{
-        [self startOfflinePlaybackLocal];
-    }];
-}
 - (void)startOfflinePlaybackLocal {
-    if (!_musicProbesEnabled || _deckMode) return;
-    // The liked-folder shuffle is not a station or a seed mix, so its row has no heart.
+    if (!_musicProbesEnabled) return;
     _mixPlayingKey = nil;
     [self disableRemoteCommands];
     NSArray<NSString *> *paths = [self offlineTrackPaths];
@@ -7495,8 +6864,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)toggleLocalPlayback {
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     if (!_musicProbesEnabled) return;
-    if (_deckMode) { [self toggleDeckPlayback]; return; }
-    if (!_localPlayer) { [self playOfflinePlaylist:_mixPlayingKey ?: [self offlinePrimaryKey]]; return; }
+    if (!_localPlayer) {
+        if (_mixPlayingKey.length) [self playOfflinePlaylist:_mixPlayingKey];
+        else [self startOfflinePlaybackLocal];
+        return;
+    }
     // Pause finishes the fade first, so the incoming track is the one that pauses
     // and the outgoing player is not left audible underneath.
     if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
@@ -7524,213 +6896,6 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self disableRemoteCommands];
     if (_popover.isShown) [self rebuildContent];
 }
-- (void)stopLocalForYouTube {
-    ++_offlinePlayGeneration; _mixStartingKey = nil;
-    [self tearDownLocalPlayer];
-    _localMode = NO;
-    _localEmpty = NO;
-    _localTitle = nil;
-    _localArtist = nil;
-    _playbackKnown = NO;
-    _playbackPlaying = NO;
-    [self disableRemoteCommands];
-}
-- (void)beginChromeFallback {
-    if (_deckMode) return;
-    _musicNote = kYouTubeChromeNote;
-    if (_localMode && _localPlayer.rate > 0) {
-        if (_popover.isShown) [self rebuildContent];
-        return;
-    }
-    _offlineTracksEntering = YES;
-    [self startOfflinePlayback];
-}
-- (void)startYouTubeProbeTimer {
-    if (_ytProbeTimer) return;
-    _ytProbeTimer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(youTubeProbeTimerFired:) userInfo:nil repeats:YES];
-}
-- (void)stopYouTubeProbeTimer {
-    [_ytProbeTimer invalidate];
-    _ytProbeTimer = nil;
-}
-- (void)youTubeProbeTimerFired:(NSTimer *)timer {
-    (void)timer;
-    if (!_popover.isShown || !_ytTabOpen) { [self stopYouTubeProbeTimer]; return; }
-    if (_ytStatusInFlight) return;
-    [self runYouTubeStatusAfter:0 generation:_musicGen];
-}
-- (void)applyYouTubeStatus:(NSDictionary *)status updateTransport:(BOOL)updateTransport {
-    if (_deckMode) { [self stopYouTubeProbeTimer]; return; }   // the deck owns the row
-    if (_amLoaded) { [self stopYouTubeProbeTimer]; return; }   // Music owns the row while it has a track
-    NSString *denied = [status[@"denied"] isKindOfClass:NSString.class] ? status[@"denied"] : @"";
-    // The hint follows the last script. A later success clears it; it is not a one-shot default.
-    if ([denied isEqual:@"javascript"]) {
-        _musicNote = kYouTubeJSNote;
-        _ytJSDenied = YES;
-        _ytTabOpen = YES;
-    } else if ([denied isEqual:@"automation"]) {
-        _musicNote = kYouTubeAutomationNote;
-        _ytJSDenied = NO;
-        [self stopYouTubeProbeTimer];
-    } else {
-        _ytJSDenied = NO;
-        if ([_musicNote isEqualToString:kYouTubeJSNote] || [_musicNote isEqualToString:kYouTubeAutomationNote])
-            _musicNote = nil;
-        BOOL tab = [status[@"tab"] boolValue];
-        if (tab) {
-            _ytTabOpen = YES;
-            if ([_musicNote isEqualToString:kYouTubeChromeNote]) _musicNote = nil;
-            if (updateTransport && [status[@"playing"] isKindOfClass:NSNumber.class]) {
-                _playbackKnown = YES;
-                _playbackPlaying = [status[@"playing"] boolValue];
-            }
-            // A command's own return can still be the pre-play title. Don't blank a label we have.
-            if ([status[@"title"] isKindOfClass:NSString.class] && (updateTransport || [status[@"title"] length] || !_ytTitle.length))
-                _ytTitle = status[@"title"];
-            if ([status[@"artist"] isKindOfClass:NSString.class] && (updateTransport || [status[@"artist"] length] || !_ytArtist.length))
-                _ytArtist = status[@"artist"];
-            NSNumber *elapsed = [status[@"elapsed"] isKindOfClass:NSNumber.class] ? status[@"elapsed"] : nil;
-            NSNumber *duration = [status[@"duration"] isKindOfClass:NSNumber.class] ? status[@"duration"] : nil;
-            if (elapsed || duration) {
-                double seconds = elapsed ? elapsed.doubleValue : 0;
-                double length = duration ? duration.doubleValue : 0;
-                if (!isfinite(seconds) || seconds < 0) seconds = 0;
-                _trackElapsed = seconds;
-                _trackSampledAt = CFAbsoluteTimeGetCurrent();
-                _trackDuration = (isfinite(length) && length > 0) ? length : 0;
-            } else {
-                _trackElapsed = 0;
-                _trackDuration = 0;
-                _trackSampledAt = 0;
-            }
-            NSInteger count = [status[@"count"] integerValue];
-            if (count > 0) [self rememberLikedCount:count];
-        } else {
-            _ytTabOpen = NO;
-            _playbackKnown = NO;
-            _playbackPlaying = NO;
-            _ytTitle = nil;
-            _ytArtist = nil;
-        }
-    }
-    // Automation denial has nothing to poll: another tell would just wait on the same dialog.
-    if ([denied isEqual:@"automation"] || !_popover.isShown || !_ytTabOpen) [self stopYouTubeProbeTimer];
-    else [self startYouTubeProbeTimer];
-    if (_popover.isShown) [self rebuildContent];
-}
-- (void)noteYouTubeScript:(NSString *)output errorText:(NSString *)errorText status:(int)status updateTransport:(BOOL)updateTransport {
-    NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-    // A timeout or a launch failure is not "no tab". Leave the last known state alone.
-    if ([parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0) return;
-    [self applyYouTubeStatus:parsed updateTransport:updateTransport];
-}
-- (void)runYouTubeStatusAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (generation != self->_musicGen || !self->_musicProbesEnabled) return;
-        if (!ChromeIsRunning()) {
-            if (self->_ytTabOpen) {
-                self->_ytTabOpen = NO;
-                self->_playbackKnown = NO;
-                [self stopYouTubeProbeTimer];
-                if (self->_popover.isShown) [self rebuildContent];
-            }
-            return;
-        }
-        // A tell application block launches Chrome when it is not running. Probes must not.
-        self->_ytStatusInFlight = YES;
-        RunAppleScript(YouTubeControlScript(@"status"), ^(NSString *output, NSString *errorText, int status) {
-            self->_ytStatusInFlight = NO;
-            if (generation != self->_musicGen) return;
-            [self noteYouTubeScript:output errorText:errorText status:status updateTransport:YES];
-        });
-    });
-}
-// Retries only while the player bar is missing, so shuffle is clicked once the page is actually there.
-- (void)runYouTubeStartGeneration:(NSUInteger)generation delay:(NSTimeInterval)delay attemptsLeft:(NSInteger)attemptsLeft {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (generation != self->_musicGen || !self->_musicProbesEnabled || !ChromeIsRunning()) return;
-        RunAppleScript(YouTubeControlScript(@"start"), ^(NSString *output, NSString *errorText, int status) {
-            if (generation != self->_musicGen) return;
-            NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-            BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
-            if (!unanswered) [self applyYouTubeStatus:parsed updateTransport:YES];
-            if ([parsed[@"denied"] isEqual:@"javascript"]) {
-                PostSystemMediaKey(NX_KEYTYPE_PLAY);
-                return;
-            }
-            BOOL known = [parsed[@"playing"] isKindOfClass:NSNumber.class] || [parsed[@"title"] length] > 0 || [parsed[@"count"] integerValue] > 0;
-            BOOL ready = [parsed[@"tab"] boolValue] && [parsed[@"denied"] isEqual:@""] && known;
-            if (!ready && attemptsLeft > 0 && [parsed[@"denied"] isEqual:@""]) {
-                NSTimeInterval next = attemptsLeft >= 2 ? 4 : 6;
-                [self runYouTubeStartGeneration:generation delay:next attemptsLeft:attemptsLeft - 1];
-            } else if (ready) {
-                [self runYouTubeStatusAfter:0.3 generation:generation];
-            }
-        });
-    });
-}
-- (void)playExistingYouTubeTabGeneration:(NSUInteger)generation {
-    [self stopLocalForYouTube];
-    _ytTabOpen = YES;
-    if (_popover.isShown) [self rebuildContent];
-    [self runYouTubeStartGeneration:generation delay:0 attemptsLeft:2];
-}
-- (void)openYouTubeTab {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!YouTubeNewTabAllowed(now, _ytTabOpenedAt)) return;
-    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
-    NSString *urlString = YouTubeLikedMusicURL(arc4random(), [self likedCountEstimate]);
-    NSURL *url = [NSURL URLWithString:urlString];
-    if (!url || !chrome) { [self beginChromeFallback]; return; }
-    _ytTabOpenedAt = now;
-    NSUInteger generation = ++_musicGen;
-    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
-    config.activates = NO;
-    [NSWorkspace.sharedWorkspace openURLs:@[url] withApplicationAtURL:chrome configuration:config
-                        completionHandler:^(NSRunningApplication *app, NSError *error) {
-        (void)app;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation != self->_musicGen) return;
-            // A failed open must not hold the next Play press off for a minute.
-            if (error) { self->_ytTabOpenedAt = 0; [self beginChromeFallback]; return; }
-            if ([self->_musicNote isEqualToString:kYouTubeChromeNote]) self->_musicNote = nil;
-            [self stopLocalForYouTube];
-            self->_ytTabOpen = YES;
-            if (self->_popover.isShown) [self rebuildContent];
-            [self runYouTubeStartGeneration:generation delay:2 attemptsLeft:2];
-        });
-    }];
-}
-- (void)startYouTubePlayback {
-    if (!_musicProbesEnabled || _ytStartPending) return;
-    NSURL *chrome = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.google.Chrome"];
-    if (!chrome) { [self beginChromeFallback]; return; }
-    // Chrome is not running, so there is no tab to reuse. openURLs launches it.
-    if (!ChromeIsRunning()) { [self openYouTubeTab]; return; }
-    _ytStartPending = YES;
-    NSUInteger generation = ++_musicGen;
-    RunAppleScript(YouTubeControlScript(@"status"), ^(NSString *output, NSString *errorText, int status) {
-        self->_ytStartPending = NO;
-        if (generation != self->_musicGen) return;
-        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        if ([parsed[@"denied"] isEqual:@"automation"]) {
-            [self applyYouTubeStatus:parsed updateTransport:YES];
-            [self openYouTubeTab];
-            return;
-        }
-        if ([parsed[@"tab"] boolValue]) {
-            if ([parsed[@"denied"] isEqual:@"javascript"]) {
-                [self applyYouTubeStatus:parsed updateTransport:YES];
-                PostSystemMediaKey(NX_KEYTYPE_PLAY);
-                return;
-            }
-            [self playExistingYouTubeTabGeneration:generation];
-            return;
-        }
-        if (status != 0) return;
-        [self openYouTubeTab];
-    });
-}
 - (NSInteger)remotePlay:(id)event {
     (void)event; if (_localPlayer.rate == 0) [self toggleLocalPlayback];
     return 0;
@@ -7749,242 +6914,12 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (NSInteger)remotePrevious:(id)event {
     (void)event; [self musicPrevious:nil]; return 0;
 }
-- (void)sendYouTubeCommand:(NSString *)action key:(UInt32)key {
-    [self sendYouTubeCommand:action key:key done:nil];
-}
-- (void)sendYouTubeCommand:(NSString *)action key:(UInt32)key done:(void (^)(BOOL ok))done {
-    if (!_musicProbesEnabled) { if (done) done(NO); return; }
-    if (!ChromeIsRunning()) {
-        _ytTabOpen = NO;
-        _playbackKnown = NO;
-        [self stopYouTubeProbeTimer];
-        if (_popover.isShown) [self rebuildContent];
-        if (done) done(NO);
-        return;
-    }
-    NSUInteger generation = ++_musicGen;
-    // The pill keeps the last probed icon until the follow-up read. play() is async,
-    // so the script's own return can still say paused.
-    if (_ytJSDenied) {
-        PostSystemMediaKey(key);
-        [self runYouTubeStatusAfter:0.3 generation:generation];
-        if (done) done(YES);
-        return;
-    }
-    RunAppleScript(YouTubeControlScript(action), ^(NSString *output, NSString *errorText, int status) {
-        if (generation != self->_musicGen) { if (done) done(NO); return; }
-        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
-        BOOL denied = [parsed[@"denied"] isEqual:@"javascript"];
-        if (denied) {
-            [self applyYouTubeStatus:parsed updateTransport:NO];
-            PostSystemMediaKey(key);
-        } else if (!unanswered) {
-            [self applyYouTubeStatus:parsed updateTransport:NO];
-        }
-        [self runYouTubeStatusAfter:0.3 generation:generation];
-        if (done) done(!denied && !unanswered);
-    });
-}
 // --- Apple Music ---
 - (NSString *)appleMusicPlaylistName {
     NSString *name = [NSUserDefaults.standardUserDefaults stringForKey:@"appleMusicPlaylist"];
     return name.length ? name : @"Favourite Songs";
 }
-// Popover open: Music first; YouTube is read only when Music has nothing loaded.
-- (void)refreshMusicSources {
-    if (!_musicProbesEnabled || _deckMode) return;
-    if (!AppleMusicIsRunning()) {
-        [self clearAppleMusic];
-        [self runYouTubeStatusAfter:0 generation:_musicGen];
-        return;
-    }
-    [self runAppleMusicCommand:@"" followUp:NO];
-}
-- (void)appleMusicChanged:(NSNotification *)note {
-    if (_deckMode) return;
-    NSString *state = [note.userInfo[@"Player State"] isKindOfClass:NSString.class] ? note.userInfo[@"Player State"] : @"";
-    if (!_popover.isShown) {
-        // Nothing is drawn; just stop routing buttons to a player that has stopped.
-        if ([state isEqual:@"Stopped"]) [self clearAppleMusic];
-        return;
-    }
-    [self runAppleMusicCommand:@"" followUp:NO];
-}
-- (void)clearAppleMusic {
-    if (!_amLoaded) return;
-    _amLoaded = NO;
-    _amTitle = _amArtist = _amAlbum = _amTrackID = nil;
-    _playbackKnown = NO;
-    _playbackPlaying = NO;
-    _trackDuration = 0;
-    _trackSampledAt = 0;
-    [self stopAppleMusicProbeTimer];
-    if (_popover.isShown) [self rebuildContent];
-}
-- (void)startAppleMusicProbeTimer {
-    if (_amProbeTimer) return;
-    _amProbeTimer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(appleMusicProbeFired:)
-                                                   userInfo:nil repeats:YES];
-}
-- (void)stopAppleMusicProbeTimer {
-    [_amProbeTimer invalidate];
-    _amProbeTimer = nil;
-}
-- (void)appleMusicProbeFired:(NSTimer *)timer {
-    (void)timer;
-    if (!_popover.isShown || !_amLoaded) { [self stopAppleMusicProbeTimer]; return; }
-    if (!_amStatusInFlight) [self runAppleMusicCommand:@"" followUp:NO];
-}
-// A tell block launches Music, so every probe checks it is running first. Commands that
-// change the track read back once more: Music answers before the new track has loaded.
-- (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp {
-    [self runAppleMusicCommand:command followUp:followUp done:nil];
-}
-- (void)noteAppleMusicUnavailable:(NSString *)note {
-    // Keep the last track as a snapshot, but never animate it as verified playback.
-    _musicNote = note;
-    if (_amLoaded && !_localMode && !_deckMode) {
-        _playbackKnown = NO;
-        _playbackPlaying = NO;
-        _trackSampledAt = 0;
-    }
-    if (_popover.isShown) [self rebuildContent];
-}
-- (void)runAppleMusicCommand:(NSString *)command followUp:(BOOL)followUp done:(void (^)(BOOL ok))done {
-    // Timer/notification probes must not invalidate a button command's callback.
-    if (!command.length && _amStatusInFlight) { if (done) done(NO); return; }
-    if (!_musicProbesEnabled) { if (done) done(NO); return; }
-    if (!AppleMusicIsRunning()) { [self clearAppleMusic]; if (done) done(NO); return; }
-    NSUInteger generation = ++_amGen;
-    _amStatusInFlight = YES;
-    RunAppleScript(AppleMusicScript(command), ^(NSString *output, NSString *errorText, int status) {
-        if (generation != self->_amGen) { if (done) done(NO); return; }
-        self->_amStatusInFlight = NO;
-        if (status != 0 || command.length)
-            GBLog("apple music: command=%{public}@ status=%d out=%{public}@ err=%{public}@", command, status,
-                  [output stringByReplacingOccurrencesOfString:YouTubeStatusSeparator withString:@"|"], errorText);
-        if (ChromeAutomationDenied(errorText)) {
-            [self noteAppleMusicUnavailable:kAppleMusicAutomationNote];
-            if (done) done(NO);
-            return;
-        }
-        if (status != 0 && ![output containsString:YouTubeStatusSeparator]) {
-            [self noteAppleMusicUnavailable:kAppleMusicUnresponsiveNote];
-            if (done) done(NO);
-            return;
-        }
-        [self applyAppleMusicStatus:ParseAppleMusicStatus(output)];
-        if (followUp)
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (generation == self->_amGen) [self runAppleMusicCommand:@"" followUp:NO];
-            });
-        if (done) done(YES);
-    });
-}
-- (void)applyAppleMusicStatus:(NSDictionary *)status {
-    if (_deckMode) return;   // the deck owns transport until now.json says it stopped
-    if ([_musicNote isEqualToString:kAppleMusicAutomationNote] || [_musicNote isEqualToString:kAppleMusicUnresponsiveNote]) _musicNote = nil;
-    _amShuffle = [status[@"shuffle"] boolValue];
-    if (![status[@"loaded"] boolValue]) {
-        BOOL was = _amLoaded;
-        [self clearAppleMusic];
-        if (was || !_ytTabOpen) [self runYouTubeStatusAfter:0 generation:_musicGen];
-        else if (_popover.isShown) [self rebuildContent];
-        return;
-    }
-    if (_localMode) {
-        // The offline player keeps the row unless Music is actually playing over it.
-        if (![status[@"playing"] boolValue]) { [self clearAppleMusic]; return; }
-        [self stopLocalForYouTube];
-    }
-    _amLoaded = YES;
-    [self stopYouTubeProbeTimer];
-    _playbackKnown = YES;
-    _playbackPlaying = [status[@"playing"] boolValue];
-    _amTitle = status[@"title"];
-    _amArtist = status[@"artist"];
-    _amAlbum = status[@"album"];
-    _amPlaylist = status[@"playlist"];
-    _amFavorited = [status[@"favorited"] boolValue];
-    _amTrackID = status[@"trackID"];
-    NSNumber *duration = status[@"duration"], *elapsed = status[@"elapsed"];
-    _trackDuration = duration ? duration.doubleValue : 0;
-    _trackElapsed = elapsed ? elapsed.doubleValue : 0;
-    _trackSampledAt = CFAbsoluteTimeGetCurrent();
-    if (_amTrackID.length && ![_amTrackID isEqual:_amArtTrackID]) [self fetchAppleMusicArt];
-    if (_popover.isShown) { [self startAppleMusicProbeTimer]; [self rebuildContent]; }
-}
-- (void)fetchAppleMusicArt {
-    NSString *trackID = _amTrackID;
-    _amArtTrackID = trackID;
-    _amArt = nil;
-    NSString *path = AppleMusicArtPath();
-    NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
-        "set artData to raw data of artwork 1 of current track\n"
-        "set trackID to persistent ID of current track\n"
-        "end tell\n"
-        "set artFile to open for access (POSIX file %@) with write permission\n"
-        "try\nset eof artFile to 0\nwrite artData to artFile\nend try\n"
-        "close access artFile\n"
-        "return trackID", AppleScriptQuoted(path)];
-    RunAppleScript(script, ^(NSString *output, NSString *errorText, int status) {
-        (void)errorText;
-        NSString *got = [output stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (status != 0 || ![got isEqual:trackID] || ![self->_amTrackID isEqual:trackID]) return;
-        self->_amArt = AppleMusicThumbnail(path, 32);
-        if (self->_popover.isShown) [self rebuildContent];
-    });
-}
-- (void)startAppleMusicPlayback {
-    if (!_musicProbesEnabled || _amStartPending) return;
-    NSString *names = [NSString stringWithFormat:@"{%@, \"Favourite Songs\", \"Favorite Songs\"}",
-                       AppleScriptQuoted([self appleMusicPlaylistName])];
-    NSString *start = [NSString stringWithFormat:
-        @"set shuffle enabled to true\n"
-        "set started to false\n"
-        "repeat with pick in %@\n"
-        "if not started and (exists user playlist (contents of pick)) then\n"
-        "play user playlist (contents of pick)\n"
-        "set started to true\n"
-        "end if\n"
-        "end repeat\n"
-        "if not started then play library playlist 1", names];
-    if (AppleMusicIsRunning()) { [self runAppleMusicCommand:start followUp:YES]; return; }
-    NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
-    if (!app) { [self startYouTubePlayback]; return; }
-    // Launched hidden: playing music is not a reason to take the screen.
-    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
-    config.activates = NO;
-    config.hides = YES;
-    _amStartPending = YES;
-    [NSWorkspace.sharedWorkspace openApplicationAtURL:app configuration:config
-                                    completionHandler:^(NSRunningApplication *running, NSError *error) {
-        (void)running;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            self->_amStartPending = NO;
-            if (error) { [self startYouTubePlayback]; return; }
-            [self runAppleMusicCommand:start followUp:YES];
-        });
-    }];
-}
-- (IBAction)openAppleMusic:(id)sender {
-    (void)sender;
-    if (!_musicProbesEnabled) return;
-    [_popover performClose:nil];
-    if (!AppleMusicIsRunning()) {
-        NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
-        if (app) [NSWorkspace.sharedWorkspace openApplicationAtURL:app configuration:[NSWorkspaceOpenConfiguration configuration]
-                                                 completionHandler:nil];
-        return;
-    }
-    RunAppleScript(@"tell application \"Music\"\ntry\nreveal current track\nend try\nactivate\nend tell",
-                   ^(NSString *o, NSString *e, int st) { (void)o; (void)e; (void)st; });
-}
 - (NSDictionary *)currentLocalIdentity {
-    if (_deckMode && _deckPath.length)
-        return LocalTrackIdentity(_stationTracks, _deckPath, _deckArtist ?: @"",
-                                  _deckTitle ?: @"", _deckPath.lastPathComponent);
     if (!_localMode || _localIndex < 0 || _localIndex >= (NSInteger)_localURLs.count) return nil;
     NSString *path = _localURLs[_localIndex].path;
     if (!path.length) return nil;
@@ -8115,19 +7050,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 - (IBAction)musicFavorite:(id)sender {
     (void)sender;
-    if ((_localMode || _deckMode) && _mixPlayingKey.length) {
-        [self loveCurrentLocalTrack];
-        return;
-    }
-    if (_amLoaded && [self appleMusicBlendBusy]) {
-        [self requestAppleMusicBlendStopThen:^{ [self musicFavorite:nil]; }];
-        return;
-    }
-    if (!_amLoaded) return;
-    _amFavorited = !_amFavorited;   // answer the click now; the read-back confirms it
-    if (_popover.isShown) [self rebuildContent];
-    [self runAppleMusicCommand:[NSString stringWithFormat:@"try\nset favorited of current track to %@\nend try",
-                                _amFavorited ? @"true" : @"false"] followUp:NO];
+    if (!_localMode) return;
+    [self loveCurrentLocalTrack];
 }
 - (NSMutableSet<NSString *> *)mixLiked {
     if (!_mixLiked) {
@@ -8138,19 +7062,14 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 - (IBAction)musicThumbsUp:(id)sender {
     (void)sender;
-    BOOL local = (_localMode || _deckMode) && _mixPlayingKey.length;
-    if (!local && [self appleMusicBlendBusy]) {
-        [self requestAppleMusicBlendStopThen:^{ [self musicThumbsUp:nil]; }];
-        return;
-    }
-    if (!local && (!_amLoaded || !_amTrackID.length)) return;
-    NSDictionary *ident = local ? [self currentLocalIdentity] : nil;
-    NSString *thumbID = local ? ([ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"]) : _amTrackID;
+    if (!_localMode) return;
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"];
     if (!thumbID.length) return;
     BOOL liked = ![[self mixLiked] containsObject:thumbID];
     if (liked) [_mixLiked addObject:thumbID]; else [_mixLiked removeObject:thumbID];
-    NSString *title = local ? (ident[@"title"] ?: _localTitle) : _amTitle;
-    NSString *artist = local ? (ident[@"artist"] ?: _localArtist) : _amArtist;
+    NSString *title = ident[@"title"] ?: _localTitle;
+    NSString *artist = ident[@"artist"] ?: _localArtist;
     NSString *line = MixFeedbackLine(thumbID, title, artist, liked, NSDate.date);
     NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -8158,552 +7077,76 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [fh seekToEndOfFile];
     [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
-    for (NSUInteger i = 0; i < _mixLibrary.count; i++)   // the next seed draw counts it straight away
+    for (NSUInteger i = 0; i < _mixLibrary.count; i++)
         if ([_mixLibrary[i][@"id"] isEqual:thumbID]) {
             NSMutableArray *lib = [_mixLibrary mutableCopy]; NSMutableDictionary *t = [lib[i] mutableCopy];
             t[@"thumb"] = @(liked); lib[i] = t; _mixLibrary = lib; break;
         }
-    // A thumbs-up is the curator signal. Taking it back does not un-heart the track.
     if (liked) {
-        [self appendSelectorFeedbackForArtist:artist title:title source:local ? @"local" : @"apple"];
-        NSString *heartKey = local ? ident[@"trackKey"] : SelectorTrackKey(_amArtist, _amTitle);
-        BOOL hearted = local ? (heartKey.length && [[self heartedKeys] containsObject:heartKey]) : _amFavorited;
-        if (!hearted) {
-            if (local) [self loveCurrentLocalTrack];
-            else {
-                _amFavorited = YES;
-                [self runAppleMusicCommand:@"try\nduplicate current track to source 1\nend try\n"
-                                            "try\nset favorited of current track to true\nend try"
-                                  followUp:NO];
-            }
-        }
+        [self appendSelectorFeedbackForArtist:artist title:title source:@"local"];
+        NSString *heartKey = ident[@"trackKey"];
+        if (heartKey.length && ![[self heartedKeys] containsObject:heartKey]) [self loveCurrentLocalTrack];
     }
     if (_popover.isShown) [self rebuildContent];
-}
-- (IBAction)musicShuffle:(id)sender {
-    (void)sender;
-    if (!_amLoaded) return;
-    if ([self appleMusicBlendBusy]) {
-        [self requestAppleMusicBlendStopThen:^{ [self musicShuffle:nil]; }];
-        return;
-    }
-    _amShuffle = !_amShuffle;
-    if (_popover.isShown) [self rebuildContent];
-    [self runAppleMusicCommand:[NSString stringWithFormat:@"set shuffle enabled to %@", _amShuffle ? @"true" : @"false"]
-                      followUp:NO];
 }
 - (IBAction)musicSeek:(id)sender {
-    if (!_amLoaded || ![sender isKindOfClass:NSSlider.class]) return;
-    if ([self appleMusicBlendBusy]) {
-        [self requestAppleMusicBlendStopThen:^{ [self musicSeek:sender]; }];
-        return;
-    }
+    if (!_localMode || !_localPlayer || ![sender isKindOfClass:NSSlider.class]) return;
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
     double seconds = ((NSSlider *)sender).doubleValue;
     if (!isfinite(seconds) || seconds < 0) return;
+    CMTime target = CMTimeMakeWithSeconds(seconds, NSEC_PER_SEC);
+    [_localPlayer seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero
+           completionHandler:^(BOOL __unused finished) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
+    }];
     _trackElapsed = seconds;
     _trackSampledAt = CFAbsoluteTimeGetCurrent();
-    [self runAppleMusicCommand:[NSString stringWithFormat:@"set player position to %ld", (long)seconds] followUp:NO];
 }
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
     ++_offlinePlayGeneration;
     _mixStartingKey = nil;
-    GBLog("music play: local=%d am=%d yt=%d netKnown=%d online=%d pending=%d", _localMode, _amLoaded, _ytTabOpen,
-          _networkKnown, _networkOnline, _amStartPending);
-    if (_deckMode) { [self toggleDeckPlayback]; return; }
     if (_localMode) { [self toggleLocalPlayback]; return; }
-    if (_amLoaded) {
-        if ([self appleMusicBlendBusy]) {
-            [self requestAppleMusicBlendStopThen:^{ [self musicPlay:nil]; }];
-            return;
-        }
-        [self runAppleMusicCommand:@"playpause\ndelay 0.3" followUp:YES];
-        return;
-    }
-    if (_ytTabOpen) {
-        if ([self youTubeBlendBusy]) {
-            [self requestYouTubeBlendStopThen:^{ [self musicPlay:nil]; }];
-            return;
-        }
-        [self sendYouTubeCommand:@"playpause" key:NX_KEYTYPE_PLAY];
-        return;
-    }
     [self ensureOfflinePlaylists];
-    [self playOfflinePlaylist:[self offlinePrimaryKey]];
+    [self startOfflinePlaybackLocal];
 }
 - (IBAction)musicPrevious:(id)sender {
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
-    if (!_musicProbesEnabled || _deckMode) return;
-    if (_localMode) {
-        // Previous decides from the track the row already shows. Snap the fade
-        // first so the outgoing player is not still sounding under that seek.
-        if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
-        double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
-        if (seconds > 3) {
-            // The clock ticks from its last sample; restart it with the seek, not 15s later.
-            [_localPlayer seekToTime:kCMTimeZero completionHandler:^(BOOL __unused finished) {
-                dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
-            }];
-            _trackElapsed = 0;
-            _trackSampledAt = CFAbsoluteTimeGetCurrent();
-            return;
-        }
-        [self playLocalIndex:_localIndex - 1];
+    if (!_musicProbesEnabled || !_localMode || !_localPlayer) return;
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
+    double seconds = CMTimeGetSeconds(_localPlayer.currentTime);
+    if (seconds > 3) {
+        [_localPlayer seekToTime:kCMTimeZero completionHandler:^(BOOL __unused finished) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
+        }];
+        _trackElapsed = 0;
+        _trackSampledAt = CFAbsoluteTimeGetCurrent();
         return;
     }
-    if (_amLoaded) {
-        if ([self appleMusicBlendBusy]) {
-            [self requestAppleMusicBlendStopThen:^{ [self musicPrevious:nil]; }];
-            return;
-        }
-        [self runAppleMusicCommand:@"back track\ndelay 0.3" followUp:YES];
-        return;
-    }
-    if (_ytTabOpen) {
-        if ([self youTubeBlendBusy]) {
-            [self requestYouTubeBlendStopThen:^{ [self musicPrevious:nil]; }];
-            return;
-        }
-        [self sendYouTubeCommand:@"previous" key:NX_KEYTYPE_PREVIOUS];
-    }
+    [self playLocalIndex:_localIndex - 1];
 }
 - (void)invalidateMusicNextArmTimer {
     [_musicNextArmTimer invalidate];
     _musicNextArmTimer = nil;
 }
 - (BOOL)musicBlendRunning {
-    return _localBlendTimer != nil || _localOutgoing != nil || _amBlendActive || _ytBlendActive;
+    return _localBlendTimer != nil || _localOutgoing != nil;
 }
 - (void)performMusicNextCutNow {
-    if (_deckMode) { [self sendDeckCommand:@"skip" mode:@"cut"]; return; }
-    if (_localMode) { [self playLocalIndex:_localIndex + 1]; return; }
-    if (_amLoaded) { [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES]; return; }
-    if (_ytTabOpen) [self sendYouTubeCommand:@"next" key:NX_KEYTYPE_NEXT];
+    if (!_localMode) return;
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
+    [self playLocalIndex:_localIndex + 1];
 }
-// A press during a blend lands on the track that blend was already entering.
-// Local index moved when the fade started, so finishing it is the cut. A service
-// dip that has not sent next yet still owes that one skip, at the original volume.
-// The skip flag, not the phase: finish-stop clears the phase to Idle before the
-// restore script returns, and a press during that restore must not send next again.
 - (void)finishRunningBlendAsCut {
-    BOOL local = _localBlendTimer != nil || _localOutgoing != nil;
-    if (local) [self finishLocalBlend];
-    if ([self appleMusicBlendBusy]) {
-        BOOL owesNext = MusicBlendCutOwesNext(_amBlendPhase, _amBlendSkipSent);
-        __weak __typeof(self) weakSelf = self;
-        [self requestAppleMusicBlendStopThen:^{
-            if (!local && owesNext) [weakSelf performMusicNextCutNow];
-        }];
-        return;
-    }
-    if ([self youTubeBlendBusy]) {
-        BOOL owesNext = MusicBlendCutOwesNext(_ytBlendPhase, _ytBlendSkipSent);
-        __weak __typeof(self) weakSelf = self;
-        [self requestYouTubeBlendStopThen:^{
-            if (!local && owesNext) [weakSelf performMusicNextCutNow];
-        }];
-    }
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
+    else [self performMusicNextCutNow];
 }
 - (void)performMusicNextBlend {
-    if (_deckMode) { [self sendDeckCommand:@"skip" mode:@"smooth"]; return; }
-    if (_localMode) {
-        if (_localBlendTimer || _localOutgoing) { [self finishLocalBlend]; return; }
-        [self beginLocalBlend];
-        return;
-    }
-    if (_amLoaded) { [self beginAppleMusicBlend]; return; }
-    if (_ytTabOpen) {
-        if (_ytJSDenied) { [self performMusicNextCutNow]; return; }
-        [self beginYouTubeBlend];
-    }
-}
-- (BOOL)appleMusicBlendBusy {
-    return _amBlendActive || _amBlendBusy || _amBlendVolumeKnown || _amBlendStopThen != nil;
-}
-- (void)stopAppleBlendTimer {
-    [_amBlendTimer invalidate];
-    _amBlendTimer = nil;
-}
-// verify publishes a new volume generation and, after the set, reads Music once.
-// A dip passes verify NO and keeps the current generation, so a restore that
-// bumps can drop it before the script starts.
-- (void)applyAppleMusicVolume:(int)volume verify:(BOOL)verify done:(void (^)(BOOL ok, BOOL dropped))done {
-    if (volume < 0) volume = 0;
-    if (volume > 100) volume = 100;
-    uint64_t generation = verify ? BumpVolumeGeneration(&gMusicVolumeGeneration)
-                                : CurrentVolumeGeneration(&gMusicVolumeGeneration);
-    NSString *script = [NSString stringWithFormat:@"tell application \"Music\" to set sound volume to %d", volume];
-    NSString *readScript = verify ? @"tell application \"Music\" to sound volume" : nil;
-    BOOL (^matches)(NSString *, NSString *, int) = nil;
-    if (verify) {
-        matches = ^BOOL(NSString *output, NSString *errorText, int status) {
-            (void)errorText;
-            int actual = 0;
-            BOOL readOK = status == 0 && MusicSoundVolume(output, &actual);
-            return MusicRestoredVolumeMatches(readOK, actual, volume);
-        };
-    }
-    RunGeneratedVolumeScript(MusicVolumeQueue(), &gMusicVolumeGeneration, generation, script, readScript,
-                            nil, matches, done);
-}
-// One restore, then whatever the interrupt was waiting to do. The phase goes Idle
-// here, before the script returns; _amBlendSkipSent is left alone so a press during
-// the restore still knows next already went out. The restore itself re-reads once
-// and writes the original again if that read differs.
-- (void)finishAppleMusicBlendStop {
-    if (_terminating || _amBlendBusy) return;
-    [self stopAppleBlendTimer];
-    _amBlendActive = NO;
-    int original = _amBlendOriginal;
-    BOOL known = _amBlendVolumeKnown;
-    _amBlendVolumeKnown = NO;
-    _amBlendPhase = MusicDipIdle;
-    if (!known) {
-        void (^go)(void) = _amBlendStopThen;
-        _amBlendStopThen = nil;
-        if (go) go();
-        return;
-    }
-    _amBlendBusy = YES;
-    NSUInteger token = _amBlendToken;
-    [self applyAppleMusicVolume:original verify:YES done:^(BOOL __unused ok, BOOL __unused dropped) {
-        if (token != self->_amBlendToken) {
-            self->_amBlendBusy = NO;
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        self->_amBlendBusy = NO;
-        void (^go)(void) = self->_amBlendStopThen;
-        self->_amBlendStopThen = nil;
-        if (go) go();
-    }];
-}
-- (void)requestAppleMusicBlendStopThen:(void (^)(void))then {
-    if (![self appleMusicBlendBusy]) { if (then) then(); return; }
-    _amBlendStopThen = then;
-    _amBlendActive = NO;
-    _amBlendToken++;
-    [self stopAppleBlendTimer];
-    if (!_amBlendBusy) [self finishAppleMusicBlendStop];
-}
-- (void)finishAppleMusicBlend {
-    [self stopAppleBlendTimer];
-    _amBlendActive = NO;
-    _amBlendVolumeKnown = NO;
-    _amBlendPhase = MusicDipIdle;
-    _amBlendSkipSent = NO;
-    _amBlendStopThen = nil;
-}
-- (void)appleMusicBlendFireNext {
-    if (!_amBlendActive || _amBlendBusy) return;
-    _amBlendPhase = MusicDipSkip;
-    _amBlendSkipSent = YES;
-    _amBlendBusy = YES;
-    NSUInteger token = _amBlendToken;
-    [self runAppleMusicCommand:@"next track\ndelay 0.3" followUp:YES done:^(BOOL ok) {
-        self->_amBlendBusy = NO;
-        if (token != self->_amBlendToken || !self->_amBlendActive) {
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        if (!ok) {
-            // The command did not land. This restore's own cut, and a press that
-            // replaces it, still owe one next.
-            self->_amBlendSkipSent = NO;
-            self->_amBlendActive = NO;
-            __weak __typeof(self) weakSelf = self;
-            self->_amBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        self->_amBlendPhase = MusicDipUp;
-        self->_amBlendApplied = 0;
-        self->_amBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
-        [self appleMusicBlendTick:nil];
-    }];
-}
-- (void)appleMusicBlendTick:(NSTimer *)timer {
-    (void)timer;
-    if (!_amBlendActive || _amBlendBusy) return;
-    if (_amBlendPhase != MusicDipDown && _amBlendPhase != MusicDipUp) return;
-    BOOL up = _amBlendPhase == MusicDipUp;
-    if (_amBlendOriginal == 0) {
-        if (up) [self finishAppleMusicBlend];
-        else [self appleMusicBlendFireNext];
-        return;
-    }
-    const double dip = 1.5;
-    BOOL phaseDone = NO;
-    double level = MusicDipLevel(CFAbsoluteTimeGetCurrent() - _amBlendPhaseStarted, dip, up, &phaseDone);
-    int target = (int)llround((double)_amBlendOriginal * level);
-    if (phaseDone) target = up ? _amBlendOriginal : 0;
-    if (target == _amBlendApplied) {
-        if (!phaseDone) return;
-        if (up) [self finishAppleMusicBlend];
-        else [self appleMusicBlendFireNext];
-        return;
-    }
-    _amBlendApplied = target;
-    NSUInteger token = _amBlendToken;
-    _amBlendBusy = YES;
-    [self applyAppleMusicVolume:target verify:NO done:^(BOOL ok, BOOL dropped) {
-        self->_amBlendBusy = NO;
-        if (token != self->_amBlendToken || !self->_amBlendActive) {
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        if (dropped) return;
-        if (!ok) {
-            BOOL owesNext = MusicBlendCutOwesNext(self->_amBlendPhase, self->_amBlendSkipSent);
-            self->_amBlendActive = NO;
-            __weak __typeof(self) weakSelf = self;
-            self->_amBlendStopThen = ^{ if (owesNext) [weakSelf performMusicNextCutNow]; };
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        [self appleMusicBlendTick:nil];
-    }];
-}
-- (void)beginAppleMusicBlend {
-    if (_amBlendActive || _amBlendBusy) { [self finishRunningBlendAsCut]; return; }
-    _amBlendSkipSent = NO;
-    _amBlendActive = YES;
-    _amBlendPhase = MusicDipDown;
-    _amBlendVolumeKnown = NO;
-    _amBlendToken++;
-    NSUInteger token = _amBlendToken;
-    _amBlendBusy = YES;
-    RunAppleScript(@"tell application \"Music\" to sound volume", ^(NSString *output, NSString *errorText, int status) {
-        (void)errorText;
-        self->_amBlendBusy = NO;
-        if (token != self->_amBlendToken || !self->_amBlendActive) {
-            [self finishAppleMusicBlendStop];
-            return;
-        }
-        int volume = 0;
-        if (status != 0 || !MusicSoundVolume(output, &volume)) {
-            self->_amBlendActive = NO;
-            [self performMusicNextCutNow];
-            return;
-        }
-        self->_amBlendOriginal = volume;
-        self->_amBlendApplied = volume;
-        self->_amBlendVolumeKnown = YES;
-        self->_amBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
-        [self stopAppleBlendTimer];
-        self->_amBlendTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 target:self
-                                                    selector:@selector(appleMusicBlendTick:)
-                                                    userInfo:nil repeats:YES];
-        [NSRunLoop.mainRunLoop addTimer:self->_amBlendTimer forMode:NSRunLoopCommonModes];
-        [self appleMusicBlendTick:nil];
-    });
-}
-- (BOOL)youTubeBlendBusy {
-    return _ytBlendActive || _ytBlendBusy || _ytBlendVolumeKnown || _ytBlendStopThen != nil;
-}
-- (void)stopYouTubeBlendTimer {
-    [_ytBlendTimer invalidate];
-    _ytBlendTimer = nil;
-}
-// Same generation rule as Music. A JavaScript denial is a failed set: the page
-// did not take the volume. verify re-reads the video volume in cents.
-- (void)applyYouTubeVolume:(double)volume verify:(BOOL)verify done:(void (^)(BOOL ok, BOOL dropped))done {
-    if (!isfinite(volume) || volume < 0) volume = 0;
-    if (volume > 1) volume = 1;
-    uint64_t generation = verify ? BumpVolumeGeneration(&gChromeVolumeGeneration)
-                                : CurrentVolumeGeneration(&gChromeVolumeGeneration);
-    NSString *script = YouTubeControlScript(YouTubeVolumeAction(volume));
-    NSString *readScript = verify ? YouTubeControlScript(@"volget") : nil;
-    BOOL (^setOK)(NSString *, NSString *, int) = ^BOOL(NSString *output, NSString *errorText, int status) {
-        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        return status == 0 && [parsed[@"denied"] isEqual:@""];
-    };
-    BOOL (^matches)(NSString *, NSString *, int) = nil;
-    if (verify) {
-        matches = ^BOOL(NSString *output, NSString *errorText, int status) {
-            NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-            NSNumber *n = [parsed[@"volume"] isKindOfClass:NSNumber.class] ? parsed[@"volume"] : nil;
-            BOOL readOK = status == 0 && [parsed[@"denied"] isEqual:@""] && n != nil;
-            return YouTubeRestoredVolumeMatches(readOK, n ? n.doubleValue : 0, volume);
-        };
-    }
-    RunGeneratedVolumeScript(ChromeVolumeQueue(), &gChromeVolumeGeneration, generation, script, readScript,
-                            setOK, matches, done);
-}
-// Idle here is "not dipping", not "next was not sent". _ytBlendSkipSent stays.
-- (void)finishYouTubeBlendStop {
-    if (_terminating || _ytBlendBusy) return;
-    [self stopYouTubeBlendTimer];
-    _ytBlendActive = NO;
-    double original = _ytBlendOriginal;
-    BOOL known = _ytBlendVolumeKnown;
-    _ytBlendVolumeKnown = NO;
-    _ytBlendPhase = MusicDipIdle;
-    if (!known) {
-        void (^go)(void) = _ytBlendStopThen;
-        _ytBlendStopThen = nil;
-        if (go) go();
-        return;
-    }
-    _ytBlendBusy = YES;
-    NSUInteger token = _ytBlendToken;
-    [self applyYouTubeVolume:original verify:YES done:^(BOOL __unused ok, BOOL __unused dropped) {
-        if (token != self->_ytBlendToken) {
-            self->_ytBlendBusy = NO;
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        self->_ytBlendBusy = NO;
-        void (^go)(void) = self->_ytBlendStopThen;
-        self->_ytBlendStopThen = nil;
-        if (go) go();
-    }];
-}
-- (void)requestYouTubeBlendStopThen:(void (^)(void))then {
-    if (![self youTubeBlendBusy]) { if (then) then(); return; }
-    _ytBlendStopThen = then;
-    _ytBlendActive = NO;
-    _ytBlendToken++;
-    [self stopYouTubeBlendTimer];
-    if (!_ytBlendBusy) [self finishYouTubeBlendStop];
-}
-- (void)finishYouTubeBlend {
-    [self stopYouTubeBlendTimer];
-    _ytBlendActive = NO;
-    _ytBlendVolumeKnown = NO;
-    _ytBlendPhase = MusicDipIdle;
-    _ytBlendSkipSent = NO;
-    _ytBlendStopThen = nil;
-}
-- (void)youTubeBlendFireNext {
-    if (!_ytBlendActive || _ytBlendBusy) return;
-    _ytBlendPhase = MusicDipSkip;
-    _ytBlendSkipSent = YES;
-    _ytBlendBusy = YES;
-    NSUInteger token = _ytBlendToken;
-    NSUInteger generation = ++_musicGen;
-    RunAppleScript(YouTubeControlScript(@"next"), ^(NSString *output, NSString *errorText, int status) {
-        self->_ytBlendBusy = NO;
-        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        BOOL unanswered = [parsed[@"denied"] isEqual:@""] && ![parsed[@"tab"] boolValue] && status != 0;
-        if ([parsed[@"denied"] isEqual:@"javascript"]) {
-            [self applyYouTubeStatus:parsed updateTransport:NO];
-            PostSystemMediaKey(NX_KEYTYPE_NEXT);
-            self->_ytBlendActive = NO;
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        if (generation == self->_musicGen && !unanswered)
-            [self applyYouTubeStatus:parsed updateTransport:NO];
-        if (generation == self->_musicGen)
-            [self runYouTubeStatusAfter:0.3 generation:generation];
-        // A status line means the click ran. unanswered is the timeout / no-tab case,
-        // where the skip still has to happen or the dip just sits at volume 0.
-        if (unanswered) {
-            // No tab, or the script timed out: the click did not run.
-            self->_ytBlendSkipSent = NO;
-            self->_ytBlendActive = NO;
-            __weak __typeof(self) weakSelf = self;
-            self->_ytBlendStopThen = ^{ [weakSelf performMusicNextCutNow]; };
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        self->_ytBlendPhase = MusicDipUp;
-        self->_ytBlendApplied = 0;
-        self->_ytBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
-        [self youTubeBlendTick:nil];
-    });
-}
-- (void)youTubeBlendTick:(NSTimer *)timer {
-    (void)timer;
-    if (!_ytBlendActive || _ytBlendBusy) return;
-    if (_ytBlendPhase != MusicDipDown && _ytBlendPhase != MusicDipUp) return;
-    BOOL up = _ytBlendPhase == MusicDipUp;
-    if (!(_ytBlendOriginal > 0)) {
-        if (up) [self finishYouTubeBlend];
-        else [self youTubeBlendFireNext];
-        return;
-    }
-    const double dip = 1.2;
-    BOOL phaseDone = NO;
-    double level = MusicDipLevel(CFAbsoluteTimeGetCurrent() - _ytBlendPhaseStarted, dip, up, &phaseDone);
-    double target = phaseDone ? (up ? _ytBlendOriginal : 0) : _ytBlendOriginal * level;
-    if (MusicVolumeCents(target) == MusicVolumeCents(_ytBlendApplied)) {
-        if (!phaseDone) return;
-        if (up) [self finishYouTubeBlend];
-        else [self youTubeBlendFireNext];
-        return;
-    }
-    _ytBlendApplied = target;
-    NSUInteger token = _ytBlendToken;
-    _ytBlendBusy = YES;
-    [self applyYouTubeVolume:target verify:NO done:^(BOOL ok, BOOL dropped) {
-        self->_ytBlendBusy = NO;
-        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        if (dropped) return;
-        if (!ok) {
-            BOOL owesNext = MusicBlendCutOwesNext(self->_ytBlendPhase, self->_ytBlendSkipSent);
-            self->_ytBlendActive = NO;
-            __weak __typeof(self) weakSelf = self;
-            self->_ytBlendStopThen = ^{ if (owesNext) [weakSelf performMusicNextCutNow]; };
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        [self youTubeBlendTick:nil];
-    }];
-}
-- (void)beginYouTubeBlend {
-    if (_ytJSDenied || !ChromeIsRunning()) { [self performMusicNextCutNow]; return; }
-    if (_ytBlendActive || _ytBlendBusy) { [self finishRunningBlendAsCut]; return; }
-    _ytBlendSkipSent = NO;
-    _ytBlendActive = YES;
-    _ytBlendPhase = MusicDipDown;
-    _ytBlendVolumeKnown = NO;
-    _ytBlendToken++;
-    NSUInteger token = _ytBlendToken;
-    _ytBlendBusy = YES;
-    RunAppleScript(YouTubeControlScript(@"volget"), ^(NSString *output, NSString *errorText, int status) {
-        self->_ytBlendBusy = NO;
-        if (token != self->_ytBlendToken || !self->_ytBlendActive) {
-            [self finishYouTubeBlendStop];
-            return;
-        }
-        NSDictionary *parsed = ParseYouTubeStatus(output, errorText);
-        if (![parsed[@"denied"] isEqual:@""]) {
-            [self applyYouTubeStatus:parsed updateTransport:NO];
-            self->_ytBlendActive = NO;
-            [self performMusicNextCutNow];
-            return;
-        }
-        if (status != 0 && ![parsed[@"tab"] boolValue]) {
-            self->_ytBlendActive = NO;
-            [self performMusicNextCutNow];
-            return;
-        }
-        NSNumber *volume = [parsed[@"volume"] isKindOfClass:NSNumber.class] ? parsed[@"volume"] : nil;
-        double original = volume ? volume.doubleValue : 1;
-        if (!isfinite(original) || original < 0) original = 1;
-        if (original > 1) original = 1;
-        self->_ytBlendOriginal = original;
-        self->_ytBlendApplied = original;
-        self->_ytBlendVolumeKnown = YES;
-        self->_ytBlendPhaseStarted = CFAbsoluteTimeGetCurrent();
-        [self stopYouTubeBlendTimer];
-        self->_ytBlendTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 target:self
-                                                    selector:@selector(youTubeBlendTick:)
-                                                    userInfo:nil repeats:YES];
-        [NSRunLoop.mainRunLoop addTimer:self->_ytBlendTimer forMode:NSRunLoopCommonModes];
-        [self youTubeBlendTick:nil];
-    });
+    if (!_localMode) return;
+    if (_localBlendTimer || _localOutgoing) { [self finishLocalBlend]; return; }
+    [self beginLocalBlend];
 }
 - (IBAction)musicNext:(id)sender {
     ++_offlinePlayGeneration; _mixStartingKey = nil;
@@ -8779,23 +7222,26 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (![subtitle isKindOfClass:NSTextField.class]) return;
     double elapsed = _trackElapsed;
     if (_trackSampledAt > 0) elapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
-    if (_amLoaded && !_localMode && !_deckMode) {
+    if (_localMode) {
         NSView *view = _popover.contentViewController.view;
         NSTextField *now = (NSTextField *)ViewWithAccessibilityIdentifier(view, @"popover.music.elapsed");
+        NSTextField *length = (NSTextField *)ViewWithAccessibilityIdentifier(view, @"popover.music.duration");
         NSSlider *slider = (NSSlider *)ViewWithAccessibilityIdentifier(view, @"popover.music.position");
         NSString *clock = FormatTrackClock(elapsed, _trackDuration);
         if ([now isKindOfClass:NSTextField.class] && clock) now.stringValue = clock;
-        if ([slider isKindOfClass:NSSlider.class]) slider.doubleValue = MIN(elapsed, _trackDuration);
-        return;
+        if ([length isKindOfClass:NSTextField.class] && _trackDuration > 0)
+            length.stringValue = FormatTrackClock(_trackDuration, _trackDuration);
+        if ([slider isKindOfClass:NSSlider.class] && _trackDuration > 0)
+            slider.doubleValue = MIN(MAX(elapsed, 0), _trackDuration);
     }
+    if (!_localMode) return;
     NSString *time = FormatTrackTime(elapsed, _trackDuration);
     if (!time.length) return;
-    NSString *artist = _deckMode ? _deckArtist : (_localMode ? _localArtist : _ytArtist);
+    NSString *artist = _localArtist;
     subtitle.stringValue = artist.length ? [NSString stringWithFormat:@"%@ · %@", artist, time] : time;
     subtitle.accessibilityLabel = subtitle.stringValue;   // VoiceOver reads the label, not the text
 }
 - (void)noteLocalPlaybackTime {
-    if (_deckMode) return;
     if (!_localPlayer) { _trackDuration = 0; _trackSampledAt = 0; return; }
     CMTime now = _localPlayer.currentTime;
     CMTime length = _localPlayer.currentItem ? _localPlayer.currentItem.duration : kCMTimeInvalid;
@@ -8808,12 +7254,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 }
 - (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
     [self ensureOfflinePlaylists];
-    BOOL offline = [self musicOffline];
-    BOOL am = _amLoaded && !_localMode && !_deckMode;
-    BOOL loaded = _ytTabOpen || _localMode || am || _deckMode;
-    // Existing Music transport remains controllable; idle Play uses the saved offline snapshot.
-    BOOL amTarget = !_deckMode && (am || (!_localMode && !_ytTabOpen && !offline));
-    if (_musicProbesEnabled && offline && !_localMode) {
+    BOOL loaded = _localMode;
+    if (_musicProbesEnabled && !_localMode) {
         NSArray *tracks = [self offlineTrackPaths];
         _localEmpty = tracks.count == 0;
     }
@@ -8822,20 +7264,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         _playbackKnown = YES;
         _playbackPlaying = _localPlayer.rate > 0;
     }
-    NSString *trackTitle = nil, *trackArtist = nil;
-    if (_deckMode && _deckTitle.length) {
-        trackTitle = _deckTitle;
-        trackArtist = _deckArtist;
-    } else if (_localMode && _localTitle.length) {
-        trackTitle = _localTitle;
-        trackArtist = _localArtist;
-    } else if (am) {
-        trackTitle = _amTitle;
-        trackArtist = _amArtist;
-    } else if (!_localMode && _ytTabOpen && _ytTitle.length) {
-        trackTitle = _ytTitle;
-        trackArtist = _ytArtist;
-    }
+    NSString *trackTitle = _localMode ? _localTitle : nil;
+    NSString *trackArtist = _localMode ? _localArtist : nil;
     NSString *symbol = @"play.fill", *playLabel = @"Play";
     if (loaded) {
         if (!_playbackKnown) { symbol = @"playpause"; playLabel = @"Play or pause"; }
@@ -8848,96 +7278,50 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
                                     action:@selector(musicPrevious:) identifier:@"popover.music.previous"
                                      label:@"Previous track"];
     prev.frame = NSOffsetRect(prev.frame, x, 0);
-    // The deck has no previous. Keep the button in the row and dim it.
-    BOOL prevOn = loaded && !_deckMode;
-    prev.enabled = prevOn;
-    if (!prevOn) prev.contentTintColor = NSColor.tertiaryLabelColor;
+    prev.enabled = loaded;
+    if (!loaded) prev.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:prev];
     x = NSMaxX(prev.frame) + 2;
     NSButton *play = [self transportButton:symbol pointSize:24 side:28
                                     action:@selector(musicPlay:) identifier:@"popover.music.play" label:playLabel];
     play.frame = NSOffsetRect(play.frame, x, 0);
     if (!loaded) {
-        NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
-        play.enabled = [coverage[@"ready"] boolValue] && !_offlineVerifyBusy;
-        play.accessibilityHelp = [self offlineStatus:coverage];
+        NSArray *liked = [self offlineTrackPaths];
+        play.enabled = liked.count > 0;
+        if (!liked.count) {
+            NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
+            play.accessibilityHelp = [self offlineStatus:coverage];
+        }
     }
     [row addSubview:play];
     x = NSMaxX(play.frame) + 2;
-    NSString *nextTip = kMusicNextTip;
-    if (_deckMode && _deckNextTitle.length)
-        nextTip = [NSString stringWithFormat:@"%@ — %@", kMusicNextTip, _deckNextTitle];
     NSButton *next = [self transportButton:@"forward.end.fill" pointSize:18 side:22
-                                    action:@selector(musicNext:) identifier:@"popover.music.next" label:nextTip];
-    next.accessibilityHelp = nextTip;
-    next.toolTip = nextTip;
+                                    action:@selector(musicNext:) identifier:@"popover.music.next" label:kMusicNextTip];
+    next.accessibilityHelp = kMusicNextTip;
+    next.toolTip = kMusicNextTip;
     next.frame = NSOffsetRect(next.frame, x, 0);
     next.enabled = loaded;
     if (!loaded) next.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:next];
-    // The output device and its volume have their own line below; the title runs to the edge.
     CGFloat textX = NSMaxX(next.frame) + 8;
     CGFloat textRight = kW - kPad;
-    NSString *detail = nil;
-    if (am) {
-        NSMutableArray *parts = [NSMutableArray array];
-        for (NSString *part in @[_amTitle ?: @"", _amArtist ?: @"", _amAlbum ?: @"", _amPlaylist ?: @""])
-            if (part.length) [parts addObject:part];
-        detail = [parts componentsJoinedByString:@" — "];
-    }
-    if (amTarget) {
-        // Cover art is the way into Music, as in Control Center's Now Playing.
-        const CGFloat side = 32;
-        NSImage *cover = am ? _amArt : nil;
-        if (!cover) {
-            NSURL *app = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:kAppleMusicBundleID];
-            cover = app ? [NSWorkspace.sharedWorkspace iconForFile:app.path]
-                        : [NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil];
-        }
-        NSButton *art = [NSButton buttonWithImage:cover target:self action:@selector(openAppleMusic:)];
-        art.title = @"";
-        art.bordered = NO;
-        art.imagePosition = NSImageOnly;
-        art.imageScaling = NSImageScaleProportionallyUpOrDown;
-        art.frame = NSMakeRect(textX, (kSoundH - side) / 2.0, side, side);
-        art.wantsLayer = YES;
-        art.layer.cornerRadius = am && _amArt ? 4 : 0;
-        art.layer.masksToBounds = YES;
-        art.accessibilityIdentifier = @"popover.music.open";
-        art.accessibilityLabel = @"Open Music";
-        art.accessibilityHelp = detail.length ? [@"Open Music — " stringByAppendingString:detail] : @"Open Music";
-        [row addSubview:art];
-        textX = NSMaxX(art.frame) + 8;
-    }
-    // The same ♥ and 👍 as Apple Music, on a local station or seed-mix queue.
-    BOOL localQueue = _mixPlayingKey.length && (_localMode || (_deckMode && _deckPath.length));
-    if (am || localQueue) {
-        BOOL hearted = NO;
-        NSString *heartError = nil;
-        NSString *thumbID = nil;
-        if (am) {
-            hearted = _amFavorited;
-            thumbID = _amTrackID;
-        } else {
-            NSDictionary *ident = [self currentLocalIdentity];
-            NSString *key = ident[@"trackKey"];
-            hearted = key.length && [[self heartedKeys] containsObject:key];
-            heartError = _localHeartError;
-            thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : key;
-        }
+    if (loaded) {
+        NSDictionary *ident = [self currentLocalIdentity];
+        NSString *key = ident[@"trackKey"];
+        BOOL hearted = key.length && [[self heartedKeys] containsObject:key];
+        NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : key;
         NSButton *heart = [self transportButton:hearted ? @"heart.fill" : @"heart" pointSize:15 side:22
                                          action:@selector(musicFavorite:) identifier:@"popover.music.favorite"
                                           label:hearted ? @"Remove from Favourites" : @"Add to Favourites"];
         heart.frame = NSOffsetRect(heart.frame, textRight - 22, 0);
-        if (heartError.length) {
+        if (_localHeartError.length) {
             heart.contentTintColor = NSColor.systemRedColor;
-            heart.toolTip = heartError;
-            heart.accessibilityHelp = heartError;
+            heart.toolTip = _localHeartError;
+            heart.accessibilityHelp = _localHeartError;
         } else {
             heart.contentTintColor = hearted ? NSColor.systemPinkColor : NSColor.secondaryLabelColor;
         }
         [row addSubview:heart];
-        // 👍 tells the curator "I like this", apart from ♥ (which keeps it in the library).
         BOOL liked = thumbID.length && [[self mixLiked] containsObject:thumbID];
         NSButton *thumb = [self transportButton:liked ? @"hand.thumbsup.fill" : @"hand.thumbsup" pointSize:14 side:22
                                          action:@selector(musicThumbsUp:) identifier:@"popover.music.thumbsup"
@@ -8948,9 +7332,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         textRight = NSMinX(thumb.frame) - 6;
     }
     CGFloat textW = textRight - textX;
-    NSString *titleText = trackTitle.length ? trackTitle : [self appleMusicPlaylistName];
-    // The row is a plain NSView, so y grows up; the flipped popover only applies to the root.
-    // Title and subtitle are one block, centred in the row with the symbols.
+    NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
     const CGFloat titleH = 15, subtitleH = 14, textGap = 1;
     CGFloat textBottom = (kSoundH - (titleH + textGap + subtitleH)) / 2.0;
     NSTextField *title = [self text:titleText font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
@@ -8962,13 +7344,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     double shownElapsed = _trackElapsed;
     if (loaded && _playbackPlaying && _trackSampledAt > 0)
         shownElapsed += CFAbsoluteTimeGetCurrent() - _trackSampledAt;
-    NSString *time = loaded && !am ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
+    NSString *time = loaded ? FormatTrackTime(shownElapsed, _trackDuration) : nil;
     NSString *subtitleText;
     if (!loaded) {
         NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
-        subtitleText = [coverage[@"total"] unsignedIntegerValue]
-            ? [NSString stringWithFormat:@"%@/%@ downloaded · saved playlist", coverage[@"available"], coverage[@"total"]]
-            : @"Offline playlist not prepared";
+        subtitleText = [self offlineStatus:coverage];
     } else if (trackArtist.length && time.length) {
         subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
     } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
@@ -8979,14 +7359,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     subtitle.accessibilityIdentifier = @"popover.music.subtitle";
     subtitle.accessibilityLabel = subtitleText;
     [row addSubview:subtitle];
-    if (detail.length) { title.accessibilityHelp = detail; subtitle.accessibilityHelp = detail; }
     [root addSubview:row];
     y += kSoundH;
-    if (am) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
+    if (loaded && _trackDuration > 0) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
     y = [self addOutputLineTo:root at:y];
     y = [self addAudioRoutesTo:root at:y];
-    // The tiles stay up when YouTube or the offline player has the transport. Hiding them
-    // unless Apple Music was the target is what made the row disappear (5 Nov 2026).
     if (!_musicOff) y = [self addSeedTilesTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
 }
@@ -9299,12 +7676,11 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     if (gap < 2) gap = 2;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
     line.accessibilityIdentifier = @"popover.mix";
-    BOOL mixPlaying = [_amPlaylist isEqualToString:kMixPlaylistName];
     NSFont *capFont = [NSFont systemFontOfSize:10];
     CGFloat x = kPad;
     for (NSUInteger i = 0; i < n; i++) {
         NSDictionary *seed = _mixSeeds[i];
-        BOOL playing = (mixPlaying || _localMode) && [seed[@"key"] isEqual:_mixPlayingKey];
+        BOOL playing = _localMode && [seed[@"key"] isEqual:_mixPlayingKey];
         BOOL starting = [seed[@"key"] isEqual:_mixStartingKey];
         NSImage *cover = _mixArt[seed[@"trackID"]];
         GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
@@ -9484,13 +7860,13 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [root addSubview:line];
     return y + h;
 }
-// Elapsed, a seek slider, the length, and shuffle under the output column.
+// Elapsed, a seek slider, and the length under the transport row.
 - (CGFloat)addAppleMusicScrubberTo:(NSView *)root at:(CGFloat)y elapsed:(double)elapsed {
     const CGFloat h = 18, clockW = 40;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, h)];
     line.accessibilityIdentifier = @"popover.music.scrubber";
     NSFont *clockFont = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
-    CGFloat shuffleX = kW - kPad - kLeadW;
+    CGFloat rightX = kW - kPad;
     BOOL timed = _trackDuration > 0;
     NSTextField *now = [self text:timed ? FormatTrackClock(elapsed, _trackDuration) : @"" font:clockFont
                             color:NSColor.secondaryLabelColor at:NSMakeRect(kPad, 2, clockW, 14)
@@ -9499,7 +7875,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [line addSubview:now];
     NSTextField *length = [self text:timed ? FormatTrackClock(_trackDuration, _trackDuration) : @"" font:clockFont
                                color:NSColor.secondaryLabelColor
-                                  at:NSMakeRect(shuffleX - 8 - clockW, 2, clockW, 14) align:NSTextAlignmentRight];
+                                  at:NSMakeRect(rightX - clockW, 2, clockW, 14) align:NSTextAlignmentRight];
     length.accessibilityIdentifier = @"popover.music.duration";
     [line addSubview:length];
     if (timed) {
@@ -9513,12 +7889,6 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         slider.accessibilityLabel = @"Position";
         [line addSubview:slider];
     }
-    NSButton *shuffle = [self transportButton:@"shuffle" pointSize:13 side:18 action:@selector(musicShuffle:)
-                                   identifier:@"popover.music.shuffle" label:@"Shuffle"];
-    shuffle.frame = NSMakeRect(shuffleX, 0, kLeadW, h);
-    shuffle.contentTintColor = _amShuffle ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
-    shuffle.accessibilityValue = _amShuffle ? @"on" : @"off";
-    [line addSubview:shuffle];
     [root addSubview:line];
     return y + h;
 }
@@ -10602,7 +8972,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         if(!self->_popover.isShown || self->_terminating)return;
         [self refresh];
-        if(self->_musicProbesEnabled && !self->_musicOff){[self yieldLocalMusicIfIdle];[self refreshMusicSources];[self ensureDeckPollTimer];}
+        if(self->_musicProbesEnabled && !self->_musicOff){[self yieldLocalMusicIfIdle];}
         [self beginSampling];[self startPowerTick];
     });
     // When the panel is taller than the screen allows it scrolls, and an overlay scroller
@@ -10702,10 +9072,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     [GBSeedTile closeLarge];
     (void)note;
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
-    [self stopYouTubeProbeTimer];
     [self stopTrackTick];
-    [self stopAppleMusicProbeTimer];
-    if (!_deckMode) [self stopDeckPollTimer];
     if (!_detailsWindow.isVisible) [self stopPowerTick];
 }
 

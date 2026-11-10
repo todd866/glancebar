@@ -877,7 +877,7 @@ NSString *SeedCaption(NSString *title);
 // (artist and title both in the filename) comes first, then other files by that artist,
 // at most 40. Legacy grouping only; never evidence of offline playlist readiness.
 NSArray<NSString *> *LocalSeedFiles(NSDictionary *seed, NSArray<NSString *> *paths);
-// A complete, ordered snapshot only. Missing/stale files never yield a partial queue.
+// Ordered snapshot: verified files play in order; missing entries are skipped. Ready when at least one file is on disk.
 // Fast UI checks validate identity, size, inode and nanosecond mtime; playback uses verifyHash.
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash);
 NSDictionary *OfflinePathsCoverage(NSArray *paths, NSString *musicRoot);

@@ -34,8 +34,19 @@ int main(void) {
             NSMutableDictionary *stale = [request mutableCopy];
             NSMutableDictionary *retag = [request[@"tracks"][0] mutableCopy]; retag[@"album"] = @"Different edition"; stale[@"tracks"] = @[retag];
             check(![OfflinePlaylistCoverage(stale, manifest, root, NO)[@"ready"] boolValue], @"same ID with stale metadata fails closed");
-            stale[@"tracks"] = @[request[@"tracks"][0], retag];
-            check([OfflinePlaylistCoverage(stale, manifest, root, NO)[@"paths"] count] == 0, @"partial playlist never supplies a playable queue");
+            NSDictionary *missing = @{@"id": @"missing-id", @"title": @"Missing", @"artist": @"Nobody", @"album": @""};
+            NSMutableDictionary *partialRequest = [request mutableCopy];
+            partialRequest[@"tracks"] = @[request[@"tracks"][0], missing];
+            NSMutableDictionary *partialManifest = [manifest mutableCopy];
+            NSMutableArray *playlists = [manifest[@"playlists"] mutableCopy];
+            NSMutableDictionary *entry = [playlists[0] mutableCopy];
+            entry[@"requestedTracks"] = partialRequest[@"tracks"];
+            entry[@"requestedTrackIDs"] = @[@"fixture-id", @"missing-id"];
+            entry[@"tracks"] = playlists[0][@"tracks"];
+            playlists[0] = entry;
+            partialManifest[@"playlists"] = playlists;
+            NSDictionary *partial = OfflinePlaylistCoverage(partialRequest, partialManifest, root, NO);
+            check([partial[@"ready"] boolValue] && [partial[@"paths"] count] == 1, @"partial playlist supplies on-disk tracks in order");
             check(![OfflinePlaylistCoverage(request, manifest, [root stringByAppendingPathComponent:@"other"], NO)[@"ready"] boolValue], @"out of pool file rejected");
             NSString *link = [root stringByAppendingPathComponent:@"link.m4a"];
             [fm createSymbolicLinkAtPath:link withDestinationPath:path error:nil];
@@ -64,13 +75,11 @@ int main(void) {
             check(!c.received, @"media-key pause cancels a pending playlist start");
             [c setValue:@YES forKey:@"localMode"]; [c setValue:@YES forKey:@"networkKnown"]; [c setValue:@YES forKey:@"networkOnline"];
             [c setValue:@"song:test" forKey:@"mixPlayingKey"]; [c yieldLocalMusicIfIdle];
-            check([[c valueForKey:@"localMode"] boolValue], @"online refresh retains paused saved offline queue");
+            check([[c valueForKey:@"localMode"] boolValue], @"yield no longer tears down paused offline queue");
             [c setValue:@NO forKey:@"localMode"];
-            [c setValue:@YES forKey:@"amLoaded"];
             [c playOfflinePlaylist:@"song:test"]; settle();
-            check(!c.received, @"loaded Music cannot be overlapped or paused implicitly");
-            [c setValue:@NO forKey:@"amLoaded"];
-            [c playOfflinePlaylist:@"song:test"];
+            check([c.received isEqual:@[path]], @"local player starts without Music/Chrome/deck guards");
+            c.received = nil;
             [c setValue:@[] forKey:@"mixSeeds"]; settle();
             check(!c.received, @"hidden old seed cannot start after asynchronous validation");
             [c setValue:@[@{@"key": @"song:test"}] forKey:@"mixSeeds"];
@@ -89,21 +98,29 @@ int main(void) {
             [c ensureStation];
             NSDictionary *stationRequest = [c valueForKey:@"offlineRequests"][@"station:triplej"];
             check([stationRequest[@"tracks"] count] == 2, @"station retains pathless queue entries as gaps");
+            NSDictionary *present = stationRequest[@"tracks"][0];
+            struct stat st; stat(path.fileSystemRepresentation, &st);
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            uint8_t bytes[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(data.bytes, (CC_LONG)data.length, bytes);
+            NSMutableString *hash = [NSMutableString string];
+            for (NSUInteger i = 0; i < sizeof(bytes); i++) [hash appendFormat:@"%02x", bytes[i]];
+            NSDictionary *record = @{@"id": present[@"id"], @"title": present[@"title"], @"artist": present[@"artist"],
+                @"album": present[@"album"], @"path": path, @"sizeBytes": @(st.st_size), @"sha256": hash,
+                @"inode": [NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino],
+                @"mtimeNs": [NSString stringWithFormat:@"%lld", (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec]};
+            NSMutableArray *requested = [NSMutableArray array];
+            for (NSDictionary *t in stationRequest[@"tracks"])
+                [requested addObject:@{@"id": t[@"id"], @"title": t[@"title"], @"artist": t[@"artist"], @"album": t[@"album"] ?: @""}];
+            NSDictionary *stationEntry = @{@"key": @"station:triplej", @"requestedTracks": requested,
+                @"requestedTrackIDs": @[present[@"id"], stationRequest[@"tracks"][1][@"id"]], @"tracks": @[record], @"ready": @YES};
+            NSMutableDictionary *stationManifest = [manifest mutableCopy];
+            stationManifest[@"playlists"] = @[manifest[@"playlists"][0], stationEntry];
+            [c setValue:stationManifest forKey:@"offlineManifest"];
             [c playStation:nil]; settle();
-            check(!c.received, @"partial station cannot reach player");
+            check([c.received isEqual:@[path]], @"partial station plays verified on-disk tracks only");
             [c setOfflineRequest:@"test:invalid" title:@"Invalid" tracks:request[@"tracks"]];
             [c setOfflineRequest:@"test:invalid" title:@"Invalid" tracks:@[@{@"title": @"Missing ID"}]];
             check([[c valueForKey:@"offlineRequests"][@"test:invalid"][@"tracks"] count] == 0, @"invalid newer request clears stale ready track list");
-            [c setValue:@YES forKey:@"amStatusInFlight"]; [c setValue:@42 forKey:@"amGen"];
-            __block BOOL called = NO, result = YES;
-            [c runAppleMusicCommand:@"" followUp:NO done:^(BOOL success) { called = YES; result = success; }];
-            check(called && !result && [[c valueForKey:@"amGen"] integerValue] == 42 && [[c valueForKey:@"amStatusInFlight"] boolValue], @"background Music probe cannot supersede active command or launch a script");
-            [c setValue:@NO forKey:@"amStatusInFlight"]; [c setValue:@YES forKey:@"amLoaded"];
-            [c setValue:@YES forKey:@"playbackKnown"]; [c setValue:@YES forKey:@"playbackPlaying"]; [c setValue:@123 forKey:@"trackSampledAt"];
-            [c noteAppleMusicUnavailable:kAppleMusicUnresponsiveNote];
-            check(![[c valueForKey:@"playbackKnown"] boolValue] && ![[c valueForKey:@"playbackPlaying"] boolValue] && [[c valueForKey:@"trackSampledAt"] doubleValue] == 0 && [[c valueForKey:@"musicNote"] isEqual:kAppleMusicUnresponsiveNote], @"Music timeout stops stale playing state and fake progress");
-            [c applyAppleMusicStatus:@{@"loaded": @YES, @"playing": @NO, @"title": @"Recovered", @"artist": @"Fixture", @"album": @"Fixture", @"trackID": @"", @"playlist": @"Fixture"}];
-            check([[c valueForKey:@"playbackKnown"] boolValue] && ![c valueForKey:@"musicNote"], @"fresh Music status clears stale warning without playback");
         } @finally { [fm removeItemAtPath:home error:nil]; }
         return failures ? 1 : 0;
     }

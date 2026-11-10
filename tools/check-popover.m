@@ -717,11 +717,18 @@ int main(int argc, const char **argv) {
             return Fail(__LINE__);
         NSTextField *claudeDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.claude.datum");
         if (![claudeDatum.stringValue hasPrefix:@"resets "]) return Fail(__LINE__);
+        [c setValue:@YES forKey:@"mixFrozen"];
+        [c setValue:[NSMutableDictionary dictionary] forKey:@"offlineRequests"];
+        [c rebuildContent];
+        root = p.contentViewController.view;
         NSView *output = FindIdentifier(root, @"popover.sound");
-        if (!SoundRow(root, @"Favourite Songs", @"Offline playlist not prepared", NO) ||
-            !FindIdentifier(root, @"popover.music.open") ||
-            ![output.accessibilityLabel isEqual:@"Sound output, Bose Flex SoundLink"] ||
-            ![output.accessibilityHelp isEqual:@"Bose Flex SoundLink"]) return Fail(__LINE__);
+        NSTextField *musicSubtitle = (NSTextField *)FindIdentifier(root, @"popover.music.subtitle");
+        if (!SoundRow(root, @"Liked Music", musicSubtitle.stringValue, NO) ||
+            ![musicSubtitle.stringValue hasSuffix:@"on this Mac"] ||
+            FindIdentifier(root, @"popover.music.open") ||
+            FindIdentifier(root, @"popover.music.shuffle") ||
+            ![output.accessibilityLabel isEqual:@"Mac output, Bose Flex SoundLink"] ||
+            ![output.accessibilityHelp containsString:@"Choose output"]) return Fail(__LINE__);
         {   // Where it will play and how loud: name beside the symbol, level coloured when loud or muted.
             NSButton *outputButton = (NSButton *)output;
             NSSlider *volume = (NSSlider *)FindIdentifier(root, @"popover.sound.volume");
@@ -740,8 +747,10 @@ int main(int argc, const char **argv) {
             [c setValue:@YES forKey:@"outputMuted"]; [c rebuildContent]; root = p.contentViewController.view;
             level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
             outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
+            NSImageView *volSymbol = (NSImageView *)FindIdentifier(root, @"popover.sound.volume.symbol");
             if (![level.stringValue isEqual:@"mute"] || ![level.textColor isEqual:NSColor.systemRedColor] ||
-                ![outputButton.contentTintColor isEqual:NSColor.systemRedColor]) return Fail(__LINE__);
+                ![volSymbol isKindOfClass:NSImageView.class] ||
+                ![volSymbol.contentTintColor isEqual:NSColor.systemRedColor]) return Fail(__LINE__);
             [c setValue:@0.55 forKey:@"outputVolume"]; [c setValue:@NO forKey:@"outputMuted"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
@@ -839,17 +848,14 @@ int main(int argc, const char **argv) {
                 [c rebuildContent]; root = p.contentViewController.view;
             }
             [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
-            [c setValue:@"Glancebar Mix" forKey:@"amPlaylist"];
+            [c setValue:@YES forKey:@"localMode"];
             [c rebuildContent]; root = p.contentViewController.view;
             s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
             NSTextField *c1 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.1");
             if (s1.layer.borderWidth < 1.9 || ![c1.textColor isEqual:NSColor.controlAccentColor]) return Fail(__LINE__);
-            [c setValue:nil forKey:@"amPlaylist"]; [c setValue:nil forKey:@"mixPlayingKey"];
+            [c setValue:@NO forKey:@"localMode"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
-            // The row was drawn only while Apple Music was the play target, so a YouTube tab
-            // (or offline playback) removed the tiles even though today's seeds were saved.
-            [c setValue:@YES forKey:@"ytTabOpen"];
-            [c setValue:@NO forKey:@"amLoaded"];
+            // Seed tiles stay visible whenever music is enabled; network state no longer hides them.
             [c setValue:@NO forKey:@"localMode"];
             [c rebuildContent]; root = p.contentViewController.view;
             if (!FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks"))
@@ -857,7 +863,6 @@ int main(int argc, const char **argv) {
             [c setValue:@YES forKey:@"musicProbesEnabled"];
             [c setValue:@YES forKey:@"networkKnown"];
             [c setValue:@NO forKey:@"networkOnline"];
-            [c setValue:@NO forKey:@"ytTabOpen"];
             [c rebuildContent]; root = p.contentViewController.view;
             if (!FindIdentifier(root, @"popover.mix.seed.0")) return Fail(__LINE__);
             [c setValue:@NO forKey:@"musicProbesEnabled"];
@@ -1345,11 +1350,11 @@ int main(int argc, const char **argv) {
             fabs(NSMaxX(cpuBar.frame) - NSMaxX(cpuGauge.frame)) > 0.5) return Fail(__LINE__);
         const char *musicState = getenv("GLANCEBAR_MUSIC_STATE");
         if (musicState && strcmp(musicState, "playing") == 0) {
-            [c setValue:@YES forKey:@"ytTabOpen"];
+            [c setValue:@YES forKey:@"localMode"];
             [c setValue:@YES forKey:@"playbackKnown"];
             [c setValue:@YES forKey:@"playbackPlaying"];
-            [c setValue:@"Midnight City" forKey:@"ytTitle"];
-            [c setValue:@"M83" forKey:@"ytArtist"];
+            [c setValue:@"Midnight City" forKey:@"localTitle"];
+            [c setValue:@"M83" forKey:@"localArtist"];
             [c setValue:@83 forKey:@"trackElapsed"];
             [c setValue:@243 forKey:@"trackDuration"];
             [c setValue:@[
@@ -1365,27 +1370,24 @@ int main(int argc, const char **argv) {
             if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
                 ![playingOut.accessibilityHelp containsString:@"click for"] ||
                 ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"] ||
-                FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+                !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "idle") == 0) {
-            [c setValue:@NO forKey:@"ytTabOpen"];
+            [c setValue:@NO forKey:@"localMode"];
             [c setValue:@NO forKey:@"playbackKnown"];
             [c setValue:@NO forKey:@"playbackPlaying"];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (!SoundRow(root, @"Favourite Songs", @"Offline playlist not prepared", NO) || !FitsChildren(root))
+            if (!SoundRow(root, @"Liked Music", @"0 of 0 on this Mac", NO) || !FitsChildren(root))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "apple") == 0) {
             [c setValue:@NO forKey:@"ytTabOpen"];
-            [c setValue:@YES forKey:@"amLoaded"];
-            [c setValue:@YES forKey:@"amFavorited"];
-            [c setValue:@YES forKey:@"amShuffle"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"playbackKnown"];
             [c setValue:@YES forKey:@"playbackPlaying"];
-            [c setValue:@"Lightning Crashes" forKey:@"amTitle"];
-            [c setValue:@"LIVE" forKey:@"amArtist"];
-            [c setValue:@"Throwing Copper" forKey:@"amAlbum"];
-            [c setValue:@"Favourite Songs" forKey:@"amPlaylist"];
+            [c setValue:@"Lightning Crashes" forKey:@"localTitle"];
+            [c setValue:@"LIVE" forKey:@"localArtist"];
             [c setValue:@83 forKey:@"trackElapsed"];
             [c setValue:@324 forKey:@"trackDuration"];
             const char *art = getenv("GLANCEBAR_MUSIC_ART");
@@ -1414,13 +1416,12 @@ int main(int argc, const char **argv) {
             NSTextField *elapsed = (NSTextField *)FindIdentifier(root, @"popover.music.elapsed");
             NSTextField *length = (NSTextField *)FindIdentifier(root, @"popover.music.duration");
             NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
-            NSButton *shuffle = (NSButton *)FindIdentifier(root, @"popover.music.shuffle");
             if (!SoundRow(root, @"Lightning Crashes", @"LIVE", YES) || !FitsChildren(root) ||
                 ![position isKindOfClass:NSSlider.class] || fabs(position.doubleValue - 83) > 1 ||
                 ![elapsed.stringValue isEqual:@"1:23"] || ![length.stringValue isEqual:@"5:24"] ||
-                ![heart.accessibilityLabel isEqual:@"Remove from Favourites"] ||
-                ![shuffle.accessibilityValue isEqual:@"on"] ||
-                ![FindIdentifier(root, @"popover.music.open").accessibilityHelp containsString:@"Throwing Copper"])
+                ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
+                FindIdentifier(root, @"popover.music.shuffle") ||
+                FindIdentifier(root, @"popover.music.open"))
                 return Fail(__LINE__);
             {   // 👍 sits just left of ♥ and doesn't crowd the title.
                 NSView *thumb = FindIdentifier(root, @"popover.music.thumbsup");
@@ -1441,7 +1442,8 @@ int main(int argc, const char **argv) {
             }
             if (mixRender) { [c setValue:frozenSeeds forKey:@"mixSeeds"]; [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"]; [c rebuildContent]; root = p.contentViewController.view; }
             // The scrubber line is the only extra height; later fixtures measure the idle panel.
-            [c setValue:@NO forKey:@"amLoaded"];
+            [c setValue:@NO forKey:@"localMode"];
+            [c setValue:nil forKey:@"mixPlayingKey"];
             [c setValue:@NO forKey:@"playbackKnown"];
             [c setValue:@NO forKey:@"playbackPlaying"];
         } else if (musicState && strcmp(musicState, "station") == 0) {
@@ -1490,11 +1492,13 @@ int main(int argc, const char **argv) {
             root = p.contentViewController.view;
             if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
                 return Fail(__LINE__);
+            [c setValue:@NO forKey:@"localMode"];
             [c setValue:@"" forKey:@"mixPlayingKey"];
             [c rebuildContent];
             root = p.contentViewController.view;
             if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
                 return Fail(__LINE__);
+            [c setValue:@YES forKey:@"localMode"];
             [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
             [c rebuildContent];
             root = p.contentViewController.view;

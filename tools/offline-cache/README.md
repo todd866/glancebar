@@ -12,7 +12,8 @@ python3 tools/offline-cache/offline_cache.py prepare --requests /path/offline-re
 `audit` only prints JSON. `prepare` publishes the same report atomically, plus a
 metadata scan cache and advisory single-writer lock beside the manifest. It
 references existing files by default, without duplicating any audio. Exit 0 means
-all nonempty playlists ready; exit 2 means a usable report with gaps; exit 75 means
+every nonempty playlist has at least one verified on-disk track (and ordered paths
+for those tracks); exit 2 means a usable report with gaps only; exit 75 means
 another preparation is active; exit 1 means an input/policy/I/O error. Consumers
 must reload reports on both 0 and 2 and validate their current requests against
 ordered `requestedTrackIDs` and the actual files. Never trust `ready` alone.

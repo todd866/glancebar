@@ -2028,9 +2028,9 @@ int main(void) {
             check(FormatTrackTime(10, 0) == nil && FormatTrackTime(10, -1) == nil &&
                   FormatTrackTime(10, NAN) == nil && FormatTrackTime(INFINITY, 100) == nil,
                   @"music: no clock without a finite positive duration, or with a non-finite elapsed");
-            check(YieldLocalMusic(YES, YES, NO) && !YieldLocalMusic(YES, YES, YES) &&
+            check(!YieldLocalMusic(YES, YES, NO) && !YieldLocalMusic(YES, YES, YES) &&
                   !YieldLocalMusic(YES, NO, NO) && !YieldLocalMusic(NO, YES, NO),
-                  @"music: local mode yields only when online and idle");
+                  @"music: phase 1 never yields local playback");
             check(YouTubeNewTabAllowed(1000, 0) && YouTubeNewTabAllowed(1000, 940) &&
                   !YouTubeNewTabAllowed(1000, 950) && !YouTubeNewTabAllowed(1000, 1000),
                   @"music: a new YouTube tab is allowed at most once a minute");
