@@ -13,10 +13,15 @@ static void check(BOOL ok, NSString *message) { fprintf(stderr, "%s %s\n", ok ? 
 @interface OfflineController : Controller
 @property NSArray *received;
 @property NSUInteger preparations, playerCalls;
+@property NSUInteger mixPrepareStarts;
 @end
 @implementation OfflineController
 - (void)playLocalPaths:(NSArray<NSString *> *)paths { self.received = paths; self.playerCalls++; }
 - (void)prepareOfflineCache { self.preparations++; }
+- (void)prepareMix:(NSDictionary *)seed then:(void (^)(NSArray *))done {
+    self.mixPrepareStarts++;
+    [super prepareMix:seed then:done];
+}
 @end
 static void settle(void) { NSDate *end = [NSDate dateWithTimeIntervalSinceNow:0.2]; while (end.timeIntervalSinceNow > 0) [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]]; }
 int main(void) {
@@ -121,6 +126,37 @@ int main(void) {
             [c setOfflineRequest:@"test:invalid" title:@"Invalid" tracks:request[@"tracks"]];
             [c setOfflineRequest:@"test:invalid" title:@"Invalid" tracks:@[@{@"title": @"Missing ID"}]];
             check([[c valueForKey:@"offlineRequests"][@"test:invalid"][@"tracks"] count] == 0, @"invalid newer request clears stale ready track list");
+            {   // Manifest after library read retries visible seeds that found nothing on disk yet.
+                OfflineController *retry = [OfflineController new];
+                [retry setValue:@YES forKey:@"musicProbesEnabled"];
+                [retry setValue:dispatch_queue_create("test.mix", DISPATCH_QUEUE_SERIAL) forKey:@"_mixQueue"];
+                [retry setValue:[NSMutableSet set] forKey:@"_mixPreparing"];
+                [retry setValue:[NSMutableDictionary dictionary] forKey:@"_offlineRequests"];
+                [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"mixWithClaude"];
+                NSMutableArray *library = [NSMutableArray array];
+                for (NSUInteger i = 0; i < 25; i++) {
+                    [library addObject:@{@"id": [NSString stringWithFormat:@"id-%lu", (unsigned long)i], @"artist": @"Artist",
+                                         @"title": [NSString stringWithFormat:@"Title %lu", (unsigned long)i], @"album": @"Album",
+                                         @"kind": @"song", @"family": @"other"}];
+                }
+                [library addObject:@{@"id": @"fixture-id", @"artist": @"Test Artist", @"title": @"Fixture", @"album": @"Test Album",
+                                     @"kind": @"song", @"family": @"other"}];
+                [retry setValue:library forKey:@"_mixLibrary"];
+                NSDictionary *seed = @{@"key": @"song:fixture", @"kind": @"song", @"title": @"Fixture", @"subtitle": @"Test Artist",
+                                       @"trackID": @"fixture-id", @"artist": @"Test Artist", @"album": @"Test Album", @"family": @"other"};
+                [retry setValue:@[seed] forKey:@"mixSeeds"];
+                [retry setValue:[NSMutableDictionary dictionary] forKey:@"_mixPrepared"];
+                [retry setValue:@{} forKey:@"_offlineManifest"];
+                [retry prepareMix:seed then:nil]; settle();
+                NSDictionary *prepared = [retry valueForKey:@"_mixPrepared"];
+                check(![prepared[@"song:fixture"] count], @"empty manifest leaves seed unprepared");
+                NSUInteger tried = retry.mixPrepareStarts;
+                [retry setValue:manifest forKey:@"_offlineManifest"];
+                [retry retryUnpreparedMixSeeds]; settle();
+                prepared = [retry valueForKey:@"_mixPrepared"];
+                check(retry.mixPrepareStarts > tried && [prepared[@"song:fixture"] count],
+                    @"manifest arrival retries unprepared seed");
+            }
         } @finally { [fm removeItemAtPath:home error:nil]; }
         return failures ? 1 : 0;
     }
