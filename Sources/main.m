@@ -6520,20 +6520,25 @@ static const NSUInteger kLibraryRefreshSyncing = 1;
 static const NSUInteger kLibraryRefreshPreparingCache = 2;
 static const NSUInteger kLibraryRefreshReadingStatus = 3;
 - (void)libraryRefreshPump {
-    if (_libraryRefreshPhase != kLibraryRefreshIdle) return;
-    if (_libraryRefreshWantsCache && !_offlineCacheBusy) {
-        _libraryRefreshWantsCache = NO;
-        [self prepareOfflineCache];
+    for (;;) {
+        if (_libraryRefreshPhase != kLibraryRefreshIdle) return;
+        if (_libraryRefreshWantsCache && !_offlineCacheBusy) {
+            _libraryRefreshWantsCache = NO;
+            [self prepareOfflineCache];
+            if (_offlineCacheBusy || _libraryRefreshPhase != kLibraryRefreshIdle) return;
+            continue;
+        }
+        if (_libraryRefreshWantsStatus) {
+            _libraryRefreshWantsStatus = NO;
+            [self reloadMusicLibraryStatus];
+            if (_libraryRefreshPhase != kLibraryRefreshIdle) return;
+            continue;
+        }
+        if (_libraryRefreshWantsSync) {
+            _libraryRefreshWantsSync = NO;
+            [self maybeScheduleMusicLibrarySync];
+        }
         return;
-    }
-    if (_libraryRefreshWantsStatus) {
-        _libraryRefreshWantsStatus = NO;
-        [self reloadMusicLibraryStatus];
-        return;
-    }
-    if (_libraryRefreshWantsSync) {
-        _libraryRefreshWantsSync = NO;
-        [self maybeScheduleMusicLibrarySync];
     }
 }
 - (void)libraryRefreshScheduleAfterRequestSave {
@@ -8520,7 +8525,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     button.accessibilityIdentifier = @"popover.sound";
     NSString *label = _playerOutputUID.length
         ? [NSString stringWithFormat:@"Player output, %@", choice[@"name"]]
-        : [NSString stringWithFormat:@"Player output, %@", choice[@"name"]];
+        : [NSString stringWithFormat:@"Player output, System, %@", choice[@"name"]];
     button.accessibilityLabel = label;
     NSString *help = [choice[@"note"] length] ? choice[@"note"] : @"";
     if ([choice[@"diverged"] boolValue] && [choice[@"systemDefaultName"] length]) {
@@ -10919,9 +10924,8 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 
 - (void)rebuildContent {
     _popoverPrepared=YES;
-    // Headless and frozen mix harnesses drive rebuild while the popover stays closed; a full
-    // tree rebuild would dominate the main thread without exercising playback.
-    if (!_popover.isShown && _mixFrozen) {
+      // Playback scale harness: frozen mix, popover never shown, music off — skip full tree rebuild.
+    if (!_popover.isShown && _mixFrozen && _musicOff) {
         SetRowNameW([self popoverNameColumnWidth]);
         return;
     }
