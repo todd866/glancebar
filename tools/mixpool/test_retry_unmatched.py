@@ -54,13 +54,35 @@ class SameSongTests(unittest.TestCase):
             {"wrapperType": "track", "trackId": 2, "artistName": "Someone Else",
              "trackName": "Maggot Brain", "collectionName": "Covers"},
         ]
-        with mock.patch.object(mixpool, "_itunes_search", return_value=results):
+        with mock.patch.object(mixpool, "_itunes_search", return_value=results), \
+                mock.patch.object(mixpool, "_itunes_album_tracks", return_value=[]):
             self.assertEqual(mixpool.itunes_song("Funkadelic", "Maggot Brain", "Maggot Brain"), [])
         results.append({"wrapperType": "track", "trackId": 3, "artistName": "Funkadelic",
                         "trackName": "Maggot Brain (Remastered)", "collectionName": "Maggot Brain"})
-        with mock.patch.object(mixpool, "_itunes_search", return_value=results):
+        with mock.patch.object(mixpool, "_itunes_search", return_value=results), \
+                mock.patch.object(mixpool, "_itunes_album_tracks", return_value=[]) as by_album:
             got = mixpool.itunes_song("Funkadelic", "Maggot Brain", "Maggot Brain")
         self.assertEqual([r["trackId"] for r in got], [3])
+        by_album.assert_not_called()  # already found on the wanted album
+
+    def test_album_lookup_finds_a_song_the_song_search_leaves_out(self):
+        song_search = [{"wrapperType": "track", "trackId": 1, "artistName": "Frank Ocean",
+                        "trackName": "White Ferrari", "collectionName": "Blonde"}]
+        album_tracks = [{"wrapperType": "track", "trackId": 9, "artistName": "Frank Ocean",
+                         "trackName": "Nights", "collectionName": "Blonde"}]
+        with mock.patch.object(mixpool, "_itunes_search", return_value=song_search), \
+                mock.patch.object(mixpool, "_itunes_album_tracks", return_value=album_tracks) as by_album:
+            got = mixpool.itunes_song("Frank Ocean", "Nights", "Blonde")
+        self.assertEqual([r["trackId"] for r in got], [9])
+        by_album.assert_called_once_with("Frank Ocean", "Blonde", song_search)
+
+    def test_failed_lookup_is_not_no_match(self):
+        with mock.patch.object(mixpool, "_itunes_search", return_value=None), \
+                mock.patch.object(mixpool, "_itunes_album_tracks", return_value=None):
+            with self.assertRaises(mixpool.LookupFailed):
+                mixpool.itunes_song("Frank Ocean", "Nights", "Blonde")
+            self.assertIsNone(mixpool.itunes_song_best("Frank Ocean", "Nights", "Blonde"))
+        self.assertEqual(mixpool._album_core("Blonde (Deluxe Edition) - EP"), "Blonde")
 
     def test_remix_is_not_the_song(self):
         self.assertFalse(mixpool._title_agrees("Gosh (Someone Remix)", "Gosh"))

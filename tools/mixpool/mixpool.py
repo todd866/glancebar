@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -275,16 +276,122 @@ def _is_compilation(res: dict) -> bool:
     return _compilation_title(str(res.get("collectionName") or ""))
 
 
+ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
+_ITUNES_MIN_GAP = 3.2  # seconds between catalogue calls: the search API allows about 20 a minute
+_itunes_last = 0.0
+
+
+class LookupFailed(Exception):
+    """The catalogue could not be asked (rate limit, network). Not the same as "no such song"."""
+
+
+def _itunes_get(url: str, params: dict) -> list[dict] | None:
+    """One paced catalogue call. None means the call failed, never "no results"."""
+    global _itunes_last
+    query = urllib.parse.urlencode(params)
+    for attempt in (1, 2):
+        wait = _ITUNES_MIN_GAP - (time.monotonic() - _itunes_last)
+        if wait > 0:
+            time.sleep(wait)
+        _itunes_last = time.monotonic()
+        try:
+            with urllib.request.urlopen(f"{url}?{query}", timeout=30) as r:
+                return json.load(r)["results"]
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429) and attempt == 1:
+                print("  catalogue rate limit; waiting 60 s", file=sys.stderr, flush=True)
+                time.sleep(60)
+                continue
+            print(f"  lookup failed: {e}", file=sys.stderr, flush=True)
+            return None
+        except Exception as e:
+            print(f"  lookup failed: {e}", file=sys.stderr, flush=True)
+            return None
+    return None
+
+
 def _itunes_search(artist: str, title: str) -> list[dict] | None:
-    q = urllib.parse.urlencode(
-        {"term": f"{artist} {title}", "entity": "song", "country": "au", "limit": 10}
+    return _itunes_get(
+        ITUNES_API, {"term": f"{artist} {title}", "entity": "song", "country": "au", "limit": 25}
     )
-    try:
-        with urllib.request.urlopen(f"{ITUNES_API}?{q}", timeout=30) as r:
-            return json.load(r)["results"]
-    except Exception as e:
-        print(f"  lookup failed: {e}", file=sys.stderr, flush=True)
+
+
+_ALBUM_TAIL = re.compile(r"\s*-\s*(?:single|ep)\s*$|\s*[\(\[][^\)\]]*[\)\]]\s*$", re.IGNORECASE)
+
+
+def _album_core(name: str) -> str:
+    text = str(name or "")
+    while True:
+        cut = _ALBUM_TAIL.sub("", text).strip()
+        if cut == text or not cut:
+            return text.strip()
+        text = cut
+
+
+def _itunes_artist_id(artist: str, song_results: list[dict] | None) -> int | None | bool:
+    """The catalogue's id for the artist: from results already in hand, else one artist search.
+
+    Returns False when the catalogue could not be asked.
+    """
+    for row in song_results or []:
+        if row.get("artistId") and _artist_agrees(str(row.get("artistName", "")), artist):
+            return row["artistId"]
+    found = _itunes_get(
+        ITUNES_API, {"term": artist, "entity": "musicArtist", "country": "au", "limit": 5}
+    )
+    if found is None:
+        return False
+    for row in found:
+        if row.get("artistId") and _artist_agrees(str(row.get("artistName", "")), artist):
+            return row["artistId"]
+    return None
+
+
+def _itunes_album_tracks(artist: str, album: str, song_results: list[dict] | None = None) -> list[dict] | None:
+    """Tracks to search when the song search left the wanted song out.
+
+    The song search ("artist title") returns the artist's popular songs and often omits the one
+    wanted, and the album search is no better. The artist's own album list is complete: find the
+    wanted album there and list its tracks; without an album match, fall back to the artist's
+    songs. None means the catalogue could not be asked.
+    """
+    import offline_cache as oc  # noqa: WPS433
+
+    artist_id = _itunes_artist_id(artist, song_results)
+    if artist_id is False:
         return None
+    if not artist_id:
+        return []
+    wanted = oc.match_fold(_album_core(album))
+    tracks: list[dict] = []
+    if wanted:
+        albums = _itunes_get(
+            ITUNES_LOOKUP, {"id": artist_id, "entity": "album", "country": "au", "limit": 200}
+        )
+        if albums is None:
+            return None
+        looked = 0
+        for row in albums:
+            if looked >= 2 or row.get("wrapperType") != "collection":
+                continue
+            got = oc.match_fold(_album_core(str(row.get("collectionName", ""))))
+            if not got or not (got == wanted or got.startswith(wanted) or wanted.startswith(got)):
+                continue
+            looked += 1
+            songs = _itunes_get(
+                ITUNES_LOOKUP, {"id": row.get("collectionId"), "entity": "song", "country": "au", "limit": 200}
+            )
+            if songs is None:
+                return None
+            tracks.extend(r for r in songs if r.get("wrapperType") == "track")
+    if not tracks:
+        songs = _itunes_get(
+            ITUNES_LOOKUP, {"id": artist_id, "entity": "song", "country": "au", "limit": 200}
+        )
+        if songs is None:
+            return None
+        tracks.extend(r for r in songs if r.get("wrapperType") == "track")
+    return tracks
 
 
 def itunes_song(artist: str, title: str, album: str = "") -> list[dict]:
@@ -294,8 +401,27 @@ def itunes_song(artist: str, title: str, album: str = "") -> list[dict]:
     credit, or a title that looks like a compilation, Hits, Now That's, or a
     year-anthology, is dropped when any other match clears the bar.
     """
-    results = _itunes_search(artist, title)
+    raw = _itunes_search(artist, title)
+    failed = raw is None
+    results = [r for r in raw or [] if r.get("wrapperType") == "track" and _same_song(r, artist, title)]
+    on_album = False
+    if results and album:
+        import offline_cache as oc  # noqa: WPS433
+
+        wanted = oc.match_fold(_album_core(album))
+        on_album = any(
+            oc.match_fold(_album_core(str(r.get("collectionName", "")))) == wanted for r in results
+        )
+    if not results or (album and not on_album):
+        # Nothing found, or only copies on other releases (a soundtrack, a compilation): look
+        # through the artist's own albums for the wanted one.
+        more = _itunes_album_tracks(artist, album, raw)
+        failed = failed or more is None
+        seen_ids = {r.get("trackId") for r in results}
+        results += [r for r in more or [] if _same_song(r, artist, title) and r.get("trackId") not in seen_ids]
     if not results:
+        if failed:
+            raise LookupFailed(f"{artist} — {title}")
         return []
     scored: list[tuple[float, int, dict]] = []
     for i, res in enumerate(results):
@@ -325,7 +451,10 @@ def itunes_song(artist: str, title: str, album: str = "") -> list[dict]:
 
 def itunes_song_best(artist: str, title: str, album: str = "") -> dict | None:
     """Single best match, for callers that want one song."""
-    found = itunes_song(artist, title, album)
+    try:
+        found = itunes_song(artist, title, album)
+    except LookupFailed:
+        return None
     return found[0] if found else None
 
 
@@ -582,7 +711,8 @@ def _load_liked() -> dict:
     return state
 
 
-def pull_liked(inventory_path: Path | None, retry_failed: bool = False) -> int:
+def pull_liked(inventory_path: Path | None, retry_failed: bool = False,
+               retry_no_match: bool = False) -> int:
     """Acquire every Apple Music favourite as lossless via amdl (resumable).
 
     Each candidate is attempted once. Content failures are stored in
@@ -596,7 +726,7 @@ def pull_liked(inventory_path: Path | None, retry_failed: bool = False) -> int:
     todo = []
     for t in am_fav:
         key = f"{t['artist']}|{t['title']}"
-        if key in state["done"] or key in state["no_match"]:
+        if key in state["done"] or (key in state["no_match"] and not retry_no_match):
             continue
         if key in state["failed"] and not retry_failed:
             continue
@@ -611,7 +741,13 @@ def pull_liked(inventory_path: Path | None, retry_failed: bool = False) -> int:
     infra_streak = 0
     for i, t in enumerate(todo, 1):
         key = f"{t['artist']}|{t['title']}"
-        songs = itunes_song(t["artist"], t["title"], t.get("album", ""))[:LIKED_CANDIDATES]
+        try:
+            songs = itunes_song(t["artist"], t["title"], t.get("album", ""))[:LIKED_CANDIDATES]
+        except LookupFailed:
+            # Not an answer about the song: leave the row as it was and try again next run.
+            print(f"[{i}/{len(todo)}] lookup failed, will retry   {t['artist']} — {t['title']}", flush=True)
+            continue
+        state["no_match"].pop(key, None)
         if not songs:
             state["no_match"][key] = t
             state["failed"].pop(key, None)
@@ -764,7 +900,10 @@ def retry_unmatched(*, go: bool = False, catalogue_path: Path | None = None) -> 
             continue
         song = None
         for a, t, al in _retry_search_variants(track):
-            ranked = itunes_song(a, t, al)
+            try:
+                ranked = itunes_song(a, t, al)
+            except LookupFailed:
+                ranked = []
             if ranked:
                 song = ranked[0]
                 break
@@ -802,6 +941,11 @@ def main() -> None:
         action="store_true",
         help="retry tracks recorded as failed",
     )
+    p_liked.add_argument(
+        "--retry-no-match",
+        action="store_true",
+        help="look again for tracks recorded as no-match (the search was weaker before 11 Nov 2026)",
+    )
     p_audit = sub.add_parser(
         "audit-liked",
         help="list favourites recorded as done with a different song (dry run by default)",
@@ -836,6 +980,7 @@ def main() -> None:
         sys.exit(pull_liked(
             getattr(args, "inventory", None),
             retry_failed=getattr(args, "retry_failed", False),
+            retry_no_match=getattr(args, "retry_no_match", False),
         ))
     elif args.cmd == "audit-liked":
         sys.exit(audit_liked(apply=bool(args.apply)))
