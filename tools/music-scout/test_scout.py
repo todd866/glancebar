@@ -334,6 +334,61 @@ class ScoutLogicTests(unittest.TestCase):
         summary = scout.cmd_acquire(cfg, self.paths, runners, go=False)
         self.assertEqual(summary["results"][0]["action"], "skipped_budget")
 
+    def test_acquire_limit_stops_after_n_queue_rows(self):
+        self.paths.queue.write_text(
+            json.dumps(
+                {
+                    "tracks": [
+                        {"artist": "A", "title": "one", "track_key": "a|one", "track_id": 1},
+                        {"artist": "B", "title": "two", "track_key": "b|two", "track_id": 2},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        runners = scout.Runners(
+            clock=lambda: "2026-11-10T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+            itunes_song_best=lambda *a, **k: {"trackId": 1, "trackName": "one", "artistName": "A", "trackTimeMillis": 180_000},
+        )
+        summary = scout.cmd_acquire(self.cfg, self.paths, runners, go=False, limit=1)
+        self.assertEqual(summary["considered"], 1)
+        self.assertEqual(len(summary["results"]), 1)
+
+    def test_mirror_acquire_to_hot_copies_and_verifies(self):
+        apple = self.root / "Apple Music"
+        hot = self.root / "hot"
+        apple.mkdir()
+        hot.mkdir()
+        rel = Path("Band/Al/track.m4a")
+        src = apple / rel
+        src.parent.mkdir(parents=True)
+        body = b"lossless-bytes" * 50
+        src.write_bytes(body)
+        cfg = dict(self.cfg, apple_music_dir=str(apple), hot_dir=str(hot))
+        meta = {
+            "size_bytes": len(body),
+            "files": [
+                {
+                    "relative_path": str(rel),
+                    "absolute_path": str(src),
+                    "size_bytes": len(body),
+                    "sha256": "a" * 64,
+                }
+            ],
+            "local_path": str(src),
+            "catalogue_relative_path": str(rel),
+            "sha256": "a" * 64,
+        }
+        out = scout.mirror_acquire_to_hot(meta, cfg)
+        dest = hot / rel
+        self.assertTrue(dest.is_file())
+        self.assertEqual(dest.read_bytes(), body)
+        self.assertEqual(Path(out["local_path"]).resolve(), dest.resolve())
+        self.assertTrue(src.is_file())
+
     def test_acquire_records_real_bytes(self):
         self.paths.queue.write_text(
             json.dumps({"tracks": [{"artist": "A", "title": "B", "track_key": "a|b", "track_id": 1}]}),

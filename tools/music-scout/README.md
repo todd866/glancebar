@@ -39,6 +39,7 @@ python3 tools/music-scout/scout.py candidates
 python3 tools/music-scout/scout.py rank
 python3 tools/music-scout/scout.py acquire          # dry-run (default)
 python3 tools/music-scout/scout.py acquire --go       # real amdl on M5
+python3 tools/music-scout/scout.py acquire --go --limit 1  # supervised single-track trial
 python3 tools/music-scout/scout.py publish
 python3 tools/music-scout/scout.py status           # exit 1 if unhealthy
 python3 tools/music-scout/scout.py run [--go]
@@ -58,8 +59,9 @@ python3 tools/music-scout/scout.py run [--go]
 ### Acquire guards
 
 Exit **75** (defer) when not on Apple **M5**, when
-`~/.local/state/METERED_LINK` exists, or on battery power. Real pulls call
-mixpool's `_run_amdl` on resolved Apple Music song URLs.
+`~/.local/state/METERED_LINK` exists, or on battery power. Real pulls call mixpool's `run_amdl_detailed` (wraps `_run_amdl`, diffs
+`~/Music/Apple Music` before/after for bytes and paths). New files are copied into
+`~/Music/Glancebar Lossless/` at the same relative path for same-night playback.
 
 ### External assumptions (read-only)
 
@@ -73,15 +75,11 @@ mixpool's `_run_amdl` on resolved Apple Music song URLs.
 
 This tool never deletes or moves audio files.
 
-## Expected launchd job (not installed here)
+## Launchd job (plist only; not installed here)
 
-On the **M5**, once per night (after triple j `queue` and mixpool inventory):
-
-```bash
-#!/bin/sh
-cd /path/to/glancebar
-python3 tools/music-scout/scout.py run --go || test $? -eq 75
-```
+`tools/music-scout/com.iantodd.glancebar-music-scout.plist` — **03:10** on the M5,
+stdout/stderr under `~/.local/state/glancebar-music-scout/`. Installs with the usual
+`launchctl bootstrap` flow when ready.
 
 Morning check can run `scout.py status` (nonzero when nothing acquired in 7
 days or the last `run` failed).

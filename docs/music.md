@@ -40,7 +40,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | `com.iantodd.triplej-daily` | M5 | installed |
 | `com.iantodd.glancebar-music-push` (03:40: masters → R2, then catalogue; `~/.local/bin/glancebar-music-push`, status in `push-status.json`) | M2 | installed 10 Nov 2026 |
 | hot-set sync (every few hours; the app also starts one on demand) | M5 | NOT YET INSTALLED |
-| scout `run` (nightly) | M5 | NOT YET INSTALLED |
+| `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | plist only (not installed) |
 
 ## Checks
 
@@ -48,3 +48,23 @@ R2 bucket and fetched as required. New music is found and acquired without being
 tracks, a sync failed, or nothing was acquired for a week: these are the hooks for the
 morning check. `defaults write com.iantodd.glancebar musicSilentQA -bool YES` runs the player
 muted for verification.
+
+## Scout acquisition timeline (M5)
+
+1. **03:10** — `scout.py run --go` ranks the queue and acquires within the weekly budget via
+   `mixpool.run_amdl_detailed` (real file sizes and paths land in `ledger.jsonl`).
+2. **Same night** — after each successful pull, scout **copies** (never moves) new ALAC into
+   `~/Music/Glancebar Lossless/` at the same relative path so Glancebar can play before
+   offload. `publish` writes `new-music.json` with title, artist, album, and duration even when
+   the Apple Music tree is later empty.
+3. **After pull** — `~/.local/state/glancebar-mix/offload-am.sh` rsyncs
+   `~/Music/Apple Music` to the M2, verifies sizes, then moves the local tree to Trash.
+4. **03:40 (M2)** — `glancebar-music-push` uploads masters to R2 and refreshes `catalogue.json`.
+5. **Later (M5)** — `musiclib.py sync` fetches wanted tracks into the hot set; the New music
+   tile and offline-cache can bind via `catalogue_relative_path` + `sha256` or metadata match.
+
+Supervised one-track trial on the M5 (mains, unmetered):
+
+```bash
+python3 tools/music-scout/scout.py acquire --go --limit 1
+```

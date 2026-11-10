@@ -22,6 +22,7 @@ Never un-likes or deletes anything; amdl is skipped for albums already pulled.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import queue
 import re
@@ -32,6 +33,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 SOURCES = {
     "youtube-liked": Path.home() / "Music/YouTube Liked",
@@ -55,6 +57,7 @@ _ANTHOLOGY = re.compile(
     r"\b(?:hits|anthems|classics|anthology|collection|annual|best|now)\b",
     re.I,
 )
+_AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".alac", ".aac", ".wav", ".aiff", ".aif"}
 
 
 def load_state() -> dict:
@@ -408,6 +411,83 @@ def _run_amdl(url: str) -> tuple[bool, bool, str]:
     if read_error is not None and not output:
         return False, True, "amdl read failed"
     return True, False, ""
+
+
+def _apple_music_audio_snapshot(root: Path) -> dict[str, int]:
+    """Relative paths under *root* → file size in bytes (audio only)."""
+    out: dict[str, int] = {}
+    if not root.is_dir():
+        return out
+    root = root.resolve()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.startswith("._") or name == ".DS_Store" or name == "OFFLOADED.txt":
+            continue
+        if path.suffix.lower() not in _AUDIO_EXTS:
+            continue
+        rel = str(path.relative_to(root))
+        try:
+            out[rel] = path.stat().st_size
+        except OSError:
+            continue
+    return out
+
+
+def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def run_amdl_detailed(
+    url: str,
+    *,
+    music_root: Path | None = None,
+    run: Callable[[str], tuple[bool, bool, str]] | None = None,
+) -> tuple[bool, bool, str, dict]:
+    """Run amdl once and return any new audio files under the Apple Music folder.
+
+    Non-breaking helper for scouts and metrics: ``pull-liked`` keeps calling
+    ``_run_amdl`` directly. On success, *detail* contains ``files`` (list of
+    dicts with relative_path, absolute_path, size_bytes, sha256) and
+    ``size_bytes`` (sum of new files).
+    """
+    root = (music_root or SOURCES["apple-music"]).expanduser().resolve()
+    before = _apple_music_audio_snapshot(root)
+    runner = run or _run_amdl
+    ok, infra, error = runner(url)
+    detail: dict = {"music_root": str(root)}
+    if not ok:
+        return ok, infra, error, detail
+    after = _apple_music_audio_snapshot(root)
+    new_rels = sorted(set(after) - set(before))
+    files: list[dict] = []
+    for rel in new_rels:
+        path = root / rel
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if after.get(rel) != size:
+            size = after[rel]
+        files.append(
+            {
+                "relative_path": rel,
+                "absolute_path": str(path),
+                "size_bytes": size,
+                "sha256": sha256_file(path),
+            }
+        )
+    detail["files"] = files
+    detail["size_bytes"] = sum(f["size_bytes"] for f in files)
+    return ok, infra, error, detail
 
 
 def _liked_summary(state: dict) -> None:

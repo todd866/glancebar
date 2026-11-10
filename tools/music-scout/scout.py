@@ -20,6 +20,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -63,6 +64,8 @@ DEFAULTS: dict[str, Any] = {
         str(HOME / ".local/state/selector/feedback.jsonl"),
     ],
     "new_music_path": str(DEFAULT_STATE / "new-music.json"),
+    "apple_music_dir": str(HOME / "Music/Apple Music"),
+    "hot_dir": str(HOME / "Music/Glancebar Lossless"),
     "ai_pick_cmd": "ai-pick",
 }
 
@@ -260,12 +263,80 @@ def _default_ai_pick(prompt: str, cmd: str) -> tuple[int, str]:
     return 0, proc.stdout or ""
 
 
-def _default_run_amdl(url: str) -> tuple[bool, bool, str]:
+def _default_run_amdl(url: str) -> tuple:
     if str(MIXPOOL_DIR) not in sys.path:
         sys.path.insert(0, str(MIXPOOL_DIR))
     import mixpool  # noqa: E402
 
-    return mixpool._run_amdl(url)
+    ok, infra, error, detail = mixpool.run_amdl_detailed(url)
+    meta = _meta_from_amdl_detail(detail) if ok else {}
+    return ok, infra, error, meta
+
+
+def _meta_from_amdl_detail(detail: dict) -> dict[str, Any]:
+    files = detail.get("files") or []
+    if not files:
+        size = int(detail.get("size_bytes") or 0)
+        return {"size_bytes": size} if size else {}
+    primary = max(files, key=lambda f: f.get("size_bytes") or 0)
+    return {
+        "size_bytes": int(detail.get("size_bytes") or sum(f.get("size_bytes") or 0 for f in files)),
+        "files": files,
+        "local_path": primary.get("absolute_path"),
+        "catalogue_relative_path": primary.get("relative_path"),
+        "sha256": primary.get("sha256"),
+    }
+
+
+def copy_file_to_hot(src: Path, apple_music_root: Path, hot_dir: Path) -> Path | None:
+    """Copy one acquired file into the hot set (never move). Returns dest or None."""
+    src = src.expanduser().resolve()
+    root = apple_music_root.expanduser().resolve()
+    hot = hot_dir.expanduser().resolve()
+    try:
+        rel = src.relative_to(root)
+    except ValueError:
+        return None
+    dest = hot / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        src_size = src.stat().st_size
+    except OSError:
+        return None
+    if dest.is_file() and dest.stat().st_size == src_size:
+        return dest
+    shutil.copy2(src, dest)
+    try:
+        if dest.stat().st_size != src_size:
+            dest.unlink(missing_ok=True)
+            return None
+    except OSError:
+        return None
+    return dest
+
+
+def mirror_acquire_to_hot(meta: dict, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Copy new audio files to the hot dir so playback works before offload."""
+    apple_root = Path(cfg.get("apple_music_dir", DEFAULTS["apple_music_dir"])).expanduser()
+    hot_dir = Path(cfg.get("hot_dir", DEFAULTS["hot_dir"])).expanduser()
+    out = dict(meta)
+    hot_paths: list[str] = []
+    for spec in meta.get("files") or []:
+        src = Path(spec.get("absolute_path") or "")
+        if not src.is_file():
+            continue
+        dest = copy_file_to_hot(src, apple_root, hot_dir)
+        if dest:
+            hot_paths.append(str(dest))
+    if hot_paths:
+        out["local_path"] = hot_paths[0]
+        out["hot_paths"] = hot_paths
+    elif meta.get("local_path"):
+        src = Path(meta["local_path"])
+        dest = copy_file_to_hot(src, apple_root, hot_dir)
+        if dest:
+            out["local_path"] = str(dest)
+    return out
 
 
 def _default_is_m5() -> bool:
@@ -843,7 +914,12 @@ def _amdl_result(result: tuple) -> tuple[bool, bool, str, dict]:
 
 
 def cmd_acquire(
-    cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: bool = False
+    cfg: dict[str, Any],
+    paths: ScoutPaths,
+    runners: Runners,
+    *,
+    go: bool = False,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     reason = acquire_defer_reason(runners)
     if reason:
@@ -864,9 +940,13 @@ def cmd_acquire(
     remaining_bytes = max(0, int(gb_budget * GIB) - acquired_bytes)
 
     results: list[dict] = []
+    considered = 0
     for row in queue:
+        if limit is not None and considered >= limit:
+            break
         if remaining_tracks <= 0 or remaining_bytes <= 0:
             break
+        considered += 1
         artist = row.get("artist") or ""
         title = row.get("title") or ""
         key = row.get("track_key") or track_key(artist, title)
@@ -914,6 +994,8 @@ def cmd_acquire(
         ok, infra, error, meta = _amdl_result(runners.run_amdl(url))
         size_bytes = int(meta.get("size_bytes") or est_bytes)
         if ok:
+            meta = mirror_acquire_to_hot(meta, cfg)
+            size_bytes = int(meta.get("size_bytes") or size_bytes)
             rec = {
                 "at": runners.clock(),
                 "action": "acquired",
@@ -928,7 +1010,17 @@ def cmd_acquire(
                 "catalogue_relative_path": meta.get("catalogue_relative_path"),
                 "sha256": meta.get("sha256"),
             }
+            if meta.get("files"):
+                rec["acquired_files"] = [
+                    {
+                        "relative_path": f.get("relative_path"),
+                        "size_bytes": f.get("size_bytes"),
+                        "sha256": f.get("sha256"),
+                    }
+                    for f in meta["files"]
+                ]
             append_jsonl(paths.ledger, rec)
+            results.append(rec)
             remaining_tracks -= 1
             remaining_bytes -= size_bytes
         elif infra:
@@ -953,13 +1045,15 @@ def cmd_acquire(
                 "track_key": key,
                 "reason": error or "unknown",
             }
-        append_jsonl(paths.ledger, rec)
-        results.append(rec)
+            append_jsonl(paths.ledger, rec)
+            results.append(rec)
 
     summary = {
         "at": runners.clock(),
         "dry_run": not go,
         "attempted": len(results),
+        "considered": considered,
+        "limit": limit,
         "acquired_before": acquired_count,
         "results": results,
     }
@@ -991,8 +1085,9 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
         }
         if row.get("local_path"):
             item["local_path"] = row["local_path"]
-        if row.get("catalogue_relative_path") and row.get("sha256"):
+        if row.get("catalogue_relative_path"):
             item["catalogue_relative_path"] = row["catalogue_relative_path"]
+        if row.get("sha256"):
             item["sha256"] = row["sha256"]
         tracks.append(item)
     tracks.sort(key=lambda r: r.get("acquired_at") or "", reverse=True)
@@ -1065,7 +1160,7 @@ def cmd_run(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: boo
         try:
             _, counts, errors = cmd_candidates(cfg, paths, runners)
             ranked = cmd_rank(cfg, paths, runners)
-            summary = cmd_acquire(cfg, paths, runners, go=go)
+            summary = cmd_acquire(cfg, paths, runners, go=go, limit=None)
             publish = cmd_publish(cfg, paths, runners)
             record_last_run(
                 paths,
@@ -1089,6 +1184,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rank")
     p_acq = sub.add_parser("acquire")
     p_acq.add_argument("--go", action="store_true", help="really run amdl (default dry-run)")
+    p_acq.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="consider at most N queue tracks (e.g. 1 for a supervised trial)",
+    )
     sub.add_parser("publish")
     sub.add_parser("status")
     p_run = sub.add_parser("run")
@@ -1112,7 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
             cmd_rank(cfg, paths, runners)
     elif args.cmd == "acquire":
         with run_lock(paths.lock):
-            summary = cmd_acquire(cfg, paths, runners, go=args.go)
+            summary = cmd_acquire(cfg, paths, runners, go=args.go, limit=args.limit)
         print(json.dumps(summary, indent=2))
     elif args.cmd == "publish":
         with run_lock(paths.lock):

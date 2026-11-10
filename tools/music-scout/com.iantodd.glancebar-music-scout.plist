@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iantodd.glancebar-music-scout</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>/usr/bin/python3 /Users/iantodd/Projects/glancebar/tools/music-scout/scout.py run --go || test $? -eq 75</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/iantodd/.local/state/glancebar-music-scout/scout-stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/iantodd/.local/state/glancebar-music-scout/scout-stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>10</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/iantodd/Projects/glancebar</string>
+</dict>
+</plist>
