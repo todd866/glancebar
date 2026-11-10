@@ -186,6 +186,73 @@ def _song_score(res: dict, artist: str, title: str, album: str) -> float:
     return score
 
 
+def _fold_variants(values) -> set[str]:
+    import offline_cache as oc  # noqa: WPS433
+
+    return {f for f in (oc.match_fold(v) for v in values) if f}
+
+
+_MIXED_TAG = re.compile(r"\s*[\(\[]mixed[\)\]]", re.IGNORECASE)
+
+
+def _title_agrees(got: str, wanted: str) -> bool:
+    import offline_cache as oc  # noqa: WPS433
+
+    # "(Mixed)" marks the copy inside a DJ-mix album; the stand-alone track is the same song.
+    got, wanted = _MIXED_TAG.sub("", got), _MIXED_TAG.sub("", wanted)
+    return bool(_fold_variants(oc.title_match_variants(got)) & _fold_variants(oc.title_match_variants(wanted)))
+
+
+def _artist_agrees(got: str, wanted: str) -> bool:
+    import offline_cache as oc  # noqa: WPS433
+
+    a = _fold_variants([got, oc.split_primary_artist(got)])
+    b = _fold_variants([wanted, oc.split_primary_artist(wanted)])
+    return bool(a & b)
+
+
+def _same_song(res: dict, artist: str, title: str) -> bool:
+    return _title_agrees(str(res.get("trackName", "")), title) and _artist_agrees(
+        str(res.get("artistName", "")), artist
+    )
+
+
+_SONG_URL = re.compile(r"/song/(.*)/(\d+)$")
+
+
+def audit_liked(*, apply: bool = False) -> int:
+    """Find favourites recorded as done whose downloaded song has a different title.
+
+    The state keeps only the song URL, whose slug is the downloaded track's name. Dry run by
+    default; with apply the rows move from "done" to "wrong_song" (record kept), so the next
+    pull-liked looks for the right song. Files already downloaded are left alone.
+    """
+    state = _load_liked()
+    wrong = []
+    for key, meta in sorted((state.get("done") or {}).items()):
+        if "|" not in key or not isinstance(meta, dict):
+            continue
+        m = _SONG_URL.search(str(meta.get("url", "")))
+        if not m:
+            continue
+        got = m.group(1).replace("-", " ")
+        title = key.split("|", 1)[1]
+        # The slug has lost its hyphens and case: compare with punctuation folded away.
+        if _title_agrees(got, title.replace("-", " ")):
+            continue
+        wrong.append((key, got))
+        print(f"wrong-song  {key}  ←  downloaded: {got}", flush=True)
+    print(f"audit-liked: {len(wrong)} of {len(state.get('done') or {})} done rows hold a different song"
+          f" ({'moved to wrong_song' if apply else 'dry run'})", flush=True)
+    if apply and wrong:
+        bucket = state.setdefault("wrong_song", {})
+        for key, got in wrong:
+            row = state["done"].pop(key)
+            bucket[key] = dict(row, downloaded=got)
+        _save_liked(state)
+    return 0
+
+
 def _year_anthology(name: str) -> bool:
     years = list(_YEAR.finditer(name))
     kinds = list(_ANTHOLOGY.finditer(name))
@@ -233,6 +300,11 @@ def itunes_song(artist: str, title: str, album: str = "") -> list[dict]:
     scored: list[tuple[float, int, dict]] = []
     for i, res in enumerate(results):
         if res.get("wrapperType") != "track":
+            continue
+        # A result must BE the wanted song. Until 11 Nov 2026 an artist match alone cleared the
+        # bar, so about fifty favourites were recorded as done with a different song by the
+        # same artist ("Maggot Brain" bound to "Can You Get To That").
+        if not _same_song(res, artist, title):
             continue
         score = _song_score(res, artist, title, album)
         if score >= 0.5:
@@ -730,6 +802,11 @@ def main() -> None:
         action="store_true",
         help="retry tracks recorded as failed",
     )
+    p_audit = sub.add_parser(
+        "audit-liked",
+        help="list favourites recorded as done with a different song (dry run by default)",
+    )
+    p_audit.add_argument("--apply", action="store_true", help="move them to wrong_song so pull-liked retries")
     p_retry = sub.add_parser(
         "retry-unmatched",
         help="re-resolve liked puller no_match/failed rows (dry-run by default)",
@@ -760,6 +837,8 @@ def main() -> None:
             getattr(args, "inventory", None),
             retry_failed=getattr(args, "retry_failed", False),
         ))
+    elif args.cmd == "audit-liked":
+        sys.exit(audit_liked(apply=bool(args.apply)))
     elif args.cmd == "retry-unmatched":
         sys.exit(
             retry_unmatched(

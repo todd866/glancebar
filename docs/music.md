@@ -89,3 +89,12 @@ Supervised one-track trial on the M5 (mains, unmetered):
 ```bash
 python3 tools/music-scout/scout.py acquire --go --limit 1
 ```
+
+## Favourites bound to the wrong song (found 11 Nov 2026)
+
+Until 11 Nov 2026 `mixpool.py pull-liked` accepted any search result by the right artist, so
+some favourites were recorded as done with a different song (or a remix, live or instrumental
+version). `itunes_song` now requires the title and the artist to agree. `mixpool.py
+audit-liked` lists the affected rows (dry run); `--apply` moves them from `done` to
+`wrong_song` in `liked-pulled.json` so the next `pull-liked` looks for the right song. The
+files already downloaded stay in the masters folder.
