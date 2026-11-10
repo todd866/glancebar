@@ -83,6 +83,21 @@ class MusicLibLogicTests(unittest.TestCase):
         _, reason = m.match_track({'title': 'Nope', 'artist': 'Nobody'}, entries)
         self.assertEqual(reason, 'no catalogue match')
 
+    def test_catalogue_paths_cannot_escape_hot_dir(self):
+        for bad in ('../x.m4a', '/etc/x.m4a', 'a/../../x.m4a', 'a//x.m4a', './x.m4a', 'a\\x.m4a',
+                    'a/x.txt', '', None, 'a/\x00.m4a'):
+            self.assertFalse(m.safe_relpath(bad), bad)
+        self.assertTrue(m.safe_relpath('Artist/Album/01 Song.m4a'))
+        entries = m.index_catalogue({'entries': [{'relativePath': '../evil.m4a'},
+                                                 {'relativePath': 'Artist/ok.m4a'}, 'junk']})
+        self.assertEqual([e['relativePath'] for e in entries], ['Artist/ok.m4a'])
+        with tempfile.TemporaryDirectory() as tmp:
+            hot = Path(tmp) / 'hot'
+            hot.mkdir()
+            os.symlink(tmp, hot / 'link')
+            self.assertIsNone(m.inside(hot, 'link/x.m4a'))
+            self.assertIsNotNone(m.inside(hot, 'Artist/x.m4a'))
+
     def test_duration_tolerance(self):
         track = dict(self.requests['playlists'][0]['tracks'][0], durationSeconds=201.5)
         ok, reason = m.match_track(track, self.catalogue['entries'])
@@ -217,15 +232,16 @@ class MusicLibRcloneTests(unittest.TestCase):
         self.assertEqual(len(doc['entries']), 1)
         self.assertTrue((self.remote / 'catalogue.json').is_file())
         m.push_command(self.masters, str(self.remote))
+        rel = 'Band/LP/track.m4a'
         self.assertTrue((self.remote / rel).is_file())
-        dest = self.state / 'fetched.json'
-        m.fetch_remote_json(str(self.remote), rel, self.hot / 'x.part')
-        # use sync path
         part = Path(str(self.hot / rel) + '.part')
         part.parent.mkdir(parents=True, exist_ok=True)
         m.remote_fetch_file(str(self.remote), rel, part)
         entry = doc['entries'][0]
         m.verify_and_install(part, self.hot / rel, entry['sha256'], entry['sizeBytes'])
+        self.assertTrue((self.hot / rel).is_file())
+        self.assertFalse(part.exists())
+        self.assertEqual(m.sha256_file(self.hot / rel), entry['sha256'])
 
 
 class FakeTrash(unittest.TestCase):

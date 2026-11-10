@@ -323,8 +323,30 @@ def match_track(track, catalogue_entries):
     return hits, None
 
 
+def safe_relpath(rel):
+    """A catalogue path is trusted only as a relative audio path with no '..' parts.
+
+    The catalogue is fetched from the remote, so a bad or tampered entry must never be able
+    to name a file outside hot_dir.
+    """
+    if not isinstance(rel, str) or not rel or '\x00' in rel or '\\' in rel:
+        return False
+    parts = rel.split('/')
+    if rel.startswith('/') or any(part in ('', '.', '..') for part in parts):
+        return False
+    return os.path.splitext(rel)[1].lower() in AUDIO_SUFFIXES
+
+
+def inside(root, rel):
+    """The destination for rel, or None when it would resolve outside root (e.g. via a symlink)."""
+    root = Path(root).resolve()
+    dest = (root / rel).resolve()
+    return dest if root in dest.parents else None
+
+
 def index_catalogue(catalogue):
-    return list(catalogue.get('entries') or [])
+    return [entry for entry in (catalogue.get('entries') or [])
+            if isinstance(entry, dict) and safe_relpath(entry.get('relativePath'))]
 
 
 def hot_file_state(hot_dir):
@@ -552,7 +574,9 @@ def sync_execute(plan, cfg, state, remote_rels, allow_metered=False, metered_fla
     for item in plan['toFetch']:
         entry = item['catalogue']
         rel = entry['relativePath']
-        dest = hot_dir / rel
+        dest = inside(hot_dir, rel) if safe_relpath(rel) else None
+        if dest is None:
+            raise ValueError('refusing to fetch outside the hot directory: %r' % (rel,))
         part = dest.with_suffix(dest.suffix + '.part')
         part.parent.mkdir(parents=True, exist_ok=True)
         remote_fetch_file(cfg['remote'], rel, part)
