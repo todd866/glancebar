@@ -63,6 +63,26 @@ muted for verification.
 5. **Later (M5)** — `musiclib.py sync` fetches wanted tracks into the hot set; the New music
    tile and offline-cache can bind via `catalogue_relative_path` + `sha256` or metadata match.
 
+## Catalogue matching and liked retries
+
+`offline_cache.catalogue_match_keys` (used by `musiclib.match_track`) applies matching-only
+normalisation: punctuation and `&`→`and`, primary artist before `feat.`/`ft.`, stripped
+`(Remastered …)` / `- Single` / clean|explicit suffixes, `The` prefix variants, and a few
+censored-title aliases. Ambiguous catalogue rows (two paths) still fail closed; duration must
+agree within 2 s when both sides know it.
+
+`mixpool.py retry-unmatched` (dry-run by default) re-walks `liked-pulled.json` `no_match` and
+`failed` rows against the cached catalogue, then tries album-less and suffix-stripped iTunes
+searches. The lead runs acquisitions; the worker only prints `would-acquire` lines.
+
+## Scout novelty
+
+`scout.py rank` tiers candidates: new primary artists first, already-owned artists capped at
+`owned_artist_share_max` (default 30%), remixes of owned recordings last. Taste-expansion
+prompts include `owned_artists_to_exclude`. Prefer `new-music.json` as the offline
+`station:triplej` source once it holds **≥12** verified tracks (paths + hashes), so the tile
+does not depend on selector queue paths under `~/Music/Glancebar Radio/`.
+
 Supervised one-track trial on the M5 (mains, unmetered):
 
 ```bash

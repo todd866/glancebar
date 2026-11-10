@@ -40,12 +40,17 @@ METERED_FLAG = HOME / ".local/state/METERED_LINK"
 ITUNES_API = "https://itunes.apple.com/search"
 ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
 MIXPOOL_DIR = Path(__file__).resolve().parent.parent / "mixpool"
+_OFFLINE_CACHE = Path(__file__).resolve().parent.parent / "offline-cache"
+if str(_OFFLINE_CACHE) not in sys.path:
+    sys.path.insert(0, str(_OFFLINE_CACHE))
+import offline_cache as oc  # noqa: E402
 
 DEFAULTS: dict[str, Any] = {
     "tracks_per_week": 20,
     "gb_per_week": 1.5,
     "fresh_days": 14,
     "exploration_share": 0.30,
+    "owned_artist_share_max": 0.30,
     "max_per_artist_week": 2,
     "new_release_days": 60,
     "llm_suggestions": 15,
@@ -513,6 +518,85 @@ def ledger_keys(ledger: Path, *, actions: set[str] | None = None) -> set[str]:
     return keys
 
 
+def primary_artist_name(artist: str) -> str:
+    return normal(oc.split_primary_artist(artist))
+
+
+def owned_artists(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
+    artists: set[str] = set()
+    for key in owned_keys(cfg, paths):
+        if "|" in key:
+            artists.add(key.split("|", 1)[0])
+    inv = Path(cfg["music_sync_inventory"]).expanduser()
+    if inv.is_file():
+        for row in json.loads(inv.read_text(encoding="utf-8")).get("am_fav") or []:
+            artists.add(primary_artist_name(row.get("artist", "")))
+    export = Path(cfg["library_export"]).expanduser()
+    if export.is_dir():
+        for p in export.rglob("*"):
+            if p.is_file() and p.suffix.lower() in _AUDIO and len(p.parents) >= 2:
+                artists.add(primary_artist_name(p.parent.parent.name))
+    return artists
+
+
+_REMIX_WORD = re.compile(r"\b(?:remix|rework|edit|flip|bootleg|version)\b", re.IGNORECASE)
+
+
+def base_title_for_owned_match(title: str) -> str:
+    text = oc.strip_match_suffixes(title)
+    text = _REMIX_WORD.sub("", text)
+    return normal(text)
+
+
+def is_remix_of_owned(artist: str, title: str, owned_track_keys: set[str]) -> bool:
+    if not oc.looks_like_remix(title):
+        return False
+    base = base_title_for_owned_match(title)
+    if not base:
+        return False
+    for key in owned_track_keys:
+        if "|" not in key:
+            continue
+        _oa, ot = key.split("|", 1)
+        if base == ot or (base in ot and len(base) > 4):
+            return True
+    return False
+
+
+def novelty_tier(
+    candidate: dict,
+    owned_artist_set: set[str],
+    owned_track_keys: set[str],
+) -> int:
+    """0 = new artist, 1 = already in library, 2 = remix/alternate of owned recording."""
+    art = primary_artist_name(candidate.get("artist", ""))
+    if is_remix_of_owned(candidate.get("artist", ""), candidate.get("title", ""), owned_track_keys):
+        return 2
+    if art in owned_artist_set:
+        return 1
+    return 0
+
+
+def enforce_owned_artist_share(
+    rows: list[dict],
+    share: float,
+    owned_artist_set: set[str],
+) -> list[dict]:
+    if not rows:
+        return rows
+    cap = max(0, int(round(len(rows) * share)))
+    chosen: list[dict] = []
+    owned_used = 0
+    for row in rows:
+        art = primary_artist_name(row.get("artist", ""))
+        if art in owned_artist_set and owned_used >= cap:
+            continue
+        chosen.append(row)
+        if art in owned_artist_set:
+            owned_used += 1
+    return chosen
+
+
 def owned_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
     keys: set[str] = set()
     keys |= walk_library_export(Path(cfg["library_export"]).expanduser())
@@ -637,20 +721,29 @@ def source_new_releases(
     return out
 
 
-def _build_taste_prompt(cfg: dict[str, Any], feedback: dict[str, dict], n: int) -> str:
+def _build_taste_prompt(
+    cfg: dict[str, Any],
+    feedback: dict[str, dict],
+    n: int,
+    *,
+    owned_artist_exclude: list[str] | None = None,
+) -> str:
     artists = liked_artists(cfg)
     likes = [k for k, v in feedback.items() if v.get("event") in ("like", "thumbs_up", "👍")]
     skips = [k for k, v in feedback.items() if v.get("event") in ("skip", "dislike")]
+    exclude = owned_artist_exclude or []
     payload = {
         "task": "suggest_tracks",
         "count": n,
         "loved_artists": artists[:20],
+        "owned_artists_to_exclude": exclude[:120],
         "recent_likes": likes[:30],
         "recent_skips": skips[:30],
         "rules": [
             "Return ONLY a JSON array",
-            "Each item: artist, title, why (one short sentence)",
-            "Artists must NOT be in loved_artists",
+            "Each item: artist, title, why (one short clause)",
+            "Primary artist must NOT appear in owned_artists_to_exclude or loved_artists",
+            "Prefer artists the listener does not already have in their library",
             "Real released tracks only",
         ],
     }
@@ -673,13 +766,20 @@ def _parse_llm_json(text: str) -> list[dict]:
 
 
 def source_taste_expansion(
-    cfg: dict[str, Any], runners: Runners, feedback: dict[str, dict] | None = None
+    cfg: dict[str, Any],
+    runners: Runners,
+    feedback: dict[str, dict] | None = None,
+    *,
+    paths: ScoutPaths | None = None,
 ) -> tuple[list[dict], str | None]:
     feedback = feedback if feedback is not None else load_feedback(
         [Path(p).expanduser() for p in cfg["feedback_paths"]]
     )
     n = int(cfg["llm_suggestions"])
-    prompt = _build_taste_prompt(cfg, feedback, n)
+    exclude: list[str] = []
+    if paths is not None:
+        exclude = sorted(owned_artists(cfg, paths))
+    prompt = _build_taste_prompt(cfg, feedback, n, owned_artist_exclude=exclude)
     code, text = runners.ai_pick(prompt, str(cfg.get("ai_pick_cmd") or DEFAULTS["ai_pick_cmd"]))
     if code == 75:
         return [], "deferred"
@@ -694,7 +794,9 @@ def source_taste_expansion(
         title = str(row.get("title") or "").strip()
         if not artist or not title:
             continue
-        if normal(artist) in loved:
+        if normal(artist) in loved or primary_artist_name(artist) in {
+            normal(a) for a in exclude
+        }:
             continue
         hit = runners.itunes_song_best(artist, title, str(row.get("album") or ""), sleep=runners.sleep)
         if not hit:
@@ -762,7 +864,7 @@ def cmd_candidates(
             errors.append(f"{name}: {exc}")
             print(f"candidates: {name} failed: {exc}", file=sys.stderr)
 
-    taste, taste_err = source_taste_expansion(cfg, runners)
+    taste, taste_err = source_taste_expansion(cfg, runners, paths=paths)
     if taste_err == "deferred":
         errors.append("taste-expansion: deferred")
     elif taste_err:
@@ -821,6 +923,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     data = json.loads(paths.candidates.read_text(encoding="utf-8"))
     candidates = data.get("candidates") or []
     owned = owned_keys(cfg, paths)
+    owned_artist_set = owned_artists(cfg, paths)
     feedback = load_feedback([Path(p).expanduser() for p in cfg["feedback_paths"]])
     hearts_path = Path(cfg["hearts_path"]).expanduser()
     hearts = load_hearts(hearts_path)
@@ -863,8 +966,12 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         else:
             rest_pool.append(scored)
 
-    explore_pool.sort(key=lambda r: (-r["score"], r["track_key"]))
-    rest_pool.sort(key=lambda r: (-r["score"], r["track_key"]))
+    def _rank_key(row: dict) -> tuple:
+        tier = novelty_tier(row, owned_artist_set, owned)
+        return (tier, -row["score"], row["track_key"])
+
+    explore_pool.sort(key=_rank_key)
+    rest_pool.sort(key=_rank_key)
 
     total_slots = len(explore_pool) + len(rest_pool)
     explore_slots = (
@@ -884,6 +991,11 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         return chosen
 
     ranked = apply_cap(explore_pool, explore_slots) + apply_cap(rest_pool, rest_slots)
+    ranked = enforce_owned_artist_share(
+        ranked,
+        float(cfg.get("owned_artist_share_max", DEFAULTS["owned_artist_share_max"])),
+        owned_artist_set,
+    )
 
     queue = {
         "generated": runners.clock(),

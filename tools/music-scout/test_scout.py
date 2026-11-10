@@ -140,6 +140,41 @@ class ScoutLogicTests(unittest.TestCase):
             chosen.append(row)
         self.assertEqual(len(chosen), 0)
 
+    def test_novelty_ordering_prefers_new_artists(self):
+        owned_key = scout.track_key("Owned Band", "Core Song")
+        (self.root / "export" / "Owned Band").mkdir()
+        (self.root / "export" / "Owned Band" / "Al").mkdir(parents=True)
+        (self.root / "export" / "Owned Band" / "Al" / "Core Song.m4a").write_bytes(b"x")
+        candidates = [
+            {"artist": "Owned Band", "title": "New Track", "source": "triplej", "why": "w", "score_hint": 1.0},
+            {"artist": "Fresh Act", "title": "Debut", "source": "triplej", "why": "w", "score_hint": 0.7},
+        ]
+        self.paths.candidates.write_text(json.dumps({"candidates": candidates}), encoding="utf-8")
+        runners = scout.Runners(clock=lambda: "2026-11-10T00:00:00Z")
+        ranked = scout.cmd_rank(self.cfg, self.paths, runners)
+        self.assertEqual(ranked[0]["artist"], "Fresh Act")
+
+    def test_remix_of_owned_demoted(self):
+        owned_key = scout.track_key("Jamie xx", "Gosh")
+        (self.root / "yt" / f"Jamie xx - Gosh [abc123def45].m4a").write_bytes(b"x")
+        candidates = [
+            {"artist": "Jamie xx", "title": "Gosh (Four Tet Remix)", "source": "triplej", "why": "w", "score_hint": 1.0},
+            {"artist": "Newcomer", "title": "First Light", "source": "triplej", "why": "w", "score_hint": 0.6},
+        ]
+        self.paths.candidates.write_text(json.dumps({"candidates": candidates}), encoding="utf-8")
+        runners = scout.Runners(clock=lambda: "2026-11-10T00:00:00Z")
+        ranked = scout.cmd_rank(self.cfg, self.paths, runners)
+        self.assertEqual(ranked[0]["artist"], "Newcomer")
+
+    def test_owned_artist_share_cap(self):
+        owned_set = {"heavy rotation"}
+        rows = [{"artist": f"Outsider {i}", "title": "Song"} for i in range(5)]
+        rows += [{"artist": "Heavy Rotation", "title": f"n{i}"} for i in range(5)]
+        capped = scout.enforce_owned_artist_share(rows, 0.30, owned_set)
+        owned_n = sum(1 for r in capped if scout.primary_artist_name(r["artist"]) == "heavy rotation")
+        self.assertLessEqual(owned_n, 3)
+        self.assertEqual(len(capped), 8)
+
     def test_exploration_share(self):
         explore = [
             {
