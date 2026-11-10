@@ -232,7 +232,9 @@ static BOOL FitsChildren(NSView *view) {
         // AppKit's segmented control has an empty private hosting view before
         // window layout. It paints no content and NSContainsRect rejects empty rects.
         if (NSIsEmptyRect(child.frame)) continue;
-        if (!NSContainsRect(view.bounds, child.frame)) {
+        // A hundredth of a point of slack: AppKit sizes a symbol image to 28.000000000000004 in a
+        // 28-point view on some display scales, which is rounding, not overflow.
+        if (!NSContainsRect(NSInsetRect(view.bounds, -0.01, -0.01), child.frame)) {
             fprintf(stderr, "outside %s (%s) in %s: %s / %s\n", child.accessibilityIdentifier.UTF8String,
                 NSStringFromClass(child.class).UTF8String, NSStringFromClass(view.class).UTF8String,
                 NSStringFromRect(child.frame).UTF8String, NSStringFromRect(view.bounds).UTF8String);
