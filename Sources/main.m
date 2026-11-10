@@ -7143,76 +7143,67 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 }
 - (void)playOfflinePlaylist:(NSString *)key {
     if (!_musicProbesEnabled) return;
-    if ([key isEqual:_mixPlayingKey] && _localPlayer && _localPlayer.rate > 0) return;
     NSUInteger generation = ++_offlinePlayGeneration;
-    _mixStartingKey = key;
+    _mixStartingKey = nil;
     _musicTimingClick = CFAbsoluteTimeGetCurrent();
     [self musicTimingMark:@"click"];
-    NSDictionary *cached = _offlineCoverageCache[[self offlineCoverageCacheKey:key]];
-    NSDictionary *coverage = cached[@"coverage"];
-    if (!coverage) coverage = [self offlineCoverage:key verifyHash:NO];
-    [self musicTimingMark:@"verify"];
     NSDictionary *tile = [self isMixPlaylistKey:key] ? [self mixTileStateForKey:key] : nil;
-    if (tile) {
-        NSString *state = tile[@"state"];
-        if ([state isEqual:@"fetching"]) {
-            _mixStartingKey = nil;
-            _musicNote = tile[@"tooltip"];
-            [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
-            _libraryRefreshWantsCache = YES;
-            [self libraryRefreshPump];
-            if (_popover.isShown) [self rebuildContent];
-            return;
-        }
-        if (![tile[@"enabled"] boolValue]) {
-            _mixStartingKey = nil;
-            _musicNote = tile[@"tooltip"];
-            [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
-            _libraryRefreshWantsCache = YES;
-            [self libraryRefreshPump];
-            if (_popover.isShown) [self rebuildContent];
-            return;
-        }
-    } else if (![coverage[@"ready"] boolValue]) {
-        _mixStartingKey = nil;
+    if (tile && ([tile[@"state"] isEqual:@"fetching"] || ![tile[@"enabled"] boolValue])) {
+        // Nothing playable on disk (or still arriving): a click asks for the tracks rather than doing nothing.
+        _musicNote = tile[@"tooltip"];
+        [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+        _libraryRefreshWantsCache = YES;
+        [self libraryRefreshPump];
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    // No hashing on the way to first audio. Each manifest record carries the size, mtime and inode
+    // the file had when its SHA-256 was last confirmed; a file that still matches all three is
+    // played now and re-hashed in the background (a mismatch drops that track from the queue).
+    // This is a stat per track, computed fresh at the click: never the display cache, which may
+    // describe the disk as it was a moment ago.
+    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSDictionary *coverage = OfflinePlaylistCoverage(request, manifest, root, NO);
+    [self musicTimingMark:@"verify"];
+    NSArray *paths = coverage[@"paths"];
+    if (![coverage[@"ready"] boolValue] || !paths.count) {
         _musicNote = [self offlineStatus:coverage];
+        [self invalidateOfflineCoverageCache];
+        if (tile) {
+            [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+            _libraryRefreshWantsCache = YES;
+            [self libraryRefreshPump];
+        }
         [self prepareOfflineCache];
         if (_popover.isShown) [self rebuildContent];
         return;
     }
-    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
-    NSArray *paths = coverage[@"paths"];
-    if (!paths.count) {
-        _mixStartingKey = nil;
-        _musicNote = [self offlineStatus:coverage];
-        if (_popover.isShown) [self rebuildContent];
-        return;
-    }
+    _mixStartingKey = key;
     if (![key isEqual:_preparedPlaylistKey]) [self discardPreparedPlaylist];
-    void (^start)(void) = ^{
+    // One hop through the main queue: repeated clicks collapse into the last one, and a pause, a
+    // manifest change or the audio gate closing before the hop cancels the start.
+    dispatch_async(dispatch_get_main_queue(), ^{
         if (generation != self->_offlinePlayGeneration) {
-            self->_mixStartingKey = nil;
-            if (self->_popover.isShown) [self rebuildContent];
-            return;
-        }
-        if (!self->_musicProbesEnabled || self->_musicOff || !paths.count ||
-            ![self offlinePlaylistStillVisible:key] ||
-            ![self->_offlineRequests[key] isEqual:request] || manifest != self->_offlineManifest) {
-            self->_mixStartingKey = nil;
-            self->_musicNote = paths.count ? @"Offline playlist changed. Nothing was started." : [self offlineStatus:coverage];
             if (self->_popover.isShown) [self rebuildContent];
             return;
         }
         self->_mixStartingKey = nil;
+        NSDictionary *currentManifest = self->_offlineManifest;
+        if (!self->_musicProbesEnabled || self->_musicOff || ![self offlinePlaylistStillVisible:key] ||
+            ![self->_offlineRequests[key] isEqual:request] ||
+            !(manifest == currentManifest || [manifest isEqual:currentManifest])) {
+            self->_musicNote = @"Offline playlist changed. Nothing was started.";
+            if (self->_popover.isShown) [self rebuildContent];
+            return;
+        }
         self->_musicNote = nil;
         self->_mixPlayingKey = key;
         [self musicTimingMark:@"queue"];
         [self playLocalPaths:paths];
         [self scheduleOfflineHashVerifyForKey:key paths:paths generation:generation];
         if (self->_popover.isShown) [self rebuildContent];
-    };
-    if ([NSThread isMainThread]) start();
-    else dispatch_async(dispatch_get_main_queue(), start);
+    });
 }
 - (void)playSeedLocally:(NSDictionary *)seed { [self playOfflinePlaylist:seed[@"key"]]; }
 - (IBAction)playSeedMix:(NSButton *)sender {
