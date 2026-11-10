@@ -6680,7 +6680,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             return;
         }
         if (![tile[@"enabled"] boolValue]) {
+            // Nothing playable on disk: a click asks for the tracks rather than doing nothing.
             _musicNote = tile[@"tooltip"];
+            [self prepareMusicLibrarySync];
+            [self prepareOfflineCache];
             if (_popover.isShown) [self rebuildContent];
             return;
         }
