@@ -38,7 +38,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | `com.iantodd.mixpool-liked` (pull favourites lossless, then offload to the M2) | M5 | installed |
 | `com.iantodd.liked-music-sync` | M5 | installed |
 | `com.iantodd.triplej-daily` | M5 | installed |
-| masters → R2 push + catalogue (nightly) | M2 | NOT YET INSTALLED |
+| `com.iantodd.glancebar-music-push` (03:40: masters → R2, then catalogue; `~/.local/bin/glancebar-music-push`, status in `push-status.json`) | M2 | installed 10 Nov 2026 |
 | hot-set sync (every few hours; the app also starts one on demand) | M5 | NOT YET INSTALLED |
 | scout `run` (nightly) | M5 | NOT YET INSTALLED |
 
