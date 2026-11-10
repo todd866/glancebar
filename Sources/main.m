@@ -6328,6 +6328,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!total) return @"0 of 0 on this Mac";
     return [NSString stringWithFormat:@"%lu of %lu on this Mac", (unsigned long)available, (unsigned long)total];
 }
+- (void)retryUnpreparedMixSeeds {
+    _onDiskLibraryIDs = nil;
+    for (NSDictionary *seed in _mixSeeds)
+        if (!_mixPrepared[seed[@"key"]] && ![_mixPreparing containsObject:seed[@"key"]]) [self prepareMix:seed then:nil];
+}
 - (NSSet<NSString *> *)onDiskLibraryTrackIDs {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (_onDiskLibraryIDs && now - _onDiskLibraryAt < 300) return _onDiskLibraryIDs;
@@ -6376,7 +6381,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_offlineCacheBusy = NO;
-            if (manifest) self->_offlineManifest = manifest;
+            if (manifest) {
+                self->_offlineManifest = manifest;
+                [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
+                [self retryUnpreparedMixSeeds];
+            }
             if (self->_popover.isShown) [self rebuildContent];
             if (self->_offlineCacheAgain) { self->_offlineCacheAgain = NO; [self prepareOfflineCache]; }
         });
@@ -6519,8 +6528,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             for (NSDictionary *seed in self->_mixSeeds) if ([seed[@"key"] isEqual:key]) current = YES;
             NSArray *paths = verified[@"paths"];
             if (self->_musicProbesEnabled && !self->_musicOff && current && paths.count &&
-                [verified[@"ready"] boolValue] && [self->_offlineRequests[key] isEqual:request] &&
-                [[self offlineCoverage:key verifyHash:NO][@"paths"] isEqual:paths]) {
+                [self->_offlineRequests[key] isEqual:request] && manifest == self->_offlineManifest) {
                 self->_musicNote = nil;
                 self->_mixPlayingKey = key;
                 [self playLocalPaths:paths];
@@ -6641,8 +6649,13 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSArray<NSURL *> *urls = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
         includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    for (NSURL *url in urls) if (url.path.length) [paths addObject:url.path];
-    _offlineTracks = LikedMusicAudioFiles(paths);
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    for (NSURL *url in urls) {
+        if (!url.path.length) continue;
+        NSString *path = url.path;
+        if ([LikedMusicAudioFiles(@[path]) count] && [OfflinePathsCoverage(@[path], root)[@"paths"] count]) [paths addObject:path];
+    }
+    _offlineTracks = paths;
     _offlineTracksAt = CFAbsoluteTimeGetCurrent();
     _offlineTracksReady = YES;
     return _offlineTracks;
@@ -6915,6 +6928,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         [_localPlayer pause];
         _playbackPlaying = NO;
     } else {
+        [self pauseAppleMusicForLocalSource];
         [_localPlayer play];
         _playbackPlaying = YES;
     }

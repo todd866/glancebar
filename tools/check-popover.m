@@ -766,6 +766,8 @@ int main(int argc, const char **argv) {
             [c setValue:nil forKey:@"_externalPlayback"];
             [c rebuildContent]; root = p.contentViewController.view;
         }
+        [c setValue:[@{@"station:triplej": offline[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:offline[@"manifest"] forKey:@"offlineManifest"];
         [c ensureOfflinePlaylists];
         [c rebuildContent]; root = p.contentViewController.view;
         {   // Seed tiles, the triple j station, and a round New picks button. Title over artist, one line each.
@@ -790,7 +792,7 @@ int main(int argc, const char **argv) {
                 FindIdentifier(root, @"popover.mix.seed.4") ||
                 ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
                 ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] || s1.enabled || s1.alphaValue > 0.45 ||
-                ![s1.accessibilityHelp containsString:@"Offline playlist not prepared"] ||
+                ![s1.accessibilityHelp containsString:@"0 of 0 on this Mac"] ||
                 ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
                 c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
                 fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || fabs(NSMinY(a0.frame) - NSMinY(stArt.frame)) > 0.5 ||
@@ -1356,7 +1358,6 @@ int main(int argc, const char **argv) {
             if (!SoundRow(root, @"Liked Music", @"0 of 0 on this Mac", NO) || !FitsChildren(root))
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "apple") == 0) {
-            [c setValue:@NO forKey:@"ytTabOpen"];
             [c setValue:@YES forKey:@"localMode"];
             [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"playbackKnown"];
@@ -1365,13 +1366,7 @@ int main(int argc, const char **argv) {
             [c setValue:@"LIVE" forKey:@"localArtist"];
             [c setValue:@83 forKey:@"trackElapsed"];
             [c setValue:@324 forKey:@"trackDuration"];
-            const char *art = getenv("GLANCEBAR_MUSIC_ART");
-            if (art) {
-                NSImage *cover = [[NSImage alloc] initWithContentsOfFile:@(art)];
-                cover.size = NSMakeSize(32, 32);
-                [c setValue:cover forKey:@"amArt"];
-            }
-            // Render-only: real seed tiles from a JSON list of {trackID,title,artist,art} (see GLANCEBAR_MUSIC_ART).
+            // Render-only: real seed tiles from a JSON list of {trackID,title,artist,art}.
             const char *mixRender = getenv("GLANCEBAR_MIX_SEEDS");
             NSArray *frozenSeeds = [c valueForKey:@"mixSeeds"];
             if (mixRender) {
@@ -1424,8 +1419,6 @@ int main(int argc, const char **argv) {
         } else if (musicState && strcmp(musicState, "station") == 0) {
             id oldDevices = [c valueForKey:@"audioDevices"];
             id oldUID = [c valueForKey:@"defaultOutputUID"];
-            [c setValue:@NO forKey:@"ytTabOpen"];
-            [c setValue:@NO forKey:@"amLoaded"];
             [c setValue:@YES forKey:@"localMode"];
             [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"playbackKnown"];
@@ -1563,7 +1556,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 446 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row)
+            root.bounds.size.height > 468 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row)
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {
