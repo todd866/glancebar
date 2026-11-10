@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import struct
 import tempfile
 import time
@@ -295,6 +296,88 @@ class MusicLibLogicTests(unittest.TestCase):
             self.requests, self.catalogue, self.hot, {}, {}, {self.rel},
             m.cap_bytes_from_config(m.load_config(self.config)), 14)
         self.assertEqual(len(plan['toFetch']), 1)
+
+    def test_oversized_playlist_library_while_small_syncs(self):
+        big = [{'id': f'id{i}', 'title': 'Song', 'artist': 'Artist', 'album': 'Album'} for i in range(150)]
+        req = {
+            'schemaVersion': 1,
+            'playlists': [
+                {'key': 'big', 'title': 'YouTube Import', 'tracks': big},
+                {'key': 'seed', 'title': 'Mix', 'tracks': self.requests['playlists'][0]['tracks']},
+            ],
+        }
+        plan = m.compute_plan(req, self.catalogue, self.hot, {}, {}, {self.rel}, 50_000_000, 14, max_tracks=120)
+        self.assertEqual(len(plan['library']), 1)
+        self.assertEqual(plan['library'][0]['key'], 'big')
+        self.assertEqual(len(plan['toFetch']), 1)
+
+    def test_sync_skips_playlist_that_does_not_fit(self):
+        other_rel = 'Band/LP/other.m4a'
+        other_path = self.masters / other_rel
+        other_path.parent.mkdir(parents=True)
+        other_body = audio_bytes('Other', 'Band', 'LP', extra=b'x' * 2000)
+        other_path.write_bytes(other_body)
+        other_sha = m.sha256_file(other_path)
+        cat = {
+            'schemaVersion': 1,
+            'entries': [
+                self.catalogue['entries'][0],
+                {
+                    'relativePath': other_rel,
+                    'sizeBytes': len(other_body),
+                    'sha256': other_sha,
+                    'tags': {'title': 'Other', 'artist': 'Band', 'album': 'LP'},
+                    'durationSeconds': 200.0,
+                },
+            ],
+        }
+        req = {
+            'schemaVersion': 1,
+            'playlists': [
+                {'key': 'first', 'title': 'First', 'tracks': self.requests['playlists'][0]['tracks']},
+                {'key': 'second', 'title': 'Second',
+                 'tracks': [{'id': '2', 'title': 'Other', 'artist': 'Band', 'album': 'LP'}]},
+            ],
+        }
+        body = self.file_path.read_bytes()
+        cap = len(body) + 500
+        plan = m.compute_plan(req, cat, self.hot, {}, {}, {self.rel, other_rel}, cap, 14)
+        cfg = m.load_config(self.config)
+        cfg = dict(cfg)
+        cfg['remote'] = str(self.remote)
+
+        def fake_fetch(remote, relpath, dest_part):
+            src = Path(remote) / relpath
+            if relpath == self.rel:
+                src = self.file_path
+            elif relpath == other_rel:
+                src = other_path
+            shutil.copy(src, dest_part)
+
+        with mock.patch.object(m, 'remote_fetch_file', side_effect=fake_fetch):
+            status = m.sync_execute(plan, cfg, self.state, {self.rel, other_rel})
+        self.assertIsNone(status.get('lastError'))
+        self.assertEqual(status.get('fetched'), 1)
+        self.assertEqual(len(status.get('skipped') or []), 1)
+
+    def test_status_healthy_with_library_playlist(self):
+        big = [{'id': f'id{i}', 'title': 'Song', 'artist': 'Artist', 'album': 'Album'} for i in range(200)]
+        req = {
+            'schemaVersion': 1,
+            'playlists': [
+                {'key': 'big', 'title': 'Library', 'tracks': big},
+                {'key': 'seed', 'title': 'Mix', 'tracks': self.requests['playlists'][0]['tracks']},
+            ],
+        }
+        path = self.hot / self.rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.file_path, path)
+        cfg = m.load_config(self.config)
+        st = m.build_status(req, self.catalogue, cfg, self.state, {'lastError': None, 'library': [
+            {'key': 'big', 'title': 'Library', 'wanted': 200, 'library': True},
+        ]})
+        self.assertTrue(st['healthy'])
+        self.assertTrue(any(p.get('library') for p in st['playlists']))
 
 
 @unittest.skipUnless(m.rclone_bin(), 'rclone not installed')

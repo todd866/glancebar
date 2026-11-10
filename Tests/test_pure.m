@@ -2038,16 +2038,32 @@ int main(void) {
                   OfflineTrackListStale(YES, NO, 60) && !OfflineTrackListStale(YES, NO, 59),
                   @"music: the offline list refreshes on entry and after 60 seconds");
             NSDictionary *incomplete = @{@"healthy": @NO, @"playlists": @[@{@"missing": @2}]};
-            check(MusicLibraryStatusIncomplete(incomplete) && !MusicLibraryStatusIncomplete(@{@"healthy": @YES, @"playlists": @[]}),
-                  @"music-library: status is incomplete when any playlist still has missing tracks");
-            NSDictionary *now = @{@"healthy": @NO, @"playlists": @[@{@"missing": @1}]};
-            check(MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 4000, 0, 0, 3, 1),
+            NSDictionary *libraryOnly = @{@"healthy": @YES, @"playlists": @[
+                @{@"key": @"big", @"missing": @500, @"library": @YES}]};
+            check(MusicLibraryStatusIncomplete(incomplete) && !MusicLibraryStatusIncomplete(libraryOnly) &&
+                  !MusicLibraryStatusIncomplete(@{@"healthy": @YES, @"playlists": @[]}),
+                  @"music-library: hot-set missing counts; library playlists do not");
+            check(!MusicLibraryCannotFetchForPlaylist(libraryOnly, @"big", YES, NO) &&
+                  MusicLibraryCannotFetchForPlaylist(@{@"playlists": @[@{@"key": @"x", @"unmatched": @2}]}, @"x", YES, NO),
+                  @"music-library: cannot-fetch is per playlist");
+            check(MusicLibraryMayStartSync(4000, 0, 0, 3, 0, 1, NO, YES, NO, NO, NO),
                   @"music-library: a new request generation may sync immediately");
-            check(!MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 4000, 3990, 0, 1, 1),
+            check(!MusicLibraryMayStartSync(2000, 1000, 1, 1, 1, 1, NO, YES, NO, NO, NO),
                   @"music-library: the same generation waits for the retry interval");
-            check(!MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 5000, 1000, 2, 1, 1) &&
-                  MusicLibraryShouldRetrySync(now, YES, NO, NO, NO, NO, 9000, 1000, 2, 1, 1),
+            check(!MusicLibraryMayStartSync(4599, 1000, 2, 1, 1, 1, NO, YES, NO, NO, NO) &&
+                  MusicLibraryMayStartSync(4601, 1000, 2, 1, 1, 1, NO, YES, NO, NO, NO),
                   @"music-library: failures back off before another sync");
+            check(!MusicLibraryMayStartSync(9000, 1000, 2, 1, 1, 1, NO, YES, NO, YES, NO) &&
+                  MusicLibraryMayStartSync(9000, 1000, 2, 1, 1, 1, NO, YES, NO, NO, YES),
+                  @"music-library: terminal failures and bypass backoff");
+            check(MusicLibrarySyncRetryInterval(1) == 30 * 60 && MusicLibrarySyncRetryInterval(2) == 60 * 60 &&
+                  MusicLibrarySyncRetryInterval(10) <= 6 * 3600,
+                  @"music-library: retry interval doubles from 30 min, capped at 6 h");
+            NSMutableArray *launches = [NSMutableArray arrayWithArray:
+                @[@(1000), @(1010), @(1020), @(1030), @(1040), @(1050)]];
+            BOOL log = NO;
+            check(!MusicLibraryHelperLaunchPermitted(1055, launches, 6, 300, &log) && log,
+                  @"music-library: helper launch rate limit backstop");
             check(MixPrepareStillValid(@"k", @[@{@"key": @"k"}], @[], 1, 2),
                   @"music-library: visible seeds accept mix results regardless of generation");
             check(MixPrepareStillValid(@"p", @[], @[@{@"key": @"p"}], 2, 2) &&

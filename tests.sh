@@ -84,6 +84,13 @@ fi
     -o "$WORK_DIR/glancebar_offline_tests"
 "$WORK_DIR/glancebar_offline_tests"
 
+# Music-library sync storm regression (intercepted helpers, no subprocess I/O).
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_music_library_storm.m \
+    -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
+    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -o "$WORK_DIR/glancebar_music_library_storm_tests"
+"$WORK_DIR/glancebar_music_library_storm_tests"
+
 # Metered-link transport and persistence coverage. The harness imports the private monitor
 # but stubs both interface counters and NSURLSession-facing tick paths.
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_metered.m \
