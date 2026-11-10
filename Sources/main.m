@@ -4590,6 +4590,8 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 // Clicks pass through to the tile; only the hover is caught, over the tile and both caption lines.
 @interface GBSeedHover : NSView
 @property (nonatomic, weak) id<GBTileHover> tile;
+@property (nonatomic, copy) NSString *preloadKey;
+@property (nonatomic, weak) Controller *controller;
 @end
 @implementation GBSeedHover
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
@@ -4608,8 +4610,18 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
     [super viewDidMoveToWindow];
     if (self.pointerInside) [self.tile showLarge];   // rebuilt under the pointer: keep the view, re-anchored
 }
-- (void)mouseEntered:(NSEvent *)event { (void)event; [self.tile showLarge]; }
-- (void)mouseExited:(NSEvent *)event { (void)event; if (!self.pointerInside) [self.tile hideLarge]; }
+- (void)mouseEntered:(NSEvent *)event {
+    (void)event;
+    [self.tile showLarge];
+    if (self.preloadKey.length && self.controller) [self.controller schedulePreloadHover:self.preloadKey];
+}
+- (void)mouseExited:(NSEvent *)event {
+    (void)event;
+    if (!self.pointerInside) {
+        [self.tile hideLarge];
+        if (self.controller) [self.controller cancelPreloadHover];
+    }
+}
 @end
 
 // This week's count, drawn on the station tile. The digit is the instrument; "new picks" is the label.
@@ -5835,7 +5847,19 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
     NSString *_mixPlayingKey, *_mixStartingKey;
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
     NSDictionary *_offlineManifest;
-    BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain, _offlineVerifyBusy;
+    BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain;
+    NSUInteger _offlineHashGeneration;
+    dispatch_queue_t _offlineHashQueue;
+    NSMutableIndexSet *_offlineHashVerified;
+    NSString *_preparedPlaylistKey;
+    AVPlayerItem *_preparedFirstItem;
+    NSTimer *_preloadHoverTimer;
+    NSString *_preloadHoverKey;
+    CFAbsoluteTime _musicTimingClick;
+    NSMutableArray<NSDictionary *> *_musicTimingLog;
+    BOOL _musicTimingEnabled;
+    NSTimer *_seekCoalesceTimer;
+    double _seekCoalesceSeconds;
     BOOL _musiclibBusy, _musiclibAgain;
     CFAbsoluteTime _musiclibLastSyncAttemptAt;
     NSUInteger _musiclibSyncFailures, _offlineRequestsGeneration, _musiclibSyncedRequestGeneration;
@@ -6412,6 +6436,58 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)invalidateOfflineCoverageCache {
     [_offlineCoverageCache removeAllObjects];
 }
+- (void)storeOfflineCoverage:(NSDictionary *)computed fingerprints:(NSArray *)fingerprints forKey:(NSString *)key
+                    cacheKey:(NSString *)cacheKey request:(NSDictionary *)request manifest:(NSDictionary *)manifest {
+    if (!computed) computed = @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
+    if (!_offlineCoverageCache) _offlineCoverageCache = [NSMutableDictionary dictionary];
+    _offlineCoverageCache[cacheKey] = @{@"coverage": computed, @"fingerprints": fingerprints ?: @[]};
+    (void)key; (void)request; (void)manifest;
+}
+- (void)scheduleOfflineCoverageRefresh:(NSString *)key {
+    NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+    if (!request || !manifest) return;
+    NSString *cacheKey = [self offlineCoverageCacheKey:key];
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSDictionary *requestCopy = request;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *computed = OfflinePlaylistCoverage(requestCopy, manifest, root, NO);
+        NSArray *fingerprints = OfflinePlaylistDiskFingerprints(requestCopy, manifest, root);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![requestCopy isEqual:self->_offlineRequests[key]] || manifest != self->_offlineManifest) return;
+            [self storeOfflineCoverage:computed fingerprints:fingerprints forKey:key cacheKey:cacheKey
+                              request:requestCopy manifest:manifest];
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+- (void)refreshOfflineCoverageCacheIfStale:(NSString *)key cached:(NSDictionary *)cached request:(NSDictionary *)request
+                                  manifest:(NSDictionary *)manifest root:(NSString *)root cacheKey:(NSString *)cacheKey {
+    NSDictionary *requestCopy = request, *manifestCopy = manifest;
+    NSDictionary *cachedCopy = cached;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSArray *disk = OfflinePlaylistDiskFingerprints(requestCopy, manifestCopy, root);
+        if ([disk isEqual:cachedCopy[@"fingerprints"]]) return;
+        NSDictionary *computed = OfflinePlaylistCoverage(requestCopy, manifestCopy, root, NO);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![requestCopy isEqual:self->_offlineRequests[key]] || manifestCopy != self->_offlineManifest) return;
+            [self storeOfflineCoverage:computed fingerprints:disk forKey:key cacheKey:cacheKey
+                              request:requestCopy manifest:manifestCopy];
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+- (NSDictionary *)offlineCoverageForDisplay:(NSString *)key {
+    NSString *cacheKey = [self offlineCoverageCacheKey:key];
+    NSDictionary *cached = _offlineCoverageCache[cacheKey];
+    if (cached) {
+        NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
+        NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+        [self refreshOfflineCoverageCacheIfStale:key cached:cached request:request manifest:manifest root:root cacheKey:cacheKey];
+        return cached[@"coverage"];
+    }
+    [self scheduleOfflineCoverageRefresh:key];
+    return @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
+}
 - (NSDictionary *)offlineCoverage:(NSString *)key verifyHash:(BOOL)verifyHash {
     if (verifyHash) {
         return OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest,
@@ -6422,8 +6498,9 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
     NSDictionary *cached = _offlineCoverageCache[cacheKey];
     if (cached) {
-        NSArray *disk = OfflinePlaylistDiskFingerprints(request, manifest, root);
-        if ([disk isEqual:cached[@"fingerprints"]]) return cached[@"coverage"];
+        NSDictionary *coverage = cached[@"coverage"];
+        [self refreshOfflineCoverageCacheIfStale:key cached:cached request:request manifest:manifest root:root cacheKey:cacheKey];
+        return coverage;
     }
     __block NSDictionary *computed = nil;
     __block NSArray *fingerprints = nil;
@@ -6431,13 +6508,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
         computed = OfflinePlaylistCoverage(request, manifest, root, NO);
         fingerprints = OfflinePlaylistDiskFingerprints(request, manifest, root);
     });
-    if (!computed) {
-        computed = @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
-        fingerprints = @[];
-    }
-    if (!_offlineCoverageCache) _offlineCoverageCache = [NSMutableDictionary dictionary];
-    _offlineCoverageCache[cacheKey] = @{@"coverage": computed, @"fingerprints": fingerprints ?: @[]};
-    return computed;
+    [self storeOfflineCoverage:computed fingerprints:fingerprints forKey:key cacheKey:cacheKey request:request manifest:manifest];
+    return computed ?: @{@"total": @0, @"available": @0, @"ready": @NO, @"complete": @NO, @"paths": @[]};
 }
 - (NSString *)offlineStatus:(NSDictionary *)coverage {
     NSUInteger total = [coverage[@"total"] unsignedIntegerValue], available = [coverage[@"available"] unsignedIntegerValue];
@@ -6515,7 +6587,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     return NO;
 }
 - (NSDictionary *)mixTileStateForKey:(NSString *)key {
-    NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    NSDictionary *coverage = [self offlineCoverageForDisplay:key];
     if (![self isMixPlaylistKey:key]) return coverage;
     return OfflineMixTileState(coverage, _musiclibBusy, [self musicLibraryCannotFetchForKey:key]);
 }
@@ -6892,8 +6964,145 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         });
     });
 }
+- (BOOL)musicTimingLogEnabled {
+    if (_musicTimingEnabled) return YES;
+    const char *env = getenv("GLANCEBAR_MUSIC_TIMING");
+    if (env && env[0] && strcmp(env, "0") != 0) return YES;
+    return [NSUserDefaults.standardUserDefaults boolForKey:@"musicTimingLog"];
+}
+- (void)musicTimingMark:(NSString *)event {
+    if (![self musicTimingLogEnabled]) return;
+    if (!_musicTimingLog) _musicTimingLog = [NSMutableArray array];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    double sinceClickMs = _musicTimingClick > 0 ? (now - _musicTimingClick) * 1000.0 : 0;
+    [_musicTimingLog addObject:@{@"event": event ?: @"", @"ms": @(sinceClickMs), @"t": @(now)}];
+    while (_musicTimingLog.count > 20) [_musicTimingLog removeObjectAtIndex:0];
+    GBLog("music timing: %{public}@ +%.0f ms", event, sinceClickMs);
+}
+- (NSArray<NSDictionary *> *)musicTimingRecent {
+    return [_musicTimingLog copy] ?: @[];
+}
+- (dispatch_queue_t)offlineHashQueue {
+    if (!_offlineHashQueue) _offlineHashQueue = dispatch_queue_create("glancebar.offline-hash", DISPATCH_QUEUE_SERIAL);
+    return _offlineHashQueue;
+}
+- (void)discardPreparedPlaylist {
+    _preparedPlaylistKey = nil;
+    _preparedFirstItem = nil;
+}
+- (void)preparePlaylistFirstItem:(NSString *)key {
+    if (!key.length || _musicOff || !_musicProbesEnabled) return;
+    if ([key isEqual:_preparedPlaylistKey] && _preparedFirstItem) return;
+    [self discardPreparedPlaylist];
+    NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    NSString *path = [coverage[@"paths"] isKindOfClass:NSArray.class] ? [coverage[@"paths"] firstObject] : nil;
+    if (!path.length) return;
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
+    item.preferredForwardBufferDuration = 2;
+    _preparedPlaylistKey = [key copy];
+    _preparedFirstItem = item;
+}
+- (void)schedulePreloadHover:(NSString *)key {
+    [_preloadHoverTimer invalidate];
+    _preloadHoverTimer = nil;
+    _preloadHoverKey = [key copy];
+    __weak Controller *weak = self;
+    _preloadHoverTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:NO block:^(NSTimer *t) {
+        (void)t;
+        Controller *self = weak;
+        if (!self || ![key isEqual:self->_preloadHoverKey]) return;
+        [self preparePlaylistFirstItem:key];
+    }];
+}
+- (void)cancelPreloadHover {
+    [_preloadHoverTimer invalidate];
+    _preloadHoverTimer = nil;
+    _preloadHoverKey = nil;
+}
+- (BOOL)offlinePlaylistStillVisible:(NSString *)key {
+    if ([key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"]) return YES;
+    for (NSDictionary *seed in _mixSeeds) if ([seed[@"key"] isEqual:key]) return YES;
+    return NO;
+}
+- (void)purgeLocalTrackAtIndex:(NSInteger)index reason:(NSString *)reason {
+    if (index < 0 || index >= (NSInteger)_localURLs.count) return;
+    NSString *path = _localURLs[index].path;
+    GBLog("music: dropping track %{public}@ (%{public}@)", path.lastPathComponent, reason);
+    NSMutableArray<NSURL *> *urls = [_localURLs mutableCopy];
+    [urls removeObjectAtIndex:(NSUInteger)index];
+    _localURLs = urls;
+    _libraryRefreshWantsSync = YES;
+    [self libraryRefreshPump];
+    if (!_localURLs.count) {
+        [self tearDownLocalPlayer];
+        _localMode = NO;
+        _mixPlayingKey = nil;
+        return;
+    }
+    if (index < _localIndex) _localIndex--;
+    else if (index == _localIndex) [self playLocalIndex:_localIndex];
+    else if (index < _localQueueEnd) _localQueueEnd--;
+}
+- (NSDictionary *)offlineManifestRecordForPath:(NSString *)path key:(NSString *)key {
+    NSDictionary *manifest = _offlineManifest;
+    if (!path.length || !manifest) return nil;
+    NSDictionary *entry = nil;
+    if ([manifest[@"schemaVersion"] isEqual:@1] && [manifest[@"playlists"] isKindOfClass:NSArray.class]) {
+        for (id candidate in manifest[@"playlists"])
+            if ([candidate isKindOfClass:NSDictionary.class] && [candidate[@"key"] isEqual:key]) { entry = candidate; break; }
+    }
+    for (id record in [entry[@"tracks"] isKindOfClass:NSArray.class] ? entry[@"tracks"] : @[]) {
+        if ([record isKindOfClass:NSDictionary.class] && [record[@"path"] isEqual:path]) return record;
+    }
+    return nil;
+}
+- (void)scheduleOfflineHashVerifyForKey:(NSString *)key paths:(NSArray *)paths generation:(NSUInteger)generation {
+    _offlineHashGeneration = generation;
+    if (!_offlineHashVerified) _offlineHashVerified = [NSMutableIndexSet indexSet];
+    else [_offlineHashVerified removeAllIndexes];
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    dispatch_async([self offlineHashQueue], ^{
+        for (NSInteger i = 0; i < (NSInteger)paths.count; i++) {
+            if (generation != self->_offlineHashGeneration) return;
+            NSString *path = paths[i];
+            if ([self->_offlineHashVerified containsIndex:(NSUInteger)i]) continue;
+            NSDictionary *record = [self offlineManifestRecordForPath:path key:key];
+            if (!record) continue;
+            BOOL ok = OfflinePlaylistVerifyRecordHash(record, root);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (generation != self->_offlineHashGeneration || ![key isEqual:self->_mixPlayingKey]) return;
+                if (ok) [self->_offlineHashVerified addIndex:(NSUInteger)i];
+                else [self purgeLocalTrackAtIndex:i reason:@"sha256 mismatch"];
+            });
+            if (!ok) break;
+        }
+    });
+}
+- (void)maintainOfflineHashVerifyAhead {
+    if (!_mixPlayingKey.length || !_localURLs.count) return;
+    NSUInteger generation = _offlineHashGeneration;
+    NSString *key = _mixPlayingKey, *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSInteger start = _localIndex + 1, end = MIN((NSInteger)_localURLs.count, _localIndex + 10);
+    dispatch_async([self offlineHashQueue], ^{
+        for (NSInteger i = start; i < end; i++) {
+            if (generation != self->_offlineHashGeneration) return;
+            if ([self->_offlineHashVerified containsIndex:(NSUInteger)i]) continue;
+            NSString *path = self->_localURLs[i].path;
+            NSDictionary *record = [self offlineManifestRecordForPath:path key:key];
+            if (!record) continue;
+            BOOL ok = OfflinePlaylistVerifyRecordHash(record, root);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (generation != self->_offlineHashGeneration) return;
+                if (ok) [self->_offlineHashVerified addIndex:(NSUInteger)i];
+                else [self purgeLocalTrackAtIndex:i reason:@"sha256 mismatch"];
+            });
+        }
+    });
+}
 - (void)playLocalPaths:(NSArray<NSString *> *)paths {
     if (!_musicProbesEnabled || !paths.count) return;
+    OfflinePlaylistResetHashMetrics();
     NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
     NSString *first = paths.firstObject;
     BOOL uniform = first.length > 0;
@@ -6911,16 +7120,23 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     if (!urls.count) return;
     _localURLs = urls;
     [self playLocalIndex:0];
+    [self musicTimingMark:@"play"];
 }
 - (void)playOfflinePlaylist:(NSString *)key {
-    if (!_musicProbesEnabled || _offlineVerifyBusy) return;
+    if (!_musicProbesEnabled) return;
+    if ([key isEqual:_mixPlayingKey] && _localPlayer) return;
     NSUInteger generation = ++_offlinePlayGeneration;
-    _mixStartingKey = nil;
+    _mixStartingKey = key;
+    _musicTimingClick = CFAbsoluteTimeGetCurrent();
+    OfflinePlaylistResetHashMetrics();
+    [self musicTimingMark:@"click"];
     NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
+    [self musicTimingMark:@"verify"];
     NSDictionary *tile = [self isMixPlaylistKey:key] ? [self mixTileStateForKey:key] : nil;
     if (tile) {
         NSString *state = tile[@"state"];
         if ([state isEqual:@"fetching"]) {
+            _mixStartingKey = nil;
             _musicNote = tile[@"tooltip"];
             [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
             _libraryRefreshWantsCache = YES;
@@ -6929,7 +7145,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             return;
         }
         if (![tile[@"enabled"] boolValue]) {
-            // Nothing playable on disk: a click asks for the tracks rather than doing nothing.
+            _mixStartingKey = nil;
             _musicNote = tile[@"tooltip"];
             [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
             _libraryRefreshWantsCache = YES;
@@ -6938,40 +7154,44 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             return;
         }
     } else if (![coverage[@"ready"] boolValue]) {
+        _mixStartingKey = nil;
         _musicNote = [self offlineStatus:coverage];
         [self prepareOfflineCache];
         if (_popover.isShown) [self rebuildContent];
         return;
     }
-    _mixStartingKey = key;
-    _offlineVerifyBusy = YES;
     NSDictionary *request = _offlineRequests[key], *manifest = _offlineManifest;
-    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
-    if (_popover.isShown) [self rebuildContent];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSDictionary *verified = OfflinePlaylistCoverage(request, manifest, root, YES);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self->_offlineVerifyBusy = NO;
-            if (generation != self->_offlinePlayGeneration) {
-                if (self->_popover.isShown) [self rebuildContent];
-                return;
-            }
+    NSArray *paths = coverage[@"paths"];
+    if (!paths.count) {
+        _mixStartingKey = nil;
+        _musicNote = [self offlineStatus:coverage];
+        if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    if (![key isEqual:_preparedPlaylistKey]) [self discardPreparedPlaylist];
+    __weak Controller *weak = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Controller *self = weak;
+        if (!self || generation != self->_offlinePlayGeneration) {
             self->_mixStartingKey = nil;
-            BOOL current = [key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"];
-            for (NSDictionary *seed in self->_mixSeeds) if ([seed[@"key"] isEqual:key]) current = YES;
-            NSArray *paths = verified[@"paths"];
-            if (self->_musicProbesEnabled && !self->_musicOff && current && paths.count &&
-                [self->_offlineRequests[key] isEqual:request] && [manifest isEqual:self->_offlineManifest]) {
-                self->_musicNote = nil;
-                self->_mixPlayingKey = key;
-                [self playLocalPaths:paths];
-            } else if (!paths.count) {
-                self->_musicNote = [self offlineStatus:verified];
-            } else {
-                self->_musicNote = @"Offline playlist changed. Nothing was started.";
-            }
             if (self->_popover.isShown) [self rebuildContent];
-        });
+            return;
+        }
+        if (!self->_musicProbesEnabled || self->_musicOff || !paths.count ||
+            ![self offlinePlaylistStillVisible:key] ||
+            ![self->_offlineRequests[key] isEqual:request] || manifest != self->_offlineManifest) {
+            self->_mixStartingKey = nil;
+            self->_musicNote = paths.count ? @"Offline playlist changed. Nothing was started." : [self offlineStatus:coverage];
+            if (self->_popover.isShown) [self rebuildContent];
+            return;
+        }
+        self->_mixStartingKey = nil;
+        self->_musicNote = nil;
+        self->_mixPlayingKey = key;
+        [self musicTimingMark:@"queue"];
+        [self playLocalPaths:paths];
+        [self scheduleOfflineHashVerifyForKey:key paths:paths generation:generation];
+        if (self->_popover.isShown) [self rebuildContent];
     });
 }
 - (void)playSeedLocally:(NSDictionary *)seed { [self playOfflinePlaylist:seed[@"key"]]; }
@@ -7345,6 +7565,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _playbackKnown = YES;
     _playbackPlaying = YES;
     [self maintainLocalPlayerQueue];
+    [self maintainOfflineHashVerifyAhead];
     if (!_localPlayer.currentItem && _localQueueEnd < (NSInteger)_localURLs.count) {
         [self extendLocalPlayerQueueIfNeeded];
         [_localPlayer play];
@@ -7370,7 +7591,15 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _externalPlayback = nil;
     index = [self wrappedLocalIndex:index];
     _localIndex = index;
-    NSArray<AVPlayerItem *> *items = [self localItemsFromIndex:index];
+    NSMutableArray<AVPlayerItem *> *items = [[self localItemsFromIndex:index] mutableCopy];
+    if (index == 0 && _preparedFirstItem && _localURLs.count) {
+        NSURL *preparedURL = [_preparedFirstItem.asset isKindOfClass:AVURLAsset.class]
+            ? ((AVURLAsset *)_preparedFirstItem.asset).URL : nil;
+        if (preparedURL && [_localURLs[0] isEqual:preparedURL]) {
+            [items replaceObjectAtIndex:0 withObject:_preparedFirstItem];
+            [self discardPreparedPlaylist];
+        }
+    }
     [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
     float level = MusicPlayerOutputVolume(_musicSilentQA);
@@ -7385,9 +7614,30 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     [self applyLocalItemURL:_localURLs[index]];
     [self enableRemoteCommands];
     [_localPlayer play];
+    OfflinePlaylistNotePlaybackStarted();
+    [self musicTimingMark:@"rate"];
+    [self maintainOfflineHashVerifyAhead];
     [self applyPlayerAudioOutput];
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
+}
+- (void)updateMusicTransportInPlace {
+    if (!_popover.isShown) return;
+    NSView *root = _popover.contentViewController.view;
+    BOOL playing = _playbackPlaying;
+    NSString *symbol = playing ? @"pause.fill" : @"play.fill";
+    NSString *label = playing ? @"Pause" : @"Play";
+    NSButton *play = (NSButton *)ViewWithAccessibilityIdentifier(root, @"popover.music.play");
+    if (![play isKindOfClass:NSButton.class]) return;
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:24 weight:NSFontWeightRegular];
+    NSImage *image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+    if (image) play.image = image;
+    play.accessibilityLabel = label;
+}
+- (void)updateMusicNextArmedInPlace {
+    if (!_popover.isShown || _musicNextArmedAt <= 0) return;
+    NSButton *next = (NSButton *)ViewWithAccessibilityIdentifier(_popover.contentViewController.view, @"popover.music.next");
+    if ([next isKindOfClass:NSButton.class]) next.contentTintColor = NSColor.controlAccentColor;
 }
 - (void)localBlendTick:(NSTimer *)timer {
     (void)timer;
@@ -7475,14 +7725,17 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     // and the outgoing player is not left audible underneath.
     if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
     if (_localPlayer.rate > 0) {
-        [_localPlayer pause];
         _playbackPlaying = NO;
+        _playbackKnown = YES;
+        [self updateMusicTransportInPlace];
+        [_localPlayer pause];
     } else {
         [self pauseAppleMusicForLocalSource];
-        [_localPlayer play];
         _playbackPlaying = YES;
+        _playbackKnown = YES;
+        [self updateMusicTransportInPlace];
+        [_localPlayer play];
     }
-    _playbackKnown = YES;
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
 }
@@ -7784,18 +8037,27 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     if (_popover.isShown) [self rebuildContent];
 }
-- (IBAction)musicSeek:(id)sender {
-    if (!_localMode || !_localPlayer || ![sender isKindOfClass:NSSlider.class]) return;
-    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
-    double seconds = ((NSSlider *)sender).doubleValue;
-    if (!isfinite(seconds) || seconds < 0) return;
+- (void)performCoalescedSeek {
+    _seekCoalesceTimer = nil;
+    if (!_localMode || !_localPlayer) return;
+    double seconds = _seekCoalesceSeconds;
     CMTime target = CMTimeMakeWithSeconds(seconds, NSEC_PER_SEC);
     [_localPlayer seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero
            completionHandler:^(BOOL __unused finished) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self noteLocalPlaybackTime]; });
     }];
+}
+- (IBAction)musicSeek:(id)sender {
+    if (!_localMode || !_localPlayer || ![sender isKindOfClass:NSSlider.class]) return;
+    if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
+    double seconds = ((NSSlider *)sender).doubleValue;
+    if (!isfinite(seconds) || seconds < 0) return;
     _trackElapsed = seconds;
     _trackSampledAt = CFAbsoluteTimeGetCurrent();
+    _seekCoalesceSeconds = seconds;
+    [_seekCoalesceTimer invalidate];
+    _seekCoalesceTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:self selector:@selector(performCoalescedSeek)
+                                                        userInfo:nil repeats:NO];
 }
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
@@ -7857,6 +8119,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         return;
     }
     if (tap != MusicNextTapWait) return;
+    [self updateMusicNextArmedInPlace];
     [self invalidateMusicNextArmTimer];
     _musicNextArmTimer = [NSTimer scheduledTimerWithTimeInterval:kMusicNextTapWindowSec target:self
                                                        selector:@selector(musicNextArmFired:)
@@ -8417,7 +8680,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         seedTile.seedKey = seed[@"key"];
         NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
         seedTile.offlineStatus = tile[@"tooltip"];
-        seedTile.enabled = [tile[@"enabled"] boolValue] && !_offlineVerifyBusy;
+        seedTile.enabled = [tile[@"enabled"] boolValue];
         seedTile.alphaValue = [tile[@"alpha"] doubleValue];
         seedTile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
         if (!cover) seedTile.contentTintColor = NSColor.tertiaryLabelColor;
@@ -8456,6 +8719,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         }
         GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
         hover.tile = seedTile;
+        hover.controller = self;
+        hover.preloadKey = seed[@"key"];
         hover.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.hover.%lu", (unsigned long)i];
         [line addSubview:hover];
         x += side + gap;
@@ -8475,7 +8740,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     station.layer.cornerRadius = 4;
     station.layer.masksToBounds = YES;
     station.alphaValue = [stationTile[@"alpha"] doubleValue];
-    station.enabled = stationOn && !_offlineVerifyBusy;
+    station.enabled = stationOn;
     station.offlineStatus = stationTile[@"tooltip"];
     station.accessibilityIdentifier = @"popover.mix.station";
     NSUInteger pickCount = station.picks.count;
@@ -8508,6 +8773,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         }
         GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
         hover.tile = station;
+        hover.controller = self;
+        hover.preloadKey = @"station:triplej";
         hover.accessibilityIdentifier = @"popover.mix.hover.station";
         [line addSubview:hover];
     }
@@ -9544,7 +9811,12 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     if (!_popover.isShown) [self togglePopover:nil];
 }
 - (void)togglePopover:(id)sender {
-    if (_popover.isShown) { [_popover close]; return; }
+    if (_popover.isShown) {
+        [self cancelPreloadHover];
+        [self discardPreparedPlaylist];
+        [_popover close];
+        return;
+    }
     // A transient popover dismisses on the mouse-DOWN of an outside click — and a click on
     // our own status-item button counts as "outside". The button's action then fires on
     // mouse-UP; without this guard it sees isShown==NO and reopens, so a second icon click
@@ -9559,6 +9831,8 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
     }
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    if (_mixPlayingKey.length) [self preparePlaylistFirstItem:_mixPlayingKey];
+    else if (_mixSeeds.firstObject[@"key"]) [self preparePlaylistFirstItem:_mixSeeds.firstObject[@"key"]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         if(!self->_popover.isShown || self->_terminating)return;
         [self refresh];
@@ -11033,6 +11307,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 }
 
 - (void)rebuildContent {
+    CFAbsoluteTime rebuildStarted = CFAbsoluteTimeGetCurrent();
     _popoverPrepared=YES;
       // Playback scale harness: frozen mix, popover never shown, music off — skip full tree rebuild.
     if (!_popover.isShown && _mixFrozen && _musicOff) {
