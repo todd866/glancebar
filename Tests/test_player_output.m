@@ -61,6 +61,12 @@ int main(void) { @autoreleasepool {
     NSDictionary *partial = OfflineMixTileState(@{@"total": @40, @"available": @12, @"complete": @NO, @"ready": @YES},
                                                 NO, YES);
     Check([partial[@"partial"] boolValue] && [partial[@"enabled"] boolValue], @"cannot-fetch allows partial play");
+    NSDictionary *idle = OfflineMixTileState(@{@"total": @40, @"available": @12, @"complete": @NO, @"ready": @YES},
+                                             NO, NO);
+    Check([idle[@"partial"] boolValue] && [idle[@"enabled"] boolValue], @"no fetch running: an incomplete tile plays what is on disk, never stuck dimmed");
+    NSDictionary *none = OfflineMixTileState(@{@"total": @40, @"available": @0, @"complete": @NO, @"ready": @NO},
+                                             NO, NO);
+    Check(![none[@"enabled"] boolValue], @"nothing on disk and no fetch running: unavailable");
 
     fprintf(stderr, "OK: %d player output checks passed\n", checks);
     return 0;

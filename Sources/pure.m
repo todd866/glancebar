@@ -103,13 +103,15 @@ NSDictionary *OfflineMixTileState(NSDictionary *coverage, BOOL syncBusy, BOOL ca
     if (complete) {
         return @{@"state": @"ready", @"enabled": @YES, @"alpha": @1.0, @"tooltip": countText, @"partial": @NO};
     }
-    if (cannotFetch) {
+    // Wait only while a fetch is actually running. With no sync in progress (it finished,
+    // failed, or some tracks have no master to fetch) the tile plays what is on disk: a tile
+    // must never sit dimmed forever.
+    if (cannotFetch || !syncBusy) {
         BOOL enabled = available > 0;
         return @{@"state": enabled ? @"partial" : @"unavailable", @"enabled": @(enabled),
                  @"alpha": enabled ? @0.85 : @0.4, @"tooltip": countText, @"partial": @(enabled)};
     }
     NSString *tip = [NSString stringWithFormat:@"fetching %lu of %lu", (unsigned long)available, (unsigned long)total];
-    if (!syncBusy && available >= total) tip = countText;
     return @{@"state": @"fetching", @"enabled": @NO, @"alpha": @0.4, @"tooltip": tip, @"partial": @NO};
 }
 
