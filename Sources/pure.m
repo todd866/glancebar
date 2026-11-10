@@ -45,6 +45,50 @@ static BOOL OfflineRequestTracksMatch(NSArray *wanted, NSArray *manifestTracks) 
     return YES;
 }
 
+static NSUInteger gOfflineHashCalls = 0;
+static NSUInteger gOfflineHashAtFirstAudio = NSUIntegerMax;
+
+void OfflinePlaylistResetHashMetrics(void) {
+    gOfflineHashCalls = 0;
+    gOfflineHashAtFirstAudio = NSUIntegerMax;
+}
+NSUInteger OfflinePlaylistHashCallCount(void) { return gOfflineHashCalls; }
+NSUInteger OfflinePlaylistHashCallsBeforeFirstAudio(void) {
+    return gOfflineHashAtFirstAudio == NSUIntegerMax ? gOfflineHashCalls : gOfflineHashAtFirstAudio;
+}
+void OfflinePlaylistNotePlaybackStarted(void) {
+    if (gOfflineHashAtFirstAudio == NSUIntegerMax) gOfflineHashAtFirstAudio = gOfflineHashCalls;
+}
+
+BOOL OfflinePlaylistVerifyRecordHash(NSDictionary *record, NSString *musicRoot) {
+    if (![record isKindOfClass:NSDictionary.class]) return NO;
+    struct stat st;
+    NSString *path = record[@"path"], *digest = record[@"sha256"];
+    if (!OfflineStat(path, musicRoot, &st) || ![record[@"sizeBytes"] isKindOfClass:NSNumber.class] ||
+        st.st_size != [record[@"sizeBytes"] longLongValue] || ![digest isKindOfClass:NSString.class] || digest.length != 64)
+        return NO;
+    NSString *stamp = [NSString stringWithFormat:@"%lld", (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec];
+    if (![record[@"mtimeNs"] isEqual:stamp] || ![record[@"inode"] isEqual:[NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino]])
+        return NO;
+    NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:path];
+    [stream open];
+    CC_SHA256_CTX hash;
+    CC_SHA256_Init(&hash);
+    uint8_t buffer[65536], bytes[CC_SHA256_DIGEST_LENGTH];
+    NSInteger n;
+    while ((n = [stream read:buffer maxLength:sizeof(buffer)]) > 0) CC_SHA256_Update(&hash, buffer, (CC_LONG)n);
+    [stream close];
+    if (n < 0) return NO;
+    gOfflineHashCalls++;
+    CC_SHA256_Final(bytes, &hash);
+    NSMutableString *actual = [NSMutableString string];
+    for (NSUInteger i = 0; i < sizeof(bytes); i++) [actual appendFormat:@"%02x", bytes[i]];
+    struct stat after;
+    return [actual isEqual:digest] && OfflineStat(path, musicRoot, &after) && after.st_ino == st.st_ino &&
+        after.st_size == st.st_size && after.st_mtimespec.tv_sec == st.st_mtimespec.tv_sec &&
+        after.st_mtimespec.tv_nsec == st.st_mtimespec.tv_nsec;
+}
+
 NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manifest, NSString *musicRoot, BOOL verifyHash) {
     NSArray *wanted = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
     NSDictionary *entry = nil;
@@ -72,21 +116,7 @@ NSDictionary *OfflinePlaylistCoverage(NSDictionary *request, NSDictionary *manif
         NSString *stamp = [NSString stringWithFormat:@"%lld", (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec];
         if (![record[@"mtimeNs"] isEqual:stamp] || ![record[@"inode"] isEqual:[NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino]]) continue;
         if (verifyHash) {
-            NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:path];
-            [stream open];
-            CC_SHA256_CTX hash; CC_SHA256_Init(&hash);
-            uint8_t buffer[65536], bytes[CC_SHA256_DIGEST_LENGTH];
-            NSInteger n;
-            while ((n = [stream read:buffer maxLength:sizeof(buffer)]) > 0) CC_SHA256_Update(&hash, buffer, (CC_LONG)n);
-            [stream close];
-            if (n < 0) continue;
-            CC_SHA256_Final(bytes, &hash);
-            NSMutableString *actual = [NSMutableString string];
-            for (NSUInteger i = 0; i < sizeof(bytes); i++) [actual appendFormat:@"%02x", bytes[i]];
-            struct stat after;
-            if (![actual isEqual:digest] || !OfflineStat(path, musicRoot, &after) || after.st_ino != st.st_ino ||
-                after.st_size != st.st_size || after.st_mtimespec.tv_sec != st.st_mtimespec.tv_sec ||
-                after.st_mtimespec.tv_nsec != st.st_mtimespec.tv_nsec) continue;
+            if (!OfflinePlaylistVerifyRecordHash(record, musicRoot)) continue;
         }
         [paths addObject:path];
     }

@@ -14,6 +14,7 @@
 #import <sys/stat.h>
 #import <unistd.h>
 #import <signal.h>
+#import "pure.h"
 
 static NSString *gFixtureHome;
 static void CleanupFixture(void) {
@@ -253,6 +254,32 @@ static NSSlider *SeekSlider(double seconds) {
 }
 @end
 
+static NSDictionary *ManifestWithCorruptHash(NSDictionary *manifest, NSString *key, NSUInteger trackIndex) {
+    if (![manifest[@"playlists"] isKindOfClass:NSArray.class]) return manifest;
+    NSMutableDictionary *root = [manifest mutableCopy];
+    NSMutableArray *playlists = [NSMutableArray array];
+    for (id item in manifest[@"playlists"]) {
+        if (![item isKindOfClass:NSDictionary.class]) { [playlists addObject:item]; continue; }
+        NSDictionary *pl = item;
+        if (![pl[@"key"] isEqual:key]) { [playlists addObject:pl]; continue; }
+        NSMutableDictionary *copy = [pl mutableCopy];
+        NSMutableArray *tracks = [NSMutableArray array];
+        NSUInteger i = 0;
+        for (id tr in [pl[@"tracks"] isKindOfClass:NSArray.class] ? pl[@"tracks"] : @[]) {
+            if (i == trackIndex && [tr isKindOfClass:NSDictionary.class]) {
+                NSMutableDictionary *bad = [tr mutableCopy];
+                bad[@"sha256"] = @"0000000000000000000000000000000000000000000000000000000000000000";
+                [tracks addObject:bad];
+            } else [tracks addObject:tr ?: @{}];
+            i++;
+        }
+        copy[@"tracks"] = tracks;
+        [playlists addObject:copy];
+    }
+    root[@"playlists"] = playlists;
+    return root;
+}
+
 static NSArray<NSString *> *GenerateTracks(NSString *musicRoot, NSArray<NSDictionary *> *specs) {
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
     [NSFileManager.defaultManager createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
@@ -265,7 +292,7 @@ static NSArray<NSString *> *GenerateTracks(NSString *musicRoot, NSArray<NSDictio
         NSString *name = [NSString stringWithFormat:@"%@ - %@ [%@].m4a", spec[@"artist"], spec[@"title"], spec[@"id"]];
         NSString *m4a = [musicRoot stringByAppendingPathComponent:name];
         if (!WriteToneWAV(wav, tones[i % 4], 12.0)) return nil;
-        if (!Afconvert(wav, m4a, formats[i])) return nil;
+        if (!Afconvert(wav, m4a, formats[i % formats.count])) return nil;
         [paths addObject:m4a];
     }
     [NSFileManager.defaultManager removeItemAtPath:tmp error:nil];
@@ -311,6 +338,9 @@ int main(void) {
         PlaybackController *c = [PlaybackController new];
         if (!MusicSilentQAEnabled()) Fail(__LINE__);
         [c setValue:@YES forKey:@"musicSilentQA"];
+        // Never script the real Music app from the harness: a popover rebuild would otherwise read
+        // the owner's library when Music happens to be open (and crashed here, having no mix queue).
+        [c setValue:@YES forKey:@"mixLibraryLoading"];
         [c setValue:@YES forKey:@"musicProbesEnabled"];
         AssertSilentQA(c, __LINE__);
         [c setValue:@YES forKey:@"mixFrozen"];
@@ -499,6 +529,200 @@ int main(void) {
         if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 8)) Fail(__LINE__);
         NSString *playerUID = LocalPlayer(c).audioOutputDeviceUniqueID;
         if (![playerUID isEqual:@"builtin"]) Fail(__LINE__);
+
+        // --- responsiveness: tile click, background hash, transport, seeks, rebuild stalls ---
+        double resp40StartMs = 0, respPauseMs = 0, respResumeMs = 0, respNextCutMs = 0;
+        NSUInteger respHashBeforeAudio = 0, respSeekApplies = 0;
+        double respRebuildStallMs = 0;
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        [c setValue:@NO forKey:@"mixFrozen"];
+        [c setValue:@NO forKey:@"musicOff"];
+        // The scenario above pins the player to a made-up device UID. Left in place, every item in
+        // the scenarios below fails with a clock error and the timings are measured on a dead
+        // player. Back to "follows the system default" (the player stays muted in silent QA).
+        [c setValue:@[builtinOut] forKey:@"audioDevices"];
+        [c setValue:@"builtin" forKey:@"defaultOutputUID"];
+        [c setPlayerOutputChoiceUID:@"" name:@""];
+        NSMutableArray *fortySpecs = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 40; i++) {
+            [fortySpecs addObject:@{@"id": [NSString stringWithFormat:@"F%lu", (unsigned long)i],
+                                    @"title": [NSString stringWithFormat:@"Fast %lu", (unsigned long)i],
+                                    @"artist": @"Resp", @"album": @""}];
+        }
+        NSString *fortySeedPath = [GenerateTracks(musicRoot, @[fortySpecs[0]]) firstObject];
+        if (!fortySeedPath.length) Fail(__LINE__);
+        NSMutableArray<NSString *> *fortyPaths = [NSMutableArray arrayWithCapacity:40];
+        for (NSUInteger i = 0; i < 40; i++) [fortyPaths addObject:fortySeedPath];
+        NSDictionary *fortyFixture = PlaylistFixture(fortySpecs, fortyPaths, @"song:resp40");
+        if (!fortyFixture) Fail(__LINE__);
+        [c setValue:[@{@"song:resp40": fortyFixture[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:fortyFixture[@"manifest"] forKey:@"offlineManifest"];
+        (void)[c offlineCoverageForDisplay:@"song:resp40"];
+        [c preparePlaylistFirstItem:@"song:resp40"];
+        NSArray *respPaths = [c offlineCoverage:@"song:resp40" verifyHash:NO][@"paths"];
+        if (respPaths.count != 40) Fail(__LINE__);
+        (void)respPaths;
+        OfflinePlaylistResetHashMetrics();
+        CFAbsoluteTime clickT0 = CFAbsoluteTimeGetCurrent();
+        [c playOfflinePlaylist:@"song:resp40"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 1.0)) Fail(__LINE__);
+        resp40StartMs = (CFAbsoluteTimeGetCurrent() - clickT0) * 1000.0;
+        if (LocalPlayer(c).audioOutputDeviceUniqueID.length) Fail(__LINE__);
+        respHashBeforeAudio = OfflinePlaylistHashCallsBeforeFirstAudio();
+        if (resp40StartMs > 300.0) {
+            fprintf(stderr, "40-track tile click: rate > 0 took %.0f ms (limit 300)\n", resp40StartMs);
+            Fail(__LINE__);
+        }
+        if (respHashBeforeAudio != 0) {
+            fprintf(stderr, "hash calls before first audio: %lu (expected 0)\n", (unsigned long)respHashBeforeAudio);
+            Fail(__LINE__);
+        }
+        // rate > 0 is only the request: the track must really be moving.
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
+        player = LocalPlayer(c);
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        NSArray *hashSpecs = @[
+            @{@"id": @"H0", @"title": @"Hash Zero", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"H1", @"title": @"Hash One", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"H2", @"title": @"Hash Two", @"artist": @"Resp", @"album": @""},
+        ];
+        NSArray *hashPaths = GenerateTracks(musicRoot, hashSpecs);
+        if (hashPaths.count != 3) Fail(__LINE__);
+        NSDictionary *hashFixture = PlaylistFixture(hashSpecs, hashPaths, @"song:hashfail");
+        if (!hashFixture) Fail(__LINE__);
+        NSDictionary *hashManifest = ManifestWithCorruptHash(hashFixture[@"manifest"], @"song:hashfail", 2);
+        [c setValue:[@{@"song:hashfail": hashFixture[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:hashManifest forKey:@"offlineManifest"];
+        [c playOfflinePlaylist:@"song:hashfail"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 3.0)) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return (NSInteger)[[c valueForKey:@"localURLs"] count] == 2; }, 8.0)) Fail(__LINE__);
+        if (LocalPlayer(c).rate <= 0 || LocalIndex(c) != 0) Fail(__LINE__);
+        // The rejected file must be gone from the player's own queue, not only from the list.
+        for (AVPlayerItem *queued in LocalPlayer(c).items) {
+            NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
+            if ([queuedURL.path isEqual:hashPaths[2]]) Fail(__LINE__);
+        }
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).items.count == 2; }, 1.0)) {
+            fprintf(stderr, "after a hash drop the player holds %lu items (want 2); urls %lu index %ld rate %.1f current %s queueEnd %ld player %p\n",
+                    (unsigned long)LocalPlayer(c).items.count, (unsigned long)[[c valueForKey:@"localURLs"] count], (long)LocalIndex(c),
+                    LocalPlayer(c).rate, LocalPlayer(c).currentItem ? "yes" : "no", (long)[[c valueForKey:@"localQueueEnd"] integerValue], LocalPlayer(c));
+            Fail(__LINE__);
+        }
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
+
+        CFAbsoluteTime pauseT0 = CFAbsoluteTimeGetCurrent();
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 0.25)) Fail(__LINE__);
+        respPauseMs = (CFAbsoluteTimeGetCurrent() - pauseT0) * 1000.0;
+        if (respPauseMs > 50.0) {
+            fprintf(stderr, "pause flip took %.1f ms (limit 50)\n", respPauseMs);
+            Fail(__LINE__);
+        }
+        CFAbsoluteTime resumeT0 = CFAbsoluteTimeGetCurrent();
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 0.25)) Fail(__LINE__);
+        respResumeMs = (CFAbsoluteTimeGetCurrent() - resumeT0) * 1000.0;
+        if (respResumeMs > 50.0) {
+            fprintf(stderr, "resume flip took %.1f ms (limit 50)\n", respResumeMs);
+            Fail(__LINE__);
+        }
+
+        NSInteger respCutFrom = LocalIndex(c);
+        CFAbsoluteTime cutT0 = CFAbsoluteTimeGetCurrent();
+        [c musicNext:nil];
+        [c musicNext:nil];
+        if (!WaitUntil(^BOOL { return LocalIndex(c) != respCutFrom; }, 0.2)) Fail(__LINE__);
+        respNextCutMs = (CFAbsoluteTimeGetCurrent() - cutT0) * 1000.0;
+        if (respNextCutMs > 150.0) {
+            fprintf(stderr, "double-tap Next cut took %.0f ms (limit 150)\n", respNextCutMs);
+            Fail(__LINE__);
+        }
+
+        [c setValue:@0 forKey:@"coalescedSeekCount"];
+        for (int ev = 0; ev < 30; ev++) [c musicSeek:SeekSlider((double)(ev % 10))];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.25]);
+        respSeekApplies = [c coalescedSeekApplyCount];
+        if (respSeekApplies > 5) {
+            fprintf(stderr, "30 scrub events → %lu seeks (limit 5)\n", (unsigned long)respSeekApplies);
+            Fail(__LINE__);
+        }
+
+        StallWatch *rebuildStalls = [StallWatch new];
+        [rebuildStalls start];
+        for (int tick = 0; tick < 5; tick++) {
+            [c rebuildContent];
+            PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.35]);
+        }
+        [rebuildStalls stop];
+        respRebuildStallMs = rebuildStalls.worstMs;
+        if (respRebuildStallMs > 100.0) {
+            fprintf(stderr, "popover rebuild stall %.1f ms during playback (limit 100)\n", respRebuildStallMs);
+            Fail(__LINE__);
+        }
+        fprintf(stderr,
+                "Responsiveness: 40-track start %.0f ms, hash-before-audio %lu, pause %.1f ms, resume %.1f ms, "
+                "Next cut %.0f ms, seeks %lu/30 events, rebuild stall %.1f ms\n",
+                resp40StartMs, (unsigned long)respHashBeforeAudio, respPauseMs, respResumeMs, respNextCutMs,
+                (unsigned long)respSeekApplies, respRebuildStallMs);
+
+        // --- a rejected track leaves by path; pause is kept; a deferred seek stays on its track ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        NSArray *dropSpecs = @[
+            @{@"id": @"D0", @"title": @"Drop Zero", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D1", @"title": @"Drop One", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D2", @"title": @"Drop Two", @"artist": @"Resp", @"album": @""},
+            @{@"id": @"D3", @"title": @"Drop Three", @"artist": @"Resp", @"album": @""},
+        ];
+        NSArray *dropPaths = GenerateTracks(musicRoot, dropSpecs);
+        if (dropPaths.count != 4) Fail(__LINE__);
+        NSDictionary *dropFixture = PlaylistFixture(dropSpecs, dropPaths, @"song:drop");
+        if (!dropFixture) Fail(__LINE__);
+        [c setValue:[@{@"song:drop": dropFixture[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:dropFixture[@"manifest"] forKey:@"offlineManifest"];
+        [c playOfflinePlaylist:@"song:drop"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 3.0)) Fail(__LINE__);
+        AssertSilentQA(c, __LINE__);
+        if (!PlayerAdvancing(c, 0.3, 3.0)) Fail(__LINE__);
+        // An upcoming track is dropped while the first plays: the current item is untouched.
+        AVPlayerItem *dropCurrent = LocalPlayer(c).currentItem;
+        [c dropLocalPath:dropPaths[2] reason:@"harness"];
+        if ([[c valueForKey:@"localURLs"] count] != 3 || LocalIndex(c) != 0) Fail(__LINE__);
+        if (LocalPlayer(c).currentItem != dropCurrent || LocalPlayer(c).rate <= 0) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).items.count == 3; }, 1.0)) {
+            fprintf(stderr, "after a drop the player holds %lu items (want 3)\n", (unsigned long)LocalPlayer(c).items.count);
+            Fail(__LINE__);
+        }
+        for (AVPlayerItem *queued in LocalPlayer(c).items) {
+            NSURL *queuedURL = [queued.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)queued.asset).URL : nil;
+            if ([queuedURL.path isEqual:dropPaths[2]]) Fail(__LINE__);
+        }
+        // The current track is dropped while paused: the next one is loaded and stays paused.
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 0.25)) Fail(__LINE__);
+        [c dropLocalPath:dropPaths[0] reason:@"harness"];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.4]);
+        if ([[c valueForKey:@"localURLs"] count] != 2 || LocalIndex(c) != 0) Fail(__LINE__);
+        if (LocalPlayer(c).rate != 0 || [[c valueForKey:@"playbackPlaying"] boolValue]) Fail(__LINE__);
+        NSURL *dropNow = [LocalPlayer(c).currentItem.asset isKindOfClass:AVURLAsset.class]
+            ? ((AVURLAsset *)LocalPlayer(c).currentItem.asset).URL : nil;
+        if (![dropNow.path isEqual:dropPaths[1]]) Fail(__LINE__);
+        // A scrub followed at once by a cut to the next track: the seek must not land on the new track.
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 0.5)) Fail(__LINE__);
+        NSInteger seekFrom = LocalIndex(c);
+        [c musicSeek:SeekSlider(6.0)];
+        [c musicNext:nil];
+        [c musicNext:nil];
+        if (!WaitUntil(^BOOL { return LocalIndex(c) != seekFrom; }, 0.3)) Fail(__LINE__);
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        if (PlayerSeconds(LocalPlayer(c)) > 3.0) {
+            fprintf(stderr, "deferred seek landed on the next track (%.1f s)\n", PlayerSeconds(LocalPlayer(c)));
+            Fail(__LINE__);
+        }
+        fprintf(stderr, "Drop/seek: rejected track leaves the queue, pause kept, seek stays on its track\n");
 
         // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
         [c tearDownLocalPlayer];
