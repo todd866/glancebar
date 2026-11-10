@@ -6,6 +6,7 @@ cd "${0:A:h}"
 /usr/bin/python3 -m unittest discover -s tools/offline-cache -v
 /usr/bin/python3 -m unittest discover -s tools/music-library -v
 /usr/bin/python3 -m unittest discover -s tools/music-scout -v
+/usr/bin/python3 -m unittest discover -s tools/music-sync -v
 
 CC="${CC:-$(xcrun --find clang)}"
 SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"

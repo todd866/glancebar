@@ -2303,6 +2303,8 @@ def favourite_apple_track(
     runners: Runners,
     library: list,
     session_box: dict,
+    *,
+    allow_browser: bool = True,
 ) -> dict:
     """Library hit, else catalog search with the same artist guard, then add and love.
 
@@ -2319,6 +2321,12 @@ def favourite_apple_track(
             "result": "ok",
             "ids": {"pid": library_hit["pid"]},
         }
+    # Glancebar invokes `love` from a heart button. A missing library song must
+    # not turn that click into an unexpected web-player window. Bulk sync may
+    # still opt into its existing catalog flow. Stop before fetching tokens,
+    # opening Chrome, or using any session supplied by a caller.
+    if not allow_browser:
+        return {"action": "library-match", "result": "no-match", "ids": {}}
     session = session_box.get("session")
     if session is None:
         session = open_apple_session(runners)
@@ -2549,9 +2557,10 @@ def _print_love(result: str, song_id: str) -> None:
 
 
 def cmd_love(args, runners: Runners) -> int:
-    """Favourite one song in Apple Music and add it to the library when it is not there.
+    """Favourite one Apple Music library song, with an optional browser catalog fallback.
 
-    Dry-run unless --apply. Prints one JSON line. Exit 0 ok, 3 no-match, 1 error.
+    Dry-run unless --apply. Library-only unless --allow-browser is explicit.
+    Prints one JSON line. Exit 0 ok, 3 no-match, 1 error.
     """
     artist = args.artist or ""
     title = args.title or ""
@@ -2582,7 +2591,9 @@ def cmd_love(args, runners: Runners) -> int:
     session_box: dict = {"session": None}
     try:
         library = collect_library(runners)
-        raw = favourite_apple_track(artist, title, runners, library, session_box)
+        raw = favourite_apple_track(
+            artist, title, runners, library, session_box, allow_browser=args.allow_browser
+        )
     except (SystemExit, Exception) as exc:
         print(redact_secrets(str(exc))[:300], file=sys.stderr)
         record("write", "error", {})
@@ -2846,6 +2857,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="perform the account write; without this flag, print a dry run",
+    )
+    love.add_argument(
+        "--allow-browser",
+        action="store_true",
+        help="allow a Chrome web-player tab for catalog search when not in the library",
     )
     love.set_defaults(func=cmd_love)
     return parser

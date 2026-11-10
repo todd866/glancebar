@@ -1709,12 +1709,58 @@ class LoveCommandTests(unittest.TestCase):
         self.assertEqual(logged[0]["at"], "2026-11-01T00:00:00Z")
         self.assertTrue(logged[0]["key"])
 
+    def test_missing_library_song_does_not_open_web_player(self):
+        # The same command the installed Glancebar uses, including a long DJ mix.
+        for artist, title in [("Band", "Song"),
+                              ("The Avalanches", "The Avalanches & Jamie XX - B2B")]:
+            with self.subTest(artist=artist, title=title):
+                osa = ScriptedOSA(songs=[{"id": "999", "title": title, "artist": artist}])
+                runners, _rng = runners_for(osa)
+                code, stdout, stderr = silence(
+                    likes_sync.main,
+                    ["love", "--artist", artist, "--title", title, "--apply"],
+                    runners,
+                )
+                self.assertEqual(code, 3, stderr)
+                self.assertEqual(json.loads(stdout), {"result": "no-match", "id": ""})
+                self.assertEqual(osa.favorited, [])
+                self.assertEqual(osa.loved, [])
+                self.assertEqual(osa.closed, 0)
+                self.assertFalse(any("Google Chrome" in script for script in osa.scripts))
+                self.assertEqual(runners.fetched, [])
+                self.assertEqual(self._applied()[-1]["action"], "library-match")
+                self.assertEqual(self._applied()[-1]["result"], "no-match")
+
+    def test_library_only_does_not_use_an_existing_catalog_session(self):
+        class ForbiddenSession:
+            def catalog_search_songs(self, term):
+                raise AssertionError("library-only heart attempted a catalog search")
+
+        osa = ScriptedOSA()
+        runners, _rng = runners_for(osa)
+        result = likes_sync.favourite_apple_track(
+            "Band", "Song", runners, [], {"session": ForbiddenSession()}, allow_browser=False
+        )
+        self.assertEqual(result, {"action": "library-match", "result": "no-match", "ids": {}})
+        self.assertEqual(osa.scripts, [])
+        self.assertEqual(runners.fetched, [])
+
+    def test_allow_browser_without_apply_is_still_a_dry_run(self):
+        osa = ScriptedOSA()
+        code, stdout, stderr, osa = self._run(
+            osa, ["love", "--artist", "Band", "--title", "Song", "--allow-browser"]
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), {"result": "dry-run", "id": ""})
+        self.assertEqual(osa.scripts, [])
+        self.assertEqual(self._applied(), [])
+
     def test_catalog_match_adds_and_loves(self):
         osa = ScriptedOSA(
             library="",
             songs=[{"id": "999", "title": "Song - Remastered 2011", "artist": "Band - Topic"}],
         )
-        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song (feat. Pal)", "--apply"])
+        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song (feat. Pal)", "--apply", "--allow-browser"])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout), {"result": "ok", "id": "999"})
         self.assertEqual(osa.favorited, [])
@@ -1734,7 +1780,7 @@ class LoveCommandTests(unittest.TestCase):
             library=library_text([("P123", "Song", "Someone Else", "LP", "false")]),
             songs=[{"id": "999", "title": "Song", "artist": "Someone Else"}],
         )
-        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song", "--apply"])
+        code, stdout, stderr, osa = self._run(osa, ["love", "--artist", "Band", "--title", "Song", "--apply", "--allow-browser"])
         self.assertEqual(code, 3, stderr)
         self.assertEqual(json.loads(stdout), {"result": "no-match", "id": ""})
         self.assertEqual(osa.favorited, [])
