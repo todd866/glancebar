@@ -10,6 +10,7 @@ import os
 import shutil
 import struct
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -279,15 +280,34 @@ def build_catalogue(masters_dir, state):
         raise ValueError(f'masters directory missing: {masters}')
     cache = load_build_cache(state)
     entries = []
-    for path in sorted(masters.rglob('*')):
-        if path.suffix.lower() not in AUDIO_SUFFIXES or not path.is_file():
+    skipped = []
+    def walk_error(exc):
+        skipped.append(f'{getattr(exc, "filename", "?")}: {exc.strerror or exc}')
+
+    found = []
+    # os.walk with onerror: one unreadable or vanished directory must not abort the catalogue.
+    for folder, _dirs, names in os.walk(masters, onerror=walk_error):
+        found.extend(Path(folder) / name for name in names)
+    for path in sorted(found):
+        if path.suffix.lower() not in AUDIO_SUFFIXES:
             continue
+        # Masters usually live on an external drive, so the laptop's "playable local file"
+        # rule (offline_cache.local_file refuses /Volumes) does not apply here. A master is
+        # any regular, non-empty, non-symlink audio file. Anything else is reported.
         try:
-            oc.local_file(path)
-        except ValueError:
+            st = path.lstat()
+        except OSError as exc:
+            skipped.append(f'{path}: {exc}')
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+            skipped.append(f'{path}: not a regular non-empty file')
             continue
         entry, cache = catalogue_entry_for_file(path, masters, cache)
         entries.append(entry)
+    if skipped:
+        print(f'catalogue: skipped {len(skipped)} file(s), first: {skipped[0]}', file=sys.stderr)
+    if not entries:
+        raise ValueError(f'no audio masters found under {masters}')
     save_build_cache(state, cache)
     return {
         'schemaVersion': CATALOGUE_SCHEMA,
