@@ -8477,10 +8477,26 @@ static void AppendFleetWord(NSTextField *datum, NSString *word) {
     datum.allowsDefaultTighteningForTruncation = YES;
     datum.attributedStringValue = base;
 }
+// A reading counts as current for five minutes: the background poll renews it every two to
+// four, and an open popover renews it every 25 s.
+static const double kRemoteReadingFreshSeconds = 300;
 // One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots,
-// and the fleet-sync status file. At most every 25 s, and only while the popover is open.
+// and the fleet-sync status file. At most every 25 s while the popover is open.
 - (void)pollRemoteMachinesIfDue {
     if (!_popover.isShown || !_musicProbesEnabled || CFAbsoluteTimeGetCurrent() - _remotePolledAt < 25) return;
+    [self pollRemoteMachinesNow];
+}
+// With the popover closed the readings are kept warm from the 15 s refresh timer, every two
+// minutes on mains and every four on battery, so opening the popover shows the other Macs at
+// once instead of after an ssh round trip (about 3 s, or a 5 s timeout for a Mac that is away).
+// Owner, 11 Nov 2026: "usually when I open it there's a long lag to get any telemetry back".
+- (void)pollRemoteMachinesInBackgroundIfDue {
+    if (_popover.isShown || !_musicProbesEnabled || !_remoteInFlight || ![self remoteMachines].count) return;
+    double every = (_bat.valid && !_bat.acConnected) ? 240 : 120;
+    if (CFAbsoluteTimeGetCurrent() - _remotePolledAt < every) return;
+    [self pollRemoteMachinesNow];
+}
+- (void)pollRemoteMachinesNow {
     _remotePolledAt = CFAbsoluteTimeGetCurrent();
     NSString *localSHA = FleetLocalSHA();
     for (NSDictionary *m in [self remoteMachines]) {
@@ -8555,7 +8571,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSDictionary *reading = _remote[host];
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         double age = reading ? now - [reading[@"at"] doubleValue] : 0;
-        BOOL fresh = reading && age < 120;
+        BOOL fresh = reading && age < kRemoteReadingFreshSeconds;
         NSDictionary *sample = reading[@"sample"];
         NSDictionary *ready = fresh ? WorkerReadiness(sample, reading[@"mode"], [reading[@"free"] integerValue], [reading[@"slots"] integerValue]) : nil;
         NSString *awayText = RemoteAwayText(reading ? age : 0);
@@ -9133,6 +9149,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 
 - (void)refresh {
     [_meteredMonitor tick];
+    [self pollRemoteMachinesInBackgroundIfDue];
     [self refreshVolumesAsync];
     BOOL wasOnAC = _bat.valid && _bat.acConnected;
     _bat = ReadBattery();
@@ -12084,7 +12101,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         NSDictionary *reading = _remote[host];
         if (![reading isKindOfClass:NSDictionary.class]) continue;
         double age = CFAbsoluteTimeGetCurrent() - [reading[@"at"] doubleValue];
-        if (age >= 120) continue;
+        if (age >= kRemoteReadingFreshSeconds) continue;
         NSArray *reported = [reading[@"sample"][@"volumes"] isKindOfClass:NSArray.class] ? reading[@"sample"][@"volumes"] : nil;
         for (NSDictionary *row in GlanceExternalVolumes(reported))
             consider(row[@"name"], [row[@"names"] isKindOfClass:NSArray.class] ? row[@"names"] : nil);
