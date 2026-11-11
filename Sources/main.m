@@ -8477,9 +8477,10 @@ static void AppendFleetWord(NSTextField *datum, NSString *word) {
     datum.allowsDefaultTighteningForTruncation = YES;
     datum.attributedStringValue = base;
 }
-// A reading counts as current for five minutes: the background poll renews it every two to
-// four, and an open popover renews it every 25 s.
-static const double kRemoteReadingFreshSeconds = 300;
+// Background poll of the other Macs: every two minutes on mains, every ten on battery (owner,
+// 11 Nov 2026: "less often on battery"). A reading counts as current for a little longer than
+// the poll interval; an open popover renews it every 25 s whatever the power source.
+static const double kRemotePollMainsSeconds = 120, kRemotePollBatterySeconds = 600;
 // One ssh round trip per Mac: its Glancebar --sample, heavy-slot governor mode and slots,
 // and the fleet-sync status file. At most every 25 s while the popover is open.
 - (void)pollRemoteMachinesIfDue {
@@ -8487,12 +8488,14 @@ static const double kRemoteReadingFreshSeconds = 300;
     [self pollRemoteMachinesNow];
 }
 // With the popover closed the readings are kept warm from the 15 s refresh timer, every two
-// minutes on mains and every four on battery, so opening the popover shows the other Macs at
+// minutes on mains and every ten on battery, so opening the popover shows the other Macs at
 // once instead of after an ssh round trip (about 3 s, or a 5 s timeout for a Mac that is away).
 // Owner, 11 Nov 2026: "usually when I open it there's a long lag to get any telemetry back".
+- (double)remotePollSeconds { return (_bat.valid && !_bat.acConnected) ? kRemotePollBatterySeconds : kRemotePollMainsSeconds; }
+- (double)remoteReadingFreshSeconds { return [self remotePollSeconds] + 180; }
 - (void)pollRemoteMachinesInBackgroundIfDue {
     if (_popover.isShown || !_musicProbesEnabled || !_remoteInFlight || ![self remoteMachines].count) return;
-    double every = (_bat.valid && !_bat.acConnected) ? 240 : 120;
+    double every = [self remotePollSeconds];
     if (CFAbsoluteTimeGetCurrent() - _remotePolledAt < every) return;
     [self pollRemoteMachinesNow];
 }
@@ -8571,7 +8574,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSDictionary *reading = _remote[host];
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         double age = reading ? now - [reading[@"at"] doubleValue] : 0;
-        BOOL fresh = reading && age < kRemoteReadingFreshSeconds;
+        BOOL fresh = reading && age < [self remoteReadingFreshSeconds];
         NSDictionary *sample = reading[@"sample"];
         NSDictionary *ready = fresh ? WorkerReadiness(sample, reading[@"mode"], [reading[@"free"] integerValue], [reading[@"slots"] integerValue]) : nil;
         NSString *awayText = RemoteAwayText(reading ? age : 0);
@@ -12101,7 +12104,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         NSDictionary *reading = _remote[host];
         if (![reading isKindOfClass:NSDictionary.class]) continue;
         double age = CFAbsoluteTimeGetCurrent() - [reading[@"at"] doubleValue];
-        if (age >= kRemoteReadingFreshSeconds) continue;
+        if (age >= [self remoteReadingFreshSeconds]) continue;
         NSArray *reported = [reading[@"sample"][@"volumes"] isKindOfClass:NSArray.class] ? reading[@"sample"][@"volumes"] : nil;
         for (NSDictionary *row in GlanceExternalVolumes(reported))
             consider(row[@"name"], [row[@"names"] isKindOfClass:NSArray.class] ? row[@"names"] : nil);
