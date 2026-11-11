@@ -622,12 +622,16 @@ int main(void) {
         }
         CFAbsoluteTime resumeT0 = CFAbsoluteTimeGetCurrent();
         [c musicPlay:nil];
-        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 0.25)) Fail(__LINE__);
+        // The target is the state and the button: they flip inside the click. The audio
+        // hardware may take longer to start (100 ms and more on some outputs) and has its
+        // own, looser limit.
+        if (![[c valueForKey:@"playbackPlaying"] boolValue]) Fail(__LINE__);
         respResumeMs = (CFAbsoluteTimeGetCurrent() - resumeT0) * 1000.0;
         if (respResumeMs > 50.0) {
             fprintf(stderr, "resume flip took %.1f ms (limit 50)\n", respResumeMs);
             Fail(__LINE__);
         }
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0; }, 0.6)) Fail(__LINE__);
 
         NSInteger respCutFrom = LocalIndex(c);
         CFAbsoluteTime cutT0 = CFAbsoluteTimeGetCurrent();

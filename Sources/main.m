@@ -7796,8 +7796,15 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         _playbackPlaying = YES;
         _playbackKnown = YES;
         [self updateMusicTransportInPlace];
-        [_localPlayer play];
-        if (!_musicSilentQA) [self pauseAppleMusicForLocalSource];
+        // Starting the audio hardware can hold the main thread for 100 ms or more. The button
+        // has already flipped; the player starts on the next turn of the run loop so that flip
+        // is drawn first. A pause in between leaves it stopped.
+        AVQueuePlayer *player = _localPlayer;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_localPlayer != player || !self->_playbackPlaying) return;
+            [player play];
+            if (!self->_musicSilentQA) [self pauseAppleMusicForLocalSource];
+        });
     }
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
@@ -8511,7 +8518,13 @@ static const double kRemotePollMainsSeconds = 120, kRemotePollBatterySeconds = 6
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             NSTask *task = [NSTask new];
             task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ssh"];
-            task.arguments = @[@"-o", @"BatchMode=yes", @"-o", @"ConnectTimeout=5", host,
+            // One kept-open connection per Mac: over a relayed tailnet link the handshake is most
+            // of a poll (3-12 s with it, about 1.5 s without), and polls slower than the watchdog
+            // were being dropped, which left the row empty (11 Nov 2026).
+            NSString *control = [NSHomeDirectory() stringByAppendingPathComponent:@".ssh/glancebar-%C"];
+            task.arguments = @[@"-o", @"BatchMode=yes", @"-o", @"ConnectTimeout=8",
+                @"-o", @"ControlMaster=auto", @"-o", [@"ControlPath=" stringByAppendingString:control],
+                @"-o", @"ControlPersist=900", @"-o", @"ServerAliveInterval=30", @"-o", @"ServerAliveCountMax=3", host,
                 (@"G=/Applications/Glancebar.app/Contents/MacOS/Glancebar; [ -x \"$G\" ] || G=\"$HOME/Applications/Glancebar.app/Contents/MacOS/Glancebar\"; "
                   "\"$G\" --sample; echo @@; cat ~/.local/state/heavy-slot/mode 2>/dev/null; echo @@; ~/.local/bin/heavy-slot status 2>/dev/null; "
                   "echo @@; cat ~/.local/state/glancebar-update/status.json 2>/dev/null")];
@@ -8521,7 +8534,7 @@ static const double kRemotePollMainsSeconds = 120, kRemotePollBatterySeconds = 6
             task.standardInput = [NSFileHandle fileHandleWithNullDevice];
             NSDictionary *reading = nil;
             if ([task launchAndReturnError:NULL]) {
-                GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:12];
+                GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:task.processIdentifier seconds:30];
                 NSString *text = [[NSString alloc] initWithData:[out.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
                 [task waitUntilExit];
                 [watchdog disarm];
