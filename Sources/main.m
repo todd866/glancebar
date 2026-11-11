@@ -7791,11 +7791,13 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         [self updateMusicTransportInPlace];
         [_localPlayer pause];
     } else {
-        [self pauseAppleMusicForLocalSource];
+        // Sound and the button first; quieting Apple Music is a slower call and comes after
+        // (and never from a silent test run, as in playLocalIndex:).
         _playbackPlaying = YES;
         _playbackKnown = YES;
         [self updateMusicTransportInPlace];
         [_localPlayer play];
+        if (!_musicSilentQA) [self pauseAppleMusicForLocalSource];
     }
     [self publishNowPlaying];
     if (_popover.isShown) [self rebuildContent];
