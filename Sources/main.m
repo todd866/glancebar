@@ -1659,6 +1659,83 @@ static os_log_t GBAILog(void) {
 }
 #define GBLog(fmt, ...) os_log(GBAILog(), fmt, ##__VA_ARGS__)
 
+// --- Playback event log ---
+// One JSON line per play, pause, track, failure, stall and output change, each with its cause.
+// On 12 Nov 2026 the headphones were sending Pause commands and nothing here recorded why the
+// player stopped; finding it took a dig through the system log.
+static NSString *PlaybackLogPath(void) {
+    const char *override = getenv("GLANCEBAR_PLAYBACK_LOG");
+    if (override && override[0]) return @(override);
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Glancebar/playback.jsonl"];
+}
+static dispatch_queue_t PlaybackLogQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.iantodd.glancebar.playback-log", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+static const unsigned long long kPlaybackLogMaxBytes = 2 * 1024 * 1024;   // then one older file is kept
+static void PlaybackLogAppend(NSString *event, NSDictionary *fields) {
+    NSString *line = PlaybackEventLine(event, fields, NSDate.date.timeIntervalSince1970);
+    dispatch_async(PlaybackLogQueue(), ^{
+        NSString *path = PlaybackLogPath();
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([[fm attributesOfItemAtPath:path error:nil] fileSize] > kPlaybackLogMaxBytes) {
+            NSString *older = [path stringByAppendingString:@".1"];
+            [fm removeItemAtPath:older error:nil];
+            [fm moveItemAtPath:path toPath:older error:nil];
+        }
+        int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0600);
+        if (fd < 0) return;
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        (void)write(fd, data.bytes, data.length);
+        close(fd);
+    });
+}
+__attribute__((unused)) static void PlaybackLogFlush(void) { dispatch_sync(PlaybackLogQueue(), ^{}); }
+
+// Reports every change of a player's timeControlStatus on the main thread, whoever caused it.
+static void *kPlayerWatchContext = &kPlayerWatchContext;
+@interface GBPlayerWatch : NSObject
+- (instancetype)initWithPlayer:(AVPlayer *)player handler:(void (^)(AVPlayer *player))handler;
+- (void)invalidate;
+@end
+@implementation GBPlayerWatch {
+    AVPlayer *_player;
+    void (^_handler)(AVPlayer *);
+    BOOL _observing;
+}
+- (instancetype)initWithPlayer:(AVPlayer *)player handler:(void (^)(AVPlayer *))handler {
+    if ((self = [super init])) {
+        _player = player;
+        _handler = [handler copy];
+        [player addObserver:self forKeyPath:@"timeControlStatus" options:0 context:kPlayerWatchContext];
+        _observing = YES;
+    }
+    return self;
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context != kPlayerWatchContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    AVPlayer *player = _player;
+    void (^handler)(AVPlayer *) = _handler;
+    if (!player || !handler) return;
+    if (NSThread.isMainThread) handler(player);
+    else dispatch_async(dispatch_get_main_queue(), ^{ handler(player); });
+}
+- (void)invalidate {
+    if (_observing) [_player removeObserver:self forKeyPath:@"timeControlStatus" context:kPlayerWatchContext];
+    _observing = NO;
+    _handler = nil;
+    _player = nil;
+}
+- (void)dealloc { [self invalidate]; }
+@end
+
 static NSString *FmtEpochClock(double epoch) {   // "12:12:08", or "—" when unset
     if (epoch <= 0) return @"—";
     NSDateFormatter *fmt = [NSDateFormatter new];
@@ -5892,6 +5969,9 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSUInteger _mixSeedsNextGen;
     CFAbsoluteTime _mixSeedsNextSince;
     BOOL _musicSilentQA;
+    NSString *_playbackCause, *_playbackRateState, *_playbackLoggedOutputUID;
+    CFAbsoluteTime _playbackCauseAt;
+    GBPlayerWatch *_localRateWatch;
     CFAbsoluteTime _offlineExportChecked, _offlinePreparedAt;
     NSDate *_offlineExportDate;
     NSUInteger _offlinePlayGeneration;
@@ -6104,6 +6184,12 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
     _musicSilentQA = MusicSilentQAEnabled();
     if (_musicSilentQA) GBLog("music: silent QA mode — player volume forced to 0");
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(playbackItemTrouble:)
+                                               name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(playbackItemTrouble:)
+                                               name:AVPlayerItemPlaybackStalledNotification object:nil];
+    [self notePlayback:@"launch" fields:@{@"pid": @(getpid()),
+        @"version": [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @""}];
     if (getenv("GLANCEBAR_MIX_FROZEN")) _mixFrozen = YES;
     _outputVolume = -1;
     _mixPrepared = [NSMutableDictionary dictionary];
@@ -6184,6 +6270,11 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
                    dispatch_get_main_queue(), ^{
         if (generation != self->_audioSettleGen) return;
         NSArray<NSDictionary *> *now = ReadAudioDevices();
+        NSDictionary *deviceDiff = PlaybackDeviceDiff(self->_audioPrevious, now);
+        if (deviceDiff && self->_audioPrevious) {
+            [self notePlayback:@"devices" fields:deviceDiff];
+            [self playbackCause:@"devices-changed"];
+        }
         NSString *adopt = ChooseNewOutputDevice(self->_audioPrevious, now, SwitchToNewOutputs());
         // A routed speaker arriving is the routed app's, not everything's.
         // (Judged with the output about to be adopted: arriving headphones are still adopted,
@@ -6205,6 +6296,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 - (void)audioDefaultChanged {
     _defaultOutputUID = DefaultOutputUID(_audioDevices ?: ReadAudioDevices());
     if (!_audioDevices) _audioDevices = ReadAudioDevices();
+    if (_defaultOutputUID.length && ![_defaultOutputUID isEqual:_playbackLoggedOutputUID]) {
+        BOOL first = _playbackLoggedOutputUID == nil;
+        _playbackLoggedOutputUID = _defaultOutputUID;
+        if (!first) {
+            [self notePlayback:@"output" fields:nil];
+            [self playbackCause:@"output-changed"];
+        }
+    }
     [self applyPlayerAudioOutput];
     [self watchOutputVolume];
     [self refreshOutputVolume];
@@ -7068,6 +7167,8 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     }
     if (urls.count == _localURLs.count) return;
     GBLog("music: dropping track %{public}@ (%{public}@)", path.lastPathComponent, reason);
+    [self notePlayback:@"drop" fields:@{@"item": path.lastPathComponent ?: @"", @"reason": reason ?: @""}];
+    [self playbackCause:@"drop"];
     _libraryRefreshWantsSync = YES;
     [self libraryRefreshPump];
     BOOL wasPlaying = _playbackPlaying;
@@ -7162,6 +7263,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     });
 }
 - (void)playLocalPaths:(NSArray<NSString *> *)paths {
+    [self playbackCauseIfNone:@"playlist"];
     if (!_musicProbesEnabled || !paths.count) return;
     OfflinePlaylistResetHashMetrics();
     NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:paths.count];
@@ -7468,6 +7570,9 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     GlanceRemoteCommandsDisable(self);
 }
 - (void)applyLocalItemURL:(NSURL *)url {
+    [self notePlayback:@"track" fields:@{@"file": url.lastPathComponent ?: @"", @"title": @"", @"artist": @"",
+        @"cause": [PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt) isEqual:@"unattributed"]
+            ? @"auto-advance" : _playbackCause}];
     [self touchMusicLibraryFile:url.path];
     NSDictionary *parsed = ParseLikedTrackFilename(url.lastPathComponent);
     _localTitle = parsed[@"title"] ?: @"";
@@ -7492,6 +7597,91 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
             if (self->_popover.isShown) [self rebuildContent];
         });
     }];
+}
+// --- Playback event log ---
+- (void)playbackCause:(NSString *)cause {
+    _playbackCause = cause;
+    _playbackCauseAt = CFAbsoluteTimeGetCurrent();
+}
+// A click or a remote command names the cause first; the code it then runs must not rename it.
+- (void)playbackCauseIfNone:(NSString *)cause {
+    if (_playbackCause.length && CFAbsoluteTimeGetCurrent() - _playbackCauseAt <= 3.0) return;
+    [self playbackCause:cause];
+}
+// A click always names the cause, except when a remote command has just arrived and is being
+// carried out through the same method (remote next calls musicNext:).
+- (void)playbackUserCause:(NSString *)cause {
+    if ([_playbackCause hasPrefix:@"remote-"] && CFAbsoluteTimeGetCurrent() - _playbackCauseAt <= 0.5) return;
+    [self playbackCause:cause];
+}
+- (void)notePlayback:(NSString *)event fields:(NSDictionary *)fields {
+    NSMutableDictionary *doc = [NSMutableDictionary dictionary];
+    if (_localMode && _localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count) {
+        doc[@"file"] = _localURLs[_localIndex].lastPathComponent ?: @"";
+        doc[@"index"] = @(_localIndex);
+        doc[@"of"] = @(_localURLs.count);
+    }
+    if (_localTitle.length) doc[@"title"] = _localTitle;
+    if (_localArtist.length) doc[@"artist"] = _localArtist;
+    if (_mixPlayingKey.length) doc[@"playlist"] = _mixPlayingKey;
+    if (_localPlayer) {
+        double elapsed = _localPlayer.currentTime.timescale != 0 ? CMTimeGetSeconds(_localPlayer.currentTime) : 0;
+        if (isfinite(elapsed)) doc[@"elapsed"] = @(round(elapsed * 10) / 10);
+    }
+    for (NSDictionary *row in _audioDevices) {
+        if (![row[@"uid"] isEqual:_defaultOutputUID]) continue;
+        doc[@"output"] = row[@"name"] ?: @"";
+        if ([row[@"transport"] integerValue] == GlanceAudioTransportBluetooth) doc[@"bluetooth"] = @YES;
+        break;
+    }
+    if (_musicSilentQA) doc[@"silentQA"] = @YES;
+    [doc addEntriesFromDictionary:fields ?: @{}];
+    PlaybackLogAppend(event, doc);
+}
+- (void)watchLocalPlayerRate {
+    [_localRateWatch invalidate];
+    _localRateWatch = nil;
+    AVQueuePlayer *player = _localPlayer;
+    if (!player) return;
+    __weak Controller *weakSelf = self;
+    _localRateWatch = [[GBPlayerWatch alloc] initWithPlayer:player handler:^(AVPlayer *changed) {
+        [weakSelf localPlayerRateChanged:changed];
+    }];
+    [self localPlayerRateChanged:player];
+}
+- (void)localPlayerRateChanged:(AVPlayer *)player {
+    if (player != _localPlayer) return;
+    NSString *state = @"paused";
+    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+    if (player.timeControlStatus == AVPlayerTimeControlStatusPlaying) state = @"playing";
+    else if (player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
+        state = @"waiting";
+        if (player.reasonForWaitingToPlay) fields[@"waitingFor"] = player.reasonForWaitingToPlay;
+    }
+    if ([state isEqual:_playbackRateState]) return;
+    _playbackRateState = state;
+    fields[@"state"] = state;
+    fields[@"cause"] = PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt);
+    [self notePlayback:@"rate" fields:fields];
+}
+- (void)playbackItemTrouble:(NSNotification *)note {
+    AVPlayerItem *item = [note.object isKindOfClass:AVPlayerItem.class] ? note.object : nil;
+    BOOL failed = [note.name isEqual:AVPlayerItemFailedToPlayToEndTimeNotification];
+    NSError *error = failed ? note.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey] : nil;
+    NSURL *url = [item.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)item.asset).URL : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+        if (url) fields[@"item"] = url.lastPathComponent ?: @"";
+        if (error) {
+            fields[@"error"] = error.localizedDescription ?: @"";
+            fields[@"code"] = @(error.code);
+            fields[@"domain"] = error.domain ?: @"";
+            NSError *under = error.userInfo[NSUnderlyingErrorKey];
+            if ([under isKindOfClass:NSError.class]) fields[@"underlying"] = @(under.code);
+        }
+        [self notePlayback:failed ? @"item-failed" : @"stalled" fields:fields];
+        [self playbackCause:failed ? @"item-failed" : @"stalled"];
+    });
 }
 - (void)detachLocalObservers {
     for (AVPlayerItem *item in _localObservedItems)
@@ -7582,6 +7772,9 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         [_localOutgoing pause];
         _localOutgoing = nil;
     }
+    [_localRateWatch invalidate];
+    _localRateWatch = nil;
+    _playbackRateState = nil;
     [_localPlayer pause];
     _localPlayer = nil;
 }
@@ -7675,6 +7868,8 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     [self enableRemoteCommands];
     if (_localStartPaused) _playbackPlaying = NO;   // replacing a rejected track while paused
     else [_localPlayer play];
+    [self playbackCauseIfNone:@"start"];
+    [self watchLocalPlayerRate];
     OfflinePlaylistNotePlaybackStarted();
     [self musicTimingMark:@"rate"];
     [self maintainOfflineHashVerifyAhead];
@@ -7733,6 +7928,9 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     incoming.volume = 0;
     incoming.muted = _musicSilentQA;
     _localPlayer = incoming;
+    _playbackRateState = nil;
+    [self playbackCauseIfNone:@"crossfade"];
+    [self watchLocalPlayerRate];
     [self attachLocalObservers:items];
     _localIndex = index;
     _localMode = YES;
@@ -7813,6 +8011,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     if (_mixPlayingKey.length && _offlineRequests[_mixPlayingKey]) return;
     BOOL playing = _localPlayer.rate > 0;
     if (!YieldLocalMusic(_localMode, _networkKnown && _networkOnline, playing)) return;
+    [self notePlayback:@"stopped" fields:@{@"cause": @"yield-idle"}];
     [self tearDownLocalPlayer];
     _localMode = NO;
     _localTitle = nil;
@@ -7822,22 +8021,32 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     [self disableRemoteCommands];
     if (_popover.isShown) [self rebuildContent];
 }
+// A keyboard play/pause key arrives as "toggle"; Bluetooth headphones send a separate Pause or Play.
+- (void)noteRemote:(NSString *)command {
+    [self notePlayback:@"remote" fields:@{@"command": command}];
+    [self playbackCause:[@"remote-" stringByAppendingString:command]];
+}
 - (NSInteger)remotePlay:(id)event {
+    [self noteRemote:@"play"];
     (void)event; if (_localPlayer.rate == 0) [self toggleLocalPlayback];
     return 0;
 }
 - (NSInteger)remotePause:(id)event {
+    [self noteRemote:@"pause"];
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)event; if (_localPlayer.rate > 0) [self toggleLocalPlayback];
     return 0;
 }
 - (NSInteger)remoteToggle:(id)event {
+    [self noteRemote:@"toggle"];
     (void)event; [self toggleLocalPlayback]; return 0;
 }
 - (NSInteger)remoteNext:(id)event {
+    [self noteRemote:@"next"];
     (void)event; [self musicNext:nil]; return 0;
 }
 - (NSInteger)remotePrevious:(id)event {
+    [self noteRemote:@"previous"];
     (void)event; [self musicPrevious:nil]; return 0;
 }
 // --- Apple Music ---
@@ -8138,6 +8347,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (IBAction)musicPlay:(id)sender {
     (void)sender;
     if (!_musicProbesEnabled) return;
+    [self playbackUserCause:@"click"];
     ++_offlinePlayGeneration;
     _mixStartingKey = nil;
     if (_localMode) { [self toggleLocalPlayback]; return; }
@@ -8145,6 +8355,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [self startOfflinePlaybackLocal];
 }
 - (IBAction)musicPrevious:(id)sender {
+    [self playbackUserCause:@"click-previous"];
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
     if (!_musicProbesEnabled || !_localMode || !_localPlayer) return;
@@ -8183,6 +8394,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [self beginLocalBlend];
 }
 - (IBAction)musicNext:(id)sender {
+    [self playbackUserCause:@"click-next"];
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
     if (!_musicProbesEnabled) return;
@@ -9162,8 +9374,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     });
 }
 
-- (void)meteredWillSleep:(NSNotification *)note { (void)note; _storageSleeping=YES; _storageIndex.paused=YES; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
-- (void)meteredDidWake:(NSNotification *)note { (void)note; _storageSleeping=NO; [_meteredMonitor wake]; [self requestStorageScanIfNeeded]; }
+- (void)meteredWillSleep:(NSNotification *)note { (void)note; [self notePlayback:@"sleep" fields:nil]; [self playbackCause:@"sleep"]; _storageSleeping=YES; _storageIndex.paused=YES; _activityGeneration++; _activitySurvey = nil; [_meteredMonitor sleep]; }
+- (void)meteredDidWake:(NSNotification *)note { (void)note; [self notePlayback:@"wake" fields:nil]; _storageSleeping=NO; [_meteredMonitor wake]; [self requestStorageScanIfNeeded]; }
 
 - (void)refresh {
     [_meteredMonitor tick];

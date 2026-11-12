@@ -1,0 +1,104 @@
+#!/usr/bin/python3
+"""Read Glancebar's playback event log: why the music started, paused, skipped or failed.
+
+  tools/playback-log              last 40 events
+  tools/playback-log -n 200       more
+  tools/playback-log --since 30   last 30 minutes
+  tools/playback-log --why        also ask the system log who sent each remote command
+                                  (a Bluetooth device's AVRCP command, or not)
+
+A keyboard play/pause key arrives as remote "toggle"; Bluetooth headphones send a separate
+"pause" or "play". A rate change with cause "unattributed" was not asked for by the app:
+look at the events just before it (devices, output, stalled, item-failed, sleep).
+"""
+import argparse, json, os, subprocess, sys, time
+from datetime import datetime, timedelta
+
+DEFAULT = os.path.expanduser("~/Library/Logs/Glancebar/playback.jsonl")
+
+
+def load(path):
+    rows = []
+    for name in (path + ".1", path):
+        try:
+            with open(name, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except OSError:
+            pass
+    return rows
+
+
+def avrcp_near(epoch):
+    """Text of a Bluetooth remote command within a second of `epoch`, or ''."""
+    start = datetime.fromtimestamp(epoch - 1.5).strftime("%Y-%m-%d %H:%M:%S")
+    end = datetime.fromtimestamp(epoch + 1.5).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        out = subprocess.run(
+            ["/usr/bin/log", "show", "--start", start, "--end", end, "--style", "compact", "--predicate",
+             'process == "bluetoothd" AND eventMessage CONTAINS "Received AVRCP"'],
+            capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "system log unavailable"
+    for line in out.splitlines():
+        if "Received AVRCP" in line:
+            return "Bluetooth: " + line.split("Received AVRCP", 1)[1].strip()
+    return "not from Bluetooth (keyboard, Control Centre or another app)"
+
+
+def describe(row, why):
+    event = row.get("event", "?")
+    if event == "rate":
+        text = f"{row.get('state', '?'):8} cause={row.get('cause', '?')}"
+        if row.get("waitingFor"):
+            text += f" waitingFor={row['waitingFor']}"
+    elif event == "remote":
+        text = f"command={row.get('command', '?')}"
+        if why and row.get("epoch"):
+            text += f"  [{avrcp_near(float(row['epoch']))}]"
+    elif event == "track":
+        text = f"cause={row.get('cause', '?')}"
+    elif event == "devices":
+        text = " ".join(f"{k}={','.join(row.get(k) or []) or '-'}" for k in ("added", "removed"))
+    elif event in ("item-failed", "stalled"):
+        text = " ".join(str(row.get(k)) for k in ("item", "error", "domain", "code", "underlying") if row.get(k) is not None)
+    elif event == "drop":
+        text = f"{row.get('item', '')} ({row.get('reason', '')})"
+    else:
+        text = " ".join(f"{k}={row[k]}" for k in ("cause", "version", "pid") if k in row)
+    track = row.get("title") or row.get("file") or ""
+    if row.get("artist") and row.get("title"):
+        track = f"{row['artist']} - {row['title']}"
+    where = row.get("output", "")
+    extra = f"  @{row['elapsed']:.0f}s" if isinstance(row.get("elapsed"), (int, float)) and event in ("rate", "remote", "stalled") else ""
+    return f"{str(row.get('t', ''))[5:19]}  {event:11} {text}{extra}  | {track}  | {where}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-n", type=int, default=40)
+    ap.add_argument("--since", type=float, default=None, help="minutes")
+    ap.add_argument("--why", action="store_true")
+    ap.add_argument("--path", default=os.environ.get("GLANCEBAR_PLAYBACK_LOG") or DEFAULT)
+    args = ap.parse_args()
+    rows = load(args.path)
+    if args.since is not None:
+        cutoff = time.time() - args.since * 60
+        rows = [r for r in rows if float(r.get("epoch") or 0) >= cutoff]
+    else:
+        rows = rows[-args.n:]
+    if not rows:
+        print(f"no playback events in {args.path}", file=sys.stderr)
+        return 1
+    for row in rows:
+        print(describe(row, args.why))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -944,6 +944,13 @@ NSArray *MixSeedsNextPromotion(NSArray *pending, NSDictionary *tileStatesByKey, 
     BOOL syncBusy, double timeoutSec);
 BOOL MusicSilentQAEnabled(void);
 float MusicPlayerOutputVolume(BOOL silentQA);
+
+// Playback event log: one JSON object per line. Values JSON cannot hold are written as text.
+NSString *PlaybackEventLine(NSString *event, NSDictionary *fields, double epoch);
+// The cause recorded just before a rate change, unless it is older than a few seconds.
+NSString *PlaybackRateCause(NSString *pendingCause, double ageSeconds);
+// Names of output devices that arrived or left; nil when the set of outputs is unchanged.
+NSDictionary *PlaybackDeviceDiff(NSArray<NSDictionary *> *before, NSArray<NSDictionary *> *after);
 // station.json: queue file paths (file or path) and this week's picks (title, artist, reason, file).
 // tracks keeps each queue file with its artist, title and identity key. nil when the data is
 // missing or not an object. An empty queue is still a station.

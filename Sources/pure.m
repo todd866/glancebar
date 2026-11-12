@@ -4545,3 +4545,51 @@ NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA) {
     return @{@"word": word, @"detail": detail};
 }
 
+// --- Playback event log ---
+NSString *PlaybackEventLine(NSString *event, NSDictionary *fields, double epoch) {
+    NSMutableDictionary *doc = [NSMutableDictionary dictionary];
+    for (id key in fields) {
+        if (![key isKindOfClass:NSString.class]) continue;
+        id value = fields[key];
+        if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class] || value == NSNull.null) {
+            if ([value isKindOfClass:NSNumber.class] && !isfinite([value doubleValue])) value = @"nan";
+            doc[key] = value;
+        } else if ([value isKindOfClass:NSArray.class] && [NSJSONSerialization isValidJSONObject:value]) {
+            doc[key] = value;
+        } else {
+            doc[key] = [value description] ?: @"";
+        }
+    }
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    });
+    @synchronized (fmt) { doc[@"t"] = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:epoch]] ?: @""; }
+    doc[@"epoch"] = @(round(epoch * 1000) / 1000);
+    doc[@"event"] = event.length ? event : @"?";
+    NSData *data = [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
+    NSString *json = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+    if (!json) json = [NSString stringWithFormat:@"{\"event\":\"unwritable\",\"epoch\":%.3f}", epoch];
+    return [json stringByAppendingString:@"\n"];
+}
+NSString *PlaybackRateCause(NSString *pendingCause, double ageSeconds) {
+    if (!pendingCause.length || ageSeconds < 0 || ageSeconds > 3.0) return @"unattributed";
+    return pendingCause;
+}
+NSDictionary *PlaybackDeviceDiff(NSArray<NSDictionary *> *before, NSArray<NSDictionary *> *after) {
+    NSMutableDictionary<NSString *, NSString *> *old = [NSMutableDictionary dictionary], *new = [NSMutableDictionary dictionary];
+    for (NSDictionary *row in before)
+        if ([row[@"uid"] isKindOfClass:NSString.class]) old[row[@"uid"]] = [row[@"name"] isKindOfClass:NSString.class] ? row[@"name"] : row[@"uid"];
+    for (NSDictionary *row in after)
+        if ([row[@"uid"] isKindOfClass:NSString.class]) new[row[@"uid"]] = [row[@"name"] isKindOfClass:NSString.class] ? row[@"name"] : row[@"uid"];
+    NSMutableArray<NSString *> *added = [NSMutableArray array], *removed = [NSMutableArray array];
+    for (NSString *uid in new) if (!old[uid]) [added addObject:new[uid]];
+    for (NSString *uid in old) if (!new[uid]) [removed addObject:old[uid]];
+    if (!added.count && !removed.count) return nil;
+    [added sortUsingSelector:@selector(compare:)];
+    [removed sortUsingSelector:@selector(compare:)];
+    return @{@"added": added, @"removed": removed};
+}

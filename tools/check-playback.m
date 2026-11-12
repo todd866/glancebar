@@ -320,6 +320,8 @@ int main(void) {
         for (NSString *dir in @[musicRoot, likedDir, support, state])
             [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         setenv("GLANCEBAR_HOME", gFixtureHome.UTF8String, 1);
+        NSString *playbackLog = [gFixtureHome stringByAppendingPathComponent:@"playback.jsonl"];
+        setenv("GLANCEBAR_PLAYBACK_LOG", playbackLog.UTF8String, 1);
 
         NSArray *specs = @[
             @{@"id": @"T1", @"title": @"Track One", @"artist": @"Artist One", @"album": @""},
@@ -376,6 +378,50 @@ int main(void) {
         AssertSilentQA(c, __LINE__);
         if (!PlayerAdvancing(c, 0.4, 3.0)) Fail(__LINE__);
         (void)moving; (void)pausedAt;
+
+        // --- event log: every pause and resume is recorded with what caused it ---
+        // (12 Nov 2026: the headphones sent Pause commands and nothing recorded why music stopped.)
+        [c remotePause:nil];
+        if (!WaitUntil(^BOOL { return player.rate == 0; }, 2)) Fail(__LINE__);
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        [c remotePlay:nil];
+        if (!WaitUntil(^BOOL { return player.rate > 0; }, 3)) Fail(__LINE__);
+        if (!PlayerAdvancing(c, 0.4, 3.0)) Fail(__LINE__);
+        PlaybackLogFlush();
+        {
+            NSString *text = [NSString stringWithContentsOfFile:playbackLog encoding:NSUTF8StringEncoding error:nil];
+            NSMutableArray<NSDictionary *> *events = [NSMutableArray array];
+            for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                if (!line.length) continue;
+                NSDictionary *event = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                if (![event isKindOfClass:NSDictionary.class]) { fprintf(stderr, "event log: unreadable line\n"); Fail(__LINE__); }
+                [events addObject:event];
+            }
+            BOOL (^has)(NSString *, NSString *, NSString *) = ^BOOL(NSString *name, NSString *key, NSString *value) {
+                for (NSDictionary *event in events)
+                    if ([event[@"event"] isEqual:name] && (!key || [event[key] isEqual:value])) return YES;
+                return NO;
+            };
+            BOOL (^rate)(NSString *, NSString *) = ^BOOL(NSString *state, NSString *cause) {
+                for (NSDictionary *event in events)
+                    if ([event[@"event"] isEqual:@"rate"] && [event[@"state"] isEqual:state] && [event[@"cause"] isEqual:cause]) return YES;
+                return NO;
+            };
+            if (!has(@"track", nil, nil)) { fprintf(stderr, "event log: no track event\n"); Fail(__LINE__); }
+            if (!rate(@"playing", @"playlist") && !rate(@"playing", @"click") && !rate(@"playing", @"start")) {
+                fprintf(stderr, "event log: first start not recorded with a cause\n%s\n", text.UTF8String); Fail(__LINE__);
+            }
+            if (!rate(@"paused", @"click")) { fprintf(stderr, "event log: click pause missing\n%s\n", text.UTF8String); Fail(__LINE__); }
+            if (!rate(@"playing", @"click")) { fprintf(stderr, "event log: click resume missing\n%s\n", text.UTF8String); Fail(__LINE__); }
+            if (!has(@"remote", @"command", @"pause")) { fprintf(stderr, "event log: remote pause command missing\n"); Fail(__LINE__); }
+            if (!rate(@"paused", @"remote-pause")) { fprintf(stderr, "event log: remote pause missing\n%s\n", text.UTF8String); Fail(__LINE__); }
+            if (!rate(@"playing", @"remote-play")) { fprintf(stderr, "event log: remote resume missing\n%s\n", text.UTF8String); Fail(__LINE__); }
+            for (NSDictionary *event in events)
+                if ([event[@"event"] isEqual:@"rate"] && [event[@"cause"] isEqual:@"unattributed"]) {
+                    fprintf(stderr, "event log: a rate change in this scenario has no cause\n%s\n", text.UTF8String); Fail(__LINE__);
+                }
+            fprintf(stderr, "Event log: %lu events, every pause and resume has a cause\n", (unsigned long)events.count);
+        }
 
         // --- seek to 6 s ---
         [c musicSeek:SeekSlider(6.0)];

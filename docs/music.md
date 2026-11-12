@@ -127,3 +127,22 @@ launchd starts the 03:10 job with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so `ai-p
 away, and the run acquired nothing. The scout now builds its own search path for helper
 commands (`_tool_env`), treats a command it cannot find as an error (only `ai-pick`'s own
 exit 75 is a deferral), and writes the errors into `last-run.json`.
+
+## Why did the music stop? The playback event log (12 Nov 2026)
+
+The player writes one JSON line per event to `~/Library/Logs/Glancebar/playback.jsonl`
+(2 MB, one older file kept): `rate` (playing, paused, waiting) with its `cause`, `remote`
+(the command received), `track`, `drop`, `item-failed`, `stalled`, `devices` (outputs that
+arrived or left), `output` (default output changed), `sleep`, `wake`, `launch`. Each line
+carries the track, the position and the current output.
+
+`tools/playback-log` prints it; `--since 30` for the last half hour; `--why` also asks the
+system log whether each remote command came from a Bluetooth device. Causes: `click`,
+`click-next`, `click-previous`, `playlist`, `remote-pause`, `remote-play`, `remote-toggle`
+(a keyboard play/pause key sends toggle; headphones send a separate pause or play),
+`auto-advance`, `crossfade`, `drop`, `devices-changed`, `output-changed`, `sleep`.
+`unattributed` means the app did not ask for the change: read the events just before it.
+
+Found with the system log before this existed: on 12 Nov 2026 the music "cut in and out"
+because the Bluetooth headphones were sending Pause and Play commands, and their link was
+dropping; the player had no stalls or errors.

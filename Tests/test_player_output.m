@@ -90,6 +90,25 @@ int main(void) { @autoreleasepool {
                                              NO, NO);
     Check(![none[@"enabled"] boolValue], @"nothing on disk and no fetch running: unavailable");
 
+    // Playback event log (12 Nov 2026: pauses sent by the headphones took a system-log dig to find).
+    NSString *line = PlaybackEventLine(@"rate", @{@"state": @"paused", @"cause": @"remote-pause",
+                                                 @"title": @"Line one\nLine two", @"when": NSDate.date,
+                                                 @"elapsed": @(12.5)}, 1794466464.25);
+    Check([line hasSuffix:@"\n"] && [line componentsSeparatedByString:@"\n"].count == 2, @"event is exactly one line");
+    NSDictionary *event = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    Check([event[@"event"] isEqual:@"rate"] && [event[@"cause"] isEqual:@"remote-pause"], @"event keeps its name and cause");
+    Check(fabs([event[@"epoch"] doubleValue] - 1794466464.25) < 0.01 && [event[@"t"] length] >= 19, @"event carries epoch and a readable time");
+    Check([event[@"when"] isKindOfClass:NSString.class], @"values JSON cannot hold are written as text, not dropped");
+    Check([PlaybackEventLine(@"x", nil, 1) hasSuffix:@"\n"], @"no fields is still a valid line");
+    Check([PlaybackRateCause(@"click", 0.4) isEqual:@"click"], @"a fresh cause is used");
+    Check([PlaybackRateCause(@"click", 9.0) isEqual:@"unattributed"], @"a stale cause is not blamed for a later change");
+    Check([PlaybackRateCause(nil, 0) isEqual:@"unattributed"], @"no cause: unattributed");
+    NSDictionary *diff = PlaybackDeviceDiff(@[builtin, bose], @[builtin]);
+    Check([diff[@"removed"] isEqual:@[bose[@"name"]]] && [diff[@"added"] count] == 0, @"device diff names the output that left");
+    diff = PlaybackDeviceDiff(@[builtin], @[builtin, bose]);
+    Check([diff[@"added"] isEqual:@[bose[@"name"]]] && [diff[@"removed"] count] == 0, @"device diff names the output that arrived");
+    Check(PlaybackDeviceDiff(@[builtin], @[builtin]) == nil, @"no change: no event");
+
     fprintf(stderr, "OK: %d player output checks passed\n", checks);
     return 0;
 }}
