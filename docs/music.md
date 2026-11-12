@@ -40,7 +40,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | `com.iantodd.triplej-daily` | M5 | installed |
 | `com.iantodd.glancebar-music-push` (03:40: masters → R2, then catalogue; `~/.local/bin/glancebar-music-push`, status in `push-status.json`) | M2 | installed 10 Nov 2026 |
 | hot-set sync (every few hours; the app also starts one on demand) | M5 | NOT YET INSTALLED |
-| `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | plist only (not installed) |
+| `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | installed |
 
 ## Checks
 
@@ -119,3 +119,11 @@ no-match by the weaker search.
 - The playback harness ran its later scenarios on a made-up output device, so every track
   failed and the timing checks passed against a dead player. It now restores a real output
   and asserts that audio is advancing.
+
+## The scout's taste step never ran from the schedule (found 12 Nov 2026)
+
+launchd starts the 03:10 job with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so `ai-pick` (in
+`~/.local/bin`) was not found; the scout recorded that as "deferred" and threw the reason
+away, and the run acquired nothing. The scout now builds its own search path for helper
+commands (`_tool_env`), treats a command it cannot find as an error (only `ai-pick`'s own
+exit 75 is a deferral), and writes the errors into `last-run.json`.

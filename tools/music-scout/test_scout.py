@@ -511,6 +511,83 @@ class ScoutLogicTests(unittest.TestCase):
         self.assertIn("broken", doc["ledger_torn_line"])
 
 
+class ScheduledEnvironmentTests(unittest.TestCase):
+    """The 03:10 job runs under launchd with PATH=/usr/bin:/bin:/usr/sbin:/sbin. On 11 and 12 Nov
+    2026 the taste step never ran because `ai-pick` (in ~/.local/bin) was not found, and that was
+    recorded as a quiet "deferred" with the reason thrown away."""
+
+    def _home(self, tmp: str) -> Path:
+        home = Path(tmp)
+        bindir = home / ".local" / "bin"
+        bindir.mkdir(parents=True)
+        for name, body in (("ai-pick", "#!/bin/sh\necho fake\n"), ("fake-engine", "#!/bin/sh\ncat\n")):
+            f = bindir / name
+            f.write_text(body, encoding="utf-8")
+            f.chmod(0o755)
+        return home
+
+    def test_ai_pick_found_under_launchd_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            old_env, old_cmds = dict(os.environ), dict(scout.ENGINE_COMMANDS)
+            try:
+                os.environ.clear()
+                os.environ.update({"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+                scout.ENGINE_COMMANDS.clear()
+                scout.ENGINE_COMMANDS["fake"] = ["fake-engine"]
+                code, text = scout._default_ai_pick("hello scout", "ai-pick")
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+                scout.ENGINE_COMMANDS.clear()
+                scout.ENGINE_COMMANDS.update(old_cmds)
+            self.assertEqual((code, text), (0, "hello scout"))
+
+    def test_missing_ai_pick_is_an_error_not_a_deferral(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_env = dict(os.environ)
+            try:
+                os.environ.clear()
+                os.environ.update({"HOME": tmp, "PATH": "/usr/bin:/bin"})
+                code, text = scout._default_ai_pick("x", "ai-pick-that-does-not-exist")
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+            self.assertNotEqual(code, 75)
+            self.assertNotEqual(code, 0)
+            self.assertIn("not found", text)
+
+    def test_taste_error_keeps_its_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp))
+            runners = scout.Runners(ai_pick=lambda prompt, cmd: (127, "ai-pick not found on PATH"))
+            rows, err = scout.source_taste_expansion(cfg, runners, {})
+            self.assertEqual(rows, [])
+            self.assertIn("not found", err)
+            runners = scout.Runners(ai_pick=lambda prompt, cmd: (75, "all pools below 20%"))
+            rows, err = scout.source_taste_expansion(cfg, runners, {})
+            self.assertTrue(err.startswith("deferred"))
+            self.assertIn("below 20%", err)
+
+    def test_run_record_keeps_the_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = _cfg(root)
+            paths = scout.ScoutPaths(root / "state")
+            orig = (scout.cmd_candidates, scout.cmd_rank, scout.cmd_acquire, scout.cmd_publish)
+            try:
+                scout.cmd_candidates = lambda *a, **k: ([], {"triplej": 0}, ["taste-expansion: ai-pick not found on PATH"])
+                scout.cmd_rank = lambda *a, **k: []
+                scout.cmd_acquire = lambda *a, **k: {"attempted": 0}
+                scout.cmd_publish = lambda *a, **k: {"tracks": []}
+                scout.cmd_run(cfg, paths, scout.Runners(clock=lambda: "2026-11-12T00:00:00Z"), go=False)
+            finally:
+                scout.cmd_candidates, scout.cmd_rank, scout.cmd_acquire, scout.cmd_publish = orig
+            doc = json.loads(paths.last_run.read_text(encoding="utf-8"))
+            self.assertFalse(doc["ok"])
+            self.assertEqual(doc["errors"], ["taste-expansion: ai-pick not found on PATH"])
+
+
 class LockTests(unittest.TestCase):
     def test_run_lock_exit_75(self):
         with tempfile.TemporaryDirectory() as tmp:

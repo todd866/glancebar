@@ -244,24 +244,52 @@ ENGINE_COMMANDS = {
 }
 
 
+def _tool_env() -> dict[str, str]:
+    """Environment for the helper commands. launchd starts the nightly job with
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin, which holds none of them: on 11 and 12 Nov 2026 `ai-pick`
+    was not found and the taste step silently never ran."""
+    env = dict(os.environ)
+    home = Path(env.get("HOME") or str(Path.home()))
+    extra = [str(home / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    node_bins = []
+    for d in (home / ".nvm" / "versions" / "node").glob("v*/bin"):
+        try:
+            node_bins.append((tuple(int(x) for x in d.parent.name[1:].split(".")), str(d)))
+        except ValueError:
+            continue
+    if node_bins:
+        extra.append(max(node_bins)[1])  # codex is installed under the newest node
+    have = [x for x in (env.get("PATH") or "").split(os.pathsep) if x]
+    env["PATH"] = os.pathsep.join(have + [x for x in extra if x not in have])
+    return env
+
+
 def _default_ai_pick(prompt: str, cmd: str) -> tuple[int, str]:
     """Ask whichever engine has capacity. `ai-pick` only NAMES the engine (exit 75 = defer);
-    the prompt is then run through that engine's own read-only command."""
+    the prompt is then run through that engine's own read-only command. Only ai-pick's own
+    exit 75 is a deferral: a command that cannot be found or run is an error with its reason."""
+    env = _tool_env()
+    pick_exe = shutil.which(cmd, path=env["PATH"])
+    if not pick_exe:
+        return 127, f"{cmd} not found on PATH ({env['PATH']})"
     try:
-        pick = subprocess.run([cmd, "--engines", ",".join(ENGINE_COMMANDS), "--min", "20"],
-                              capture_output=True, text=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return 75, "ai-pick unavailable"
+        pick = subprocess.run([pick_exe, "--engines", ",".join(ENGINE_COMMANDS), "--min", "20"],
+                              capture_output=True, text=True, timeout=60, env=env)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return 1, f"{cmd}: {exc}"
     if pick.returncode != 0:
-        return (75 if pick.returncode == 75 else pick.returncode), (pick.stderr or "")
+        return pick.returncode, (pick.stderr or pick.stdout or "").strip()[-400:]
     engine = (pick.stdout or "").strip().splitlines()[-1].strip() if (pick.stdout or "").strip() else ""
     argv = ENGINE_COMMANDS.get(engine)
     if not argv:
-        return 75, f"ai-pick named an engine this tool cannot run: {engine!r}"
+        return 1, f"{cmd} named an engine this tool cannot run: {engine!r}"
+    exe = shutil.which(argv[0], path=env["PATH"])
+    if not exe:
+        return 127, f"{engine}: {argv[0]} not found on PATH"
     try:
-        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=600,
-                              cwd=str(Path(__file__).resolve().parent))
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        proc = subprocess.run([exe, *argv[1:]], input=prompt, capture_output=True, text=True, timeout=600,
+                              cwd=str(Path(__file__).resolve().parent), env=env)
+    except (subprocess.TimeoutExpired, OSError) as exc:
         return 1, f"{engine}: {exc}"
     if proc.returncode != 0:
         return proc.returncode, f"{engine}: {(proc.stderr or proc.stdout or '')[-400:]}"
@@ -781,10 +809,11 @@ def source_taste_expansion(
         exclude = sorted(owned_artists(cfg, paths))
     prompt = _build_taste_prompt(cfg, feedback, n, owned_artist_exclude=exclude)
     code, text = runners.ai_pick(prompt, str(cfg.get("ai_pick_cmd") or DEFAULTS["ai_pick_cmd"]))
+    reason = " ".join(str(text or "").split())[:300]
     if code == 75:
-        return [], "deferred"
+        return [], "deferred" + (f": {reason}" if reason else "")
     if code != 0:
-        return [], f"ai-pick exit {code}"
+        return [], f"ai-pick exit {code}" + (f": {reason}" if reason else "")
     raw = _parse_llm_json(text)
     loved = {normal(a) for a in liked_artists(cfg)}
     out: list[dict] = []
@@ -865,9 +894,7 @@ def cmd_candidates(
             print(f"candidates: {name} failed: {exc}", file=sys.stderr)
 
     taste, taste_err = source_taste_expansion(cfg, runners, paths=paths)
-    if taste_err == "deferred":
-        errors.append("taste-expansion: deferred")
-    elif taste_err:
+    if taste_err:
         errors.append(f"taste-expansion: {taste_err}")
     else:
         by_source["taste-expansion"] = taste
@@ -1311,7 +1338,8 @@ def cmd_run(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: boo
                 paths,
                 ok=not errors,
                 stage="run",
-                detail={"counts": counts, "queue": len(ranked), "acquire": summary, "publish_tracks": len(publish.get("tracks") or [])},
+                detail={"counts": counts, "errors": errors, "queue": len(ranked), "acquire": summary,
+                        "publish_tracks": len(publish.get("tracks") or [])},
                 clock=runners.clock(),
             )
             return 0
