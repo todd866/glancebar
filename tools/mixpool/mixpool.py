@@ -648,6 +648,17 @@ def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _download_metadata(path) -> dict:
+    lib = Path(__file__).resolve().parent.parent / "music-library"
+    if str(lib) not in sys.path:
+        sys.path.insert(0, str(lib))
+    try:
+        import trackmeta  # noqa: E402
+        return trackmeta.check_download(path)
+    except Exception as exc:  # the download itself succeeded; say why the check did not run
+        return {"ok": False, "gaps": [f"metadata check failed: {type(exc).__name__}: {exc}"]}
+
+
 def run_amdl_detailed(
     url: str,
     *,
@@ -685,6 +696,10 @@ def run_amdl_detailed(
                 "absolute_path": str(path),
                 "size_bytes": size,
                 "sha256": sha256_file(path),
+                # Every download keeps its metadata and cover (owner rule, 12 Nov 2026): the
+                # cover file is written beside the track if amdl left none, and anything
+                # missing is recorded with the download.
+                "metadata": _download_metadata(path),
             }
         )
     detail["files"] = files
@@ -764,12 +779,18 @@ def pull_liked(inventory_path: Path | None, retry_failed: bool = False,
         outcome = "fail"
         for song in songs:
             tried.append(song.get("trackId"))
-            ok, infra, error = _run_amdl(_song_url(song))
+            ok, infra, error, detail = run_amdl_detailed(_song_url(song))
             if ok:
                 state["done"][key] = {
                     "track_id": song["trackId"],
                     "url": _song_url(song),
                 }
+                gaps = sorted({gap for f in detail.get("files") or []
+                               for gap in (f.get("metadata") or {}).get("gaps") or []})
+                if gaps:
+                    state["done"][key]["metadata_gaps"] = gaps
+                    print(f"  downloaded, but metadata is incomplete: {', '.join(gaps)}",
+                          file=sys.stderr, flush=True)
                 state["failed"].pop(key, None)
                 outcome = "ok"
                 break

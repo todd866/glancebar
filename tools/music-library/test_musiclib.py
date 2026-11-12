@@ -10,6 +10,10 @@ from unittest import mock
 
 import musiclib as m
 
+# The tests must not read this Mac's real metered-link marker: on a hotspot four sync tests
+# failed with "metered link; refuse fetch" (12 Nov 2026). Tests that want it pass metered_flag.
+m.METERED_FLAG = Path('/nonexistent/glancebar-tests/METERED_LINK')
+
 
 def atom(kind, body):
     return struct.pack('>I4s', len(body) + 8, kind) + body

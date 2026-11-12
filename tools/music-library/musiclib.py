@@ -26,6 +26,7 @@ if _bundle.is_file():
 elif _dev.is_dir() and str(_dev) not in sys.path:
     sys.path.insert(0, str(_dev))
 import offline_cache as oc  # noqa: E402
+import trackmeta  # noqa: E402
 
 HOME = Path.home()
 DEFAULT_CONFIG = HOME / '.config/glancebar/music-library.json'
@@ -106,56 +107,9 @@ def sha256_file(path, chunk=1024 * 1024):
 
 
 def mp4_duration_seconds(path):
-    """Read track duration from the first mdhd atom under moov/trak."""
-    duration = None
-    timescale = None
-    with Path(path).open('rb') as f:
-        def walk(start, end, depth=0, parents=()):
-            nonlocal duration, timescale
-            if depth > 10 or start > end:
-                return
-            pos = start
-            while pos + 8 <= end:
-                f.seek(pos)
-                raw = f.read(8)
-                if len(raw) != 8:
-                    return
-                size, kind = struct.unpack('>I4s', raw)
-                header = 8
-                if size == 1:
-                    ext = f.read(8)
-                    if len(ext) != 8:
-                        return
-                    size, header = struct.unpack('>Q', ext)[0], 16
-                if size == 0:
-                    size = end - pos
-                if size < header or pos + size > end:
-                    return
-                body = pos + header
-                if kind == b'mdhd' and parents == (b'moov', b'trak', b'mdia') and size - header >= 20:
-                    f.seek(body)
-                    version = f.read(1)[0]
-                    if version == 0 and size - header >= 20:
-                        data = f.read(19)
-                        if len(data) == 19:
-                            timescale = struct.unpack('>I', data[7:11])[0]
-                            duration = struct.unpack('>I', data[11:15])[0]
-                    elif version == 1 and size - header >= 32:
-                        data = f.read(31)
-                        if len(data) == 31:
-                            timescale = struct.unpack('>I', data[15:19])[0]
-                            duration = struct.unpack('>Q', data[19:27])[0]
-                elif kind in (b'moov', b'trak', b'mdia', b'minf', b'stbl', b'udta', b'meta', b'ilst'):
-                    walk(body + (4 if kind == b'meta' else 0), pos + size, depth + 1, parents + (kind,))
-                pos += size
-
-        try:
-            walk(0, Path(path).stat().st_size)
-        except (OSError, struct.error):
-            return None
-    if duration is not None and timescale and timescale > 0:
-        return round(duration / timescale, 3)
-    return None
+    """Track duration in seconds, or None. (Until 12 Nov 2026 this read the wrong bytes of the
+    media header and every catalogue entry said 0.0.)"""
+    return trackmeta.read_track_metadata(path).get('durationSeconds')
 
 
 def rclone_bin():
@@ -256,24 +210,33 @@ def catalogue_entry_for_file(path, masters_root, cache):
     st = path.stat()
     stamp = [st.st_size, str(st.st_mtime_ns)]
     prev = cache.get(rel, {})
-    if prev.get('stamp') == stamp and prev.get('entry'):
+    unchanged = prev.get('stamp') == stamp and prev.get('entry')
+    if unchanged and 'meta' in prev['entry']:
         return prev['entry'], cache
     tags = {}
     duration = None
+    meta = {}
     if path.suffix.lower() in ('.m4a', '.mp4'):
         try:
             tags = oc.mp4_tags(path)
         except (OSError, ValueError, UnicodeError):
             tags = {}
-        duration = mp4_duration_seconds(path)
+        full = trackmeta.read_track_metadata(path)
+        duration = full.get('durationSeconds')
+        meta = trackmeta.catalogue_metadata(full)
     entry = {
         'relativePath': rel,
         'sizeBytes': st.st_size,
         'mtimeNs': str(st.st_mtime_ns),
-        'sha256': sha256_file(path),
-        'tags': {k: tags.get(k, '') for k in ('title', 'artist', 'album')},
+        # An unchanged file read before metadata was recorded keeps its hash: only the header
+        # is read again, not the whole file.
+        'sha256': prev['entry']['sha256'] if unchanged and prev['entry'].get('sha256') else sha256_file(path),
+        'tags': {k: tags.get(k, '') or meta.get(k, '') for k in ('title', 'artist', 'album')},
+        # Everything the file says about itself (owner rule, 12 Nov 2026): identifiers, credits,
+        # dates, numbering, and the embedded cover's size and hash.
+        'meta': meta,
     }
-    if duration is not None:
+    if duration:
         entry['durationSeconds'] = duration
     cache[rel] = {'stamp': stamp, 'entry': entry}
     return entry, cache
@@ -338,11 +301,21 @@ def atomic_write_json(path, document):
             temp.unlink(missing_ok=True)
 
 
-def catalogue_command(masters_dir, remote, state, upload=True):
+ARCHIVE_DIR_NAME = '_metadata'
+
+
+def catalogue_command(masters_dir, remote, state, upload=True, archive=True):
     state = state_dir(state)
     doc = build_catalogue(masters_dir, state)
     local_out = state / 'catalogue.json'
     atomic_write_json(local_out, doc)
+    if archive:
+        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026).
+        try:
+            atomic_write_json(Path(masters_dir).expanduser().resolve() / ARCHIVE_DIR_NAME / 'library-metadata.json', doc)
+        except OSError as exc:
+            print(f'catalogue: could not write the metadata record beside the masters: {exc}', file=sys.stderr)
+            raise
     if upload:
         upload_local_json(local_out, remote, 'catalogue.json')
     return doc
@@ -418,7 +391,7 @@ def match_track(track, catalogue_entries):
     for position in sorted(candidates):
         entry = candidates[position]
         tags = entry.get('tags') or {}
-        entry_dur = entry.get('durationSeconds')
+        entry_dur = entry.get('durationSeconds') or None   # 0.0 in old catalogues means unknown
         if not duration_ok(req_dur, entry_dur):
             continue
         exact = match_key(tags.get('artist', ''), tags.get('title', '')) == exact_key
@@ -1010,6 +983,7 @@ def main(argv=None):
     c_cat.add_argument('--config', type=Path)
     c_cat.add_argument('--state', type=Path)
     c_cat.add_argument('--no-upload', action='store_true')
+    c_cat.add_argument('--no-archive', action='store_true', help='do not write _metadata/library-metadata.json beside the masters')
 
     c_push = sub.add_parser('push', help='rclone copy masters to remote (no deletes)')
     c_push.add_argument('--masters', type=Path, required=True)
@@ -1043,8 +1017,18 @@ def main(argv=None):
     try:
         if args.command == 'catalogue':
             cfg = load_config(args.config)
-            doc = catalogue_command(args.masters, cfg['remote'], args.state, upload=not args.no_upload)
-            print(json.dumps({'entries': len(doc['entries']), 'remote': cfg['remote']}, indent=2))
+            doc = catalogue_command(args.masters, cfg['remote'], args.state, upload=not args.no_upload,
+                                    archive=not args.no_archive)
+            incomplete = []
+            for entry in doc['entries']:
+                gaps = trackmeta.metadata_gaps({**(entry.get('meta') or {}), **(entry.get('tags') or {}),
+                                                'art': (entry.get('meta') or {}).get('art'),
+                                                'durationSeconds': entry.get('durationSeconds')})
+                if gaps:
+                    incomplete.append({'relativePath': entry['relativePath'], 'missing': gaps})
+            print(json.dumps({'entries': len(doc['entries']), 'remote': cfg['remote'],
+                              'metadataIncomplete': len(incomplete), 'firstIncomplete': incomplete[:5]},
+                             indent=2, ensure_ascii=False))
             return 0
         if args.command == 'push':
             cfg = load_config(args.config)

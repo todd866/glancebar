@@ -146,3 +146,25 @@ system log whether each remote command came from a Bluetooth device. Causes: `cl
 Found with the system log before this existed: on 12 Nov 2026 the music "cut in and out"
 because the Bluetooth headphones were sending Pause and Play commands, and their link was
 dropping; the player had no stalls or errors.
+
+## Metadata and cover art are kept with every download (12 Nov 2026)
+
+Owner rule: every downloaded song keeps its metadata, album art included, and that record
+lives on the M2's external drive with the masters.
+
+- **In the file.** `amdl` writes full tags (title, artist, album, album artist, composer,
+  genre, date, track and disc numbers, ISRC, UPC, copyright, lyrics) and a 1500 px cover into
+  each `.m4a`, and a `cover.jpg` in the album folder. YouTube likes carry title, artist, date
+  and the video thumbnail.
+- **Checked at download.** `mixpool.run_amdl_detailed` runs `trackmeta.check_download` on each
+  new file: it writes `cover.jpg` from the embedded art if the folder has none, and records
+  what is missing (`metadata.gaps`) with the download, in the scout ledger and in
+  `liked-pulled.json` (`metadata_gaps`). `tools/music-library/trackmeta.py check FILE...`
+  does the same by hand; `show FILE` prints everything.
+- **In the catalogue.** Each `catalogue.json` entry has `meta` (all of the above except the
+  lyrics text; `hasLyrics`, and the cover's format, size and hash) and a real
+  `durationSeconds`. Until this date the duration reader used the wrong bytes and every entry
+  said 0.0, so no duration check ever ran.
+- **Beside the masters.** Every catalogue build writes the same document to
+  `<masters>/_metadata/library-metadata.json` on the M2's drive, and prints how many masters
+  have incomplete metadata.
