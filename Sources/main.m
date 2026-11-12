@@ -6421,7 +6421,14 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     // The read used to be the only place saved seeds were applied, so the row vanished (5 Nov 2026).
     if (!_mixSeeds.count) {
         NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:@"mixSeeds"];
-        if ([saved isKindOfClass:NSArray.class] && saved.count) _mixSeeds = saved;
+        if ([saved isKindOfClass:NSArray.class] && saved.count) {
+            _mixSeeds = saved;
+            // Covers were only loaded after a library read, which needs Music open: after a
+            // relaunch with Music closed the tiles showed the placeholder note (12 Nov 2026).
+            for (NSDictionary *seed in saved)
+                if ([seed isKindOfClass:NSDictionary.class]) [self loadMixArt:seed];
+            if (_popover.isShown) [self rebuildContent];
+        }
     }
     [self ensureOfflinePlaylists];
     if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;

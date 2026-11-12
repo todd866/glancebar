@@ -859,9 +859,20 @@ int main(int argc, const char **argv) {
                                         @"subtitle": @"Saved Artist", @"trackID": @"Z", @"artist": @"Saved Artist",
                                         @"album": @"", @"family": @"other"}];
                 [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
+                // The saved tile's cover is on disk. With Music closed nothing else loads it: after a
+                // relaunch the tiles showed the placeholder note (12 Nov 2026).
+                NSString *savedArt = [MixDirectory(@"art") stringByAppendingPathComponent:@"Z.jpg"];
+                NSImage *swatch = [[NSImage alloc] initWithSize:NSMakeSize(8, 8)];
+                [swatch lockFocus]; [NSColor.redColor setFill]; NSRectFill(NSMakeRect(0, 0, 8, 8)); [swatch unlockFocus];
+                NSBitmapImageRep *swatchRep = [NSBitmapImageRep imageRepWithData:swatch.TIFFRepresentation];
+                [[swatchRep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{}] writeToFile:savedArt atomically:YES];
+                [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
                 [c ensureMixSeeds];
                 NSArray *restored = [c valueForKey:@"mixSeeds"];
                 BOOL savedOK = restored.count == 1 && [restored[0][@"title"] isEqual:@"Saved Seed"];
+                BOOL savedArtOK = [[c valueForKey:@"mixArt"] objectForKey:@"Z"] != nil;
+                [NSFileManager.defaultManager removeItemAtPath:savedArt error:nil];
+                if (!savedArtOK) { fprintf(stderr, "saved tile: cover on disk was not loaded\n"); return Fail(__LINE__); }
                 [c setValue:@YES forKey:@"mixFrozen"];
                 [c setValue:liveSeeds forKey:@"mixSeeds"];
                 [args removeObjectForKey:@"mixSeeds"];
