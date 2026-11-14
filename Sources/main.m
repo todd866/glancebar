@@ -4818,14 +4818,15 @@ static NSImage *StationTileImage(BOOL dimmed) {
 
 static const CGFloat kTileCaptionBasePt = 11.5;
 static const CGFloat kTileCaptionFloorPt = 10.0;
+static const CGFloat kLabelPad = 8;   // what an NSTextField label needs beyond its text's width
 
 static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width, CGFloat basePt) {
     CGFloat pt = basePt > 0 ? basePt : kTileCaptionBasePt;
     while (pt >= kTileCaptionFloorPt) {
         NSFont *font = [NSFont systemFontOfSize:pt];
-        // A label draws its text 2 pt in from each side, so it needs 4 pt of slack: with 2 the
-        // metric said "fits" and AppKit still drew "House Pa…".
-        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + 4 <= width) return pt;
+        // A label needs kLabelPad more than its text or AppKit truncates it (measured with the
+        // cell's expansion frame: 58.9 pt of text is cut in a 65.2 pt label and whole in 70).
+        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + kLabelPad <= width) return pt;
         pt -= 0.5;
     }
     return kTileCaptionFloorPt;
@@ -4978,7 +4979,7 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
     BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
                      mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
     BOOL clipped = truncates && self.stringValue.length &&
-        self.attributedStringValue.size.width + 4 > NSWidth(self.bounds);
+        self.attributedStringValue.size.width + 8 > NSWidth(self.bounds);   // AppKit truncates below text + 8
     if (self.maximumNumberOfLines > 1 && self.stringValue.length && self.font)   // a wrapping label clips past its last line
         clipped = NSHeight([self.stringValue boundingRectWithSize:NSMakeSize(NSWidth(self.bounds) - 4, 1000)
                                                           options:NSStringDrawingUsesLineFragmentOrigin
@@ -9679,9 +9680,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = l ? NSLineBreakByTruncatingTail : NSLineBreakByTruncatingTail;
             cap.allowsDefaultTighteningForTruncation = YES;
-            cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
+            cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaptionLine1(cap, captions[l], capW);
+            else GBApplyTileCaptionLine1(cap, captions[l], capW + kLabelPad);
             cap.accessibilityIdentifier = [NSString stringWithFormat:l ? @"popover.mix.artist.%lu" : @"popover.mix.caption.%lu", (unsigned long)i];
             [line addSubview:cap];
         }
@@ -9756,9 +9757,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.textColor = showPlaying ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
-            cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
-            if (l) GBApplyTileCaption(cap, showCaps[l], capW, 10);
-            else GBApplyTileCaptionLine1(cap, showCaps[l], capW);
+            cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
+            if (l) GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, 10);
+            else GBApplyTileCaptionLine1(cap, showCaps[l], capW + kLabelPad);
             cap.accessibilityIdentifier = l ? @"popover.music.show.artist" : @"popover.music.show.caption";
             [line addSubview:cap];
         }
@@ -9820,9 +9821,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
                 : (l ? NSColor.secondaryLabelColor : (stationOn ? NSColor.labelColor : NSColor.tertiaryLabelColor));
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
-            cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
+            cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaptionLine1(cap, captions[l], capW);
+            else GBApplyTileCaptionLine1(cap, captions[l], capW + kLabelPad);
             cap.accessibilityIdentifier = l ? @"popover.mix.artist.4" : @"popover.mix.caption.4";
             [line addSubview:cap];
         }

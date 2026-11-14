@@ -301,7 +301,8 @@ static BOOL FramesEqual(NSRect a, NSRect b) {
 }
 static BOOL CaptionFits(NSTextField *field) {
     if (![field isKindOfClass:NSTextField.class] || !field.stringValue.length) return YES;
-    return [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width + 2 <= NSWidth(field.bounds);
+    // AppKit's own answer: a label's cell has an expansion frame only when it truncates its text.
+    return NSIsEmptyRect([field.cell expansionFrameWithFrame:field.bounds inView:field]);
 }
 static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
     if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
