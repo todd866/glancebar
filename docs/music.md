@@ -203,6 +203,21 @@ Found with the system log before this existed: on 12 Nov 2026 the music "cut in 
 because the Bluetooth headphones were sending Pause and Play commands, and their link was
 dropping; the player had no stalls or errors.
 
+## Kind tiles (popover)
+
+The mix row under the player is **Dance · Alt · Rap · Chill**, an offered **radio-show** tile when one
+exists, and **New music** (station) on the right. Each kind tile shows a 2×2 mosaic of covers for
+tracks on this Mac (placeholder letter when the kind is empty), a note **typemark** at the top-left of
+the cover, the kind name, and an on-disk **song count**. Clicking a kind starts that kind queue
+(`cause: click` in `playback.jsonl`); clicking the same kind again reshuffles it. The playing kind gets
+an accent border on its tile and caption. There is no refresh or **New picks** control — kinds come from
+`mixLibrary` and the offline manifest, not saved seed mixes.
+
+Harness ids: `popover.music.kind.{dance|alt|rap|chill}`, `.caption`, `.songs`, `.typemark`; station
+unchanged (`popover.mix.station`, captions `popover.mix.caption.4` / `popover.mix.artist.4`). With a show
+offered the row uses six 50pt tiles; otherwise five at 54pt. `tools/check-popover.m` exercises layout and
+counts with `GLANCEBAR_MUSIC_STATE` modes `kinds-render`, `kinds-five`, and `kinds-empty`.
+
 ## Playing by kind
 
 Kinds: **dance**, **alt**, **rap**, **chill**, **any**. Genres map with chill checked first

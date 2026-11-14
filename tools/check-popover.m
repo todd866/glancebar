@@ -93,6 +93,14 @@ static BOOL HasText(NSView *view, NSString *text) {
 // The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
 // A container row that cannot show every volume name, and a host disk that has a
 // disk image on it, keep the full names in the row tooltip.
+static BOOL KindTileTip(NSView *view) {
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    return [ident hasPrefix:@"popover.music.kind."];
+}
+static BOOL ShowTileTip(NSView *view) {
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    return [ident isEqual:@"popover.music.show"] || [ident isEqual:@"popover.mix.station"];
+}
 static BOOL VolumeNamesTip(NSView *view) {
     NSString *ident = view.accessibilityIdentifier ?: @"";
     if (!view.toolTip.length || ![view.toolTip isEqual:view.accessibilityHelp]) return NO;
@@ -118,7 +126,9 @@ static BOOL RecoveryTip(NSView *view) {
     return [view.toolTip isEqual:field.stringValue] && AppKitTruncatesLabel(field);
 }
 static NSView *WordyTip(NSView *view) {
-    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) return view;
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
+        !KindTileTip(view) && !ShowTileTip(view))
+        return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
 }
@@ -289,10 +299,6 @@ static BOOL WriteSilentM4A(NSString *path, NSString *__unused artist, NSData *co
     if (coverPNG.length && !EmbedCoverInM4A(path, coverPNG)) return NO;
     return [NSFileManager.defaultManager fileExistsAtPath:path];
 }
-static BOOL FramesEqual(NSRect a, NSRect b) {
-    return fabs(a.origin.x - b.origin.x) < 0.6 && fabs(a.origin.y - b.origin.y) < 0.6 &&
-        fabs(a.size.width - b.size.width) < 0.6 && fabs(a.size.height - b.size.height) < 0.6;
-}
 static BOOL CaptionFits(NSTextField *field) {
     if (![field isKindOfClass:NSTextField.class] || !field.stringValue.length) return YES;
     // AppKit's own answer: a label's cell has an expansion frame only when it truncates its text.
@@ -327,10 +333,138 @@ static NSView *FindIdentifier(NSView *view, NSString *identifier) {
     for (NSView *child in view.subviews) { NSView *hit = FindIdentifier(child, identifier); if (hit) return hit; }
     return nil;
 }
-static NSUInteger MixSeedTileCount(NSView *root) {
-    NSUInteger n = 0;
-    while (FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)n])) n++;
-    return n;
+static NSDictionary *ManifestTrackRecord(NSString *path, NSString *tid, NSString *title, NSString *artist) {
+    struct stat st;
+    if (stat(path.fileSystemRepresentation, &st)) return nil;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    uint8_t bytes[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, bytes);
+    NSMutableString *hash = [NSMutableString string];
+    for (NSUInteger i = 0; i < sizeof(bytes); i++) [hash appendFormat:@"%02x", bytes[i]];
+    return @{@"id": tid, @"title": title, @"artist": artist, @"album": @"", @"path": path,
+             @"sizeBytes": @(st.st_size), @"sha256": hash,
+             @"inode": [NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino],
+             @"mtimeNs": [NSString stringWithFormat:@"%lld",
+                          (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec]};
+}
+static NSDictionary *MergeOfflineManifest(NSDictionary *base, NSDictionary *extra) {
+    NSMutableArray *playlists = [NSMutableArray array];
+    if ([base[@"playlists"] isKindOfClass:NSArray.class]) [playlists addObjectsFromArray:base[@"playlists"]];
+    if ([extra[@"playlists"] isKindOfClass:NSArray.class]) [playlists addObjectsFromArray:extra[@"playlists"]];
+    return @{@"schemaVersion": @1, @"playlists": playlists};
+}
+static NSDictionary *ManifestReplacingKindHarness(NSDictionary *base, NSDictionary *kindManifest) {
+    NSMutableArray *playlists = [NSMutableArray array];
+    if ([base[@"playlists"] isKindOfClass:NSArray.class]) {
+        for (id item in base[@"playlists"]) {
+            if ([item isKindOfClass:NSDictionary.class] && [item[@"key"] isEqual:@"kind:harness"]) continue;
+            [playlists addObject:item];
+        }
+    }
+    if ([kindManifest[@"playlists"] isKindOfClass:NSArray.class]) [playlists addObjectsFromArray:kindManifest[@"playlists"]];
+    return @{@"schemaVersion": @1, @"playlists": playlists};
+}
+static NSArray<NSString *> *KindTileIDs(void) { return @[@"dance", @"alt", @"rap", @"chill"]; }
+static BOOL MixRowHasLegacySeedTiles(NSView *root) {
+    if (FindIdentifier(root, @"popover.mix.newpicks")) return YES;
+    for (NSUInteger i = 0; i < 8; i++)
+        if (FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i])) return YES;
+    return NO;
+}
+static NSView *KindTileButton(NSView *root, NSString *kind) {
+    return FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@", kind]);
+}
+static BOOL KindMixRowLayoutOK(NSView *root, NSUInteger tileCount, CGFloat expectedSide) {
+    if (MixRowHasLegacySeedTiles(root)) return NO;
+    if (tileCount != 5 && tileCount != 6) return NO;
+    NSMutableArray<NSView *> *tiles = [NSMutableArray array];
+    for (NSString *kind in KindTileIDs()) {
+        NSView *t = KindTileButton(root, kind);
+        if (!t) return NO;
+        [tiles addObject:t];
+    }
+    if (tileCount == 6) {
+        if (!FindIdentifier(root, @"popover.music.show")) return NO;
+        [tiles addObject:FindIdentifier(root, @"popover.music.show")];
+    } else if (FindIdentifier(root, @"popover.music.show")) return NO;
+    NSView *station = FindIdentifier(root, @"popover.mix.station");
+    if (!station) return NO;
+    [tiles addObject:station];
+    CGFloat gap = -1;
+    for (NSView *t in tiles) {
+        if (fabs(NSWidth(t.frame) - expectedSide) > 0.6 || fabs(NSHeight(t.frame) - expectedSide) > 0.6) return NO;
+    }
+    if (fabs(NSMinX(tiles.firstObject.frame) - kPad) > 0.6) return NO;
+    if (fabs(NSMaxX(tiles.lastObject.frame) - (kW - kPad)) > 0.6) return NO;
+    for (NSUInteger i = 1; i < tiles.count; i++) {
+        CGFloat g = NSMinX(tiles[i].frame) - NSMaxX(tiles[i - 1].frame);
+        if (gap < 0) gap = g;
+        else if (fabs(g - gap) > 0.6) return NO;
+    }
+    return gap >= 0;
+}
+static BOOL KindTileDetailsOK(NSView *root, NSString *kind, NSString *caption, NSUInteger songs,
+                               BOOL playing, BOOL empty) {
+    GBKindTile *tile = (GBKindTile *)KindTileButton(root, kind);
+    if (![tile isKindOfClass:GBKindTile.class]) return NO;
+    if (empty ? (tile.enabled || tile.alphaValue > 0.5) : (!tile.enabled || tile.alphaValue < 0.95)) return NO;
+    if (playing ? tile.layer.borderWidth < 1.5 : tile.layer.borderWidth > 0.1) return NO;
+    NSView *mark = FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@.typemark", kind]);
+    if (!mark || fabs(mark.frame.origin.y - 3) > 1.5) return NO;
+    NSTextField *cap = (NSTextField *)FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@.caption", kind]);
+    NSTextField *cnt = (NSTextField *)FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@.songs", kind]);
+    if (![cap.stringValue isEqual:caption]) return NO;
+    NSString *want = songs == 1 ? @"1 song" : [NSString stringWithFormat:@"%lu songs", (unsigned long)songs];
+    if (![cnt.stringValue isEqual:want]) return NO;
+    if (playing && ![cap.textColor isEqual:NSColor.controlAccentColor]) return NO;
+    return YES;
+}
+static NSDictionary *KindHarnessTracks(NSString *musicDir, BOOL chillOnDisk) {
+    NSArray *specs = @[
+        @{@"id": @"KD1", @"title": @"Dance One", @"artist": @"Dance Harness", @"genre": @"House", @"kindKey": @"dance", @"hue": @0.08},
+        @{@"id": @"KD2", @"title": @"Dance Two", @"artist": @"Dance Harness", @"genre": @"Techno", @"kindKey": @"dance", @"hue": @0.12},
+        @{@"id": @"KA1", @"title": @"Alt One", @"artist": @"Alt Harness", @"genre": @"Indie Rock", @"kindKey": @"alt", @"hue": @0.35},
+        @{@"id": @"KA2", @"title": @"Alt Two", @"artist": @"Alt Harness", @"genre": @"Alternative", @"kindKey": @"alt", @"hue": @0.40},
+        @{@"id": @"KR1", @"title": @"Rap One", @"artist": @"Rap Harness", @"genre": @"Hip-Hop/Rap", @"kindKey": @"rap", @"hue": @0.62},
+        @{@"id": @"KR2", @"title": @"Rap Two", @"artist": @"Rap Harness", @"genre": @"Rap", @"kindKey": @"rap", @"hue": @0.66},
+        @{@"id": @"KC1", @"title": @"Chill One", @"artist": @"Chill Harness", @"genre": @"Ambient", @"kindKey": @"chill", @"hue": @0.78},
+    ];
+    NSMutableArray *library = [NSMutableArray array];
+    NSMutableArray *records = [NSMutableArray array];
+    NSMutableArray *wanted = [NSMutableArray array];
+    for (NSDictionary *spec in specs) {
+        NSString *path = [musicDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.m4a", spec[@"id"]]];
+        if (!WriteSilentM4A(path, spec[@"artist"], FixtureCoverPNG([spec[@"hue"] doubleValue]), 0.15)) return nil;
+        [library addObject:@{@"id": spec[@"id"], @"title": spec[@"title"], @"artist": spec[@"artist"], @"album": @"",
+                             @"genre": spec[@"genre"], @"plays": @8, @"idleDays": @14, @"fav": @NO, @"dislike": @NO,
+                             @"year": @2024}];
+        BOOL onDisk = ![spec[@"kindKey"] isEqual:@"chill"] || chillOnDisk;
+        if (onDisk) {
+            NSDictionary *rec = ManifestTrackRecord(path, spec[@"id"], spec[@"title"], spec[@"artist"]);
+            if (!rec) return nil;
+            [records addObject:rec];
+            [wanted addObject:@{@"id": spec[@"id"], @"title": spec[@"title"], @"artist": spec[@"artist"]}];
+        }
+    }
+    NSDictionary *manifest = records.count ? @{@"playlists": @[@{@"key": @"kind:harness", @"requestedTracks": wanted,
+        @"requestedTrackIDs": [wanted valueForKey:@"id"], @"tracks": records, @"ready": @YES}]} : @{@"playlists": @[]};
+    return @{@"library": library, @"manifest": manifest};
+}
+static BOOL KindStationCaptionsOK(NSView *root) {
+    NSTextField *stCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
+    NSTextField *stArt = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.4");
+    return stCap && stArt && [stCap.stringValue isEqual:@"New music"] && [stArt.stringValue isEqual:@"for you"];
+}
+static BOOL KindMixRowOK(NSView *root, NSUInteger tileCount, CGFloat side,
+                          NSDictionary<NSString *, NSNumber *> *songCounts, NSString *playingKind) {
+    if (!KindMixRowLayoutOK(root, tileCount, side) || !FindIdentifier(root, @"popover.mix.station") ||
+        !KindStationCaptionsOK(root)) return NO;
+    for (NSString *kind in KindTileIDs()) {
+        NSUInteger n = [songCounts[kind] unsignedIntegerValue];
+        BOOL playing = playingKind.length && [playingKind isEqual:kind];
+        if (!KindTileDetailsOK(root, kind, [kind capitalizedString], n, playing, n == 0)) return NO;
+    }
+    return YES;
 }
 static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL transportOn) {
     NSTextField *titleField = (NSTextField *)FindIdentifier(root, @"popover.music.title");
@@ -357,7 +491,8 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
 }
 static BOOL FitsChildren(NSView *view) {
     if ([view isKindOfClass:GBRecoverableTextField.class] && !RecoverableLabelOK((NSTextField *)view)) return NO;
-    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view)) {
+    if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
+        !KindTileTip(view) && !ShowTileTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
     }
@@ -561,16 +696,14 @@ int main(int argc, const char **argv) {
         setenv("GLANCEBAR_HOME", fixtureHome.UTF8String, 1);
         Controller *c = [Controller new];
         NSDictionary *offline = OfflineFixture(stationFixture, @"station:triplej");
+        NSDictionary *kindPack = KindHarnessTracks(fixtureMusic, YES);
+        if (!kindPack) return Fail(__LINE__);
         [c setValue:[@{@"station:triplej": offline[@"request"]} mutableCopy] forKey:@"offlineRequests"];
-        [c setValue:offline[@"manifest"] forKey:@"offlineManifest"];
-        // Seed tiles from a fixture: the harness never reads the real Music library.
+        [c setValue:MergeOfflineManifest(offline[@"manifest"], kindPack[@"manifest"]) forKey:@"offlineManifest"];
+        // Kind tiles from a fixture library: the harness never reads the real Music library.
         [c setValue:@YES forKey:@"mixFrozen"];
         [c setValue:@YES forKey:@"audioFrozen"];   // never read this Mac's live volume mid-check
-        [c setValue:@[@{@"key": @"song:A1", @"kind": @"song", @"title": @"Muse (feat. Kate Morgan)", @"subtitle": @"Rezident", @"trackID": @"A1", @"artist": @"Rezident", @"album": @"Only For A Moment EP", @"family": @"dance"},
-                      @{@"key": @"song:B1", @"kind": @"song", @"title": @"Kota", @"subtitle": @"Bonobo", @"trackID": @"B1", @"artist": @"Bonobo", @"album": @"Animal Magic", @"family": @"dance"},
-                      @{@"key": @"song:C1", @"kind": @"song", @"title": @"Crowbar", @"subtitle": @"Waxahatchee", @"trackID": @"C1", @"artist": @"Waxahatchee", @"album": @"Tigers Blood", @"family": @"alt"},
-                      @{@"key": @"song:D1", @"kind": @"song", @"title": @"So Long, See You Tomorrow Anniversary", @"subtitle": @"Bombay Bicycle Club", @"trackID": @"D1", @"artist": @"Bombay Bicycle Club", @"album": @"So Long", @"family": @"alt"}]
-              forKey:@"mixSeeds"];
+        [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
         [c setValue:@YES forKey:@"stationLoaded"];
         [c setValue:@YES forKey:@"stationAvailable"];
         [c setValue:@[stationFixture] forKey:@"stationFiles"];
@@ -901,116 +1034,37 @@ int main(int argc, const char **argv) {
             [c rebuildContent]; root = p.contentViewController.view;
         }
         [c setValue:[@{@"station:triplej": offline[@"request"]} mutableCopy] forKey:@"offlineRequests"];
-        [c setValue:offline[@"manifest"] forKey:@"offlineManifest"];
+        [c setValue:MergeOfflineManifest(offline[@"manifest"], kindPack[@"manifest"]) forKey:@"offlineManifest"];
+        [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
         [c ensureOfflinePlaylists];
         [c rebuildContent]; root = p.contentViewController.view;
-        {   // Seed tiles, the triple j station, and a round New picks button. Title over artist, one line each.
+        {   // Dance, Alt, Rap, Chill kind tiles and the New music station; five 54pt covers in one row.
             NSView *mix = FindIdentifier(root, @"popover.mix");
             NSView *line = FindIdentifier(root, @"popover.sound.line");
-            NSTextField *c0 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.0");
-            NSTextField *a0 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.0");
-            NSTextField *c3 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.3");
-            NSTextField *a3 = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.3");
-            NSButton *s0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
-            NSButton *s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
-            NSButton *s3 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.3");
-            NSButton *station = (NSButton *)FindIdentifier(root, @"popover.mix.station");
-            NSButton *picks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
-            NSTextField *stCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
-            NSTextField *stArt = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.4");
-            NSView *badge = FindIdentifier(root, @"popover.mix.station.badge");
-            CGFloat gapSeeds = NSMinX(s1.frame) - NSMaxX(s0.frame);
-            CGFloat gapStation = NSMinX(station.frame) - NSMaxX(s3.frame);
-            CGFloat gapButton = NSMinX(picks.frame) - NSMaxX(station.frame);
-            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 || !picks || !station || !s3 ||
-                FindIdentifier(root, @"popover.mix.seed.4") ||
-                ![c0.stringValue isEqual:@"Muse"] || ![a0.stringValue isEqual:@"Rezident"] ||
-                ![s1.accessibilityLabel containsString:@"the song Kota by Bonobo"] || s1.enabled || s1.alphaValue > 0.45 ||
-                ![s1.accessibilityHelp containsString:@"0 of 0 on this Mac"] ||
-                ![c3.toolTip isEqual:c3.stringValue] || ![a3.stringValue isEqual:@"Bombay Bicycle Club"] || !FitsChildren(root) ||
-                c0.lineBreakMode != NSLineBreakByTruncatingTail || fabs(NSMaxY(a0.frame) - NSMinY(c0.frame)) > 0.5 || NSMinY(a0.frame) < 0 ||
-                fabs(NSMinY(a0.frame) - NSMinY(a3.frame)) > 0.5 || fabs(NSMinY(a0.frame) - NSMinY(stArt.frame)) > 0.5 ||
-                NSHeight(c0.frame) < ceil(c0.font.ascender - c0.font.descender) ||
-                ![c0.textColor isEqual:NSColor.labelColor] || ![a0.textColor isEqual:NSColor.secondaryLabelColor] ||
-                ![a3.toolTip isEqual:a3.stringValue] || a3.lineBreakMode != NSLineBreakByTruncatingTail ||
-                ![picks.accessibilityLabel isEqual:@"New picks"] || picks.action != @selector(newMixPicks:) ||
-                fabs(NSWidth(picks.frame) - 22) > 0.5 || fabs(NSHeight(picks.frame) - 22) > 0.5 ||
-                fabs(picks.layer.cornerRadius - 11) > 0.5 ||
-                fabs(NSWidth(station.frame) - 54) > 0.5 || fabs(NSHeight(station.frame) - 54) > 0.5 ||
-                fabs(NSMidY(picks.frame) - NSMidY(station.frame)) > 0.5 ||
-                fabs(NSMinX(s0.frame) - kPad) > 0.6 || fabs(NSMaxX(picks.frame) - (kW - kPad)) > 0.6 ||
-                fabs(gapSeeds - gapStation) > 0.6 || fabs(gapSeeds - gapButton) > 0.6 || gapSeeds < 2 ||
-                ![stCap.stringValue isEqual:@"New music"] || ![stArt.stringValue isEqual:@"for you"] ||
-                !badge || ![badge.accessibilityLabel isEqual:@"3 new picks"] || station.alphaValue < 0.95)
+            NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
+            if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 ||
+                !KindMixRowOK(root, 5, 54, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
-            {   // A cover tile carries its image for the large hover view.
-                NSImage *art = [NSImage imageWithSize:NSMakeSize(60, 60) flipped:NO drawingHandler:^BOOL(NSRect r) { [NSColor.systemRedColor setFill]; NSRectFill(r); return YES; }];
-                [c setValue:[@{@"A1": art} mutableCopy] forKey:@"mixArt"];
-                [c rebuildContent]; root = p.contentViewController.view;
-                GBSeedTile *t0 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.0"), *t2 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.2");
-                if (![t0 isKindOfClass:GBSeedTile.class] || t0.cover != art || t2.cover) return Fail(__LINE__);
-                // The hover card names the song in full: the zone spans tile and captions, clicks pass through.
-                GBSeedHover *h3 = (GBSeedHover *)FindIdentifier(root, @"popover.mix.hover.3");
-                GBSeedTile *t3 = (GBSeedTile *)FindIdentifier(root, @"popover.mix.seed.3");
-                if (![h3 isKindOfClass:GBSeedHover.class] || h3.tile != t3 || [h3 hitTest:NSMakePoint(NSMidX(h3.frame), NSMidY(h3.frame))] ||
-                    ![t3.songTitle isEqual:@"So Long, See You Tomorrow Anniversary"] || ![t3.songArtist isEqual:@"Bombay Bicycle Club"] ||
-                    NSMaxY(h3.frame) < NSMaxY(t3.frame) - 0.5 || NSMinY(h3.frame) > 0.5) return Fail(__LINE__);
-                [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
-                [c rebuildContent]; root = p.contentViewController.view;
-            }
-            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
+            NSView *badge = FindIdentifier(root, @"popover.mix.station.badge");
+            NSButton *station = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+            if (!badge || ![badge.accessibilityLabel isEqual:@"3 new picks"] || station.alphaValue < 0.95)
+                return Fail(__LINE__);
+            [c setValue:@"kind:dance" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"localMode"];
             [c rebuildContent]; root = p.contentViewController.view;
-            s1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
-            NSTextField *c1 = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.1");
-            if (s1.layer.borderWidth < 1.9 || ![c1.textColor isEqual:NSColor.controlAccentColor]) return Fail(__LINE__);
+            if (!KindMixRowOK(root, 5, 54, counts, @"dance")) return Fail(__LINE__);
             [c setValue:@NO forKey:@"localMode"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
-            // Seed tiles stay visible whenever music is enabled; network state no longer hides them.
-            [c setValue:@NO forKey:@"localMode"];
-            [c rebuildContent]; root = p.contentViewController.view;
-            if (!FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks"))
-                return Fail(__LINE__);
+            // Kind tiles stay visible whenever music is enabled; network state no longer hides them.
             [c setValue:@YES forKey:@"musicProbesEnabled"];
             [c setValue:@YES forKey:@"networkKnown"];
             [c setValue:@NO forKey:@"networkOnline"];
             [c rebuildContent]; root = p.contentViewController.view;
-            if (!FindIdentifier(root, @"popover.mix.seed.0")) return Fail(__LINE__);
+            if (!KindTileButton(root, @"dance")) return Fail(__LINE__);
             [c setValue:@NO forKey:@"musicProbesEnabled"];
             [c setValue:@NO forKey:@"networkKnown"];
             [c setValue:@YES forKey:@"networkOnline"];
             [c rebuildContent]; root = p.contentViewController.view;
-            {   // Saved seeds show when the library cannot be read (Music closed, or offline).
-                NSArray *liveSeeds = [c valueForKey:@"mixSeeds"];
-                [c setValue:nil forKey:@"mixSeeds"];
-                [c setValue:@NO forKey:@"mixFrozen"];
-                [c setValue:@NO forKey:@"musicOff"];
-                NSMutableDictionary *args = [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain] mutableCopy] ?: [NSMutableDictionary dictionary];
-                args[@"mixSeeds"] = @[@{@"key": @"song:Z", @"kind": @"song", @"title": @"Saved Seed",
-                                        @"subtitle": @"Saved Artist", @"trackID": @"Z", @"artist": @"Saved Artist",
-                                        @"album": @"", @"family": @"other"}];
-                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
-                // The saved tile's cover is on disk. With Music closed nothing else loads it: after a
-                // relaunch the tiles showed the placeholder note (12 Nov 2026).
-                NSString *savedArt = [MixDirectory(@"art") stringByAppendingPathComponent:@"Z.jpg"];
-                NSImage *swatch = [[NSImage alloc] initWithSize:NSMakeSize(8, 8)];
-                [swatch lockFocus]; [NSColor.redColor setFill]; NSRectFill(NSMakeRect(0, 0, 8, 8)); [swatch unlockFocus];
-                NSBitmapImageRep *swatchRep = [NSBitmapImageRep imageRepWithData:swatch.TIFFRepresentation];
-                [[swatchRep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{}] writeToFile:savedArt atomically:YES];
-                [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"];
-                [c ensureMixSeeds];
-                NSArray *restored = [c valueForKey:@"mixSeeds"];
-                BOOL savedOK = restored.count == 1 && [restored[0][@"title"] isEqual:@"Saved Seed"];
-                BOOL savedArtOK = [[c valueForKey:@"mixArt"] objectForKey:@"Z"] != nil;
-                [NSFileManager.defaultManager removeItemAtPath:savedArt error:nil];
-                if (!savedArtOK) { fprintf(stderr, "saved tile: cover on disk was not loaded\n"); return Fail(__LINE__); }
-                [c setValue:@YES forKey:@"mixFrozen"];
-                [c setValue:liveSeeds forKey:@"mixSeeds"];
-                [args removeObjectForKey:@"mixSeeds"];
-                [NSUserDefaults.standardUserDefaults setVolatileDomain:args forName:NSArgumentDomain];
-                [c rebuildContent]; root = p.contentViewController.view;
-                if (!savedOK) return Fail(__LINE__);
-            }
             {   // Missing station.json dims the tile and hides the count. It must not remove the row.
                 [c setValue:@NO forKey:@"stationAvailable"];
                 [c setValue:@[] forKey:@"stationPicks"];
@@ -1018,7 +1072,7 @@ int main(int argc, const char **argv) {
                 NSButton *dimmed = (NSButton *)FindIdentifier(root, @"popover.mix.station");
                 GBStationTile *cardTile = (GBStationTile *)dimmed;
                 if (!dimmed || dimmed.alphaValue > 0.5 || FindIdentifier(root, @"popover.mix.station.badge") ||
-                    !FindIdentifier(root, @"popover.mix.seed.0") || !FindIdentifier(root, @"popover.mix.newpicks") ||
+                    !KindTileButton(root, @"dance") || MixRowHasLegacySeedTiles(root) ||
                     ![cardTile isKindOfClass:GBStationTile.class]) return Fail(__LINE__);
                 [c setValue:@YES forKey:@"stationAvailable"];
                 [c setValue:@[
@@ -1525,27 +1579,13 @@ int main(int argc, const char **argv) {
                 return Fail(__LINE__);
         } else if (musicState && strcmp(musicState, "apple") == 0) {
             [c setValue:@YES forKey:@"localMode"];
-            [c setValue:@"song:B1" forKey:@"mixPlayingKey"];
+            [c setValue:@"kind:dance" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"playbackKnown"];
             [c setValue:@YES forKey:@"playbackPlaying"];
             [c setValue:@"Lightning Crashes" forKey:@"localTitle"];
             [c setValue:@"LIVE" forKey:@"localArtist"];
             [c setValue:@83 forKey:@"trackElapsed"];
             [c setValue:@324 forKey:@"trackDuration"];
-            // Render-only: real seed tiles from a JSON list of {trackID,title,artist,art}.
-            const char *mixRender = getenv("GLANCEBAR_MIX_SEEDS");
-            NSArray *frozenSeeds = [c valueForKey:@"mixSeeds"];
-            if (mixRender) {
-                NSArray *list = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@(mixRender)] options:0 error:nil];
-                NSMutableArray *seeds = [NSMutableArray array]; NSMutableDictionary *covers = [NSMutableDictionary dictionary];
-                for (NSDictionary *s in list) {
-                    [seeds addObject:@{@"key": [@"song:" stringByAppendingString:s[@"trackID"]], @"kind": @"song", @"title": s[@"title"],
-                                       @"subtitle": s[@"artist"], @"trackID": s[@"trackID"], @"artist": s[@"artist"], @"album": @"", @"family": @"other"}];
-                    NSImage *img = [[NSImage alloc] initWithContentsOfFile:s[@"art"]];
-                    if (img) covers[s[@"trackID"]] = img;
-                }
-                [c setValue:seeds forKey:@"mixSeeds"]; [c setValue:covers forKey:@"mixArt"];
-            }
             [c rebuildContent];
             root = p.contentViewController.view;
             NSSlider *position = (NSSlider *)FindIdentifier(root, @"popover.music.position");
@@ -1574,13 +1614,6 @@ int main(int argc, const char **argv) {
                 NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
                 if (!RenderOffscreen(root, [stem stringByAppendingString:@"-music.png"], look)) return Fail(__LINE__);
             }
-            if (mixRender && argc > 1) {   // and the hover card for the last seed, full names under the cover
-                GBSeedTile *last = nil;
-                for (NSUInteger i = 0; i < 4; i++) { NSView *v = FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i]); if (v) last = (GBSeedTile *)v; }
-                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
-                if (last && !RenderOffscreen([last largeCard], [stem stringByAppendingString:@"-card.png"], argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua)) return Fail(__LINE__);
-            }
-            if (mixRender) { [c setValue:frozenSeeds forKey:@"mixSeeds"]; [c setValue:[NSMutableDictionary dictionary] forKey:@"mixArt"]; [c rebuildContent]; root = p.contentViewController.view; }
             // The scrubber line is the only extra height; later fixtures measure the idle panel.
             [c setValue:@NO forKey:@"localMode"];
             [c setValue:nil forKey:@"mixPlayingKey"];
@@ -1630,7 +1663,7 @@ int main(int argc, const char **argv) {
             heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
             if (![heart.accessibilityLabel isEqual:@"Remove from Favourites"]) return Fail(__LINE__);
             [c setValue:[NSMutableSet set] forKey:@"heartedKeys"];
-            [c setValue:@"song:SEED" forKey:@"mixPlayingKey"];
+            [c setValue:@"kind:alt" forKey:@"mixPlayingKey"];
             [c rebuildContent];
             root = p.contentViewController.view;
             if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup") ||
@@ -1701,14 +1734,6 @@ int main(int argc, const char **argv) {
             [@"" writeToFile:fbPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
             [c rebuildContent];
             root = p.contentViewController.view;
-            NSButton *ref0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
-            NSButton *ref1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
-            NSButton *ref2 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.2");
-            NSButton *ref3 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.3");
-            NSButton *refStation = (NSButton *)FindIdentifier(root, @"popover.mix.station");
-            NSButton *refPicks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
-            if (!ref0 || !ref1 || !ref2 || !ref3 || !refStation || !refPicks) return Fail(__LINE__);
-            NSRect slot0 = ref0.frame, slot1 = ref1.frame, slot2 = ref2.frame, slot3 = ref3.frame, slotStation = refStation.frame, slotPicks = refPicks.frame;
             double savedDur = (strcmp(musicState, "shows-playing") == 0) ? 14400.0 : 240.0;
             NSDictionary *showsState = @{@"version": @1, @"episodes": @{
                 epA: @{@"position": @72, @"duration": @(savedDur), @"finished": @NO, @"updated": @"2026-11-14T09:00:00Z"},
@@ -1732,24 +1757,21 @@ int main(int argc, const char **argv) {
             if (![c embeddedArtworkForPath:epA] || [c stationMosaicCovers].count < 4) return Fail(__LINE__);
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (MixSeedTileCount(root) != 3 || FindIdentifier(root, @"popover.mix.seed.3")) return Fail(__LINE__);
             GBShowTile *show = (GBShowTile *)FindIdentifier(root, @"popover.music.show");
-            NSButton *seed0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
-            NSButton *seed1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
-            NSButton *seed2 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.2");
             GBStationTile *station = (GBStationTile *)FindIdentifier(root, @"popover.mix.station");
-            NSButton *picks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
             NSTextField *showCap = (NSTextField *)FindIdentifier(root, @"popover.music.show.caption");
             NSTextField *showSub = (NSTextField *)FindIdentifier(root, @"popover.music.show.artist");
             NSTextField *nmCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
             GBShowProgressView *prog = (GBShowProgressView *)FindIdentifier(root, @"popover.music.show.progress");
             NSView *showMark = FindIdentifier(root, @"popover.music.show.typemark");
             NSView *stMark = FindIdentifier(root, @"popover.mix.station.typemark");
-            if (!show || !seed0 || !seed1 || !seed2 || !station || !picks || !showCap || !showSub || !nmCap || !prog) return Fail(__LINE__);
-            if (!FramesEqual(seed0.frame, slot0) || !FramesEqual(seed1.frame, slot1) || !FramesEqual(seed2.frame, slot2) ||
-                !FramesEqual(show.frame, slot3) || !FramesEqual(station.frame, slotStation) || !FramesEqual(picks.frame, slotPicks))
+            NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
+            if (!show || !station || !showCap || !showSub || !nmCap || !prog ||
+                MixRowHasLegacySeedTiles(root) || !KindMixRowLayoutOK(root, 6, 50) ||
+                !KindMixRowOK(root, 6, 50, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
-            if (NSMinX(show.frame) <= NSMaxX(seed2.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)
+            NSView *chill = KindTileButton(root, @"chill");
+            if (NSMinX(show.frame) <= NSMaxX(chill.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)
                 return Fail(__LINE__);
             if (![showCap.stringValue isEqual:@"House Party"] || ![nmCap.stringValue isEqual:@"New music"] ||
                 ![ShowTileCaptionLine2(day, @"Marita Lee", utc) isEqual:showSub.stringValue])
@@ -1859,6 +1881,90 @@ int main(int argc, const char **argv) {
             [c setValue:@NO forKey:@"showsLoaded"];
             [c setValue:[NSMutableDictionary dictionary] forKey:@"showCoverCache"];
             [c rebuildContent];
+        } else if (musicState && (strcmp(musicState, "kinds-render") == 0 || strcmp(musicState, "kinds-five") == 0 ||
+                                  strcmp(musicState, "kinds-empty") == 0)) {
+            BOOL withShow = strcmp(musicState, "kinds-render") == 0;
+            BOOL chillEmpty = strcmp(musicState, "kinds-empty") == 0;
+            if (chillEmpty) {
+                NSDictionary *emptyPack = KindHarnessTracks(fixtureMusic, NO);
+                if (!emptyPack) return Fail(__LINE__);
+                [c setValue:emptyPack[@"library"] forKey:@"mixLibrary"];
+                NSDictionary *liveManifest = [c valueForKey:@"offlineManifest"];
+                [c setValue:ManifestReplacingKindHarness(liveManifest, emptyPack[@"manifest"]) forKey:@"offlineManifest"];
+                [c setValue:nil forKey:@"_onDiskLibraryIDs"];
+                [c setValue:nil forKey:@"_kindTileSnapshot"];
+            }
+            NSMutableArray *picks8 = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 8; i++)
+                [picks8 addObject:@{@"title": [NSString stringWithFormat:@"Pick %lu", (unsigned long)i],
+                                   @"artist": @"Scout", @"reason": @"scout", @"file": @""}];
+            [c setValue:picks8 forKey:@"stationPicks"];
+            if (withShow) {
+                NSDate *day = [NSDate dateWithTimeIntervalSince1970:1763107200];
+                NSString *showDir = [fixtureMusic stringByAppendingPathComponent:@"Kinds Render Show"];
+                [NSFileManager.defaultManager createDirectoryAtPath:showDir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *epA = [showDir stringByAppendingPathComponent:@"2026-11-14-ep1.m4a"];
+                NSString *epB = [showDir stringByAppendingPathComponent:@"2026-11-07-ep2.m4a"];
+                NSString *epC = [showDir stringByAppendingPathComponent:@"2026-11-01-ep3.m4a"];
+                if (!WriteSilentM4A(epA, @"Marita Lee", FixtureCoverPNG(0.52), 120) ||
+                    !WriteSilentM4A(epB, @"Marita Lee", FixtureCoverPNG(0.56), 120) ||
+                    !WriteSilentM4A(epC, @"Marita Lee", FixtureCoverPNG(0.48), 120))
+                    return Fail(__LINE__);
+                NSDictionary *showsState = @{@"version": @1, @"episodes": @{
+                    epA: @{@"position": @72, @"duration": @240, @"finished": @NO, @"updated": @"2026-11-14T09:00:00Z"},
+                    epB: @{@"position": @0, @"duration": @240, @"finished": @NO, @"updated": @"2026-11-07T09:00:00Z"},
+                    epC: @{@"position": @0, @"duration": @240, @"finished": @NO, @"updated": @"2026-11-01T09:00:00Z"}}};
+                NSString *showsPath = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/shows.json"];
+                [ShowsStateToJSON(showsState) writeToFile:showsPath atomically:YES];
+                NSArray *episodes = @[
+                    @{@"path": epA, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                    @{@"path": epB, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                    @{@"path": epC, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240}];
+                [c setValue:@YES forKey:@"showsLoaded"];
+                [c setValue:episodes forKey:@"showEpisodes"];
+                [c setValue:ShowsPickOfferedEpisode(episodes, showsState) forKey:@"showOffered"];
+                [c setValue:showsState forKey:@"showsState"];
+                [c setValue:[NSMutableDictionary dictionary] forKey:@"showCoverCache"];
+                [c setValue:@YES forKey:@"localMode"];
+                [c setValue:@"kind:dance" forKey:@"mixPlayingKey"];
+            } else {
+                [c setValue:nil forKey:@"showOffered"];
+                [c setValue:@[] forKey:@"showEpisodes"];
+                [c setValue:@NO forKey:@"showsLoaded"];
+            }
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSDictionary *counts = chillEmpty ? @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @0}
+                                              : @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
+            NSUInteger tiles = withShow ? 6u : 5u;
+            CGFloat side = withShow ? 50 : 54;
+            NSString *playing = withShow ? @"dance" : nil;
+            if (!KindMixRowOK(root, tiles, side, counts, playing) || !FitsChildren(root)) return Fail(__LINE__);
+            if (withShow) {
+                GBCountBadge *showBadge = (GBCountBadge *)FindIdentifier(root, @"popover.music.show.badge");
+                NSView *stBadge = FindIdentifier(root, @"popover.mix.station.badge");
+                if (!showBadge || showBadge.count != 2 || !stBadge ||
+                    ![stBadge.accessibilityLabel isEqual:@"8 new picks"])
+                    return Fail(__LINE__);
+            }
+            const char *rowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (rowPNG && rowPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:rowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (withShow) {
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"kind-tiles-light.png"], NSAppearanceNameAqua) ||
+                        !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"kind-tiles-dark.png"], NSAppearanceNameDarkAqua))
+                        return Fail(__LINE__);
+                } else if (strcmp(musicState, "kinds-five") == 0) {
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"kind-tiles-five-light.png"], NSAppearanceNameAqua))
+                        return Fail(__LINE__);
+                } else if (chillEmpty) {
+                    GBKindTile *chill = (GBKindTile *)KindTileButton(root, @"chill");
+                    if (chill.enabled || chill.alphaValue > 0.5) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"kind-tiles-empty-light.png"], NSAppearanceNameAqua))
+                        return Fail(__LINE__);
+                }
+            }
         } else if (musicState && strcmp(musicState, "dislike") == 0) {
             NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];
             NSString *trackB = [fixtureMusic stringByAppendingPathComponent:@"dislike-b.m4a"];

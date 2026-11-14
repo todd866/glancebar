@@ -3715,6 +3715,50 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
     return ordered;
 }
 
+NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind) {
+    if (!kind.length || !tracks.count) return 0;
+    NSUInteger n = 0;
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        if (!MusicKindMatches(kind, t)) continue;
+        if (onDiskIDs.count && ![onDiskIDs containsObject:t[@"id"]]) continue;
+        n++;
+    }
+    return n;
+}
+
+NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                             NSString *kind) {
+    if (!kind.length || !tracks.count) return @[];
+    NSMutableArray<NSDictionary *> *eligible = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        if (!MusicKindMatches(kind, t)) continue;
+        if (onDiskIDs.count && ![onDiskIDs containsObject:t[@"id"]]) continue;
+        [eligible addObject:t];
+    }
+    if (!eligible.count) return @[];
+    [eligible sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult r = [@(MixTrackWeight(b)) compare:@(MixTrackWeight(a))];
+        return r != NSOrderedSame ? r : [a[@"id"] compare:b[@"id"]];
+    }];
+    NSMutableArray<NSString *> *picked = [NSMutableArray array];
+    NSMutableSet<NSString *> *albums = [NSMutableSet set];
+    for (NSDictionary *t in eligible) {
+        if (picked.count >= 4) break;
+        NSString *albumKey = [[NSString stringWithFormat:@"%@|%@", t[@"artist"] ?: @"", t[@"album"] ?: @""] lowercaseString];
+        if (albumKey.length > 1 && [albums containsObject:albumKey]) continue;
+        [picked addObject:t[@"id"]];
+        if (albumKey.length > 1) [albums addObject:albumKey];
+    }
+  for (NSDictionary *t in eligible) {
+        if (picked.count >= 4) break;
+        if ([picked containsObject:t[@"id"]]) continue;
+        [picked addObject:t[@"id"]];
+    }
+    return picked;
+}
+
 // Seeds are songs Ian will recognise: ones he has actually played here, weighted by plays and how
 // recently. Favourites alone mean little (1,240 of 1,412 were bulk-imported YouTube likes, 30 Oct 2026),
 // so they only fill in when too few played songs are left.

@@ -864,6 +864,11 @@ NSString *MusicKindForGenre(NSString *genre);
 // recentIDs at the back; no dislikes; artist at most twice per sliding window of ten when possible.
 NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *kind, NSUInteger count,
                                     uint64_t seed, NSArray<NSString *> *recentIDs);
+// Tracks of kind that are on this Mac (onDiskIDs non-empty ⇒ require membership; empty ⇒ count all matches).
+NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind);
+// Up to four track ids: heaviest on this Mac by mix weight, different albums where possible.
+NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                             NSString *kind);
 // One-shot CLI control flags. kind: 0 = not a control invocation, 1 = post command, 2 = usage error, 3 = print last kind.
 typedef struct {
     int kind;

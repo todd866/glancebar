@@ -4843,9 +4843,6 @@ static void GBApplyTileCaption(NSTextField *cap, NSString *text, CGFloat capW, C
 #pragma clang diagnostic pop
 }
 
-static void GBApplyTileCaptionLine1(NSTextField *cap, NSString *text, CGFloat capW) {
-    GBApplyTileCaption(cap, text, capW, kTileCaptionBasePt);
-}
 
 static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
     NSString *words = [showName isKindOfClass:NSString.class] ? showName : @"";
@@ -4948,15 +4945,50 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
 }
 @end
 
-static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
+@interface GBKindTile : NSButton
+@property(nonatomic, copy) NSString *musicKind;
+@end
+@implementation GBKindTile
+@end
+
+static NSColor *KindTileFlatColor(NSString *kind) {
+    if ([kind isEqual:@"dance"]) return [NSColor colorWithCalibratedHue:0.06 saturation:0.48 brightness:0.78 alpha:1];
+    if ([kind isEqual:@"alt"]) return [NSColor colorWithCalibratedHue:0.58 saturation:0.42 brightness:0.72 alpha:1];
+    if ([kind isEqual:@"rap"]) return [NSColor colorWithCalibratedHue:0.78 saturation:0.38 brightness:0.68 alpha:1];
+    if ([kind isEqual:@"chill"]) return [NSColor colorWithCalibratedHue:0.48 saturation:0.35 brightness:0.72 alpha:1];
+    return [NSColor colorWithWhite:0.55 alpha:0.35];
+}
+
+static NSImage *KindTilePlaceholderImage(NSString *kind, NSString *name, CGFloat side) {
+    unichar initial = name.length ? [name characterAtIndex:0] : '?';
+    NSColor *bg = KindTileFlatColor(kind);
+    return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+        [clip addClip];
+        [bg setFill];
+        NSRectFill(rect);
+        NSString *letter = [NSString stringWithCharacters:&initial length:1];
+        NSFont *font = [NSFont systemFontOfSize:side * 0.42 weight:NSFontWeightSemibold];
+        NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.88]};
+        NSSize sz = [letter sizeWithAttributes:attrs];
+        [letter drawAtPoint:NSMakePoint((rect.size.width - sz.width) / 2.0, (rect.size.height - sz.height) / 2.0) withAttributes:attrs];
+        return YES;
+    }];
+}
+
+static NSString *KindSongCountLine(NSUInteger count) {
+    return count == 1 ? @"1 song" : [NSString stringWithFormat:@"%lu songs", (unsigned long)count];
+}
+
+static NSImage *TileMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOOL dimmed) {
     NSMutableArray<NSImage *> *tiles = [NSMutableArray arrayWithCapacity:4];
     for (NSImage *img in covers) if (img) [tiles addObject:img];
     while (tiles.count < 4) {
         if (tiles.count) [tiles addObject:tiles[tiles.count - 1]];
         else break;
     }
-    if (!tiles.count) return StationTileImage(dimmed);
-    return [NSImage imageWithSize:NSMakeSize(54, 54) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+    if (!tiles.count) return nil;
+    return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
         NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
         [clip addClip];
         const CGFloat half = rect.size.width / 2.0;
@@ -4967,6 +4999,17 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
         }
         return YES;
     }];
+}
+
+static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
+    NSMutableArray<NSImage *> *tiles = [NSMutableArray arrayWithCapacity:4];
+    for (NSImage *img in covers) if (img) [tiles addObject:img];
+    while (tiles.count < 4) {
+        if (tiles.count) [tiles addObject:tiles[tiles.count - 1]];
+        else break;
+    }
+    if (!tiles.count) return StationTileImage(dimmed);
+    return TileMosaicImage(tiles, 54, dimmed) ?: StationTileImage(dimmed);
 }
 
 @interface GBRecoverableTextField : NSTextField
@@ -5264,6 +5307,8 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
             ((GBSeedTile *)old).songArtist = ((GBSeedTile *)new).songArtist;
             ((GBSeedTile *)old).seedKey = ((GBSeedTile *)new).seedKey;
         }
+        if ([old isKindOfClass:GBKindTile.class] && [new isKindOfClass:GBKindTile.class])
+            ((GBKindTile *)old).musicKind = ((GBKindTile *)new).musicKind;
         if ([old isKindOfClass:PillButton.class] && [new isKindOfClass:PillButton.class])
             ((PillButton *)old).onColor = ((PillButton *)new).onColor;
         old.needsDisplay = YES;
@@ -5605,6 +5650,10 @@ static NSString *PopoverRequestObject(void) {
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
+- (void)ensureKindTileSnapshot;
+- (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk;
+- (NSArray<NSImage *> *)kindMosaicCoversForIDs:(NSArray<NSString *> *)ids;
+- (NSUInteger)kindTileStamp;
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause;
 - (void)handleControlCommand:(NSString *)command;
 - (void)updateIdleRemoteCommands;
@@ -6162,6 +6211,10 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSDictionary *_showsState;
     NSMutableDictionary<NSString *, NSImage *> *_showCoverCache;
     NSMutableDictionary<NSString *, NSImage *> *_stationCoverCache;
+    NSDictionary<NSString *, NSDictionary *> *_kindTileSnapshot;
+    CFAbsoluteTime _kindTileAt;
+    NSUInteger _kindTileStamp;
+    BOOL _kindTileBusy;
     NSTimer *_showPositionTimer;
     double _showSeekResume;
     dispatch_queue_t _showsQueue;
@@ -6656,6 +6709,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             }
             self->_mixLibrary = marked;
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
+            self->_kindTileAt = 0;
             [self chooseMixSeeds:NO];
         });
         return;
@@ -6752,6 +6806,8 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 }
 - (void)invalidateOfflineCoverageCache {
     [_offlineCoverageCache removeAllObjects];
+    _kindTileAt = 0;
+    _onDiskLibraryIDs = nil;
 }
 - (void)storeOfflineCoverage:(NSDictionary *)computed fingerprints:(NSArray *)fingerprints forKey:(NSString *)key
                     cacheKey:(NSString *)cacheKey request:(NSDictionary *)request manifest:(NSDictionary *)manifest {
@@ -6865,6 +6921,80 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     _onDiskLibraryAt = now;
     return _onDiskLibraryIDs;
 }
+
+static NSArray<NSDictionary *> *GBKindTileOrder(void) {
+    return @[@{@"kind": @"dance", @"name": @"Dance"}, @{@"kind": @"alt", @"name": @"Alt"},
+             @{@"kind": @"rap", @"name": @"Rap"}, @{@"kind": @"chill", @"name": @"Chill"}];
+}
+
+- (NSUInteger)kindTileStamp {
+    return (NSUInteger)_mixLibrary.count ^ _offlineRequestsGeneration ^
+        (NSUInteger)(_offlineManifest ? _offlineManifest.hash : 0);
+}
+
+- (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSDictionary *def in GBKindTileOrder()) {
+        NSString *kind = def[@"kind"];
+        NSUInteger count = MusicKindOnMacCount(library, onDisk, kind);
+        NSArray *ids = count ? MusicKindMosaicTrackIDs(library, onDisk, kind) : @[];
+        out[kind] = @{@"count": @(count), @"ids": ids};
+    }
+    return out;
+}
+
+- (void)ensureKindTileSnapshot {
+    NSUInteger stamp = [self kindTileStamp];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_kindTileSnapshot && _kindTileStamp == stamp && now - _kindTileAt < 60) return;
+    if (_kindTileBusy) return;
+    if (!_mixLibrary.count) {
+        _kindTileSnapshot = @{};
+        _kindTileStamp = stamp;
+        _kindTileAt = now;
+        return;
+    }
+    NSArray *library = _mixLibrary;
+    NSSet *onDisk = [self onDiskLibraryTrackIDs];
+    if (_mixFrozen) {
+        _kindTileSnapshot = [self computeKindTileSnapshot:library onDisk:onDisk];
+        _kindTileStamp = stamp;
+        _kindTileAt = now;
+        return;
+    }
+    _kindTileBusy = YES;
+    dispatch_async(_mixQueue, ^{
+        NSDictionary *snap = [self computeKindTileSnapshot:library onDisk:onDisk];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_kindTileBusy = NO;
+            if ([self kindTileStamp] != stamp) return;
+            self->_kindTileSnapshot = snap;
+            self->_kindTileStamp = stamp;
+            self->_kindTileAt = CFAbsoluteTimeGetCurrent();
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+
+- (NSArray<NSImage *> *)kindMosaicCoversForIDs:(NSArray<NSString *> *)ids {
+    NSMutableArray *covers = [NSMutableArray array];
+    for (NSString *tid in ids) {
+        if (covers.count >= 4) break;
+        if (_mixArt[tid]) { [covers addObject:_mixArt[tid]]; continue; }
+        NSDictionary *rec = [self manifestRecordForTrackID:tid];
+        NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : nil;
+        if (!path.length) continue;
+        if (_stationCoverCache[path]) { [covers addObject:_stationCoverCache[path]]; continue; }
+        NSImage *img = [self embeddedArtworkForPath:path];
+        if (img) {
+            _stationCoverCache[path] = img;
+            _mixArt[tid] = img;
+            [covers addObject:img];
+        }
+    }
+    return covers;
+}
+
 - (NSString *)musicLibraryHotDirPath {
     if (_musicLibraryHotDir.length) return _musicLibraryHotDir;
     NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".config/glancebar/music-library.json"];
@@ -7754,6 +7884,10 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 - (IBAction)playSeedMix:(NSButton *)sender {
     if (sender.tag < 0 || sender.tag >= (NSInteger)_mixSeeds.count) return;
     [self playSeedLocally:_mixSeeds[sender.tag]];
+}
+- (IBAction)playKindTile:(GBKindTile *)sender {
+    if (![sender isKindOfClass:GBKindTile.class] || !sender.musicKind.length) return;
+    [self playKind:sender.musicKind cause:@"click"];
 }
 - (IBAction)newMixPicks:(id)sender {
     (void)sender;
@@ -9870,81 +10004,89 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     return y;
 }
 
-// Four seed songs, the triple j station, and a round New picks button. A click plays
-// that seed's mix; the playing tile is outlined. Missing station.json dims the station.
+// Dance, Alt, Rap, Chill, New music, and an offered show. Kind tiles play tracks on this Mac.
 - (CGFloat)addSeedTilesTo:(NSView *)root at:(CGFloat)y {
     if (_musicOff) return y;
     [self ensureMixSeeds];
     [self ensureShows];
     [self ensureStation];
-    const CGFloat side = 54, buttonSide = 22, capH = 30, top = 6, rowH = 14;
+    [self ensureKindTileSnapshot];
+    const CGFloat capH = 30, top = 6, rowH = 14;
     BOOL showTile = _showOffered != nil;
-    NSUInteger n = MIN(_mixSeeds.count, showTile ? 3u : 4u);
-    NSUInteger tiles = n + (showTile ? 1 : 0) + 1;
-    NSUInteger gaps = tiles;
-    CGFloat gap = (kW - 2 * kPad - tiles * side - buttonSide) / (CGFloat)gaps;
-    if (gap < 2) gap = 2;
+    NSUInteger tileCount = 5 + (showTile ? 1u : 0u);
+    const CGFloat side = tileCount >= 6 ? 50 : 54;
+    CGFloat contentW = kW - 2 * kPad;
+    CGFloat gap = tileCount > 1 ? (contentW - tileCount * side) / (CGFloat)(tileCount - 1) : 0;
+    if (gap < 0) gap = 0;
     NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y + top, kW, side + capH)];
     line.accessibilityIdentifier = @"popover.mix";
     NSFont *capFont = [NSFont systemFontOfSize:10];
+    // One size for every tile's name: the largest at which the longest one fits. Sized one by
+    // one, "House Party" came out smaller than "Chill" beside it, and two names that each
+    // filled their tile's width ran together as "House PartyNew music".
+    CGFloat namePt = kTileCaptionBasePt;
+    {
+        NSMutableArray<NSString *> *rowNames = [NSMutableArray arrayWithObject:@"New music"];
+        for (NSDictionary *def in GBKindTileOrder()) if ([def[@"name"] length]) [rowNames addObject:def[@"name"]];
+        if (showTile && [_showOffered[@"show"] length]) [rowNames addObject:_showOffered[@"show"]];
+        for (NSString *rowName in rowNames)
+            namePt = MIN(namePt, TileCaptionFitPointSize(rowName, side + gap + kLabelPad, kTileCaptionBasePt));
+    }
     CGFloat x = kPad;
-    for (NSUInteger i = 0; i < n; i++) {
-        NSDictionary *seed = _mixSeeds[i];
-        BOOL playing = _localMode && [seed[@"key"] isEqual:_mixPlayingKey];
-        BOOL starting = [seed[@"key"] isEqual:_mixStartingKey];
-        NSImage *cover = [self seedCoverForSeed:seed] ?: _mixArt[seed[@"trackID"]];
-        GBSeedTile *seedTile = [GBSeedTile buttonWithImage:cover ?: [[NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil]
-                                                   imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular]]
-                                  target:self action:@selector(playSeedMix:)];
-        seedTile.cover = cover;
-        seedTile.songTitle = SeedCaption(seed[@"title"]);
-        seedTile.songArtist = seed[@"artist"];
-        seedTile.seedKey = seed[@"key"];
-        NSDictionary *tile = [self mixTileStateForKey:seed[@"key"]];
-        seedTile.offlineStatus = tile[@"tooltip"];
-        seedTile.enabled = [tile[@"enabled"] boolValue];
-        seedTile.alphaValue = [tile[@"alpha"] doubleValue];
-        seedTile.imageScaling = cover ? NSImageScaleProportionallyUpOrDown : NSImageScaleNone;
-        if (!cover) seedTile.contentTintColor = NSColor.tertiaryLabelColor;
-        seedTile.tag = (NSInteger)i;
-        seedTile.wantsLayer = YES;
-        seedTile.title = @"";
-        seedTile.bordered = NO;
-        seedTile.imagePosition = NSImageOnly;
-        seedTile.layer.cornerRadius = 4;
-        seedTile.layer.masksToBounds = YES;
-        seedTile.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)i];
-        BOOL album = [seed[@"kind"] isEqual:@"album"];
-        seedTile.accessibilityLabel = [NSString stringWithFormat:@"Play a mix from %@ %@ by %@", album ? @"the album" : @"the song",
-                                   seed[@"title"], seed[@"subtitle"]];
-        seedTile.accessibilityHelp = [NSString stringWithFormat:@"%@ — %@ · a mix around this %@", seed[@"title"], seed[@"subtitle"],
-                                  album ? @"album" : @"song"];
-        seedTile.accessibilityHelp = [seedTile.accessibilityHelp stringByAppendingFormat:@" · %@", seedTile.offlineStatus];
-        if (!cover) seedTile.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
-        if (playing) { seedTile.layer.borderWidth = 2; seedTile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
-        if (starting) seedTile.alphaValue = 0.45;
-        seedTile.frame = NSMakeRect(x, capH, side, side);
-        [line addSubview:seedTile];
-        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
-        NSArray *captions = @[SeedCaption(seed[@"title"]), seed[@"artist"] ?: @""];
+    NSDictionary *snap = _kindTileSnapshot ?: @{};
+    NSImage *kindMark = GBTypeMarkImage(@"music.note");
+    for (NSDictionary *def in GBKindTileOrder()) {
+        NSString *kind = def[@"kind"], *name = def[@"name"];
+        NSDictionary *info = [snap[kind] isKindOfClass:NSDictionary.class] ? snap[kind] : @{@"count": @0, @"ids": @[]};
+        NSUInteger onCount = [info[@"count"] unsignedIntegerValue];
+        NSArray *ids = [info[@"ids"] isKindOfClass:NSArray.class] ? info[@"ids"] : @[];
+        BOOL playing = _localMode && [_mixPlayingKey isEqual:[NSString stringWithFormat:@"kind:%@", kind]];
+        BOOL empty = onCount == 0;
+        NSImage *img = nil;
+        if (!empty) {
+            img = TileMosaicImage([self kindMosaicCoversForIDs:ids], side, NO);
+            if (!img) img = KindTilePlaceholderImage(kind, name, side);
+        } else img = KindTilePlaceholderImage(kind, name, side);
+        GBKindTile *kindTile = [GBKindTile buttonWithImage:img target:self action:@selector(playKindTile:)];
+        kindTile.musicKind = kind;
+        kindTile.title = @"";
+        kindTile.bordered = NO;
+        kindTile.imagePosition = NSImageOnly;
+        kindTile.imageScaling = NSImageScaleNone;
+        kindTile.wantsLayer = YES;
+        kindTile.layer.cornerRadius = 4;
+        kindTile.layer.masksToBounds = YES;
+        kindTile.enabled = !empty;
+        kindTile.alphaValue = empty ? 0.45 : 1;
+        kindTile.accessibilityIdentifier = [NSString stringWithFormat:@"popover.music.kind.%@", kind];
+        NSString *lineTip = empty ? @"Nothing on this Mac yet"
+            : [NSString stringWithFormat:@"%@ · %@ on this Mac", name, KindSongCountLine(onCount)];
+        kindTile.toolTip = lineTip;
+        kindTile.accessibilityLabel = lineTip;
+        if (playing) { kindTile.layer.borderWidth = 2; kindTile.layer.borderColor = NSColor.controlAccentColor.CGColor; }
+        kindTile.frame = NSMakeRect(x, capH, side, side);
+        [line addSubview:kindTile];
+        if (kindMark) {
+            NSImageView *mark = [NSImageView imageViewWithImage:kindMark];
+            mark.frame = NSMakeRect(3, 3, 16, 16);
+            mark.accessibilityIdentifier = [NSString stringWithFormat:@"popover.music.kind.%@.typemark", kind];
+            [kindTile addSubview:mark];
+        }
+        CGFloat capW = side + gap, capX = x - gap / 2.0;
+        NSString *countLine = KindSongCountLine(onCount);
+        NSArray *captions = @[name, countLine];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.textColor = playing ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
-            cap.lineBreakMode = l ? NSLineBreakByTruncatingTail : NSLineBreakByTruncatingTail;
-            cap.allowsDefaultTighteningForTruncation = YES;
+            cap.lineBreakMode = NSLineBreakByTruncatingTail;
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaptionLine1(cap, captions[l], capW + kLabelPad);
-            cap.accessibilityIdentifier = [NSString stringWithFormat:l ? @"popover.mix.artist.%lu" : @"popover.mix.caption.%lu", (unsigned long)i];
+            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
+            cap.accessibilityIdentifier = l ? [NSString stringWithFormat:@"popover.music.kind.%@.songs", kind]
+                                             : [NSString stringWithFormat:@"popover.music.kind.%@.caption", kind];
             [line addSubview:cap];
         }
-        GBSeedHover *hover = [[GBSeedHover alloc] initWithFrame:NSMakeRect(capX, 0, capW, capH + side)];
-        hover.tile = seedTile;
-        hover.controller = self;
-        hover.preloadKey = seed[@"key"];
-        hover.accessibilityIdentifier = [NSString stringWithFormat:@"popover.mix.hover.%lu", (unsigned long)i];
-        [line addSubview:hover];
         x += side + gap;
     }
     if (showTile) {
@@ -10012,7 +10154,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, 10);
-            else GBApplyTileCaptionLine1(cap, showCaps[l], capW + kLabelPad);
+            else GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, namePt);
             cap.accessibilityIdentifier = l ? @"popover.music.show.artist" : @"popover.music.show.caption";
             [line addSubview:cap];
         }
@@ -10076,7 +10218,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaptionLine1(cap, captions[l], capW + kLabelPad);
+            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
             cap.accessibilityIdentifier = l ? @"popover.mix.artist.4" : @"popover.mix.caption.4";
             [line addSubview:cap];
         }
@@ -10087,24 +10229,6 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         hover.accessibilityIdentifier = @"popover.mix.hover.station";
         [line addSubview:hover];
     }
-    x += side + gap;
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightSemibold];
-    NSButton *picks = [NSButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"arrow.triangle.2.circlepath" accessibilityDescription:nil]
-                                                imageWithSymbolConfiguration:cfg] target:self action:@selector(newMixPicks:)];
-    picks.title = @"";
-    picks.bordered = NO;
-    picks.imagePosition = NSImageOnly;
-    picks.imageScaling = NSImageScaleNone;
-    picks.contentTintColor = NSColor.secondaryLabelColor;
-    picks.wantsLayer = YES;
-    picks.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.15].CGColor;
-    picks.layer.cornerRadius = buttonSide / 2.0;
-    picks.layer.masksToBounds = YES;
-    picks.accessibilityIdentifier = @"popover.mix.newpicks";
-    picks.accessibilityLabel = @"New picks";
-    picks.accessibilityHelp = @"Four new songs and albums to start a mix from";
-    picks.frame = NSMakeRect(x, capH + (side - buttonSide) / 2.0, buttonSide, buttonSide);
-    [line addSubview:picks];
     [root addSubview:line];
     return y + top + side + capH;
 }
