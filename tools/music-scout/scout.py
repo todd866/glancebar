@@ -78,6 +78,7 @@ DEFAULTS: dict[str, Any] = {
     "storefront": "au",
     "playback_log": str(HOME / "Library/Logs/Glancebar/playback.jsonl"),
     "reject_skips": 2,
+    "station_playlist": "station:triplej",
 }
 
 _SHORT_MONTHS = (
@@ -250,76 +251,81 @@ def _path_basename(path_value: str | None) -> str:
 
 
 def skip_rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
-    """Early click-next skips on separate days (scout-published tracks only)."""
+    """Scout-published tracks the listener skipped early on separate days.
+
+    The player's log has one `track` line each time a file starts: `file` is the file that
+    is starting, `cause` is why it started and `epoch` is when. The line does not say how far
+    the previous file played (`elapsed` there is the outgoing position after an automatic
+    advance and about zero after a click), so this rule uses the clock alone. The time from
+    one start line to the next is the longest the first file can have played: a pause, a
+    stall or a sleep only makes that gap longer. So a short gap that ends in `click-next`
+    is a real early skip, and a long one is never counted.
+
+    A track is rejected when it was left by `click-next` within 40% of its duration (60 s
+    when the duration is unknown) on `reject_skips` separate days, and no automatic advance
+    ever followed it (it was never played to the end). Only lines from the New music
+    playlist are judged, so a file of the same name elsewhere cannot count.
+    """
     acquired = _scout_acquired_index(paths.ledger)
     if not acquired:
         return set()
-    reject_n = int(cfg.get("reject_skips", DEFAULTS["reject_skips"]))
-    log_path = Path(cfg["playback_log"]).expanduser()
-    rows = _playback_log_rows(log_path)
+    reject_n = max(1, int(cfg.get("reject_skips", DEFAULTS["reject_skips"])))
+    station = str(cfg.get("station_playlist", DEFAULTS["station_playlist"]))
+    rows = _playback_log_rows(Path(cfg["playback_log"]).expanduser())
     if not rows:
         return set()
 
     basename_to_key: dict[str, str] = {}
     for key, row in acquired.items():
-        base = _path_basename(row.get("local_path"))
-        if base:
-            basename_to_key[base] = key
-        base = _path_basename(row.get("catalogue_relative_path"))
-        if base:
-            basename_to_key.setdefault(base, key)
+        for field in ("local_path", "catalogue_relative_path"):
+            base = _path_basename(row.get(field))
+            if base:
+                basename_to_key.setdefault(base, key)
 
     def row_key(row: dict) -> str | None:
-        key = _playback_track_key(row)
-        if key and key in acquired:
-            return key
-        base = row.get("file") or ""
+        if str(row.get("playlist") or "") != station:
+            return None
+        base = str(row.get("file") or "")
         if base in basename_to_key:
             return basename_to_key[base]
-        return None
+        key = _playback_track_key(row)
+        return key if key in acquired else None
 
-    playing: str | None = None
-    last_elapsed: dict[str, float] = {}
+    def limit_for(key: str) -> float:
+        try:
+            duration = float(acquired[key].get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        return 0.4 * duration if duration > 0 else 60.0
+
+    current: str | None = None
+    started = 0.0
     completed: set[str] = set()
     skip_days: dict[str, set[str]] = defaultdict(set)
 
     for row in rows:
-        elapsed = row.get("elapsed")
-        elapsed_f = float(elapsed) if isinstance(elapsed, (int, float)) else None
-        key = row_key(row)
-        if key and elapsed_f is not None:
-            last_elapsed[key] = elapsed_f
-
-        event = row.get("event") or ""
+        event = str(row.get("event") or "")
+        if event == "launch":
+            current = None  # the app restarted: the gap across a restart says nothing
+            continue
+        if event != "track":
+            continue
+        epoch = row.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+            current = None
+            continue
         cause = str(row.get("cause") or "")
-        if event == "track":
-            if cause == "auto-advance" and playing:
-                completed.add(playing)
-            if cause == "click-next" and playing and playing in acquired:
-                dur = acquired[playing].get("duration_seconds")
-                try:
-                    dur_f = float(dur) if dur is not None else None
-                except (TypeError, ValueError):
-                    dur_f = None
-                el = last_elapsed.get(playing, elapsed_f)
-                early = False
-                if el is not None:
-                    if dur_f and dur_f > 0:
-                        early = el < 0.4 * dur_f
-                    else:
-                        early = el < 60.0
-                if early and playing not in completed:
-                    day = (row.get("t") or row.get("at") or "")[:10]
-                    if day:
-                        skip_days[playing].add(day)
-            if key:
-                playing = key
+        if current is not None:
+            gap = float(epoch) - started
+            if cause in ("auto-advance", "crossfade"):
+                completed.add(current)
+            elif cause == "click-next" and 0 <= gap < limit_for(current):
+                day = str(row.get("t") or "")[:10] or datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d")
+                skip_days[current].add(day)
+        current = row_key(row)
+        started = float(epoch)
 
-    rejected: set[str] = set()
-    for key, days in skip_days.items():
-        if len(days) >= reject_n:
-            rejected.add(key)
-    return rejected
+    return {key for key, days in skip_days.items() if len(days) >= reject_n and key not in completed}
 
 
 def rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
@@ -970,6 +976,8 @@ def source_shazam(cfg: dict[str, Any], runners: Runners, rejected: set[str]) -> 
         shazam_at = _latest_signal_at(signals, "shazam")
         if not shazam_at:
             continue
+        if not (row.get("artist") and row.get("title")):
+            continue  # nothing to search for
         shazam_dt = parse_iso(shazam_at) or datetime.min.replace(tzinfo=timezone.utc)
         day = format_signal_day(shazam_at, now)
         cand: dict[str, Any] = {
@@ -1008,7 +1016,7 @@ def source_tv_likes(cfg: dict[str, Any], runners: Runners, rejected: set[str]) -
         if any(sig.get("kind") == "dislike" for sig in signals):
             continue
         tv_likes = [sig for sig in signals if sig.get("kind") == "like" and sig.get("source") == "tv"]
-        if not tv_likes:
+        if not tv_likes or not (row.get("artist") and row.get("title")):
             continue
         like_at = _latest_signal_at(tv_likes, "like")
         day = format_signal_day(like_at, now) if like_at else ""
@@ -1699,6 +1707,8 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
         shazam_dt = parse_iso(shazam_at or "")
         if not shazam_dt or shazam_dt < fresh_cutoff:
             continue
+        if row.get("owned"):
+            continue  # already a master: nothing is waiting
         shazam_fresh += 1
         if key not in ledger_all:
             shazam_waiting += 1

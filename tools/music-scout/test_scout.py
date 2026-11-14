@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -294,42 +294,86 @@ class MediaShareTests(unittest.TestCase):
         path = Path(self.cfg["playback_log"])
         path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
 
+    # Lines shaped like the player's real log: a `track` line names the FILE that is starting
+    # (title and artist are empty), with an epoch; nothing says how far the last file played.
+    def _start(self, file_name, cause, day, clock, playlist="station:triplej"):
+        hour, minute, second = (int(part) for part in clock.split(":"))
+        epoch = datetime(2026, 11, int(day), hour, minute, second, tzinfo=timezone.utc).timestamp()
+        return {"event": "track", "cause": cause, "file": file_name, "title": "", "artist": "",
+                "playlist": playlist, "epoch": epoch, "elapsed": 0.0,
+                "t": f"2026-11-{int(day):02d} {clock}.000"}
+
+    def _skip_day(self, day, seconds, file_name="01. Early Leave.m4a", playlist="station:triplej"):
+        return [
+            self._start(file_name, "playlist", day, "10:00:00", playlist),
+            self._start("02. Next.m4a", "click-next", day, f"10:{seconds // 60:02d}:{seconds % 60:02d}", playlist),
+        ]
+
     def test_skip_rejection_two_days_not_one(self):
-        key = self._acquired("Skip Act", "Early Leave", duration_seconds=200.0)
-        day1 = [
-            {"event": "track", "cause": "start", "artist": "Skip Act", "title": "Early Leave", "t": "2026-11-01T10:00:00Z"},
-            {"event": "rate", "cause": "click-next", "artist": "Skip Act", "title": "Early Leave", "elapsed": 20, "t": "2026-11-01T10:01:00Z"},
-            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-01T10:01:01Z"},
-        ]
-        self._playback(day1)
+        key = self._acquired("Skip Act", "Early Leave", duration_seconds=200.0,
+                             local_path="/music/AM-Lossless/Skip Act/EP/01. Early Leave.m4a")
+        self._playback(self._skip_day(1, 20))
         self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
-        day2 = day1 + [
-            {"event": "track", "cause": "start", "artist": "Skip Act", "title": "Early Leave", "t": "2026-11-02T10:00:00Z"},
-            {"event": "rate", "cause": "click-next", "artist": "Skip Act", "title": "Early Leave", "elapsed": 30, "t": "2026-11-02T10:01:00Z"},
-            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-02T10:01:01Z"},
-        ]
-        self._playback(day2)
+        # A second early skip the same day is still one day.
+        self._playback(self._skip_day(1, 20) + [
+            self._start("01. Early Leave.m4a", "click", 1, "11:00:00"),
+            self._start("02. Next.m4a", "click-next", 1, "11:00:30"),
+        ])
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        self._playback(self._skip_day(1, 20) + self._skip_day(2, 79))
         self.assertIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        self.assertIn(key, scout.rejected_keys(self.cfg, self.paths))
 
     def test_skip_not_rejected_late_or_completed(self):
-        key = self._acquired("Late Act", "Long Play", duration_seconds=100.0)
-        late = [
-            {"event": "track", "cause": "start", "artist": "Late Act", "title": "Long Play", "t": "2026-11-01T10:00:00Z"},
-            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 50, "t": "2026-11-01T10:01:00Z"},
-            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-01T10:01:01Z"},
-        ]
-        self._playback(late)
+        key = self._acquired("Late Act", "Long Play", duration_seconds=200.0,
+                             local_path="/music/AM-Lossless/Late Act/LP/01. Early Leave.m4a")
+        # 80 s is 40% of 200 s: on the line is not early.
+        self._playback(self._skip_day(1, 80) + self._skip_day(2, 80))
         self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
-        completed = [
-            {"event": "track", "cause": "start", "artist": "Late Act", "title": "Long Play", "t": "2026-11-01T10:00:00Z"},
-            {"event": "track", "cause": "auto-advance", "artist": "Other", "title": "Next", "t": "2026-11-01T10:05:00Z"},
-            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 10, "t": "2026-11-02T10:01:00Z"},
-            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-02T10:01:01Z"},
-            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 10, "t": "2026-11-03T10:01:00Z"},
-            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-03T10:01:01Z"},
-        ]
-        self._playback(completed)
+        # Played to the end once (an automatic advance followed it): two early skips do not reject it.
+        self._playback([
+            self._start("01. Early Leave.m4a", "playlist", 1, "09:00:00"),
+            self._start("02. Next.m4a", "auto-advance", 1, "09:03:20"),
+        ] + self._skip_day(2, 10) + self._skip_day(3, 10))
         self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        # A crossfade at the end is also played to the end.
+        self._playback([
+            self._start("01. Early Leave.m4a", "playlist", 1, "09:00:00"),
+            self._start("02. Next.m4a", "crossfade", 1, "09:03:15"),
+        ] + self._skip_day(2, 10) + self._skip_day(3, 10))
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+
+    def test_skip_ignores_other_playlists_restarts_and_other_ways_of_leaving(self):
+        key = self._acquired("Same Name", "Early Leave", duration_seconds=200.0,
+                             local_path="/music/AM-Lossless/Same Name/EP/01. Early Leave.m4a")
+        # The same file name in another playlist is another song.
+        self._playback(self._skip_day(1, 10, playlist="song:ABC") + self._skip_day(2, 10, playlist="song:ABC"))
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        # Choosing another tile or track is not a skip.
+        self._playback([
+            self._start("01. Early Leave.m4a", "playlist", 1, "10:00:00"),
+            self._start("02. Next.m4a", "playlist", 1, "10:00:10"),
+            self._start("01. Early Leave.m4a", "playlist", 2, "10:00:00"),
+            self._start("02. Next.m4a", "click", 2, "10:00:10"),
+        ])
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        # A restart between the two lines: the gap says nothing.
+        relaunch = {"event": "launch", "epoch": 0, "t": "2026-11-02 10:00:05.000"}
+        day2 = self._skip_day(2, 10)
+        self._playback(self._skip_day(1, 10) + [day2[0], relaunch, day2[1]])
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        # Unknown duration: 60 s is the line.
+        other = self._acquired("No Length", "Short", duration_seconds=None,
+                               local_path="/music/AM-Lossless/No Length/EP/07. Short.m4a")
+        self._playback(self._skip_day(1, 59, "07. Short.m4a") + self._skip_day(2, 60, "07. Short.m4a"))
+        self.assertNotIn(other, scout.skip_rejected_keys(self.cfg, self.paths))
+        self._playback(self._skip_day(1, 59, "07. Short.m4a") + self._skip_day(2, 59, "07. Short.m4a"))
+        self.assertIn(other, scout.skip_rejected_keys(self.cfg, self.paths))
+        # A line with no clock is not guessed at.
+        broken = self._skip_day(1, 10, "07. Short.m4a")
+        broken[1]["epoch"] = None
+        self._playback(broken + self._skip_day(2, 10, "07. Short.m4a"))
+        self.assertNotIn(other, scout.skip_rejected_keys(self.cfg, self.paths))
 
     def test_publish_omits_rejected(self):
         key = scout.track_key("Pub Reject", "Song")
