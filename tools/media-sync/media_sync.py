@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sqlite3
 import sys
 import time
@@ -31,7 +32,22 @@ import scout  # noqa: E402
 track_key = scout.track_key
 normal = scout.normal
 
-DEFAULT_HOST = socket.gethostname().split(".")[0].lower()
+def _default_host() -> str:
+    """This Mac's short name. `gethostname` can return an address on some networks (a file
+    was once written as signals-192.json), so ask macOS for the local host name first."""
+    try:
+        out = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"],
+                             capture_output=True, text=True, timeout=5)
+        name = out.stdout.strip().lower()
+        if out.returncode == 0 and name:
+            return name
+    except (OSError, subprocess.SubprocessError):
+        pass
+    name = socket.gethostname().split(".")[0].lower()
+    return name if name and not name.isdigit() else "this-mac"
+
+
+DEFAULT_HOST = _default_host()
 
 DEFAULTS: Dict[str, Any] = {
     "host": DEFAULT_HOST,
