@@ -72,7 +72,19 @@ DEFAULTS: dict[str, Any] = {
     "apple_music_dir": str(HOME / "Music/Apple Music"),
     "hot_dir": str(HOME / "Music/Glancebar Lossless"),
     "ai_pick_cmd": "ai-pick",
+    "media_share": str(HOME / ".local/state/mac-sync/media"),
+    "shazam_fresh_days": 30,
+    "shazam_backlog_per_run": 5,
+    "storefront": "au",
+    "playback_log": str(HOME / "Library/Logs/Glancebar/playback.jsonl"),
+    "reject_skips": 2,
+    "station_playlist": "station:triplej",
 }
+
+_SHORT_MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
 
 _YT_NAME = re.compile(
     r"^(?P<artist>.+?) - (?P<title>.+) \[(?P<vid>[A-Za-z0-9_-]+)\]\.m4a$",
@@ -108,6 +120,255 @@ def normal(value: str) -> str:
 
 def track_key(artist: str, title: str) -> str:
     return f"{normal(artist)}|{normal(title)}"
+
+
+def _signal_identity(sig: dict) -> tuple[str, str, str]:
+    return (str(sig.get("kind") or ""), str(sig.get("source") or ""), str(sig.get("at") or ""))
+
+
+def _merge_track_row(base: dict | None, row: dict) -> dict:
+    out = dict(base or {})
+    for field in ("artist", "title", "album"):
+        if not out.get(field) and row.get(field):
+            out[field] = row[field]
+    ids = dict(out.get("ids") or {})
+    for key, value in (row.get("ids") or {}).items():
+        if value and not ids.get(key):
+            ids[key] = value
+    out["ids"] = ids
+    signals = list(out.get("signals") or [])
+    seen = {_signal_identity(s) for s in signals}
+    for sig in row.get("signals") or []:
+        ident = _signal_identity(sig)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        signals.append(sig)
+    out["signals"] = signals
+    if row.get("owned"):
+        out["owned"] = True
+    if not out.get("video") and row.get("video"):
+        out["video"] = row["video"]
+    return out
+
+
+def load_universe(share: Path) -> tuple[dict[str, dict], list[str]]:
+    """Merged media signals view (see SCHEMA.md). Returns (tracks by key, parse errors)."""
+    errors: list[str] = []
+    merged: dict[str, dict] = {}
+    if not share.is_dir():
+        return merged, errors
+    for path in sorted(share.glob("signals-*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        for key, row in (data.get("tracks") or {}).items():
+            nkey = normal(key)
+            merged[nkey] = _merge_track_row(merged.get(nkey), row)
+    return merged, errors
+
+
+def media_like_keys(universe: dict[str, dict]) -> set[str]:
+    keys: set[str] = set()
+    for key, row in universe.items():
+        for sig in row.get("signals") or []:
+            if sig.get("kind") == "like":
+                keys.add(key)
+                break
+    return keys
+
+
+def format_signal_day(iso_utc: str, now: datetime) -> str:
+    dt = parse_iso(iso_utc)
+    if not dt:
+        return ""
+    local = dt.astimezone()
+    month = _SHORT_MONTHS[local.month - 1]
+    if local.year != now.astimezone().year:
+        return f"{local.day} {month} {local.year}"
+    return f"{local.day} {month}"
+
+
+def apple_music_row_fields(ids: dict, storefront: str) -> dict[str, Any]:
+    am = str((ids or {}).get("apple_music") or "").strip()
+    if not am:
+        return {}
+    out: dict[str, Any] = {"url": f"https://music.apple.com/{storefront}/song/{am}"}
+    if am.isdigit():
+        out["track_id"] = int(am)
+    return out
+
+
+def _playback_log_rows(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    for name in (str(path) + ".1", str(path)):
+        p = Path(name)
+        if not p.is_file():
+            continue
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _playback_track_key(row: dict) -> str | None:
+    artist = row.get("artist") or ""
+    title = row.get("title") or ""
+    if artist and title:
+        return track_key(artist, title)
+    file_name = row.get("file") or ""
+    if file_name:
+        m = _YT_NAME.match(file_name)
+        if m:
+            return track_key(m.group("artist"), m.group("title"))
+    return None
+
+
+def _scout_acquired_index(ledger: Path) -> dict[str, dict]:
+    """Scout-published tracks: key → latest acquired row."""
+    index: dict[str, dict] = {}
+    for row in read_jsonl_rows(ledger):
+        if row.get("action") != "acquired":
+            continue
+        key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
+        index[key] = row
+    return index
+
+
+def _path_basename(path_value: str | None) -> str:
+    if not path_value:
+        return ""
+    return Path(path_value).name
+
+
+def skip_rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
+    """Scout-published tracks the listener skipped early on separate days.
+
+    The player's log has one `track` line each time a file starts: `file` is the file that
+    is starting, `cause` is why it started and `epoch` is when. The line does not say how far
+    the previous file played (`elapsed` there is the outgoing position after an automatic
+    advance and about zero after a click), so this rule uses the clock alone. The time from
+    one start line to the next is the longest the first file can have played: a pause, a
+    stall or a sleep only makes that gap longer. So a short gap that ends in `click-next`
+    is a real early skip, and a long one is never counted.
+
+    A track is rejected when it was left by `click-next` within 40% of its duration (60 s
+    when the duration is unknown) on `reject_skips` separate days, and no automatic advance
+    ever followed it (it was never played to the end). Only lines from the New music
+    playlist are judged, so a file of the same name elsewhere cannot count.
+    """
+    acquired = _scout_acquired_index(paths.ledger)
+    if not acquired:
+        return set()
+    reject_n = max(1, int(cfg.get("reject_skips", DEFAULTS["reject_skips"])))
+    station = str(cfg.get("station_playlist", DEFAULTS["station_playlist"]))
+    rows = _playback_log_rows(Path(cfg["playback_log"]).expanduser())
+    if not rows:
+        return set()
+
+    basename_to_key: dict[str, str] = {}
+    for key, row in acquired.items():
+        for field in ("local_path", "catalogue_relative_path"):
+            base = _path_basename(row.get(field))
+            if base:
+                basename_to_key.setdefault(base, key)
+
+    def row_key(row: dict) -> str | None:
+        if str(row.get("playlist") or "") != station:
+            return None
+        base = str(row.get("file") or "")
+        if base in basename_to_key:
+            return basename_to_key[base]
+        key = _playback_track_key(row)
+        return key if key in acquired else None
+
+    def limit_for(key: str) -> float:
+        try:
+            duration = float(acquired[key].get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        return 0.4 * duration if duration > 0 else 60.0
+
+    current: str | None = None
+    started = 0.0
+    completed: set[str] = set()
+    skip_days: dict[str, set[str]] = defaultdict(set)
+
+    for row in rows:
+        event = str(row.get("event") or "")
+        if event == "launch":
+            current = None  # the app restarted: the gap across a restart says nothing
+            continue
+        if event != "track":
+            continue
+        epoch = row.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+            current = None
+            continue
+        cause = str(row.get("cause") or "")
+        if current is not None:
+            gap = float(epoch) - started
+            if cause in ("auto-advance", "crossfade"):
+                completed.add(current)
+            elif cause == "click-next" and 0 <= gap < limit_for(current):
+                day = str(row.get("t") or "")[:10] or datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d")
+                skip_days[current].add(day)
+        current = row_key(row)
+        started = float(epoch)
+
+    return {key for key, days in skip_days.items() if len(days) >= reject_n and key not in completed}
+
+
+def rejected_keys(cfg: dict[str, Any], paths: ScoutPaths) -> set[str]:
+    keys: set[str] = set()
+    universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
+    for key, row in universe.items():
+        for sig in row.get("signals") or []:
+            if sig.get("kind") == "dislike":
+                keys.add(key)
+                break
+    feedback = load_feedback([Path(p).expanduser() for p in cfg["feedback_paths"]])
+    for key, row in feedback.items():
+        if (row.get("event") or "") in ("dislike", "less"):
+            keys.add(key)
+    keys |= ledger_keys(paths.ledger, actions={"rejected"})
+    keys |= skip_rejected_keys(cfg, paths)
+    return keys
+
+
+def record_skip_rejections(
+    cfg: dict[str, Any],
+    paths: ScoutPaths,
+    skip_keys: set[str],
+    *,
+    clock: str,
+) -> None:
+    acquired = _scout_acquired_index(paths.ledger)
+    existing = ledger_keys(paths.ledger, actions={"rejected"})
+    for key in skip_keys:
+        if key in existing:
+            continue
+        row = acquired.get(key) or {}
+        append_jsonl(
+            paths.ledger,
+            {
+                "action": "rejected",
+                "track_key": key,
+                "artist": row.get("artist") or "",
+                "title": row.get("title") or "",
+                "at": clock,
+                "reason": "early_skip",
+            },
+        )
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
@@ -673,6 +934,107 @@ def liked_artists(cfg: dict[str, Any]) -> list[str]:
 # --- sources ---
 
 
+def _latest_signal_at(signals: list[dict], kind: str) -> str:
+    best = ""
+    best_dt: datetime | None = None
+    for sig in signals:
+        if sig.get("kind") != kind:
+            continue
+        at = sig.get("at") or ""
+        dt = parse_iso(at)
+        if dt is None and not at:
+            continue
+        if dt is None:
+            if not best:
+                best = at
+            continue
+        if best_dt is None or dt > best_dt:
+            best_dt = dt
+            best = at
+    return best
+
+
+def source_shazam(cfg: dict[str, Any], runners: Runners, rejected: set[str]) -> list[dict]:
+    universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
+    now = parse_iso(runners.clock()) or utc_now()
+    fresh_days = int(cfg.get("shazam_fresh_days", DEFAULTS["shazam_fresh_days"]))
+    backlog_cap = int(cfg.get("shazam_backlog_per_run", DEFAULTS["shazam_backlog_per_run"]))
+    storefront = str(cfg.get("storefront", DEFAULTS["storefront"]))
+    fresh_cutoff = now - timedelta(days=fresh_days)
+
+    fresh_rows: list[dict] = []
+    backlog: list[tuple[datetime, dict]] = []
+
+    for key, row in universe.items():
+        if row.get("owned"):
+            continue
+        if key in rejected:
+            continue
+        signals = row.get("signals") or []
+        if any(sig.get("kind") == "dislike" for sig in signals):
+            continue
+        shazam_at = _latest_signal_at(signals, "shazam")
+        if not shazam_at:
+            continue
+        if not (row.get("artist") and row.get("title")):
+            continue  # nothing to search for
+        shazam_dt = parse_iso(shazam_at) or datetime.min.replace(tzinfo=timezone.utc)
+        day = format_signal_day(shazam_at, now)
+        cand: dict[str, Any] = {
+            "artist": row.get("artist") or "",
+            "title": row.get("title") or "",
+            "album": row.get("album") or "",
+            "source": "shazam",
+            "why": f"Shazamed {day}" if day else "Shazamed",
+        }
+        cand.update(apple_music_row_fields(row.get("ids") or {}, storefront))
+        if shazam_dt >= fresh_cutoff:
+            cand["score_hint"] = 0.95
+            cand["priority"] = True
+            fresh_rows.append(cand)
+        else:
+            cand["score_hint"] = 0.6
+            backlog.append((shazam_dt, cand))
+
+    backlog.sort(key=lambda pair: pair[0], reverse=True)
+    out = list(fresh_rows)
+    out.extend(cand for _, cand in backlog[:backlog_cap])
+    return out
+
+
+def source_tv_likes(cfg: dict[str, Any], runners: Runners, rejected: set[str]) -> list[dict]:
+    universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
+    now = parse_iso(runners.clock()) or utc_now()
+    storefront = str(cfg.get("storefront", DEFAULTS["storefront"]))
+    out: list[dict] = []
+    for key, row in universe.items():
+        if row.get("owned"):
+            continue
+        if key in rejected:
+            continue
+        signals = row.get("signals") or []
+        if any(sig.get("kind") == "dislike" for sig in signals):
+            continue
+        tv_likes = [sig for sig in signals if sig.get("kind") == "like" and sig.get("source") == "tv"]
+        if not tv_likes or not (row.get("artist") and row.get("title")):
+            continue
+        like_at = _latest_signal_at(tv_likes, "like")
+        day = format_signal_day(like_at, now) if like_at else ""
+        why = f"Liked on the TV {day}".strip() if day else "Liked on the TV"
+        cand: dict[str, Any] = {
+            "artist": row.get("artist") or "",
+            "title": row.get("title") or "",
+            "album": row.get("album") or "",
+            "source": "tv-like",
+            "score_hint": 0.9,
+            "priority": True,
+            "why": why,
+        }
+        cand.update(apple_music_row_fields(row.get("ids") or {}, storefront))
+        out.append(cand)
+    return out
+
+
 def source_triplej(cfg: dict[str, Any]) -> list[dict]:
     station = Path(cfg["triplej_state"]).expanduser() / "station.json"
     if not station.is_file():
@@ -881,10 +1243,16 @@ def cmd_candidates(
 ) -> tuple[list[dict], dict[str, int], list[str]]:
     errors: list[str] = []
     by_source: dict[str, list[dict]] = defaultdict(list)
+    rejected = rejected_keys(cfg, paths)
+    _, universe_errors = load_universe(Path(cfg["media_share"]).expanduser())
+    for msg in universe_errors:
+        errors.append(f"media-share: {msg}")
 
     for name, fn in (
         ("triplej", lambda: source_triplej(cfg)),
         ("new-release", lambda: source_new_releases(cfg, runners)),
+        ("shazam", lambda: source_shazam(cfg, runners, rejected)),
+        ("tv-like", lambda: source_tv_likes(cfg, runners, rejected)),
     ):
         try:
             rows = fn()
@@ -903,7 +1271,11 @@ def cmd_candidates(
     counts: dict[str, int] = {}
     for name, rows in by_source.items():
         counts[name] = len(rows)
-        merged.extend(rows)
+        for row in rows:
+            key = track_key(row.get("artist", ""), row.get("title", ""))
+            if key in rejected:
+                continue
+            merged.append(row)
 
     doc = {
         "generated": runners.clock(),
@@ -924,16 +1296,21 @@ def score_candidate(
     *,
     ever_hearted: set[str] | None = None,
     current_hearts: set[str] | None = None,
+    media_likes: set[str] | None = None,
 ) -> float:
     base = float(c.get("score_hint") or 0.5)
     key = track_key(c.get("artist", ""), c.get("title", ""))
     ev = feedback.get(normal(key), {})
     event = ev.get("event") or ""
+    like_bonus = 0.0
     if event in ("like", "thumbs_up", "👍"):
-        base += 0.4
+        like_bonus = 0.4
     elif event in ("skip", "dislike"):
         base -= 0.5
     nkey = normal(key)
+    if nkey in (media_likes or set()):
+        like_bonus = max(like_bonus, 0.4)
+    base += like_bonus
     hearts_now = current_hearts or set()
     ever = ever_hearted or set()
     if nkey in ever and nkey not in hearts_now:
@@ -958,6 +1335,11 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     artist_affinity = Counter()
     for a in liked_artists(cfg):
         artist_affinity[a] += 1
+    universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
+    media_likes = media_like_keys(universe)
+    skip_rejected = skip_rejected_keys(cfg, paths)
+    record_skip_rejections(cfg, paths, skip_rejected, clock=runners.clock())
+    rejected = rejected_keys(cfg, paths)
 
     # recent offers this week (per artist cap)
     week_ago = utc_now() - timedelta(days=7)
@@ -972,7 +1354,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     max_art = int(cfg["max_per_artist_week"])
     explore_share = float(cfg["exploration_share"])
     seen: set[str] = set()
-    ranked: list[dict] = []
+    priority_pool: list[dict] = []
     explore_pool: list[dict] = []
     rest_pool: list[dict] = []
 
@@ -981,14 +1363,21 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         if key in seen:
             continue
         seen.add(key)
-        if key in owned or normal(key) in hearts:
+        if key in rejected or key in owned or normal(key) in hearts:
             continue
         scored = dict(c)
         scored["score"] = score_candidate(
-            c, feedback, artist_affinity, ever_hearted=ever_hearted, current_hearts=hearts
+            c,
+            feedback,
+            artist_affinity,
+            ever_hearted=ever_hearted,
+            current_hearts=hearts,
+            media_likes=media_likes,
         )
         scored["track_key"] = key
-        if c.get("source") == "taste-expansion":
+        if c.get("priority"):
+            priority_pool.append(scored)
+        elif c.get("source") == "taste-expansion":
             explore_pool.append(scored)
         else:
             rest_pool.append(scored)
@@ -997,6 +1386,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         tier = novelty_tier(row, owned_artist_set, owned)
         return (tier, -row["score"], row["track_key"])
 
+    priority_pool.sort(key=lambda row: (-row["score"], row["track_key"]))
     explore_pool.sort(key=_rank_key)
     rest_pool.sort(key=_rank_key)
 
@@ -1017,12 +1407,21 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
             chosen.append(row)
         return chosen
 
-    ranked = apply_cap(explore_pool, explore_slots) + apply_cap(rest_pool, rest_slots)
-    ranked = enforce_owned_artist_share(
-        ranked,
-        float(cfg.get("owned_artist_share_max", DEFAULTS["owned_artist_share_max"])),
-        owned_artist_set,
-    )
+    ranked = list(priority_pool) + apply_cap(explore_pool, explore_slots) + apply_cap(rest_pool, rest_slots)
+    if priority_pool:
+        tail = ranked[len(priority_pool) :]
+        tail = enforce_owned_artist_share(
+            tail,
+            float(cfg.get("owned_artist_share_max", DEFAULTS["owned_artist_share_max"])),
+            owned_artist_set,
+        )
+        ranked = ranked[: len(priority_pool)] + tail
+    else:
+        ranked = enforce_owned_artist_share(
+            ranked,
+            float(cfg.get("owned_artist_share_max", DEFAULTS["owned_artist_share_max"])),
+            owned_artist_set,
+        )
 
     queue = {
         "generated": runners.clock(),
@@ -1236,6 +1635,7 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
     fresh_days = int(cfg["fresh_days"])
     cutoff = utc_now() - timedelta(days=fresh_days)
     hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+    rejected = rejected_keys(cfg, paths)
     tracks: list[dict] = []
     for row in read_jsonl_rows(paths.ledger):
         if row.get("action") != "acquired":
@@ -1244,7 +1644,7 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
         if not at or at < cutoff:
             continue
         key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
-        if normal(key) in hearts:
+        if key in rejected or normal(key) in hearts:
             continue
         item = {
             "track_key": key,
@@ -1297,6 +1697,22 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
     if paths.source_stats.is_file():
         source_doc = json.loads(paths.source_stats.read_text(encoding="utf-8"))
 
+    shazam_fresh = 0
+    shazam_waiting = 0
+    universe, _ = load_universe(Path(cfg["media_share"]).expanduser())
+    fresh_cutoff = now - timedelta(days=int(cfg.get("shazam_fresh_days", DEFAULTS["shazam_fresh_days"])))
+    ledger_all = ledger_keys(paths.ledger)
+    for key, row in universe.items():
+        shazam_at = _latest_signal_at(row.get("signals") or [], "shazam")
+        shazam_dt = parse_iso(shazam_at or "")
+        if not shazam_dt or shazam_dt < fresh_cutoff:
+            continue
+        if row.get("owned"):
+            continue  # already a master: nothing is waiting
+        shazam_fresh += 1
+        if key not in ledger_all:
+            shazam_waiting += 1
+
     status = {
         "generated": runners.clock(),
         "last_run": last,
@@ -1310,6 +1726,7 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
         "failures_total": failures,
         "ledger_torn_line": torn,
         "last_acquired_at": last_acquire.isoformat().replace("+00:00", "Z") if last_acquire else None,
+        "shazam": {"fresh": shazam_fresh, "waiting": shazam_waiting},
     }
     code = 0
     if torn:
