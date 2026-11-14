@@ -698,13 +698,25 @@ def list_walked_videos(cfg: Dict[str, Any]) -> List[Tuple[str, str, str, str, st
         return []
 
 
+def index_videos_by_key(
+    videos: List[Tuple[str, str, str, str, str]]
+) -> Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]]:
+    """Match key -> the videos that carry it. Each video's keys are worked out once.
+
+    Comparing every pick with every video recomputed both sides' keys each time: 300 picks
+    against 1,100 videos ran for more than ten minutes on the Mac that serves the TV."""
+    index: Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]] = {}
+    for video in videos:
+        for key in _catalogue_keys(video[1], video[2]):
+            index.setdefault(key, []).append(video)
+    return index
+
+
 def track_has_local_video(
-    artist: str, title: str, videos: List[Tuple[str, str, str, str, str]]
+    artist: str, title: str,
+    video_index: Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]],
 ) -> bool:
-    for _folder, va, vt, _vid, _rel in videos:
-        if catalogue_keys_intersect(artist, title, va, vt):
-            return True
-    return False
+    return any(key in video_index for key in _catalogue_keys(artist, title))
 
 
 def build_tv_channel_scores(
@@ -717,19 +729,20 @@ def build_tv_channel_scores(
     channels: Dict[str, Dict[str, Any]] = {}
     matched_n: Dict[str, int] = {}
     pick_n: Dict[str, int] = {}
+    video_index = index_videos_by_key(videos)
     for station, picks in station_picks.items():
         pick_n[station] = len(picks)
         items: Dict[str, Dict[str, Any]] = {}
-        for _folder, va, vt, _vid, rel in videos:
-            src = tv_catalogue_src(prefix, rel)
-            for pick in picks:
-                if catalogue_keys_intersect(
-                    pick.get("artist", ""), pick.get("title", ""), va, vt
-                ):
-                    items[src] = {
-                        "score": pick.get("score", 0.0),
-                        "why": pick.get("why") or "",
-                    }
+        # Picks come best first; a video that matches two picks keeps the better score.
+        for pick in picks:
+            for key in _catalogue_keys(pick.get("artist", ""), pick.get("title", "")):
+                for video in video_index.get(key, ()):
+                    src = tv_catalogue_src(prefix, video[4])
+                    if src not in items:
+                        items[src] = {
+                            "score": pick.get("score", 0.0),
+                            "why": pick.get("why") or "",
+                        }
         if station == "triplej":
             lav = re.compile(r"like a version", re.IGNORECASE)
             for folder, va, vt, _vid, rel in videos:
@@ -998,6 +1011,7 @@ def export_pick_rows(
     share = expand(cfg["share_dir"])
     station_picks, _, _ = load_picks_from_share(share)
     videos = list_walked_videos(cfg)
+    video_index = index_videos_by_key(videos)
     extra: List[Dict[str, str]] = []
     for station in sorted(station_picks.keys()):
         added = 0
@@ -1015,7 +1029,7 @@ def export_pick_rows(
             mtr = merged.get(key) or {}
             if (mtr.get("video") or "").strip():
                 continue
-            if videos and track_has_local_video(artist, title, videos):
+            if videos and track_has_local_video(artist, title, video_index):
                 continue
             extra.append(
                 {

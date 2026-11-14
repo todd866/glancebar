@@ -430,6 +430,22 @@ class CheckRowsTest(MediaSyncTestBase):
         self.assertEqual(rc, 0)
 
 
+class MatchingSpeedTest(unittest.TestCase):
+    # 300 picks against 1,200 videos took more than ten minutes when every pair was compared
+    # and both sides' keys were recomputed each time. Indexed, it is well under a second.
+    def test_picks_against_a_large_video_folder_is_fast(self):
+        videos = [(f"Act {i}", f"Act {i}", f"Song {i}", f"id{i}", f"Act {i}/Act {i} - Song {i} [id{i}].mp4")
+                  for i in range(1200)]
+        picks = [{"artist": f"Act {i * 4}", "title": f"Song {i * 4}", "score": 1.0 - i / 400.0, "why": "x"}
+                 for i in range(300)]
+        started = time.perf_counter()
+        index = ms.index_videos_by_key(videos)
+        hits = sum(1 for p in picks if ms.track_has_local_video(p["artist"], p["title"], index))
+        elapsed = time.perf_counter() - started
+        self.assertEqual(hits, 300)
+        self.assertLess(elapsed, 2.0, f"matching took {elapsed:.2f} s")
+
+
 class MalformedTest(MediaSyncTestBase):
     def test_malformed_hearts(self):
         Path(self.cfg["hearts_path"]).write_text("{not json", encoding="utf-8")
