@@ -4819,8 +4819,8 @@ static NSImage *StationTileImage(BOOL dimmed) {
 static const CGFloat kTileCaptionBasePt = 11.5;
 static const CGFloat kTileCaptionFloorPt = 10.5;
 
-static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width) {
-    CGFloat pt = kTileCaptionBasePt;
+static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width, CGFloat basePt) {
+    CGFloat pt = basePt > 0 ? basePt : kTileCaptionBasePt;
     while (pt >= kTileCaptionFloorPt) {
         NSFont *font = [NSFont systemFontOfSize:pt];
         if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + 2 <= width) return pt;
@@ -4829,8 +4829,8 @@ static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width) {
     return kTileCaptionFloorPt;
 }
 
-static void GBApplyTileCaptionLine1(NSTextField *cap, NSString *text, CGFloat capW) {
-    CGFloat pt = TileCaptionFitPointSize(text, capW);
+static void GBApplyTileCaption(NSTextField *cap, NSString *text, CGFloat capW, CGFloat basePt) {
+    CGFloat pt = TileCaptionFitPointSize(text, capW, basePt);
     cap.font = [NSFont systemFontOfSize:pt];
     cap.stringValue = text;
     if ([cap respondsToSelector:@selector(updateClippedTextHelp)])
@@ -4838,6 +4838,10 @@ static void GBApplyTileCaptionLine1(NSTextField *cap, NSString *text, CGFloat ca
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         [cap performSelector:@selector(updateClippedTextHelp)];
 #pragma clang diagnostic pop
+}
+
+static void GBApplyTileCaptionLine1(NSTextField *cap, NSString *text, CGFloat capW) {
+    GBApplyTileCaption(cap, text, capW, kTileCaptionBasePt);
 }
 
 static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
@@ -4890,6 +4894,8 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
     if (_fraction <= 0) return;
+    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:4 yRadius:4];
+    [clip addClip];
     NSRect track = NSMakeRect(0, 0, NSWidth(self.bounds), 3);
     [[NSColor colorWithWhite:0 alpha:0.45] setFill];
     NSRectFill(track);
@@ -4936,11 +4942,6 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
     }
     content.frame = NSMakeRect(0, 0, width + 2 * pad, y + pad);
     return content;
-}
-- (void)drawRect:(NSRect)dirtyRect {
-    [super drawRect:dirtyRect];
-    if (_typeMark) [_typeMark drawInRect:NSMakeRect(3, NSHeight(self.bounds) - 19, 16, 16)
-                                fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
 }
 @end
 
@@ -5596,6 +5597,13 @@ static NSString *PopoverRequestObject(void) {
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
 - (NSUInteger)coalescedSeekApplyCount;
+- (NSImage *)embeddedArtworkForPath:(NSString *)path;
+- (NSArray<NSImage *> *)stationMosaicCovers;
+- (void)saveShowPositionNow;
+- (void)performMusicNextCutNow;
+- (NSString *)showsJSONPath;
+- (void)noteLocalPlaybackTime;
+- (void)updateShowEpisodeState:(NSString *)path position:(double)position duration:(double)duration finished:(BOOL)finished;
 @end
 
 // CoreAudio property reads. Output streams are the output scope of kAudioDevicePropertyStreams;
@@ -7580,12 +7588,24 @@ static NSString *const kShowMixKey = @"show:episode";
     if (!path.length) return nil;
     if (_showCoverCache[path]) return _showCoverCache[path];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    for (AVMetadataItem *item in asset.commonMetadata) {
-        if (item.commonKey != AVMetadataCommonKeyArtwork) continue;
-        NSData *d = [item.dataValue isKindOfClass:NSData.class] ? item.dataValue : nil;
-        NSImage *img = d.length ? [[NSImage alloc] initWithData:d] : nil;
-        if (img) { _showCoverCache[path] = img; return img; }
+    NSImage *(^scan)(NSArray<AVMetadataItem *> *) = ^NSImage *(NSArray<AVMetadataItem *> *items) {
+        if (!items.count) return nil;
+        for (AVMetadataItem *item in items) {
+            BOOL art = item.commonKey == AVMetadataCommonKeyArtwork;
+            NSString *ident = [item.identifier isKindOfClass:NSString.class] ? item.identifier : @"";
+            if (!art && ![ident containsString:@"covr"]) continue;
+            NSData *d = [item.dataValue isKindOfClass:NSData.class] ? item.dataValue : nil;
+            NSImage *img = d.length ? [[NSImage alloc] initWithData:d] : nil;
+            if (img) return img;
+        }
+        return nil;
+    };
+    NSImage *found = scan(asset.commonMetadata);
+    if (!found) {
+        for (NSString *fmt in asset.availableMetadataFormats)
+            if ((found = scan([asset metadataForFormat:fmt]))) break;
     }
+    if (found) { _showCoverCache[path] = found; return found; }
     return nil;
 }
 - (NSImage *)showCoverForEpisode:(NSDictionary *)episode episodes:(NSArray *)all {
@@ -7769,14 +7789,23 @@ static NSString *const kShowMixKey = @"show:episode";
 - (NSArray<NSImage *> *)stationMosaicCovers {
     NSMutableArray *covers = [NSMutableArray array];
     NSArray *tracks = [_stationTracks sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
-        return [((NSDictionary *)b)[@"file"] ?: @"" compare:((NSDictionary *)a)[@"file"] ?: @""];
+        NSString *pa = ((NSDictionary *)a)[@"local_path"] ?: ((NSDictionary *)a)[@"id"] ?: @"";
+        NSString *pb = ((NSDictionary *)b)[@"local_path"] ?: ((NSDictionary *)b)[@"id"] ?: @"";
+        return [pb compare:pa];
     }];
     for (NSDictionary *t in tracks) {
         if (covers.count >= 4) break;
-        NSString *file = t[@"file"];
-        if (![file isKindOfClass:NSString.class] || !file.length) continue;
-        NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"Music/Glancebar Radio/%@", file]];
+        NSString *path = nil;
+        if ([t[@"local_path"] isKindOfClass:NSString.class] && [(NSString *)t[@"local_path"] length])
+            path = t[@"local_path"];
+        else if ([t[@"file"] isKindOfClass:NSString.class] && [(NSString *)t[@"file"] length]) {
+            NSString *file = t[@"file"];
+            path = [file hasPrefix:@"/"] ? file
+                : [GBHomeDirectory() stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"Music/Glancebar Radio/%@", file]];
+        } else if ([t[@"path"] isKindOfClass:NSString.class] && [(NSString *)t[@"path"] length])
+            path = t[@"path"];
+        if (!path.length) continue;
         if (_stationCoverCache[path]) { [covers addObject:_stationCoverCache[path]]; continue; }
         NSImage *img = [self embeddedArtworkForPath:path];
         if (img) { _stationCoverCache[path] = img; [covers addObject:img]; }
@@ -9093,6 +9122,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (!isfinite(elapsed) || elapsed < 0) elapsed = 0;
     _trackElapsed = elapsed;
     _trackSampledAt = CFAbsoluteTimeGetCurrent();
+    if ([self playingShowEpisode] && _localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count) {
+        NSDictionary *st = [self showEpisodeState:_localURLs[_localIndex].path];
+        double savedDur = [st[@"duration"] doubleValue];
+        if (savedDur > 0) duration = savedDur;
+    }
     _trackDuration = (isfinite(duration) && duration > 0) ? duration : 0;
 }
 - (CGFloat)addMusicControlsTo:(NSView *)root at:(CGFloat)y {
@@ -9584,8 +9618,8 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [self ensureShows];
     [self ensureStation];
     const CGFloat side = 54, buttonSide = 22, capH = 30, top = 6, rowH = 14;
-    NSUInteger n = MIN(_mixSeeds.count, 4);
     BOOL showTile = _showOffered != nil;
+    NSUInteger n = MIN(_mixSeeds.count, showTile ? 3u : 4u);
     NSUInteger tiles = n + (showTile ? 1 : 0) + 1;
     NSUInteger gaps = tiles;
     CGFloat gap = (kW - 2 * kPad - tiles * side - buttonSide) / (CGFloat)gaps;
@@ -9688,11 +9722,18 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         if (showPlaying) { show.layer.borderWidth = 2; show.layer.borderColor = NSColor.controlAccentColor.CGColor; }
         show.frame = NSMakeRect(x, capH, side, side);
         [line addSubview:show];
+        if (show.typeMark) {
+            NSImageView *mark = [NSImageView imageViewWithImage:show.typeMark];
+            mark.frame = NSMakeRect(3, side - 19, 16, 16);
+            mark.accessibilityIdentifier = @"popover.music.show.typemark";
+            [show addSubview:mark];
+        }
         if (progress > 0) {
-            GBShowProgressView *bar = [[GBShowProgressView alloc] initWithFrame:NSMakeRect(x, capH + side - 3, side, 3)];
+            GBShowProgressView *bar = [[GBShowProgressView alloc] initWithFrame:NSMakeRect(0, 0, side, 3)];
+            bar.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
             bar.fraction = progress;
             bar.accessibilityIdentifier = @"popover.music.show.progress";
-            [line addSubview:bar];
+            [show addSubview:bar];
         }
         if (badge > 0) {
             GBCountBadge *badgeV = [[GBCountBadge alloc] initWithFrame:NSMakeRect(NSMaxX(show.frame) - 18, NSMaxY(show.frame) - 18, 16, 16)];
@@ -9700,7 +9741,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             badgeV.accessibilityIdentifier = @"popover.music.show.badge";
             [line addSubview:badgeV];
         }
-        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
+        CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *showCaps = @[offer[@"show"] ?: @"", ShowTileCaptionLine2(offer[@"broadcast"], offer[@"presenter"], nil)];
         for (NSUInteger l = 0; l < showCaps.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:showCaps[l]];
@@ -9708,7 +9749,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByTruncatingTail;
             cap.frame = NSMakeRect(capX, capH - 2 - rowH * (l + 1), capW, rowH);
-            if (l) cap.font = capFont;
+            if (l) GBApplyTileCaption(cap, showCaps[l], capW, 10);
             else GBApplyTileCaptionLine1(cap, showCaps[l], capW);
             cap.accessibilityIdentifier = l ? @"popover.music.show.artist" : @"popover.music.show.caption";
             [line addSubview:cap];
@@ -9750,7 +9791,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSImage *typeMark = GBTypeMarkImage(@"dot.radiowaves.left.and.right");
         if (typeMark) {
             NSImageView *mark = [NSImageView imageViewWithImage:typeMark];
-            mark.frame = NSMakeRect(x + 3, capH + side - 19, 16, 16);
+            mark.frame = NSMakeRect(x + 3, capH + 3, 16, 16);
             mark.accessibilityIdentifier = @"popover.mix.station.typemark";
             [line addSubview:mark];
         }
@@ -9763,7 +9804,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [line addSubview:badge];
     }
     {
-        CGFloat capW = side + gap - 2, capX = x - (gap - 2) / 2;
+        CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *captions = @[@"New music", @"for you"];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
