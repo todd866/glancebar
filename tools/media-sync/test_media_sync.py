@@ -43,6 +43,9 @@ class MediaSyncTestBase(unittest.TestCase):
             "scout_state": str(self.root / "scout"),
             "selector_state": str(self.root / "selector"),
             "tv_video_log": "",
+            "rotations": [],
+            "tv_channel_scores": "",
+            "tv_src_prefix": "music",
             "check": dict(ms.DEFAULTS["check"]),
         }
         for d in (self.root / "mixpool/logs", self.root / "apple", self.root / "mlib",
@@ -523,11 +526,495 @@ class CheckRowsTest(MediaSyncTestBase):
         self.assertEqual(rc, 0)
 
 
+class MatchingSpeedTest(unittest.TestCase):
+    # 300 picks against 1,200 videos took more than ten minutes when every pair was compared
+    # and both sides' keys were recomputed each time. Indexed, it is well under a second.
+    def test_picks_against_a_large_video_folder_is_fast(self):
+        videos = [(f"Act {i}", f"Act {i}", f"Song {i}", f"id{i}", f"Act {i}/Act {i} - Song {i} [id{i}].mp4")
+                  for i in range(1200)]
+        picks = [{"artist": f"Act {i * 4}", "title": f"Song {i * 4}", "score": 1.0 - i / 400.0, "why": "x"}
+                 for i in range(300)]
+        started = time.perf_counter()
+        index = ms.index_videos_by_key(videos)
+        hits = sum(1 for p in picks if ms.track_has_local_video(p["artist"], p["title"], index))
+        elapsed = time.perf_counter() - started
+        self.assertEqual(hits, 300)
+        self.assertLess(elapsed, 2.0, f"matching took {elapsed:.2f} s")
+
+
 class MalformedTest(MediaSyncTestBase):
     def test_malformed_hearts(self):
         Path(self.cfg["hearts_path"]).write_text("{not json", encoding="utf-8")
         st, _ = ms.collect_hearts(self.cfg)
         self.assertFalse(st["ok"])
+
+
+def scores_doc(tracks):
+    return {
+        "generated": "2026-11-14T12:00:00Z",
+        "tracks": tracks,
+    }
+
+
+class PicksTests(MediaSyncTestBase):
+    def scores_path(self):
+        p = self.root / "scores.json"
+        self.cfg["rotations"] = [{"station": "triplej", "scores": str(p)}]
+        return p
+
+    def test_threshold_cap_and_rank_scores(self):
+        tracks = []
+        for i in range(5):
+            tracks.append(
+                {
+                    "track_key": f"x|t{i}",
+                    "artist": f"Pick Artist {i}",
+                    "title": f"Pick Song {i}",
+                    "score": 10.0 - i,
+                    "reason": f"like Artist {i}",
+                    "play_count": i,
+                }
+            )
+        tracks.append(
+            {
+                "track_key": "low|x",
+                "artist": "Low Score",
+                "title": "Cut Off",
+                "score": 1.0,
+                "reason": "weak",
+                "play_count": 0,
+            }
+        )
+        self.scores_path().write_text(json.dumps(scores_doc(tracks)), encoding="utf-8")
+        self.cfg["picks_min_score"] = 2.0
+        self.cfg["picks_max"] = 3
+        ms.cmd_collect(self.cfg)
+        doc = json.loads((self.share / "picks-testhost.json").read_text(encoding="utf-8"))
+        picks = doc["stations"]["triplej"]
+        self.assertEqual(len(picks), 3)
+        self.assertEqual(picks[0]["score"], 1.0)
+        self.assertAlmostEqual(picks[-1]["score"], 0.25)
+        self.assertEqual(picks[0]["key"], ms.track_key("Pick Artist 0", "Pick Song 0"))
+
+    def test_one_pick_scores_one(self):
+        p = self.scores_path()
+        p.write_text(
+            json.dumps(
+                scores_doc(
+                    [
+                        {
+                            "track_key": "a|b",
+                            "artist": "Solo Pick",
+                            "title": "Only One",
+                            "score": 5.0,
+                            "reason": "like Solo",
+                            "play_count": 1,
+                        }
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        ms.cmd_collect(self.cfg)
+        picks = json.loads((self.share / "picks-testhost.json").read_text(encoding="utf-8"))[
+            "stations"
+        ]["triplej"]
+        self.assertEqual(len(picks), 1)
+        self.assertEqual(picks[0]["score"], 1.0)
+
+    def test_disliked_dropped(self):
+        self.scores_path().write_text(
+            json.dumps(
+                scores_doc(
+                    [
+                        {
+                            "track_key": "a|b",
+                            "artist": "Hated",
+                            "title": "Song",
+                            "score": 9.0,
+                            "reason": "like X",
+                            "play_count": 0,
+                        }
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        key = ms.track_key("Hated", "Song")
+        sig = {
+            "version": 1,
+            "host": "other",
+            "generated": ms.iso_now(),
+            "sources": {},
+            "tracks": {
+                key: {
+                    **ms.empty_track("Hated", "Song"),
+                    "signals": [{"kind": "dislike", "source": "glancebar", "at": ""}],
+                }
+            },
+        }
+        (self.share / "signals-other.json").write_text(json.dumps(sig), encoding="utf-8")
+        ms.cmd_collect(self.cfg)
+        self.assertFalse((self.share / "picks-testhost.json").exists())
+
+    def test_missing_scores_skipped(self):
+        self.cfg["rotations"] = [{"station": "triplej", "scores": str(self.root / "nope.json")}]
+        ms.cmd_collect(self.cfg)
+        self.assertFalse((self.share / "picks-testhost.json").exists())
+
+    def test_two_stations(self):
+        tj = self.root / "tj.json"
+        dj = self.root / "dj.json"
+        self.cfg["rotations"] = [
+            {"station": "triplej", "scores": str(tj)},
+            {"station": "doublej", "scores": str(dj)},
+        ]
+        tj.write_text(
+            json.dumps(
+                scores_doc(
+                    [
+                        {
+                            "track_key": "a|a",
+                            "artist": "Tj Art",
+                            "title": "Tj Song",
+                            "score": 4.0,
+                            "reason": "station",
+                            "play_count": 0,
+                        }
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        dj.write_text(
+            json.dumps(
+                scores_doc(
+                    [
+                        {
+                            "track_key": "b|b",
+                            "artist": "Dj Art",
+                            "title": "Dj Song",
+                            "score": 3.0,
+                            "reason": "station",
+                            "play_count": 0,
+                        }
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        ms.cmd_collect(self.cfg)
+        doc = json.loads((self.share / "picks-testhost.json").read_text(encoding="utf-8"))
+        self.assertIn("triplej", doc["stations"])
+        self.assertIn("doublej", doc["stations"])
+
+    def test_sources_without_picks_writes_nothing(self):
+        self.scores_path().write_text(
+            json.dumps(
+                scores_doc(
+                    [
+                        {
+                            "track_key": "a|a",
+                            "artist": "X",
+                            "title": "Y",
+                            "score": 5.0,
+                            "reason": "r",
+                            "play_count": 0,
+                        }
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        self.cfg["sources"] = ["shazam", "glancebar"]
+        ms.cmd_collect(self.cfg)
+        self.assertFalse((self.share / "picks-testhost.json").exists())
+
+
+class TvScoresTests(MediaSyncTestBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg["tv_channel_scores"] = str(self.root / "channel-scores.json")
+        self.vroot = Path(self.cfg["tv_music_videos"])
+
+    def write_picks(self, host, generated, stations):
+        (self.share / f"picks-{host}.json").write_text(
+            json.dumps(
+                {"version": 1, "host": host, "generated": generated, "stations": stations}
+            ),
+            encoding="utf-8",
+        )
+
+    def pick(self, artist, title, score=0.9, why="like test"):
+        key = ms.track_key(artist, title)
+        return {"key": key, "artist": artist, "title": title, "score": score, "raw": 5.0, "why": why, "plays": 0}
+
+    def video(self, folder, name):
+        d = self.vroot / folder
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"x")
+
+    def run_tv(self, force=False):
+        return ms.cmd_tv_scores(self.cfg, argparse_namespace(out=None, force=force))
+
+    def test_exact_and_loose_match(self):
+        self.write_picks(
+            "a",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("Match Art", "Match Song")]},
+        )
+        self.video("Match Art", "Match Art - Match Song (Official Video) [v1].mp4")
+        self.assertEqual(self.run_tv(), 0)
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        src = "music/Match Art/Match Art - Match Song (Official Video) [v1].mp4"
+        self.assertIn(src, doc["channels"]["triplej"]["items"])
+
+    def test_feat_match(self):
+        self.write_picks(
+            "a",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("Feat Art", "Main Song")]},
+        )
+        self.video("Feat Art", "Feat Art - Main Song feat. Guest [v2].mp4")
+        self.assertEqual(self.run_tv(), 0)
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(doc["channels"]["triplej"]["items"]), 1)
+
+    def test_no_match_leaves_empty_station(self):
+        self.write_picks(
+            "a",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("Ghost", "Track")]},
+        )
+        self.run_tv()
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["channels"]["triplej"]["items"], {})
+
+    def test_two_videos_one_pick(self):
+        p = self.pick("Dup Art", "Dup Song", 0.8)
+        self.write_picks("a", "2026-11-14T10:00:00Z", {"triplej": [p]})
+        self.video("Dup Art", "Dup Art - Dup Song [v3].mp4")
+        self.video("Dup Art", "Dup Art - Dup Song (Official Video) [v4].mp4")
+        self.run_tv()
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(doc["channels"]["triplej"]["items"]), 2)
+
+    def test_like_a_version_rule(self):
+        self.write_picks("a", "2026-11-14T10:00:00Z", {"triplej": []})
+        self.video("Like A Version", "Band Z - Cover Song [lav1].mp4")
+        self.run_tv()
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        key = list(doc["channels"]["triplej"]["items"].keys())[0]
+        self.assertEqual(doc["channels"]["triplej"]["items"][key]["score"], 0.6)
+        self.assertEqual(doc["channels"]["triplej"]["items"][key]["why"], "Like A Version")
+
+    def test_src_prefix(self):
+        self.cfg["tv_src_prefix"] = "vault"
+        self.write_picks(
+            "a",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("Pref Art", "Pref Song")]},
+        )
+        self.video("Pref Art", "Pref Art - Pref Song [px].mp4")
+        self.run_tv()
+        doc = json.loads((self.root / "channel-scores.json").read_text(encoding="utf-8"))
+        src = list(doc["channels"]["triplej"]["items"].keys())[0]
+        self.assertTrue(src.startswith("vault/Pref Art/"))
+
+    def test_broken_picks_skipped(self):
+        (self.share / "picks-bad.json").write_text("{", encoding="utf-8")
+        self.write_picks(
+            "good",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("Ok Art", "Ok Song")]},
+        )
+        self.video("Ok Art", "Ok Art - Ok Song [ok].mp4")
+        self.assertEqual(self.run_tv(), 0)
+
+    def test_newer_picks_file_wins(self):
+        old_pick = self.pick("Old Art", "Old Song")
+        new_pick = self.pick("New Art", "New Song")
+        self.write_picks("old", "2026-11-13T10:00:00Z", {"triplej": [old_pick]})
+        self.write_picks("new", "2026-11-14T10:00:00Z", {"triplej": [new_pick]})
+        self.video("New Art", "New Art - New Song [n].mp4")
+        self.run_tv()
+        merged, _, _ = ms.load_picks_from_share(self.share)
+        self.assertEqual(len(merged["triplej"]), 1)
+        self.assertEqual(merged["triplej"][0]["artist"], "New Art")
+
+    def test_half_size_guard_and_force(self):
+        self.write_picks(
+            "a",
+            "2026-11-14T10:00:00Z",
+            {"triplej": [self.pick("A", "One"), self.pick("B", "Two")]},
+        )
+        self.video("A", "A - One [a].mp4")
+        self.video("B", "B - Two [b].mp4")
+        self.run_tv()
+        out = self.root / "channel-scores.json"
+        self.write_picks("a", "2026-11-14T11:00:00Z", {"triplej": [self.pick("C", "Three")]})
+        self.assertEqual(self.run_tv(), 3)
+        self.assertEqual(len(json.loads(out.read_text(encoding="utf-8"))["channels"]["triplej"]["items"]), 2)
+        self.assertEqual(self.run_tv(force=True), 0)
+        self.assertEqual(len(json.loads(out.read_text(encoding="utf-8"))["channels"]["triplej"]["items"]), 0)
+
+    def test_no_picks_readable_aborts(self):
+        (self.share / "picks-x.json").write_text("{", encoding="utf-8")
+        out = self.root / "channel-scores.json"
+        out.write_text(json.dumps({"version": 1, "channels": {"triplej": {"items": {"x": {}}}}}), encoding="utf-8")
+        self.assertEqual(self.run_tv(), 3)
+
+    def test_off_when_unset(self):
+        self.cfg["tv_channel_scores"] = ""
+        import io
+        import contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ms.cmd_tv_scores(self.cfg, argparse_namespace(out=None, force=False))
+        self.assertEqual(rc, 0)
+        self.assertIn("off", buf.getvalue())
+
+
+class ExportPicksTests(MediaSyncTestBase):
+    def test_picks_appended_and_capped(self):
+        key = ms.track_key("Liked", "Song")
+        sig = {
+            "version": 1,
+            "host": "testhost",
+            "generated": ms.iso_now(),
+            "sources": {},
+            "tracks": {
+                key: {
+                    **ms.empty_track("Liked", "Song"),
+                    "signals": [{"kind": "like", "source": "glancebar", "at": ""}],
+                    "ids": {"apple_music": "", "isrc": "", "youtube": "yt99"},
+                }
+            },
+        }
+        (self.share / "signals-testhost.json").write_text(json.dumps(sig), encoding="utf-8")
+        picks = []
+        for i in range(5):
+            art, tit = f"Want {i}", f"Track {i}"
+            picks.append(
+                {
+                    "key": ms.track_key(art, tit),
+                    "artist": art,
+                    "title": tit,
+                    "score": 1.0 - i * 0.1,
+                    "raw": 5.0,
+                    "why": "rotation",
+                    "plays": 0,
+                }
+            )
+        (self.share / "picks-testhost.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "host": "testhost",
+                    "generated": "2026-11-14T12:00:00Z",
+                    "stations": {"triplej": picks},
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = self.root / "export.json"
+        ms.cmd_export_likes(self.cfg, argparse_namespace(out=str(out), force=False, picks=2))
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(rows[0]["videoId"], "yt99")
+        pick_rows = [r for r in rows if r["videoId"].startswith("pick:")]
+        self.assertEqual(len(pick_rows), 2)
+
+    def test_skips_pick_with_video(self):
+        art, tit = "Has Vid", "On Disk"
+        key = ms.track_key(art, tit)
+        vid_root = Path(self.cfg["tv_music_videos"])
+        (vid_root / art).mkdir(parents=True, exist_ok=True)
+        (vid_root / art / f"{art} - {tit} [hv].mp4").write_bytes(b"x")
+        (self.share / "picks-testhost.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "host": "testhost",
+                    "generated": "2026-11-14T12:00:00Z",
+                    "stations": {
+                        "triplej": [
+                            {
+                                "key": key,
+                                "artist": art,
+                                "title": tit,
+                                "score": 1.0,
+                                "raw": 5.0,
+                                "why": "r",
+                                "plays": 0,
+                            }
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.share / "signals-testhost.json").write_text(
+            json.dumps({"version": 1, "host": "t", "generated": "", "sources": {}, "tracks": {}}),
+            encoding="utf-8",
+        )
+        out = self.root / "export.json"
+        old = [{"videoId": f"id{i}", "title": f"t{i}", "artist": f"a{i}"} for i in range(5)]
+        out.write_text(json.dumps(old), encoding="utf-8")
+        ms.cmd_export_likes(self.cfg, argparse_namespace(out=str(out), force=True, picks=5))
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        self.assertFalse(any(r["videoId"].startswith("pick:") for r in rows))
+
+
+class TvChannelCheckTests(MediaSyncTestBase):
+    def channel_file(self):
+        return self.root / "tv-channel.json"
+
+    def run_check(self):
+        return ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+
+    def row(self):
+        self.run_check()
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        return [r for r in doc["rows"] if r["name"] == "tv channel"][0]
+
+    def test_tv_channel_pass_and_thresholds(self):
+        self.cfg["tv_channel_scores"] = str(self.channel_file())
+        doc = {
+            "version": 1,
+            "generated": ms.iso_now(),
+            "channels": {
+                "triplej": {"items": {"music/a.mp4": {"score": 1.0, "why": ""}}},
+                "doublej": {"items": {}},
+            },
+        }
+        self.channel_file().write_text(json.dumps(doc), encoding="utf-8")
+        os.utime(self.channel_file(), (self.t0 - 2 * 3600, self.t0 - 2 * 3600))
+        row = self.row()
+        self.assertEqual(row["status"], "pass")
+        self.assertIn("triplej 1", row["value"])
+        self.assertIn("doublej 0", row["value"])
+        os.utime(self.channel_file(), (self.t0 - 40 * 3600, self.t0 - 40 * 3600))
+        self.assertEqual(self.row()["status"], "warn")
+        os.utime(self.channel_file(), (self.t0 - 100 * 3600, self.t0 - 100 * 3600))
+        self.assertEqual(self.row()["status"], "fail")
+
+    def test_tv_channel_warn_all_zero(self):
+        self.cfg["tv_channel_scores"] = str(self.channel_file())
+        self.channel_file().write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "channels": {"triplej": {"items": {}}, "doublej": {"items": {}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.row()["status"], "warn")
+
+    def test_tv_channel_missing(self):
+        self.cfg["tv_channel_scores"] = str(self.channel_file())
+        self.assertEqual(self.row()["status"], "warn")
 
 
 if __name__ == "__main__":

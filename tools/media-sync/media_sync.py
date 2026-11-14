@@ -70,6 +70,13 @@ DEFAULTS: Dict[str, Any] = {
     "scout_state": str(HOME / ".local/state/glancebar-music-scout"),
     "selector_state": str(HOME / ".local/state/selector"),
     "tv_video_log": "",
+    "rotations": [
+        {"station": "triplej", "scores": str(HOME / ".local/state/selector/scores.json")},
+    ],
+    "picks_min_score": 2.0,
+    "picks_max": 300,
+    "tv_channel_scores": "",
+    "tv_src_prefix": "music",
     "check": {
         "ledger_warn_h": 30,
         "ledger_fail_h": 72,
@@ -90,6 +97,8 @@ DEFAULTS: Dict[str, Any] = {
         "triplej_fail_h": 72,
         "tv_videos_warn_h": 36,
         "tv_videos_fail_h": 96,
+        "tv_channel_warn_h": 36,
+        "tv_channel_fail_h": 96,
         "peer_stale_h": 50,
     },
 }
@@ -104,6 +113,9 @@ _YT_NAME = re.compile(
     re.IGNORECASE,
 )
 _VID_TAIL = re.compile(r" \[([A-Za-z0-9_-]+)\]$")
+_MATCH_FEAT_TRAIL = re.compile(
+    r"\s+(?:feat\.?|ft\.?|featuring)\s+.+$", re.IGNORECASE
+)
 _STRIP_DECOR = re.compile(
     r"\s*[\(\[]"
     r"(?:Official Video|Official Music Video|Official Audio|Visualiser|"
@@ -531,6 +543,24 @@ def collect_tv_likes(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dic
     return source_status(True, count), tracks
 
 
+def iter_music_videos(root: Path):
+    """Yield artist_folder, parsed artist, title, video_id, relative path under root."""
+    with os.scandir(root) as artists:
+        for artist_ent in artists:
+            if not artist_ent.is_dir(follow_symlinks=False):
+                continue
+            folder = artist_ent.name
+            with os.scandir(artist_ent.path) as files:
+                for fent in files:
+                    if not fent.is_file(follow_symlinks=False):
+                        continue
+                    if Path(fent.name).suffix.lower() not in _VIDEO:
+                        continue
+                    artist, title, vid = parse_bracketed_name(Path(fent.name).stem)
+                    rel = f"{folder}/{fent.name}"
+                    yield folder, artist, title, vid, rel
+
+
 def collect_videos(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     tracks: Dict[str, Dict[str, Any]] = {}
     root_s = (cfg.get("tv_music_videos") or "").strip()
@@ -541,25 +571,228 @@ def collect_videos(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[
         return source_status(False, 0, "missing"), tracks
     count = 0
     try:
-        with os.scandir(root) as artists:
-            for artist_ent in artists:
-                if not artist_ent.is_dir(follow_symlinks=False):
-                    continue
-                with os.scandir(artist_ent.path) as files:
-                    for fent in files:
-                        if not fent.is_file(follow_symlinks=False):
-                            continue
-                        if Path(fent.name).suffix.lower() not in _VIDEO:
-                            continue
-                        artist, title, vid = parse_bracketed_name(Path(fent.name).stem)
-                        key = track_key(artist, title)
-                        tr = tracks.setdefault(key, empty_track(artist, title))
-                        if vid:
-                            tr["video"] = vid
-                        count += 1
+        for _folder, artist, title, vid, _rel in iter_music_videos(root):
+            key = track_key(artist, title)
+            tr = tracks.setdefault(key, empty_track(artist, title))
+            if vid:
+                tr["video"] = vid
+            count += 1
     except OSError as exc:
         return source_status(False, 0, str(exc)[:120]), tracks
     return source_status(True, count), tracks
+
+
+def rank_pick_score(index: int, total: int) -> float:
+    if total <= 1:
+        return 1.0
+    return 1.0 - index * 0.75 / (total - 1)
+
+
+def _catalogue_keys(artist: str, title: str) -> Set[Tuple[str, str]]:
+    keys: Set[Tuple[str, str]] = set(oc.catalogue_match_keys(artist, title))
+    stripped = _MATCH_FEAT_TRAIL.sub("", str(title or "")).strip()
+    if stripped and stripped != title:
+        keys |= oc.catalogue_match_keys(artist, stripped)
+    return keys
+
+
+def catalogue_keys_intersect(
+    artist_a: str, title_a: str, artist_b: str, title_b: str
+) -> bool:
+    return bool(_catalogue_keys(artist_a, title_a) & _catalogue_keys(artist_b, title_b))
+
+
+def picks_from_scores(
+    scores_path: Path,
+    merged: Dict[str, Dict[str, Any]],
+    min_score: float,
+    max_n: int,
+) -> List[Dict[str, Any]]:
+    doc, err = read_json_file(scores_path)
+    if doc is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for tr in doc.get("tracks") or []:
+        if not isinstance(tr, dict):
+            continue
+        raw = tr.get("score")
+        try:
+            raw_f = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if raw_f < min_score:
+            continue
+        artist = str(tr.get("artist") or "")
+        title = str(tr.get("title") or "")
+        key = track_key(artist, title)
+        mtr = merged.get(key) or {}
+        if has_dislike(mtr):
+            continue
+        rows.append(
+            {
+                "artist": artist,
+                "title": title,
+                "raw": raw_f,
+                "why": str(tr.get("reason") or ""),
+                "plays": int(tr.get("play_count") or 0),
+            }
+        )
+    rows.sort(key=lambda r: r["raw"], reverse=True)
+    rows = rows[:max_n]
+    out: List[Dict[str, Any]] = []
+    total = len(rows)
+    for i, row in enumerate(rows):
+        key = track_key(row["artist"], row["title"])
+        out.append(
+            {
+                "key": key,
+                "artist": row["artist"],
+                "title": row["title"],
+                "score": round(rank_pick_score(i, total), 6),
+                "raw": row["raw"],
+                "why": row["why"],
+                "plays": row["plays"],
+            }
+        )
+    return out
+
+
+def write_host_picks(cfg: Dict[str, Any], stations: Dict[str, List[Dict[str, Any]]]) -> None:
+    if not stations:
+        return
+    host = cfg.get("host") or DEFAULT_HOST
+    doc = {
+        "version": 1,
+        "host": host,
+        "generated": iso_now(),
+        "stations": stations,
+    }
+    share = expand(cfg["share_dir"])
+    atomic_write_json(share / f"picks-{host}.json", doc)
+
+
+def load_picks_from_share(
+    share_dir: Path,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int], List[str]]:
+    """Merged station picks, pick counts per station, warnings."""
+    merged: Dict[str, List[Dict[str, Any]]] = {}
+    pick_counts: Dict[str, int] = {}
+    station_age: Dict[str, Tuple[str, int]] = {}
+    warnings: List[str] = []
+    any_ok = False
+    if not share_dir.is_dir():
+        return merged, pick_counts, warnings
+    for path in sorted(share_dir.glob("picks-*.json")):
+        doc, err = read_json_file(path)
+        if doc is None:
+            warnings.append(f"{path.name}: {err}")
+            continue
+        any_ok = True
+        gen = parse_iso(doc.get("generated") or "")
+        gen_epoch = int(gen.timestamp()) if gen else 0
+        for station, picks in (doc.get("stations") or {}).items():
+            if not isinstance(picks, list):
+                continue
+            pick_counts[station] = pick_counts.get(station, 0) + len(picks)
+            prev = station_age.get(station)
+            if prev is None or gen_epoch >= prev[1]:
+                station_age[station] = (path.name, gen_epoch)
+                merged[station] = picks
+    if not any_ok:
+        warnings.append("no readable picks files")
+    return merged, pick_counts, warnings
+
+
+def tv_catalogue_src(prefix: str, rel_path: str) -> str:
+    p = (prefix or "music").strip().strip("/")
+    return f"{p}/{rel_path}".replace("\\", "/")
+
+
+def list_walked_videos(cfg: Dict[str, Any]) -> List[Tuple[str, str, str, str, str]]:
+    root_s = (cfg.get("tv_music_videos") or "").strip()
+    if not root_s:
+        return []
+    root = expand(root_s)
+    if not root.is_dir():
+        return []
+    try:
+        return list(iter_music_videos(root))
+    except OSError:
+        return []
+
+
+def index_videos_by_key(
+    videos: List[Tuple[str, str, str, str, str]]
+) -> Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]]:
+    """Match key -> the videos that carry it. Each video's keys are worked out once.
+
+    Comparing every pick with every video recomputed both sides' keys each time: 300 picks
+    against 1,100 videos ran for more than ten minutes on the Mac that serves the TV."""
+    index: Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]] = {}
+    for video in videos:
+        for key in _catalogue_keys(video[1], video[2]):
+            index.setdefault(key, []).append(video)
+    return index
+
+
+def track_has_local_video(
+    artist: str, title: str,
+    video_index: Dict[Tuple[str, str], List[Tuple[str, str, str, str, str]]],
+) -> bool:
+    return any(key in video_index for key in _catalogue_keys(artist, title))
+
+
+def build_tv_channel_scores(
+    cfg: Dict[str, Any],
+    station_picks: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[Dict[str, Any], Dict[str, int], Dict[str, int]]:
+    """Return doc, videos matched per station, pick counts per station."""
+    prefix = (cfg.get("tv_src_prefix") or "music").strip() or "music"
+    videos = list_walked_videos(cfg)
+    channels: Dict[str, Dict[str, Any]] = {}
+    matched_n: Dict[str, int] = {}
+    pick_n: Dict[str, int] = {}
+    video_index = index_videos_by_key(videos)
+    for station, picks in station_picks.items():
+        pick_n[station] = len(picks)
+        items: Dict[str, Dict[str, Any]] = {}
+        # Picks come best first; a video that matches two picks keeps the better score.
+        for pick in picks:
+            for key in _catalogue_keys(pick.get("artist", ""), pick.get("title", "")):
+                for video in video_index.get(key, ()):
+                    src = tv_catalogue_src(prefix, video[4])
+                    if src not in items:
+                        items[src] = {
+                            "score": pick.get("score", 0.0),
+                            "why": pick.get("why") or "",
+                        }
+        if station == "triplej":
+            lav = re.compile(r"like a version", re.IGNORECASE)
+            for folder, va, vt, _vid, rel in videos:
+                src = tv_catalogue_src(prefix, rel)
+                if src in items:
+                    continue
+                if lav.search(folder) or lav.search(vt) or lav.search(va):
+                    items[src] = {"score": 0.6, "why": "Like A Version"}
+        channels[station] = {"items": items}
+        matched_n[station] = len(items)
+    for station in station_picks:
+        channels.setdefault(station, {"items": {}})
+    return (
+        {"version": 1, "generated": iso_now(), "channels": channels},
+        matched_n,
+        pick_n,
+    )
+
+
+def channel_score_item_count(doc: Dict[str, Any]) -> int:
+    total = 0
+    for ch in (doc.get("channels") or {}).values():
+        if isinstance(ch, dict):
+            items = ch.get("items") or {}
+            if isinstance(items, dict):
+                total += len(items)
+    return total
 
 
 def build_catalogue_owned_index(catalogue_path: Path) -> Set[Tuple[str, str]]:
@@ -727,6 +960,30 @@ def cmd_collect(cfg: Dict[str, Any]) -> int:
         atomic_write_json(stamp, {"at": now_epoch(), "host": host, "sources": sources})
     except OSError:
         pass
+
+    picks_on = not enabled or "picks" in enabled
+    if picks_on:
+        merged = merge_share_including_host(share)
+        min_score = float(cfg.get("picks_min_score", 2.0))
+        max_n = int(cfg.get("picks_max", 300))
+        station_picks: Dict[str, List[Dict[str, Any]]] = {}
+        rots = cfg["rotations"] if "rotations" in cfg else DEFAULTS["rotations"]
+        for rot in rots:
+            if not isinstance(rot, dict):
+                continue
+            station = str(rot.get("station") or "").strip()
+            scores_s = str(rot.get("scores") or "").strip()
+            if not station or not scores_s:
+                continue
+            picks = picks_from_scores(expand(scores_s), merged, min_score, max_n)
+            if picks:
+                station_picks[station] = picks
+                print(f"picks {station} {len(picks)}")
+        if station_picks:
+            try:
+                write_host_picks(cfg, station_picks)
+            except OSError:
+                return 1
     return 0
 
 
@@ -766,19 +1023,68 @@ def cmd_show(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def export_pick_rows(
+    cfg: Dict[str, Any],
+    merged: Dict[str, Dict[str, Any]],
+    existing_ids: Set[str],
+    per_station: int,
+) -> List[Dict[str, str]]:
+    if per_station <= 0:
+        return []
+    share = expand(cfg["share_dir"])
+    station_picks, _, _ = load_picks_from_share(share)
+    videos = list_walked_videos(cfg)
+    video_index = index_videos_by_key(videos)
+    extra: List[Dict[str, str]] = []
+    for station in sorted(station_picks.keys()):
+        added = 0
+        for pick in station_picks.get(station) or []:
+            if added >= per_station:
+                break
+            key = pick.get("key") or track_key(
+                pick.get("artist", ""), pick.get("title", "")
+            )
+            vid_id = f"pick:{station}:{key}"
+            if vid_id in existing_ids:
+                continue
+            artist = pick.get("artist") or ""
+            title = pick.get("title") or ""
+            mtr = merged.get(key) or {}
+            if (mtr.get("video") or "").strip():
+                continue
+            if videos and track_has_local_video(artist, title, video_index):
+                continue
+            extra.append(
+                {
+                    "videoId": vid_id,
+                    "title": title,
+                    "artist": artist,
+                }
+            )
+            existing_ids.add(vid_id)
+            added += 1
+    return extra
+
+
 def cmd_export_likes(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     merged = merge_share_including_host(expand(cfg["share_dir"]))
     rows = liked_export_rows(merged)
+    picks_n = int(getattr(args, "picks", 0) or 0)
     out = Path(args.out).expanduser()
     old_count = 0
     if out.is_file():
         try:
             old = json.loads(out.read_text(encoding="utf-8"))
             if isinstance(old, list):
-                old_count = len(old)
+                old_count = sum(
+                    1
+                    for r in old
+                    if isinstance(r, dict)
+                    and not str(r.get("videoId") or "").startswith("pick:")
+                )
         except (OSError, json.JSONDecodeError):
             old_count = 0
-    if not rows and not args.force:
+    if not rows and not args.force and picks_n <= 0:
         print("export aborted: merged view has no liked tracks")
         return 3
     if old_count and len(rows) < old_count * 0.8 and not args.force:
@@ -786,11 +1092,56 @@ def cmd_export_likes(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
             f"export aborted: new list {len(rows)} rows is below 80% of existing {old_count}"
         )
         return 3
+    existing_ids = {r["videoId"] for r in rows}
+    if picks_n > 0:
+        rows = rows + export_pick_rows(cfg, merged, existing_ids, picks_n)
     try:
         atomic_write_json(out, rows)
     except OSError as exc:
         print(f"export failed: {exc}")
         return 1
+    return 0
+
+
+def cmd_tv_scores(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    out_s = (cfg.get("tv_channel_scores") or "").strip()
+    if not out_s:
+        print("off")
+        return 0
+    out = Path(args.out).expanduser() if getattr(args, "out", None) else expand(out_s)
+    share = expand(cfg["share_dir"])
+    station_picks, _counts, warnings = load_picks_from_share(share)
+    for w in warnings:
+        print(w)
+    readable = False
+    if share.is_dir():
+        for path in share.glob("picks-*.json"):
+            doc, _err = read_json_file(path)
+            if doc is not None:
+                readable = True
+                break
+    new_doc, matched_n, pick_n = build_tv_channel_scores(cfg, station_picks)
+    new_total = channel_score_item_count(new_doc)
+    old_total = 0
+    if out.is_file():
+        old_doc, _ = read_json_file(out)
+        if isinstance(old_doc, dict):
+            old_total = channel_score_item_count(old_doc)
+    if not readable and not args.force:
+        print("tv-scores aborted: no picks file could be read")
+        return 3
+    if out.is_file() and old_total and new_total < old_total * 0.5 and not args.force:
+        print(
+            f"tv-scores aborted: new file {new_total} items is below half of existing {old_total}"
+        )
+        return 3
+    try:
+        atomic_write_json(out, new_doc)
+    except OSError as exc:
+        print(f"tv-scores failed: {exc}")
+        return 1
+    for station in sorted(station_picks.keys()):
+        print(f"{station} {matched_n.get(station, 0)} videos of {pick_n.get(station, 0)} picks")
     return 0
 
 
@@ -1177,6 +1528,46 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 fact = f"{n} music likes"
         rows.append(make_row("tv likes", st, fact, host))
 
+    tv_channel_path_s = (cfg.get("tv_channel_scores") or "").strip()
+    if tv_channel_path_s:
+        path = expand(tv_channel_path_s)
+        st = "pass"
+        fact = ""
+        warn_h = float(chk.get("tv_channel_warn_h", 36))
+        fail_h = float(chk.get("tv_channel_fail_h", 96))
+        if not path.is_file():
+            st = "warn"
+            fact = "missing"
+        else:
+            doc, err = read_json_file(path)
+            if doc is None:
+                st = "warn"
+                fact = f"unreadable: {err}"
+            else:
+                try:
+                    age_h = (now - path.stat().st_mtime) / 3600.0
+                except OSError:
+                    age_h = 0
+                parts: List[str] = []
+                all_zero = True
+                for station in sorted((doc.get("channels") or {}).keys()):
+                    ch = (doc.get("channels") or {}).get(station) or {}
+                    items = ch.get("items") or {}
+                    n = len(items) if isinstance(items, dict) else 0
+                    if n:
+                        all_zero = False
+                    parts.append(f"{station} {n}")
+                fact = ", ".join(parts) if parts else "no stations"
+                if age_h > fail_h:
+                    st = "fail"
+                    fact = f"{fact}; stale {age_fact(age_h * 3600)}"
+                elif age_h > warn_h:
+                    st = "warn"
+                    fact = f"{fact}; age {age_fact(age_h * 3600)}"
+                elif all_zero and parts:
+                    st = "warn"
+        rows.append(make_row("tv channel", st, fact, host))
+
     # `check.rows` names the rows this Mac answers for; the default is every row whose input
     # exists here. (A Mac can hold a leftover file that belongs to another Mac's job.)
     wanted = chk.get("rows") or None
@@ -1272,8 +1663,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_export = sub.add_parser("export-likes", help="Export liked tracks for TV video finder")
     p_export.add_argument("--out", required=True)
+    p_export.add_argument("--picks", type=int, default=0)
     p_export.add_argument("--force", action="store_true")
     p_export.set_defaults(func=lambda a, c: cmd_export_likes(c, a))
+
+    p_tv = sub.add_parser("tv-scores", help="Build TV channel score file from picks and videos")
+    p_tv.add_argument("--out", default=None)
+    p_tv.add_argument("--force", action="store_true")
+    p_tv.set_defaults(func=lambda a, c: cmd_tv_scores(c, a))
 
     p_check = sub.add_parser("check", help="Health checks for music pipeline")
     p_check.add_argument("--json", action="store_true")
