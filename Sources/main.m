@@ -4817,13 +4817,15 @@ static NSImage *StationTileImage(BOOL dimmed) {
 }
 
 static const CGFloat kTileCaptionBasePt = 11.5;
-static const CGFloat kTileCaptionFloorPt = 10.5;
+static const CGFloat kTileCaptionFloorPt = 10.0;
 
 static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width, CGFloat basePt) {
     CGFloat pt = basePt > 0 ? basePt : kTileCaptionBasePt;
     while (pt >= kTileCaptionFloorPt) {
         NSFont *font = [NSFont systemFontOfSize:pt];
-        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + 2 <= width) return pt;
+        // A label draws its text 2 pt in from each side, so it needs 4 pt of slack: with 2 the
+        // metric said "fits" and AppKit still drew "House Pa…".
+        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + 4 <= width) return pt;
         pt -= 0.5;
     }
     return kTileCaptionFloorPt;
@@ -7704,6 +7706,10 @@ static NSString *const kShowMixKey = @"show:episode";
     if (_showsScanBusy) return;
     _showsScanBusy = YES;
     _showsRootDate = mod;
+    // Made on first use, not only at launch: the popover is also built by the test harnesses,
+    // which never run the launch step, and dispatching onto a nil queue is a crash (it took
+    // the playback harness down with signal 11).
+    if (!_showsQueue) _showsQueue = dispatch_queue_create("com.iantodd.glancebar.shows", DISPATCH_QUEUE_SERIAL);
     dispatch_async(_showsQueue, ^{
         NSArray *episodes = [self scanShowEpisodesAtPath:root];
         dispatch_async(dispatch_get_main_queue(), ^{ [self applyShowsScanResult:episodes]; });
@@ -9724,13 +9730,15 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         [line addSubview:show];
         if (show.typeMark) {
             NSImageView *mark = [NSImageView imageViewWithImage:show.typeMark];
-            mark.frame = NSMakeRect(3, side - 19, 16, 16);
+            // An NSButton's own coordinates are flipped (y grows downward): 3 is the top.
+            mark.frame = NSMakeRect(3, 3, 16, 16);
             mark.accessibilityIdentifier = @"popover.music.show.typemark";
             [show addSubview:mark];
         }
         if (progress > 0) {
-            GBShowProgressView *bar = [[GBShowProgressView alloc] initWithFrame:NSMakeRect(0, 0, side, 3)];
-            bar.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+            // Bottom edge of the cover. The button is flipped, so the bottom is y = side - 3.
+            GBShowProgressView *bar = [[GBShowProgressView alloc] initWithFrame:NSMakeRect(0, side - 3, side, 3)];
+            bar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
             bar.fraction = progress;
             bar.accessibilityIdentifier = @"popover.music.show.progress";
             [show addSubview:bar];
@@ -9791,7 +9799,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSImage *typeMark = GBTypeMarkImage(@"dot.radiowaves.left.and.right");
         if (typeMark) {
             NSImageView *mark = [NSImageView imageViewWithImage:typeMark];
-            mark.frame = NSMakeRect(x + 3, capH + 3, 16, 16);
+            mark.frame = NSMakeRect(x + 3, capH + side - 19, 16, 16);   // top-left of the cover (this row is not flipped)
             mark.accessibilityIdentifier = @"popover.mix.station.typemark";
             [line addSubview:mark];
         }

@@ -128,8 +128,8 @@ fi
 GLANCEBAR_MUSIC_STATE=playing "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_MUSIC_STATE=idle "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=dislike "$WORK_DIR/glancebar_popover_tests"
-GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-row GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$HOME/.local/state/media-sync/renders}" "$WORK_DIR/glancebar_popover_tests"
-GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-playing GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$HOME/.local/state/media-sync/renders}" "$WORK_DIR/glancebar_popover_tests"
+GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-row GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
+GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-playing GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 if [[ -n "${GLANCEBAR_POPOVER_HARNESS_OUT:-}" ]]; then
     cp "$WORK_DIR/glancebar_popover_tests" "$GLANCEBAR_POPOVER_HARNESS_OUT"
 fi

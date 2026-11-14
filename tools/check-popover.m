@@ -1746,10 +1746,15 @@ int main(int argc, const char **argv) {
                 ![ShowTileCaptionLine2(day, @"Latifa Tee", utc) isEqual:showSub.stringValue])
                 return Fail(__LINE__);
             if (!CaptionFits(showCap) || !CaptionFits(showSub) || !CaptionFits(nmCap)) return Fail(__LINE__);
+            // The label's own test for "clipped" sets a tooltip with the full text: none here.
+            if (showCap.toolTip.length || showSub.toolTip.length || nmCap.toolTip.length) return Fail(__LINE__);
             if (fabs(prog.fraction - (72.0 / savedDur)) > 0.05) return Fail(__LINE__);
-            if (fabs(NSMinY(prog.frame)) > 1.0) return Fail(__LINE__);
-            if (fabs(NSMinY(stMark.frame) - NSMinY(station.frame) - 3) > 1.5) return Fail(__LINE__);
-            if (fabs(NSMinY(showMark.frame) - (NSHeight(show.bounds) - 19)) > 2.5) return Fail(__LINE__);
+            // The bar is on the cover's bottom edge (the button's coordinates are flipped).
+            if (fabs(NSMaxY(prog.frame) - NSHeight(show.bounds)) > 1.0 || NSHeight(prog.frame) > 3.5) return Fail(__LINE__);
+            // Type marks sit at the top-left of their covers; the badge is top-right.
+            if (!stMark || fabs(NSMaxY(stMark.frame) - (NSMaxY(station.frame) - 3)) > 1.5 ||
+                fabs(NSMinX(stMark.frame) - (NSMinX(station.frame) + 3)) > 1.5) return Fail(__LINE__);
+            if (!showMark || fabs(NSMinY(showMark.frame) - 3) > 1.5 || fabs(NSMinX(showMark.frame) - 3) > 1.5) return Fail(__LINE__);
             if ([c stationMosaicCovers].count < 4) return Fail(__LINE__);
             const char *musicRowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
             if (musicRowPNG && musicRowPNG[0] && strcmp(musicState, "shows-row") == 0) {
