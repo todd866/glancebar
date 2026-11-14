@@ -656,35 +656,26 @@ def cmd_collect(cfg: Dict[str, Any]) -> int:
     parts: List[Dict[str, Dict[str, Any]]] = []
     sources: Dict[str, Dict[str, Any]] = {}
 
-    st, tr = collect_shazam(expand(cfg["shazam_db"]))
-    sources["shazam"] = st
-    parts.append(tr)
-    print(f"shazam {st['count']} {st['ok']}")
-
-    st, tr = collect_hearts(cfg)
-    sources["glancebar"] = st
-    parts.append(tr)
-    print(f"glancebar {st['count']} {st['ok']}")
-
-    st, tr = collect_apple_music(cfg)
-    sources["apple-music"] = st
-    parts.append(tr)
-    print(f"apple-music {st['count']} {st['ok']}")
-
-    st, tr = collect_youtube(cfg)
-    sources["youtube"] = st
-    parts.append(tr)
-    print(f"youtube {st['count']} {st['ok']}")
-
-    st, tr = collect_tv_likes(cfg)
-    sources["tv"] = st
-    parts.append(tr)
-    print(f"tv {st['count']} {st['ok']}")
-
-    st, tr = collect_videos(cfg)
-    sources["video"] = st
-    parts.append(tr)
-    print(f"video {st['count']} {st['ok']}")
+    # `sources` in the config names the ones this Mac may speak for; the default is all.
+    # A Mac that only holds the TV's data must not publish stray likes from an old test run.
+    enabled = cfg.get("sources") or None
+    collectors = (
+        ("shazam", lambda: collect_shazam(expand(cfg["shazam_db"]))),
+        ("glancebar", lambda: collect_hearts(cfg)),
+        ("apple-music", lambda: collect_apple_music(cfg)),
+        ("youtube", lambda: collect_youtube(cfg)),
+        ("tv", lambda: collect_tv_likes(cfg)),
+        ("video", lambda: collect_videos(cfg)),
+    )
+    for name, fn in collectors:
+        if enabled and name not in enabled:
+            sources[name] = source_status(False, 0, "off")
+            print(f"{name} off")
+            continue
+        st, tr = fn()
+        sources[name] = st
+        parts.append(tr)
+        print(f"{name} {st['count']} {st['ok']}")
 
     tracks = merge_track_dicts(parts)
     apply_owned(tracks, expand(cfg["catalogue"]))
@@ -898,7 +889,7 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 st = "warn"
                 fact = f"{fact}; age {age_fact(age_h * 3600)}"
             for name, src in (doc.get("sources") or {}).items():
-                if not src.get("ok") and src.get("error") not in ("", "missing", None):
+                if not src.get("ok") and src.get("error") not in ("", "missing", "off", None):
                     st = "warn" if st == "pass" else st
                     fact = f"{fact}; {name}: {src.get('error')}"
         rows.append(make_row("ledger", st, fact, host, detail))
@@ -1163,6 +1154,11 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 fact = f"{n} music likes"
         rows.append(make_row("tv likes", st, fact, host))
 
+    # `check.rows` names the rows this Mac answers for; the default is every row whose input
+    # exists here. (A Mac can hold a leftover file that belongs to another Mac's job.)
+    wanted = chk.get("rows") or None
+    if wanted:
+        rows = [r for r in rows if r.get("name") in wanted]
     local_rows = list(rows)
     peer_stale_h = float(chk.get("peer_stale_h", 50))
     if share.is_dir():
@@ -1195,7 +1191,12 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 continue
             for pr in doc.get("rows") or []:
                 if isinstance(pr, dict):
-                    rows.append(pr)
+                    # Say whose row it is: two Macs both have a `ledger` row.
+                    named = dict(pr)
+                    named["name"] = f"{peer_host} {pr.get('name') or 'check'}"
+                    named["key"] = f"media:{peer_host}:{pr.get('name') or 'check'}"
+                    named["host"] = peer_host
+                    rows.append(named)
 
     summary = summarise_check(rows)
     doc_out = {

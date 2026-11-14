@@ -176,9 +176,19 @@ def remote_object_meta(remote, relpath):
     return {'sizeBytes': int(row.get('Size') or row.get('size') or 0), 'sha256': sha}
 
 
-def remote_confirms_catalogue(remote, relpath, entry, meta=None):
-    """True when the remote object matches catalogue size and hash when reported."""
-    meta = meta if meta is not None else remote_object_meta(remote, relpath)
+_ASK_REMOTE = object()
+
+
+def remote_confirms_catalogue(remote, relpath, entry, meta=_ASK_REMOTE):
+    """True when the remote object matches catalogue size and hash when reported.
+
+    `meta` is what a lookup already answered; None means the object is not there. Only when
+    no answer is passed is the remote asked. (None used to mean "ask", so a caller's own
+    lookup that found nothing fell through to the real rclone: a unit test reached the
+    network, and failed on a Mac with no rclone.)
+    """
+    if meta is _ASK_REMOTE:
+        meta = remote_object_meta(remote, relpath)
     if not meta:
         return False, 'remote object missing'
     expected_size = int(entry.get('sizeBytes') or 0)

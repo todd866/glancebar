@@ -344,6 +344,43 @@ class CheckRowsTest(MediaSyncTestBase):
         os.utime(log, (self.t0 - 40 * 3600, self.t0 - 40 * 3600))
         self.assertEqual(self.tv_row()["status"], "warn")
 
+    def test_a_mac_answers_only_for_its_own_sources_and_rows(self):
+        # Leftovers on a Mac that only serves the TV: an old likes file and its stale log.
+        (self.root / "liked-pulled.json").write_text(json.dumps({"done": {"Old|Test": {"track_id": 1}}}), encoding="utf-8")
+        log = self.root / "mixpool/logs/pull-liked.log"
+        log.write_text("x", encoding="utf-8")
+        os.utime(log, (self.t0 - 9 * 86400, self.t0 - 9 * 86400))
+        (self.root / "tv-storage.json").write_text(json.dumps({"onto.tv.likes": "{}"}), encoding="utf-8")
+        self.cfg["sources"] = ["tv", "video"]
+        self.assertEqual(ms.cmd_collect(self.cfg), 0)
+        doc = json.loads((self.share / "signals-testhost.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["sources"]["apple-music"], {"ok": False, "count": 0, "error": "off"})
+        self.assertNotIn(ms.track_key("Old", "Test"), doc["tracks"])
+        self.run_check()
+        names = [r["name"] for r in json.loads((self.state / "check.json").read_text(encoding="utf-8"))["rows"]]
+        self.assertIn("favourites", names)   # unfiltered: the leftover shows (and fails)
+        self.cfg["check"]["rows"] = ["ledger", "tv likes"]
+        self.run_check()
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(r["name"] for r in doc["rows"]), ["ledger", "tv likes"])
+        self.assertEqual(doc["status"], "pass")   # 'off' sources are not a ledger warning
+
+    def test_rows_from_another_mac_carry_its_name(self):
+        self.write_ledger()
+        peer = {"version": 1, "host": "other", "generated": int(self.t0), "status": "fail",
+                "rows": [{"key": "media:upload", "status": "fail", "name": "upload", "host": "other",
+                          "value": "failed", "datum": "", "detail": "failed 2 h ago"}]}
+        (self.share / "check-other.json").write_text(json.dumps(peer), encoding="utf-8")
+        os.utime(self.share / "check-other.json", (self.t0, self.t0))
+        self.run_check()
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        row = [r for r in doc["rows"] if r["host"] == "other"][0]
+        self.assertEqual((row["name"], row["key"], row["status"]), ("other upload", "media:other:upload", "fail"))
+        self.assertEqual(doc["datum"], "other upload")
+        # What this Mac publishes for the others holds only its own rows.
+        mine = json.loads((self.share / "check-testhost.json").read_text(encoding="utf-8"))
+        self.assertFalse([r for r in mine["rows"] if r.get("host") == "other"])
+
     def test_shazam_waiting_warn(self):
         self.write_shazam_db()
         ms.cmd_collect(self.cfg)

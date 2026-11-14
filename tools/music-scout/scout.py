@@ -1352,6 +1352,7 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
     data = json.loads(paths.candidates.read_text(encoding="utf-8"))
     candidates = data.get("candidates") or []
     owned = owned_keys(cfg, paths)
+    really_owned = ownership_sources(cfg, paths)
     owned_artist_set = owned_artists(cfg, paths)
     feedback = load_feedback([Path(p).expanduser() for p in cfg["feedback_paths"]])
     hearts_path = Path(cfg["hearts_path"]).expanduser()
@@ -1388,7 +1389,12 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         if key in seen:
             continue
         seen.add(key)
-        if key in rejected or key in owned or normal(key) in hearts:
+        if key in rejected or normal(key) in hearts:
+            continue
+        # `owned` also holds everything the scout has ever offered, so it does not repeat
+        # itself. A Shazam or a TV like is his own signal: only a real copy (or a search
+        # that found nothing) stops it, not a dry-run offer from last week.
+        if key in (really_owned if c.get("priority") else owned):
             continue
         scored = dict(c)
         scored["score"] = score_candidate(
