@@ -11,9 +11,10 @@ likes count as likes.
 ## Commands
 
 ```bash
-tools/media-sync/media_sync.py collect   # write share/signals-<host>.json
+tools/media-sync/media_sync.py collect   # write share/signals-<host>.json (+ picks when configured)
 tools/media-sync/media_sync.py show      # merged human view
-tools/media-sync/media_sync.py export-likes --out PATH
+tools/media-sync/media_sync.py export-likes --out PATH [--picks N]
+tools/media-sync/media_sync.py tv-scores [--out PATH] [--force]
 tools/media-sync/media_sync.py check     # PASS/WARN/FAIL lines + check.json
 ```
 
@@ -33,6 +34,11 @@ All commands accept `--config PATH` (default `~/.config/glancebar/media-sync.jso
 | `yt_liked_dir` / `music_sync_inventory` | YouTube likes files or inventory fallback |
 | `catalogue` | music-library cache | `owned` matching |
 | `tv_storage` / `tv_music_videos` | off unless set | TV likes and on-disk videos |
+| `rotations` | one `triplej` scores path | station score files for `collect` picks |
+| `picks_min_score` / `picks_max` | `2.0` / `300` | threshold and cap for published picks |
+| `tv_channel_scores` | `""` | output path for `tv-scores` (empty = off) |
+| `tv_src_prefix` | `music` | catalogue `src` prefix for on-disk videos |
+| `sources` | all collectors + `picks` | omit `picks` to skip `picks-<host>.json` |
 | `check` | thresholds object | overrides for row timing (see below) |
 
 Paths under `mixpool_state`, `apple_music_dir`, `music_library_state`, `scout_state`,
@@ -52,6 +58,7 @@ Paths under `mixpool_state`, `apple_music_dir`, `music_library_state`, `scout_st
 | `triple j` | no `station.json` | selector station refresh |
 | `tv videos` | `tv_video_log` empty | liked songs with a video file + log age |
 | `tv likes` | `tv_storage` empty | TV-side likes readability |
+| `tv channel` | `tv_channel_scores` empty | per-station video counts vs picks; file age |
 | peer `check-*.json` | — | other Mac rows or stale warning |
 
 Default thresholds live under `check` in config (hours/days as in the brief).
@@ -59,5 +66,7 @@ Default thresholds live under `check` in config (hours/days as in the brief).
 ## Files written
 
 - `<share>/signals-<host>.json` — this Mac’s signals (`SCHEMA.md` in repo brief)
+- `<share>/picks-<host>.json` — station rotation picks scored for taste (M5 by default)
+- `<tv_channel_scores>` — TV channel membership and scores (M2 when set)
 - `<share>/check-<host>.json` — this Mac’s check rows for peers
 - `<state_dir>/check.json` — local rows plus fresh peer rows

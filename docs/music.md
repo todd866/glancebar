@@ -83,18 +83,24 @@ What reads it:
   `playback.jsonl`). The scout refreshes the record itself before it reads candidates.
 - **TV music videos** (M2, `com.iantodd.selector-media`, 18:30Z): `export-likes` rewrites the
   finder's `likes.json` from every like on every surface before each pass (it keeps the old
-  list if the new one is empty or under 80% of it). A Shazam alone gets no video.
+  list if the new one is empty or under 80% of liked rows). `--picks N` appends up to N
+  rotation picks per station that lack a video. A Shazam alone gets no video.
+- **TV channel scores** (M2): `tv-scores` merges every `picks-*.json` from the share with the
+  on-disk music-video tree into `tv_channel_scores` (per-station `src` → score/why). The TV
+  stack reads that file for station channels such as triple j.
+- **Station picks** (M5): `collect` also writes `picks-<host>.json` from each `rotations`
+  scores file (threshold, dislike filter, rank-normalised score).
 - **The check**: `media_sync.py check` prints `PASS|WARN|FAIL name: fact` and writes
   `~/.local/state/media-sync/check.json`. Rows: `ledger`, `shazam` (fresh ones waiting more
   than 3 days), `favourites`, `offload`, `scout`, `hot set`, `triple j` on the M5; `upload`,
-  `tv videos`, `tv likes` on the M2. Each Mac also publishes its own rows to the shared
+  `tv videos`, `tv likes`, `tv channel` on the M2. Each Mac also publishes its own rows to the shared
   folder, so either Mac's check shows the whole chain. It runs in the menu-bar morning check
   (M5, 18:15Z) and at the end of the M2's music-video pass.
 - **Fleet**: `.fleet/check` names that result file; `fleet morning` reads it into a
   `check glancebar` row of the digest (fleet `docs/morning.md`, "The result file").
 
 Site config is `~/.config/glancebar/media-sync.json` on each Mac (`host`; on the M2 also
-`tv_storage`, `tv_music_videos`, `tv_video_log`).
+`tv_storage`, `tv_music_videos`, `tv_video_log`, `tv_channel_scores`).
 
 ## Scout acquisition timeline (M5)
 
