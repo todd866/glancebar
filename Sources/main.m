@@ -4979,7 +4979,11 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
     BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
                      mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
     BOOL clipped = truncates && self.stringValue.length &&
-        self.attributedStringValue.size.width + 8 > NSWidth(self.bounds);   // AppKit truncates below text + 8
+        // Known gap (14 Nov 2026): AppKit truncates a label below text + 8, so a label within
+        // 4 to 8 pt of its field is cut with no tooltip. Using 8 here flags labels across the
+        // popover and fails its fit check, so it needs its own pass. Tile captions do not
+        // depend on this: they are sized with kLabelPad.
+        self.attributedStringValue.size.width + 4 > NSWidth(self.bounds);
     if (self.maximumNumberOfLines > 1 && self.stringValue.length && self.font)   // a wrapping label clips past its last line
         clipped = NSHeight([self.stringValue boundingRectWithSize:NSMakeSize(NSWidth(self.bounds) - 4, 1000)
                                                           options:NSStringDrawingUsesLineFragmentOrigin
