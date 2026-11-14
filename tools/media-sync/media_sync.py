@@ -372,12 +372,35 @@ def collect_hearts(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[
         )
         count += 1
     fb_path = expand(cfg["glancebar_feedback"])
+    disliked: Dict[str, str] = {}
+    for row in read_jsonl(fb_path):
+        key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
+        if not key:
+            continue
+        event = row.get("event")
+        at = row.get("at")
+        at_iso = epoch_to_iso(at) if not isinstance(at, str) else str(at or "")
+        if event == "dislike":
+            disliked[key] = at_iso
+        elif event == "undislike":
+            disliked.pop(key, None)
+        elif row.get("liked"):
+            disliked.pop(key, None)
+    for key, at_iso in disliked.items():
+        if "|" not in key:
+            continue
+        artist, title = key.split("|", 1)
+        tr = tracks.setdefault(key, empty_track(artist, title))
+        add_signal(tr, {"kind": "dislike", "source": "glancebar", "at": at_iso})
+        count += 1
     for row in read_jsonl(fb_path):
         if not row.get("liked"):
             continue
         artist = str(row.get("artist") or "")
         title = str(row.get("title") or "")
-        key = track_key(artist, title)
+        key = row.get("track_key") or track_key(artist, title)
+        if key in disliked:
+            continue
         tr = tracks.setdefault(key, empty_track(artist, title))
         add_signal(
             tr,

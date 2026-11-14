@@ -77,8 +77,8 @@ What reads it:
   the TV, is ranked ahead of every other candidate, inside the normal weekly budget, and
   shows in New music with its reason ("Shazamed 14 Nov"). Older Shazams are ordinary
   candidates, five a night at most. Heart it and it is a favourite; leave it and it ages out
-  after `fresh_days`. A track is never offered again once it is rejected: a dislike, or
-  skipped with Next within the first 40% on two separate days in the New music playlist
+  after `fresh_days`. A track is never offered again once it is rejected by the dislike
+  button, or by two early skips with Next within the first 40% on two separate days in the New music playlist
   without ever being played to the end (judged by the clock between track starts in
   `playback.jsonl`). The scout refreshes the record itself before it reads candidates.
 - **TV music videos** (M2, `com.iantodd.selector-media`, 18:30Z): `export-likes` rewrites the
@@ -187,7 +187,7 @@ carries the track, the position and the current output.
 system log whether each remote command came from a Bluetooth device. Causes: `click`,
 `click-next`, `click-previous`, `playlist`, `remote-pause`, `remote-play`, `remote-toggle`
 (a keyboard play/pause key sends toggle; headphones send a separate pause or play),
-`auto-advance`, `crossfade`, `drop`, `devices-changed`, `output-changed`, `sleep`.
+`auto-advance`, `crossfade`, `drop`, `dislike`, `devices-changed`, `output-changed`, `sleep`.
 `unattributed` means the app did not ask for the change: read the events just before it.
 
 Found with the system log before this existed: on 12 Nov 2026 the music "cut in and out"

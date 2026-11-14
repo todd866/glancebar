@@ -5931,6 +5931,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSMutableSet<NSString *> *_mixPreparing;
     NSMutableDictionary<NSString *, NSImage *> *_mixArt;       // track id → cover
     NSMutableSet<NSString *> *_mixLiked;                       // track ids given a 👍 (mix/feedback.jsonl)
+    NSMutableSet<NSString *> *_mixDisliked;                    // keys / track ids disliked (mix/feedback.jsonl)
     NSString *_mixPlayingKey, *_mixStartingKey;
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
     NSDictionary *_offlineManifest;
@@ -7386,6 +7387,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
             NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
             if (!trackKey.length || !title.length) continue;
+            if ([[self mixDisliked] containsObject:trackKey]) continue;
             NSString *album = [row[@"album"] isKindOfClass:NSString.class] ? row[@"album"] : @"";
             NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObjectsAndKeys:trackKey, @"id", title, @"title",
                                           artist, @"artist", album, @"album", nil];
@@ -7429,6 +7431,8 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         NSString *file = [row[@"file"] isKindOfClass:NSString.class] ? row[@"file"] : ([row[@"path"] isKindOfClass:NSString.class] ? row[@"path"] : @"");
         NSMutableDictionary *track = [NSMutableDictionary dictionaryWithObject:[NSString stringWithFormat:@"station:%lu:%@", (unsigned long)i, file] forKey:@"id"];
         for (NSString *field in @[@"title", @"artist", @"album"]) track[field] = [row[field] isKindOfClass:NSString.class] ? row[field] : @"";
+        NSString *rowKey = SelectorTrackKey(track[@"artist"], track[@"title"]);
+        if (rowKey.length && [[self mixDisliked] containsObject:rowKey]) continue;
         [tracks addObject:track];
         if (file.length) { NSMutableDictionary *source = [track mutableCopy]; source[@"path"] = file; [sources addObject:source]; }
     }
@@ -8284,8 +8288,66 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (!_localMode) return;
     NSDictionary *ident = [self currentLocalIdentity];
     NSString *key = ident[@"trackKey"] ?: @"";
+    NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : key;
     if (key.length && [[self heartedKeys] containsObject:key]) [self unloveCurrentLocalTrack];
-    else [self loveCurrentLocalTrack];
+    else {
+        if ([self trackIsMixDisliked:thumbID trackKey:key]) [self clearMixDislikeForIdentity:ident];
+        [self loveCurrentLocalTrack];
+    }
+}
+- (void)appendMixFeedbackLine:(NSString *)line {
+    if (!line.length) return;
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    [fh seekToEndOfFile];
+    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+- (NSMutableSet<NSString *> *)mixDisliked {
+    if (!_mixDisliked) {
+        NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+        _mixDisliked = [MixDislikedKeys([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]) mutableCopy];
+    }
+    return _mixDisliked;
+}
+- (BOOL)trackIsMixDisliked:(NSString *)thumbID trackKey:(NSString *)trackKey {
+    NSSet *set = [self mixDisliked];
+    return (thumbID.length && [set containsObject:thumbID]) || (trackKey.length && [set containsObject:trackKey]);
+}
+- (void)clearMixDislikeForIdentity:(NSDictionary *)ident {
+    NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"];
+    NSString *trackKey = ident[@"trackKey"] ?: @"";
+    if (!thumbID.length && !trackKey.length) return;
+    NSString *line = MixDislikeLine(thumbID ?: @"", trackKey, ident[@"title"] ?: _localTitle, ident[@"artist"] ?: _localArtist, NO, NSDate.date);
+    [self appendMixFeedbackLine:line];
+    if (thumbID.length) [[self mixDisliked] removeObject:thumbID];
+    if (trackKey.length) [[self mixDisliked] removeObject:trackKey];
+    for (NSUInteger i = 0; i < _mixLibrary.count; i++) {
+        NSString *libID = _mixLibrary[i][@"id"];
+        if ((thumbID.length && [libID isEqual:thumbID]) || (trackKey.length && [SelectorTrackKey(_mixLibrary[i][@"artist"], _mixLibrary[i][@"title"]) isEqual:trackKey])) {
+            NSMutableArray *lib = [_mixLibrary mutableCopy];
+            NSMutableDictionary *t = [lib[i] mutableCopy];
+            [t removeObjectForKey:@"dislike"];
+            lib[i] = t;
+            _mixLibrary = lib;
+            break;
+        }
+    }
+}
+- (void)removeStationTracksForKey:(NSString *)trackKey {
+    if (!trackKey.length || !_stationTracks.count) return;
+    NSMutableArray *tracks = [NSMutableArray array], *picks = [NSMutableArray array];
+    for (NSUInteger i = 0; i < _stationTracks.count; i++) {
+        NSDictionary *t = _stationTracks[i];
+        NSString *kid = [t[@"id"] isKindOfClass:NSString.class] ? t[@"id"] : @"";
+        NSString *k = kid.length ? kid : SelectorTrackKey(t[@"artist"], t[@"title"]);
+        if ([k isEqual:trackKey]) continue;
+        [tracks addObject:t];
+        if (i < _stationPicks.count) [picks addObject:_stationPicks[i]];
+    }
+    _stationTracks = tracks;
+    _stationPicks = picks;
 }
 - (NSMutableSet<NSString *> *)mixLiked {
     if (!_mixLiked) {
@@ -8299,18 +8361,14 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (!_localMode) return;
     NSDictionary *ident = [self currentLocalIdentity];
     NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"];
+    NSString *trackKey = ident[@"trackKey"] ?: @"";
     if (!thumbID.length) return;
+    if ([self trackIsMixDisliked:thumbID trackKey:trackKey]) [self clearMixDislikeForIdentity:ident];
     BOOL liked = ![[self mixLiked] containsObject:thumbID];
     if (liked) [_mixLiked addObject:thumbID]; else [_mixLiked removeObject:thumbID];
     NSString *title = ident[@"title"] ?: _localTitle;
     NSString *artist = ident[@"artist"] ?: _localArtist;
-    NSString *line = MixFeedbackLine(thumbID, title, artist, liked, NSDate.date);
-    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
-    if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    [fh seekToEndOfFile];
-    [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-    [fh closeFile];
+    [self appendMixFeedbackLine:MixFeedbackLine(thumbID, title, artist, liked, NSDate.date)];
     for (NSUInteger i = 0; i < _mixLibrary.count; i++)
         if ([_mixLibrary[i][@"id"] isEqual:thumbID]) {
             NSMutableArray *lib = [_mixLibrary mutableCopy]; NSMutableDictionary *t = [lib[i] mutableCopy];
@@ -8320,6 +8378,57 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         [self appendSelectorFeedbackForArtist:artist title:title source:@"local"];
         NSString *heartKey = ident[@"trackKey"];
         if (heartKey.length && ![[self heartedKeys] containsObject:heartKey]) [self loveCurrentLocalTrack];
+    }
+    if (_popover.isShown) [self rebuildContent];
+}
+- (IBAction)musicThumbsDown:(id)sender {
+    (void)sender;
+    if (!_localMode) return;
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *thumbID = [ident[@"trackID"] length] ? ident[@"trackID"] : ident[@"trackKey"];
+    NSString *trackKey = ident[@"trackKey"] ?: @"";
+    if (!thumbID.length && !trackKey.length) return;
+    NSString *title = ident[@"title"] ?: _localTitle;
+    NSString *artist = ident[@"artist"] ?: _localArtist;
+    BOOL disliked = [self trackIsMixDisliked:thumbID trackKey:trackKey];
+    NSString *line = MixDislikeLine(thumbID ?: @"", trackKey, title, artist, !disliked, NSDate.date);
+    [self appendMixFeedbackLine:line];
+    if (!disliked) {
+        if (thumbID.length) [[self mixDisliked] addObject:thumbID];
+        if (trackKey.length) [[self mixDisliked] addObject:trackKey];
+        if (thumbID.length) [[self mixLiked] removeObject:thumbID];
+        if (trackKey.length && [[self heartedKeys] containsObject:trackKey]) [self unloveCurrentLocalTrack];
+        for (NSUInteger i = 0; i < _mixLibrary.count; i++) {
+            NSString *libID = _mixLibrary[i][@"id"];
+            if ((thumbID.length && [libID isEqual:thumbID]) || (trackKey.length && [SelectorTrackKey(_mixLibrary[i][@"artist"], _mixLibrary[i][@"title"]) isEqual:trackKey])) {
+                NSMutableArray *lib = [_mixLibrary mutableCopy];
+                NSMutableDictionary *t = [lib[i] mutableCopy];
+                t[@"dislike"] = @YES;
+                t[@"thumb"] = @NO;
+                lib[i] = t;
+                _mixLibrary = lib;
+                break;
+            }
+        }
+        [self removeStationTracksForKey:trackKey.length ? trackKey : thumbID];
+        NSString *path = (_localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count) ? _localURLs[_localIndex].path : nil;
+        [self playbackUserCause:@"dislike"];
+        if (path.length) [self dropLocalPath:path reason:@"dislike"];
+        else if (_popover.isShown) [self rebuildContent];
+        return;
+    }
+    if (thumbID.length) [[self mixDisliked] removeObject:thumbID];
+    if (trackKey.length) [[self mixDisliked] removeObject:trackKey];
+    for (NSUInteger i = 0; i < _mixLibrary.count; i++) {
+        NSString *libID = _mixLibrary[i][@"id"];
+        if ((thumbID.length && [libID isEqual:thumbID]) || (trackKey.length && [SelectorTrackKey(_mixLibrary[i][@"artist"], _mixLibrary[i][@"title"]) isEqual:trackKey])) {
+            NSMutableArray *lib = [_mixLibrary mutableCopy];
+            NSMutableDictionary *t = [lib[i] mutableCopy];
+            [t removeObjectForKey:@"dislike"];
+            lib[i] = t;
+            _mixLibrary = lib;
+            break;
+        }
     }
     if (_popover.isShown) [self rebuildContent];
 }
@@ -8604,13 +8713,20 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         }
         [row addSubview:heart];
         BOOL liked = thumbID.length && [[self mixLiked] containsObject:thumbID];
+        BOOL disliked = [self trackIsMixDisliked:thumbID trackKey:key];
         NSButton *thumb = [self transportButton:liked ? @"hand.thumbsup.fill" : @"hand.thumbsup" pointSize:14 side:22
                                          action:@selector(musicThumbsUp:) identifier:@"popover.music.thumbsup"
                                           label:liked ? @"Remove thumbs-up" : @"Thumbs-up: mixes should play more like this"];
         thumb.frame = NSOffsetRect(heart.frame, -22, 0);
         thumb.contentTintColor = liked ? NSColor.systemBlueColor : NSColor.secondaryLabelColor;
         [row addSubview:thumb];
-        textRight = NSMinX(thumb.frame) - 6;
+        NSButton *thumbsDown = [self transportButton:disliked ? @"hand.thumbsdown.fill" : @"hand.thumbsdown" pointSize:14 side:22
+                                               action:@selector(musicThumbsDown:) identifier:@"popover.music.thumbsdown"
+                                                label:disliked ? @"Remove dislike" : @"Dislike: skip this and never play it again"];
+        thumbsDown.frame = NSOffsetRect(thumb.frame, -22, 0);
+        thumbsDown.contentTintColor = disliked ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+        [row addSubview:thumbsDown];
+        textRight = NSMinX(thumbsDown.frame) - 6;
     }
     CGFloat textW = textRight - textX;
     NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
