@@ -1550,6 +1550,66 @@ int main(int argc, const char **argv) {
             [c setValue:oldUID forKey:@"defaultOutputUID"];
             [c rebuildContent];
             root = p.contentViewController.view;
+        } else if (musicState && strcmp(musicState, "shows-row") == 0) {
+            NSDate *day = [NSDate dateWithTimeIntervalSince1970:1763107200];
+            NSString *epA = [fixtureMusic stringByAppendingPathComponent:@"House Party/2026-11-14-ep1.m4a"];
+            NSString *epB = [fixtureMusic stringByAppendingPathComponent:@"House Party/2026-11-07-ep2.m4a"];
+            NSString *epC = [fixtureMusic stringByAppendingPathComponent:@"House Party/2026-11-01-ep3.m4a"];
+            [NSFileManager.defaultManager createDirectoryAtPath:[epA stringByDeletingLastPathComponent]
+                                    withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"silent show" writeToFile:epA atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"silent show" writeToFile:epB atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"silent show" writeToFile:epC atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSDictionary *showsState = @{@"version": @1, @"episodes": @{
+                epA: @{@"position": @72, @"duration": @240, @"finished": @NO, @"updated": @"2026-11-14T09:00:00Z"}}};
+            NSString *showsPath = [fixtureHome stringByAppendingPathComponent:
+                                   @"Library/Application Support/Glancebar/mix/shows.json"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:[showsPath stringByDeletingLastPathComponent]
+                                    withIntermediateDirectories:YES attributes:nil error:nil];
+            [ShowsStateToJSON(showsState) writeToFile:showsPath atomically:YES];
+            NSImage *cover = [NSImage imageWithSize:NSMakeSize(54, 54) flipped:NO drawingHandler:^BOOL(NSRect r) {
+                [[NSColor systemTealColor] setFill]; NSRectFill(r); return YES;
+            }];
+            NSArray *episodes = @[
+                @{@"path": epA, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                @{@"path": epB, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                @{@"path": epC, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240}];
+            NSDictionary *offer = ShowsPickOfferedEpisode(episodes, showsState);
+            [c setValue:@YES forKey:@"showsLoaded"];
+            [c setValue:episodes forKey:@"showEpisodes"];
+            [c setValue:offer forKey:@"showOffered"];
+            [c setValue:showsState forKey:@"showsState"];
+            NSMutableDictionary *covers = [NSMutableDictionary dictionary];
+            covers[epA] = cover; covers[epB] = cover; covers[epC] = cover;
+            [c setValue:covers forKey:@"showCoverCache"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSView *mix = FindIdentifier(root, @"popover.mix");
+            GBShowTile *show = (GBShowTile *)FindIdentifier(root, @"popover.music.show");
+            NSButton *seed2 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.2");
+            GBStationTile *station = (GBStationTile *)FindIdentifier(root, @"popover.mix.station");
+            NSTextField *cap = (NSTextField *)FindIdentifier(root, @"popover.music.show.caption");
+            GBShowProgressView *prog = (GBShowProgressView *)FindIdentifier(root, @"popover.music.show.progress");
+            if (!mix || ![show isKindOfClass:GBShowTile.class] || !seed2 || !station) return Fail(__LINE__);
+            if (NSMinX(show.frame) < NSMaxX(seed2.frame) - 0.5 || NSMinX(station.frame) < NSMaxX(show.frame) - 0.5)
+                return Fail(__LINE__);
+            if (![cap.stringValue isEqual:@"House Party"]) return Fail(__LINE__);
+            if (cap.stringValue.length < 11) return Fail(__LINE__);
+            if (!prog || fabs(prog.fraction - 0.3) > 0.05) return Fail(__LINE__);
+            const char *musicRowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (musicRowPNG && musicRowPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:musicRowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"show-tile-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"show-tile-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+            }
+            [c setValue:nil forKey:@"showOffered"];
+            [c setValue:@[] forKey:@"showEpisodes"];
+            [c setValue:@NO forKey:@"showsLoaded"];
+            [c setValue:[NSMutableDictionary dictionary] forKey:@"showCoverCache"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
         } else if (musicState && strcmp(musicState, "dislike") == 0) {
             NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];
             NSString *trackB = [fixtureMusic stringByAppendingPathComponent:@"dislike-b.m4a"];

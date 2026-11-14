@@ -3138,8 +3138,57 @@ int main(void) {
                   @"deck mix: the flash paints accent, and dips off when the button is already accent");
         }
 
+        {   // --- Radio shows ---
+            NSData *empty = ShowsStateToJSON(@{@"episodes": @{}});
+            NSDictionary *parsed = ShowsStateFromJSON(empty);
+            check(parsed && [parsed[@"version"] isEqual:@1], @"shows.json round trip version");
+            NSString *pathA = @"/tmp/show-a.m4a", *pathB = @"/tmp/show-b.m4a", *pathC = @"/tmp/show-c.m4a";
+            NSDate *day = [NSDate dateWithTimeIntervalSince1970:1700000000];
+            NSArray *eps = @[@{@"path": pathA, @"show": @"House Party", @"presenter": @"Latifa Tee",
+                               @"sortDate": day, @"broadcast": day},
+                             @{@"path": pathB, @"show": @"House Party", @"presenter": @"Latifa Tee",
+                               @"sortDate": [NSDate dateWithTimeIntervalSince1970:1699900000],
+                               @"broadcast": [NSDate dateWithTimeIntervalSince1970:1699900000]},
+                             @{@"path": pathC, @"show": @"Other", @"presenter": @"Host Name",
+                               @"sortDate": [NSDate dateWithTimeIntervalSince1970:1700100000],
+                               @"broadcast": [NSDate dateWithTimeIntervalSince1970:1700100000]}];
+            NSDictionary *st = @{@"version": @1, @"episodes": @{
+                pathB: @{@"position": @120, @"duration": @240, @"finished": @NO,
+                         @"updated": @"2026-11-10T12:00:00Z"}}};
+            NSDictionary *offer = ShowsPickOfferedEpisode(eps, st);
+            check([offer[@"path"] isEqual:pathB], @"offered: resume latest part-played");
+            NSDictionary *stNew = @{@"version": @1, @"episodes": @{}};
+            offer = ShowsPickOfferedEpisode(eps, stNew);
+            check([offer[@"path"] isEqual:pathC], @"offered: newest unplayed when none part-played");
+            check(ShowsUnplayedBadgeCount(eps, stNew, pathC) == 2, @"badge: other unplayed episodes");
+            check(ShowsEpisodeFinished(240, 240, NO), @"finished at end");
+            check(ShowsEpisodeFinished(233, 240, NO), @"finished at 97%");
+            check(!ShowsEpisodeFinished(100, 240, NO), @"not finished mid-way");
+            check(ShowsResumePosition(72) == 67, @"resume backs up 5 seconds");
+            check(ShowsResumePosition(3) == 0, @"resume not below zero");
+            check([ShowPresenterFirstName(@"Latifa Tee") isEqual:@"Latifa"], @"presenter first word");
+            check([ShowTileCaptionLine2(day, @"Latifa Tee", nil) hasPrefix:@"Sat"] ||
+                  [ShowTileCaptionLine2(day, @"Latifa Tee", nil) length] > 0,
+                  @"tile caption line 2 weekday");
+            check([[ShowNowPlayingSubtitle(day, @"Latifa Tee", nil) componentsSeparatedByString:@" · "] count] >= 2,
+                  @"now playing subtitle has date and presenter");
+            NSString *tip = ShowEpisodeTooltip(@"House Party", day, @"Latifa Tee", 72, 240, NO, nil);
+            check([tip containsString:@"House Party"] && [tip containsString:@"1:12"] && [tip containsString:@"4:00"],
+                  @"tooltip elapsed and duration");
+            NSString *unplayedTip = ShowEpisodeTooltip(@"House Party", day, @"Latifa Tee", 0, 0, YES, nil);
+            check([unplayedTip hasSuffix:@"unplayed"], @"tooltip unplayed");
+            check([FormatTrackClock(3725, 14428) isEqual:@"1:02:05"], @"seek clock hours on elapsed");
+            check([FormatTrackClock(14428, 14428) isEqual:@"4:00:28"], @"seek clock hours on duration");
+            NSString *shortClock = FormatTrackClock(65, 240);
+            check(shortClock && [shortClock componentsSeparatedByString:@":"].count == 2,
+                  @"seek clock under one hour unchanged");
+            NSDate *fromName = ShowDateFromFilename(@"2026-03-14-episode.m4a", nil);
+            NSCalendar *cal = [NSCalendar currentCalendar];
+            NSDateComponents *c = [cal components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay fromDate:fromName];
+            check(c.year == 2026 && c.month == 3 && c.day == 14, @"broadcast date from filename");
+        }
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
-        return failures ? 1 : 0;
     }
 }

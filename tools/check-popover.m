@@ -1,4 +1,5 @@
 // Render the real popover offscreen; never launch the app, status item, or samplers.
+#import <math.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #pragma clang diagnostic ignored "-Watomic-property-with-user-defined-accessor"
@@ -186,6 +187,123 @@ static BOOL RenderOffscreen(NSView *view, NSString *path, NSAppearanceName appea
     NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
     return [png writeToFile:path atomically:YES];
 }
+static BOOL WriteToneWAV(NSString *path, double hz, double seconds) {
+    const int sampleRate = 44100;
+    int frames = (int)(sampleRate * seconds + 0.5);
+    if (frames < 1) return NO;
+    NSMutableData *pcm = [NSMutableData dataWithLength:(NSUInteger)frames * 2];
+    int16_t *samples = pcm.mutableBytes;
+    for (int i = 0; i < frames; i++) {
+        double t = (double)i / sampleRate;
+        int16_t s = (int16_t)lrint(0.12 * sin(2.0 * M_PI * hz * t) * 32767.0);
+        samples[i] = s;
+    }
+    uint32_t dataBytes = (uint32_t)pcm.length, riffSize = 36 + dataBytes;
+    NSMutableData *wav = [NSMutableData data];
+    [wav appendBytes:"RIFF" length:4]; [wav appendBytes:&riffSize length:4]; [wav appendBytes:"WAVE" length:4];
+    [wav appendBytes:"fmt " length:4];
+    uint32_t fmtSize = 16; [wav appendBytes:&fmtSize length:4];
+    uint16_t audioFormat = 1, channels = 1; [wav appendBytes:&audioFormat length:2]; [wav appendBytes:&channels length:2];
+    uint32_t rate = (uint32_t)sampleRate; [wav appendBytes:&rate length:4];
+    uint32_t byteRate = rate * 2; [wav appendBytes:&byteRate length:4];
+    uint16_t blockAlign = 2, bits = 16; [wav appendBytes:&blockAlign length:2]; [wav appendBytes:&bits length:2];
+    [wav appendBytes:"data" length:4]; [wav appendBytes:&dataBytes length:4]; [wav appendData:pcm];
+    return [wav writeToFile:path atomically:YES];
+}
+static BOOL Afconvert(NSString *wav, NSString *m4a) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/afconvert"];
+    task.arguments = @[@"-f", @"m4af", @"-d", @"aac@22050", wav, m4a];
+    if (![task launchAndReturnError:NULL]) return NO;
+    [task waitUntilExit];
+    return task.terminationStatus == 0 && [NSFileManager.defaultManager fileExistsAtPath:m4a];
+}
+static NSData *FixtureCoverPNG(CGFloat hue) {
+    const CGFloat side = 200;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:side pixelsHigh:side
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+        bytesPerRow:0 bitsPerPixel:0];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:rep]];
+    NSGradient *g = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedHue:hue saturation:0.65 brightness:0.5 alpha:1]
+                                                   endingColor:[NSColor colorWithCalibratedHue:hue + 0.15 saturation:0.45 brightness:0.82 alpha:1]];
+    [g drawInRect:NSMakeRect(0, 0, side, side) angle:40];
+    [[NSColor whiteColor] setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(NSMakeRect(0, 0, side, side), 55, 55)] fill];
+    [NSGraphicsContext restoreGraphicsState];
+    return [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+}
+static NSString *FFmpegPath(void) {
+    NSString *home = NSHomeDirectory();
+    for (NSString *p in @[
+            [home stringByAppendingPathComponent:@".local/bin/ffmpeg"],
+            @"/opt/homebrew/bin/ffmpeg",
+            @"/usr/local/bin/ffmpeg"]) {
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:p]) return p;
+    }
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    task.arguments = @[ @"-lc", @"command -v ffmpeg" ];
+    NSPipe *out = [NSPipe pipe];
+    task.standardOutput = out;
+    if ([task launchAndReturnError:NULL]) {
+        [task waitUntilExit];
+        if (task.terminationStatus == 0) {
+            NSData *d = [[out fileHandleForReading] readDataToEndOfFile];
+            NSString *path = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([NSFileManager.defaultManager isExecutableFileAtPath:path]) return path;
+        }
+    }
+    return nil;
+}
+static BOOL EmbedCoverInM4A(NSString *m4a, NSData *coverPNG) {
+    if (!coverPNG.length) return YES;
+    NSString *ffmpeg = FFmpegPath();
+    if (!ffmpeg.length) return NO;
+    NSString *cover = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.png", NSUUID.UUID.UUIDString]];
+    NSString *out = [NSString stringWithFormat:@"%@.embed.m4a", m4a.stringByDeletingPathExtension];
+    if (![coverPNG writeToFile:cover atomically:YES]) return NO;
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:ffmpeg];
+    task.arguments = @[@"-y", @"-loglevel", @"error", @"-i", m4a, @"-i", cover,
+                       @"-map", @"0:a", @"-map", @"1:v", @"-c:a", @"copy", @"-c:v", @"mjpeg",
+                       @"-disposition:v:0", @"attached_pic", out];
+    BOOL ok = NO;
+    if ([task launchAndReturnError:NULL]) {
+        [task waitUntilExit];
+        ok = task.terminationStatus == 0 && [NSFileManager.defaultManager fileExistsAtPath:out];
+    }
+    if (ok) {
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtPath:m4a error:nil];
+        ok = [fm moveItemAtPath:out toPath:m4a error:nil];
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:cover error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:out error:nil];
+    return ok;
+}
+static BOOL WriteSilentM4A(NSString *path, NSString *__unused artist, NSData *coverPNG, double seconds) {
+    if (seconds < 0.05) seconds = 0.1;
+    NSString *wav = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.wav", NSUUID.UUID.UUIDString]];
+    if (!WriteToneWAV(wav, 440, seconds)) return NO;
+    if (!Afconvert(wav, path)) {
+        [[NSFileManager defaultManager] removeItemAtPath:wav error:nil];
+        return NO;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:wav error:nil];
+    if (coverPNG.length && !EmbedCoverInM4A(path, coverPNG)) return NO;
+    return [NSFileManager.defaultManager fileExistsAtPath:path];
+}
+static BOOL FramesEqual(NSRect a, NSRect b) {
+    return fabs(a.origin.x - b.origin.x) < 0.6 && fabs(a.origin.y - b.origin.y) < 0.6 &&
+        fabs(a.size.width - b.size.width) < 0.6 && fabs(a.size.height - b.size.height) < 0.6;
+}
+static BOOL CaptionFits(NSTextField *field) {
+    if (![field isKindOfClass:NSTextField.class] || !field.stringValue.length) return YES;
+    // AppKit's own answer: a label's cell has an expansion frame only when it truncates its text.
+    return NSIsEmptyRect([field.cell expansionFrameWithFrame:field.bounds inView:field]);
+}
 static void DumpClaudeCaption(NSView *view) {   // diagnostics on a width failure
     if ([view isKindOfClass:NSTextField.class] && [view.accessibilityIdentifier isEqual:@"popover.claude.caption"]) {
         NSTextField *f = (NSTextField *)view;
@@ -199,6 +317,11 @@ static NSView *FindIdentifier(NSView *view, NSString *identifier) {
     if ([view.accessibilityIdentifier isEqual:identifier]) return view;
     for (NSView *child in view.subviews) { NSView *hit = FindIdentifier(child, identifier); if (hit) return hit; }
     return nil;
+}
+static NSUInteger MixSeedTileCount(NSView *root) {
+    NSUInteger n = 0;
+    while (FindIdentifier(root, [NSString stringWithFormat:@"popover.mix.seed.%lu", (unsigned long)n])) n++;
+    return n;
 }
 static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL transportOn) {
     NSTextField *titleField = (NSTextField *)FindIdentifier(root, @"popover.music.title");
@@ -1534,6 +1657,200 @@ int main(int argc, const char **argv) {
             [c setValue:oldUID forKey:@"defaultOutputUID"];
             [c rebuildContent];
             root = p.contentViewController.view;
+        } else if (musicState && (strcmp(musicState, "shows-row") == 0 || strcmp(musicState, "shows-playing") == 0)) {
+            NSTimeZone *utc = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+            NSDate *day = [NSDate dateWithTimeIntervalSince1970:1763107200];
+            NSString *showDir = [fixtureMusic stringByAppendingPathComponent:@"House Party"];
+            [NSFileManager.defaultManager createDirectoryAtPath:showDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *epA = [showDir stringByAppendingPathComponent:@"2026-11-14-ep1.m4a"];
+            NSString *epB = [showDir stringByAppendingPathComponent:@"2026-11-07-ep2.m4a"];
+            NSString *epC = [showDir stringByAppendingPathComponent:@"2026-11-01-ep3.m4a"];
+            if (!WriteSilentM4A(epA, @"Latifa Tee", FixtureCoverPNG(0.52), 120) ||
+                !WriteSilentM4A(epB, @"Latifa Tee", FixtureCoverPNG(0.56), 120) ||
+                !WriteSilentM4A(epC, @"Latifa Tee", FixtureCoverPNG(0.48), 120))
+                return Fail(__LINE__);
+            NSMutableArray *pickPaths = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 4; i++) {
+                NSString *p = [fixtureMusic stringByAppendingPathComponent:
+                               [NSString stringWithFormat:@"new-music-%lu.m4a", (unsigned long)i]];
+                if (!WriteSilentM4A(p, @"Pick Artist", FixtureCoverPNG(0.08 + 0.14 * i), 0.1)) return Fail(__LINE__);
+                [pickPaths addObject:p];
+            }
+            NSMutableArray *stationTracks = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 4; i++)
+                [stationTracks addObject:@{@"id": [NSString stringWithFormat:@"pick-%lu", (unsigned long)i],
+                                          @"title": @"Pick", @"artist": @"Artist", @"album": @"", @"local_path": pickPaths[i]}];
+            [c setValue:stationTracks forKey:@"stationTracks"];
+            [c setValue:@[
+                @{@"title": @"One", @"artist": @"A", @"reason": @"", @"file": pickPaths[0]},
+                @{@"title": @"Two", @"artist": @"B", @"reason": @"", @"file": pickPaths[1]},
+                @{@"title": @"Three", @"artist": @"C", @"reason": @"", @"file": pickPaths[2]},
+                @{@"title": @"Four", @"artist": @"D", @"reason": @"", @"file": pickPaths[3]}
+            ] forKey:@"stationPicks"];
+            NSString *fbPath = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/feedback.jsonl"];
+            [NSFileManager.defaultManager createDirectoryAtPath:[fbPath stringByDeletingLastPathComponent]
+                                    withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"" writeToFile:fbPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSButton *ref0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
+            NSButton *ref1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            NSButton *ref2 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.2");
+            NSButton *ref3 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.3");
+            NSButton *refStation = (NSButton *)FindIdentifier(root, @"popover.mix.station");
+            NSButton *refPicks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
+            if (!ref0 || !ref1 || !ref2 || !ref3 || !refStation || !refPicks) return Fail(__LINE__);
+            NSRect slot0 = ref0.frame, slot1 = ref1.frame, slot2 = ref2.frame, slot3 = ref3.frame, slotStation = refStation.frame, slotPicks = refPicks.frame;
+            double savedDur = (strcmp(musicState, "shows-playing") == 0) ? 14400.0 : 240.0;
+            NSDictionary *showsState = @{@"version": @1, @"episodes": @{
+                epA: @{@"position": @72, @"duration": @(savedDur), @"finished": @NO, @"updated": @"2026-11-14T09:00:00Z"},
+                epB: @{@"position": @0, @"duration": @(savedDur), @"finished": @NO, @"updated": @"2026-11-07T09:00:00Z"},
+                epC: @{@"position": @0, @"duration": @(savedDur), @"finished": @NO, @"updated": @"2026-11-01T09:00:00Z"}}};
+            NSString *showsPath = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/shows.json"];
+            [ShowsStateToJSON(showsState) writeToFile:showsPath atomically:YES];
+            NSArray *episodes = @[
+                @{@"path": epA, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
+                @{@"path": epB, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
+                @{@"path": epC, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)}];
+            NSDictionary *offer = ShowsPickOfferedEpisode(episodes, showsState);
+            [c setValue:@YES forKey:@"musicProbesEnabled"];
+            [c setValue:@YES forKey:@"musicSilentQA"];
+            [c setValue:@YES forKey:@"showsLoaded"];
+            [c setValue:episodes forKey:@"showEpisodes"];
+            [c setValue:offer forKey:@"showOffered"];
+            [c setValue:showsState forKey:@"showsState"];
+            [c setValue:[NSMutableDictionary dictionary] forKey:@"showCoverCache"];
+            [c setValue:[NSMutableDictionary dictionary] forKey:@"stationCoverCache"];
+            if (![c embeddedArtworkForPath:epA] || [c stationMosaicCovers].count < 4) return Fail(__LINE__);
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (MixSeedTileCount(root) != 3 || FindIdentifier(root, @"popover.mix.seed.3")) return Fail(__LINE__);
+            GBShowTile *show = (GBShowTile *)FindIdentifier(root, @"popover.music.show");
+            NSButton *seed0 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.0");
+            NSButton *seed1 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.1");
+            NSButton *seed2 = (NSButton *)FindIdentifier(root, @"popover.mix.seed.2");
+            GBStationTile *station = (GBStationTile *)FindIdentifier(root, @"popover.mix.station");
+            NSButton *picks = (NSButton *)FindIdentifier(root, @"popover.mix.newpicks");
+            NSTextField *showCap = (NSTextField *)FindIdentifier(root, @"popover.music.show.caption");
+            NSTextField *showSub = (NSTextField *)FindIdentifier(root, @"popover.music.show.artist");
+            NSTextField *nmCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
+            GBShowProgressView *prog = (GBShowProgressView *)FindIdentifier(root, @"popover.music.show.progress");
+            NSView *showMark = FindIdentifier(root, @"popover.music.show.typemark");
+            NSView *stMark = FindIdentifier(root, @"popover.mix.station.typemark");
+            if (!show || !seed0 || !seed1 || !seed2 || !station || !picks || !showCap || !showSub || !nmCap || !prog) return Fail(__LINE__);
+            if (!FramesEqual(seed0.frame, slot0) || !FramesEqual(seed1.frame, slot1) || !FramesEqual(seed2.frame, slot2) ||
+                !FramesEqual(show.frame, slot3) || !FramesEqual(station.frame, slotStation) || !FramesEqual(picks.frame, slotPicks))
+                return Fail(__LINE__);
+            if (NSMinX(show.frame) <= NSMaxX(seed2.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)
+                return Fail(__LINE__);
+            if (![showCap.stringValue isEqual:@"House Party"] || ![nmCap.stringValue isEqual:@"New music"] ||
+                ![ShowTileCaptionLine2(day, @"Latifa Tee", utc) isEqual:showSub.stringValue])
+                return Fail(__LINE__);
+            if (!CaptionFits(showCap) || !CaptionFits(showSub) || !CaptionFits(nmCap)) return Fail(__LINE__);
+            // The label's own test for "clipped" sets a tooltip with the full text: none here.
+            if (showCap.toolTip.length || showSub.toolTip.length || nmCap.toolTip.length) return Fail(__LINE__);
+            if (fabs(prog.fraction - (72.0 / savedDur)) > 0.05) return Fail(__LINE__);
+            // The bar is on the cover's bottom edge (the button's coordinates are flipped).
+            if (fabs(NSMaxY(prog.frame) - NSHeight(show.bounds)) > 1.0 || NSHeight(prog.frame) > 3.5) return Fail(__LINE__);
+            // Type marks sit at the top-left of their covers; the badge is top-right.
+            if (!stMark || fabs(NSMaxY(stMark.frame) - (NSMaxY(station.frame) - 3)) > 1.5 ||
+                fabs(NSMinX(stMark.frame) - (NSMinX(station.frame) + 3)) > 1.5) return Fail(__LINE__);
+            if (!showMark || fabs(NSMinY(showMark.frame) - 3) > 1.5 || fabs(NSMinX(showMark.frame) - 3) > 1.5) return Fail(__LINE__);
+            if ([c stationMosaicCovers].count < 4) return Fail(__LINE__);
+            const char *musicRowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (musicRowPNG && musicRowPNG[0] && strcmp(musicState, "shows-row") == 0) {
+                NSString *dir = [NSString stringWithUTF8String:musicRowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"show-tile-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"show-tile-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+            }
+            if (strcmp(musicState, "shows-row") == 0) {
+                [c playShow:show];
+                for (int spin = 0; spin < 30; spin++)
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                if (![[c valueForKey:@"localMode"] boolValue] || ![[c valueForKey:@"mixPlayingKey"] isEqual:@"show:episode"])
+                    return Fail(__LINE__);
+                [c rebuildContent];
+                root = p.contentViewController.view;
+                NSTextField *elapsed = (NSTextField *)FindIdentifier(root, @"popover.music.elapsed");
+                if (!elapsed || ![elapsed.stringValue containsString:@":"]) return Fail(__LINE__);
+                double pos = 0;
+                NSScanner *scan = [NSScanner scannerWithString:elapsed.stringValue];
+                int m = 0, s = 0;
+                if ([scan scanString:@"0:" intoString:NULL] || [scan scanInt:&m]) {
+                    if ([scan scanString:@":" intoString:NULL]) [scan scanInt:&s];
+                    pos = m * 60 + s;
+                }
+                if (pos < 62 || pos > 72) return Fail(__LINE__);
+                [c musicPlay:nil];
+                for (int spin = 0; spin < 20; spin++)
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                [c saveShowPositionNow];
+                NSString *jsonPath = [c showsJSONPath];
+                NSString *saved = [NSString stringWithContentsOfFile:jsonPath encoding:NSUTF8StringEncoding error:nil];
+                if (!saved.length || ![saved containsString:@"House Party"] || ![saved containsString:@"\"position\""])
+                    return Fail(__LINE__);
+                [c rebuildContent];
+                root = p.contentViewController.view;
+                if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+                    return Fail(__LINE__);
+                NSButton *thumbsDown = (NSButton *)FindIdentifier(root, @"popover.music.thumbsdown");
+                NSView *title = FindIdentifier(root, @"popover.music.title");
+                if (!thumbsDown || FindIdentifier(root, @"popover.music.thumbsup") ||
+                    NSMaxX(title.frame) > NSMinX(thumbsDown.frame) - 6 + 0.5)
+                    return Fail(__LINE__);
+                [c performMusicNextCutNow];
+                for (int spin = 0; spin < 40; spin++)
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                if (![[c valueForKey:@"localURLs"][0] path] || ![[[c valueForKey:@"localURLs"][0] path] isEqual:epB])
+                    return Fail(__LINE__);
+                [c musicThumbsDown:nil];
+                NSString *fb = [NSString stringWithContentsOfFile:fbPath encoding:NSUTF8StringEncoding error:nil];
+                if ([fb containsString:@"dislike"] || [fb containsString:@"event"]) return Fail(__LINE__);
+                NSString *after = [NSString stringWithContentsOfFile:jsonPath encoding:NSUTF8StringEncoding error:nil];
+                if (![after containsString:@"\"finished\":true"] && ![after containsString:@"\"finished\": true"])
+                    return Fail(__LINE__);
+            }
+            if (strcmp(musicState, "shows-playing") == 0) {
+                [c setValue:@YES forKey:@"localMode"];
+                [c setValue:@YES forKey:@"playbackKnown"];
+                [c setValue:@YES forKey:@"playbackPlaying"];
+                [c setValue:@"show:episode" forKey:@"mixPlayingKey"];
+                [c setValue:@"House Party" forKey:@"localTitle"];
+                [c setValue:ShowNowPlayingSubtitle(day, @"Latifa Tee", utc) forKey:@"localArtist"];
+                [c setValue:@[[NSURL fileURLWithPath:epA]] forKey:@"localURLs"];
+                [c setValue:@0 forKey:@"localIndex"];
+                [c playShow:show];
+                for (int spin = 0; spin < 40; spin++)
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                [c updateShowEpisodeState:epA position:67 duration:14400 finished:NO];
+                [c noteLocalPlaybackTime];
+                [c rebuildContent];
+                root = p.contentViewController.view;
+                show = (GBShowTile *)FindIdentifier(root, @"popover.music.show");
+                if (!show || show.layer.borderWidth < 1.5) return Fail(__LINE__);
+                NSTextField *elapsed = (NSTextField *)FindIdentifier(root, @"popover.music.elapsed");
+                NSTextField *length = (NSTextField *)FindIdentifier(root, @"popover.music.duration");
+                NSSlider *position = (NSSlider *)FindIdentifier(root, @"popover.music.position");
+                if (!elapsed || !length || !position || position.maxValue < 3600 ||
+                    ![length.stringValue containsString:@":"] || NSWidth(length.frame) < 48)
+                    return Fail(__LINE__);
+                if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+                    return Fail(__LINE__);
+                const char *rowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+                if (rowPNG && rowPNG[0]) {
+                    NSString *dir = [NSString stringWithUTF8String:rowPNG];
+                    if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"show-playing-light.png"], NSAppearanceNameAqua))
+                        return Fail(__LINE__);
+                }
+            }
+            [c tearDownLocalPlayer];
+            [c setValue:nil forKey:@"showOffered"];
+            [c setValue:@[] forKey:@"showEpisodes"];
+            [c setValue:@NO forKey:@"showsLoaded"];
+            [c setValue:[NSMutableDictionary dictionary] forKey:@"showCoverCache"];
+            [c rebuildContent];
         } else if (musicState && strcmp(musicState, "dislike") == 0) {
             NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];
             NSString *trackB = [fixtureMusic stringByAppendingPathComponent:@"dislike-b.m4a"];

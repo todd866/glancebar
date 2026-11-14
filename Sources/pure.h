@@ -1124,3 +1124,30 @@ NSInteger HeavySlotCounts(NSString *status, NSInteger *freeSlots);
 // A state other than ok wins over the behind count; the count is then kept in the detail.
 NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA);
 
+// --- Radio shows (folder scan, shows.json, tile copy) ---
+// shows.json version 1: @{@"version": @1, @"episodes": @{path: @{position, duration, finished, updated}}}.
+// Parse returns nil for missing/invalid data; an empty episodes dict is still valid.
+NSDictionary *ShowsStateFromJSON(NSData *json);
+NSData *ShowsStateToJSON(NSDictionary *state);
+BOOL ShowsEpisodeFinished(double position, double duration, BOOL finishedFlag);
+BOOL ShowsEpisodeUnplayed(NSDictionary *episodeState, NSDictionary *episode);
+// Episodes: @[@{@"path", @"show", @"presenter", @"broadcast" (NSDate), @"sortDate" (NSDate)}].
+// Picks the episode to offer, or nil.
+NSDictionary *ShowsPickOfferedEpisode(NSArray<NSDictionary *> *episodes, NSDictionary *state);
+// Unplayed episodes other than offeredPath (nil counts all unplayed).
+NSUInteger ShowsUnplayedBadgeCount(NSArray<NSDictionary *> *episodes, NSDictionary *state, NSString *offeredPath);
+double ShowsResumePosition(double savedPosition);
+// Short weekday in the local zone: "Sat".
+NSString *ShowWeekdayShort(NSDate *date, NSTimeZone *zone);
+// Presenter's first word: "Latifa Tee" → "Latifa".
+NSString *ShowPresenterFirstName(NSString *presenter);
+// Tile caption line 2: "Sat · Latifa".
+NSString *ShowTileCaptionLine2(NSDate *broadcast, NSString *presenter, NSTimeZone *zone);
+// Now-playing artist line: "Sat 14 Nov · Latifa Tee".
+NSString *ShowNowPlayingSubtitle(NSDate *broadcast, NSString *presenter, NSTimeZone *zone);
+// Tooltip: "House Party · Sat 14 Nov · Latifa Tee · 1:12 of 4:00" or "· unplayed".
+NSString *ShowEpisodeTooltip(NSString *showName, NSDate *broadcast, NSString *presenter,
+                              double position, double duration, BOOL unplayed, NSTimeZone *zone);
+// Leading YYYY-MM-DD in a file name, else nil.
+NSDate *ShowDateFromFilename(NSString *filename, NSTimeZone *zone);
+
