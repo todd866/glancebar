@@ -354,7 +354,7 @@ int main(void) {
                         @"trackID": @"T1", @"artist": @"Artist One", @"album": @"", @"family": @"other"}]
               forKey:@"mixSeeds"];
 
-        // --- seed tile: 4-track queue starts and time advances ---
+        // --- offline playlist: 4-track queue starts and time advances ---
         if (![[c offlineCoverage:@"song:playback" verifyHash:YES][@"ready"] boolValue]) Fail(__LINE__);
         [c playOfflinePlaylist:@"song:playback"];
         if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 8)) Fail(__LINE__);
@@ -854,6 +854,56 @@ int main(void) {
         if (rapNo) Fail(__LINE__);
         if (LocalPlayer(c) != beforeUnknown) Fail(__LINE__);
         fprintf(stderr, "Kind play: control handler, pause, next, idle Play key, unknown and empty kinds\n");
+
+        // --- kind tile click: play cause and reshuffle on second click ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        [c setValue:nil forKey:@"mixPlayingKey"];
+        NSArray *tileSpecs = @[
+            @{@"id": @"DK1", @"title": @"Kind Dance One", @"artist": @"Kind Harness", @"album": @"", @"genre": @"House"},
+            @{@"id": @"DK2", @"title": @"Kind Dance Two", @"artist": @"Kind Harness", @"album": @"", @"genre": @"Techno"},
+            @{@"id": @"DK3", @"title": @"Kind Dance Three", @"artist": @"Kind Harness", @"album": @"", @"genre": @"House"},
+        ];
+        NSArray *tilePaths = GenerateTracks(musicRoot, tileSpecs);
+        if (tilePaths.count != 3) Fail(__LINE__);
+        NSMutableArray *tileLib = [NSMutableArray array];
+        for (NSUInteger i = 0; i < tileSpecs.count; i++) {
+            NSMutableDictionary *row = [tileSpecs[i] mutableCopy];
+            row[@"plays"] = @10;
+            row[@"idleDays"] = @30;
+            row[@"fav"] = @NO;
+            row[@"dislike"] = @NO;
+            row[@"year"] = @2024;
+            [tileLib addObject:row];
+        }
+        [c setValue:tileLib forKey:@"mixLibrary"];
+        NSDictionary *tileFixture = PlaylistFixture(tileSpecs, tilePaths, @"kind:dance");
+        if (!tileFixture) Fail(__LINE__);
+        [c setValue:[@{@"kind:dance": tileFixture[@"request"]} mutableCopy] forKey:@"offlineRequests"];
+        [c setValue:tileFixture[@"manifest"] forKey:@"offlineManifest"];
+        NSImage *tileImg = [[NSImage alloc] initWithSize:NSMakeSize(50, 50)];
+        GBKindTile *danceTile = [GBKindTile buttonWithImage:tileImg target:c action:@selector(playKindTile:)];
+        danceTile.musicKind = @"dance";
+        [c playKindTile:danceTile];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 5)) Fail(__LINE__);
+        if (![[c valueForKey:@"playbackCause"] isEqual:@"click"] ||
+            ![[c valueForKey:@"mixPlayingKey"] isEqual:@"kind:dance"])
+            Fail(__LINE__);
+        NSDictionary *offlineReqs = [c valueForKey:@"offlineRequests"];
+        NSDictionary *danceReq = [offlineReqs isKindOfClass:NSDictionary.class] ? offlineReqs[@"kind:dance"] : nil;
+        NSArray *firstIDs = [[danceReq[@"tracks"] isKindOfClass:NSArray.class] ? danceReq[@"tracks"] : @[] valueForKey:@"id"];
+        uint64_t seedBefore = [[c valueForKey:@"kindPlaySeed"] unsignedLongLongValue];
+        [c playKindTile:danceTile];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 3)) Fail(__LINE__);
+        if (![[c valueForKey:@"playbackCause"] isEqual:@"click"]) Fail(__LINE__);
+        uint64_t seedAfter = [[c valueForKey:@"kindPlaySeed"] unsignedLongLongValue];
+        danceReq = [offlineReqs isKindOfClass:NSDictionary.class] ? offlineReqs[@"kind:dance"] : nil;
+        NSArray *secondIDs = [[danceReq[@"tracks"] isKindOfClass:NSArray.class] ? danceReq[@"tracks"] : @[] valueForKey:@"id"];
+        if (seedAfter == seedBefore || [firstIDs isEqual:secondIDs]) {
+            fprintf(stderr, "kind tile: second click did not reshuffle (seed or order unchanged)\n");
+            Fail(__LINE__);
+        }
+        fprintf(stderr, "Kind tile: click starts dance, second click reshuffles\n");
 
         // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
         [c tearDownLocalPlayer];

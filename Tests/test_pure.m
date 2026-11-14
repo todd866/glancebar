@@ -2457,6 +2457,18 @@ int main(void) {
             check(anyQ.count == 12, @"kind queue: any is every track");
             NSMutableDictionary *kindByID = [NSMutableDictionary dictionary];
             for (NSDictionary *t in kindLib) kindByID[t[@"id"]] = t;
+            NSSet *onDiskKind = [NSSet setWithArray:@[@"D000", @"D001", @"D002", @"D003", @"D004", @"A000", @"A001", @"DIS"]];
+            check(MusicKindOnMacCount(kindLib, onDiskKind, @"dance") == 5, @"kind on-mac count: dance only on-disk");
+            check(MusicKindOnMacCount(kindLib, onDiskKind, @"chill") == 0, @"kind on-mac count: none");
+            check(MusicKindOnMacCount(kindLib, onDiskKind, @"alt") == 2, @"kind on-mac count: alt");
+            NSArray *mosaic = MusicKindMosaicTrackIDs(kindLib, onDiskKind, @"dance");
+            check(mosaic.count == 4, @"kind mosaic: four covers");
+            NSMutableSet *mosaicAlbums = [NSMutableSet set];
+            for (NSString *tid in mosaic) {
+                NSDictionary *t = kindByID[tid];
+                [mosaicAlbums addObject:[NSString stringWithFormat:@"%@|%@", t[@"artist"], t[@"album"]]];
+            }
+            check(mosaicAlbums.count == 4, @"kind mosaic: different albums when possible");
             BOOL artistOk = YES;
             for (NSUInteger w = 0; w + 10 <= danceQ.count; w++) {
                 NSMutableDictionary *counts = [NSMutableDictionary dictionary];
