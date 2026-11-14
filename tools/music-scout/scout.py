@@ -1351,6 +1351,9 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         raise SystemExit("rank: run candidates first")
     data = json.loads(paths.candidates.read_text(encoding="utf-8"))
     candidates = data.get("candidates") or []
+    # The same song can arrive from two sources (a new release he also Shazamed). The first
+    # row seen wins the de-duplication below, so his own signal must be seen first.
+    candidates = sorted(candidates, key=lambda c: 0 if c.get("priority") else 1)
     owned = owned_keys(cfg, paths)
     really_owned = ownership_sources(cfg, paths)
     owned_artist_set = owned_artists(cfg, paths)

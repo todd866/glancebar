@@ -401,10 +401,11 @@ class MediaShareTests(unittest.TestCase):
             scout.append_jsonl(self.paths.ledger, {"at": "2026-11-10T04:00:00Z", "action": action,
                                                    "artist": "Heard Act", "title": "Radio Song",
                                                    "track_key": scout.track_key("Heard Act", "Radio Song")})
+            # The new-release row comes first, as it does in the real candidates file.
             cands = [
+                {"artist": "Heard Act", "title": "Radio Song", "source": "new-release", "score_hint": 0.8},
                 {"artist": "Heard Act", "title": "Radio Song", "source": "shazam", "priority": True,
                  "score_hint": 0.95, "why": "Shazamed 14 Nov"},
-                {"artist": "Heard Act", "title": "Radio Song", "source": "new-release", "score_hint": 0.8},
             ]
             self.paths.candidates.write_text(json.dumps({"candidates": cands}), encoding="utf-8")
             runners = scout.Runners(clock=lambda: "2026-11-14T12:00:00Z")
@@ -412,6 +413,8 @@ class MediaShareTests(unittest.TestCase):
 
         key = scout.track_key("Heard Act", "Radio Song")
         self.assertIn(key, offered_and_candidates("offered"))
+        queued = json.loads(self.paths.queue.read_text(encoding="utf-8"))["tracks"][0]
+        self.assertEqual((queued["source"], queued["why"]), ("shazam", "Shazamed 14 Nov"))
         self.assertNotIn(key, offered_and_candidates("acquired"))
         self.assertNotIn(key, offered_and_candidates("no_match"))
         # Without his signal, an earlier offer still stops a repeat.
