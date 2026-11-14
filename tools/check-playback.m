@@ -774,6 +774,87 @@ int main(void) {
         }
         fprintf(stderr, "Drop/seek: rejected track leaves the queue, pause kept, seek stays on its track\n");
 
+        // --- play by kind: control handler, pause, next, unknown kind, empty kind, idle Play key ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        [c setValue:nil forKey:@"mixPlayingKey"];
+        NSArray *kindSpecs = @[
+            @{@"id": @"DK1", @"title": @"Kind Dance One", @"artist": @"Kind Harness", @"album": @"", @"genre": @"House"},
+            @{@"id": @"DK2", @"title": @"Kind Dance Two", @"artist": @"Kind Harness", @"album": @"", @"genre": @"Techno"},
+            @{@"id": @"AK1", @"title": @"Kind Alt One", @"artist": @"Alt Harness", @"album": @"", @"genre": @"Indie Rock"},
+        ];
+        NSArray *kindPaths = GenerateTracks(musicRoot, kindSpecs);
+        if (kindPaths.count != 3) Fail(__LINE__);
+        NSMutableArray *lib = [NSMutableArray array];
+        for (NSUInteger i = 0; i < kindSpecs.count; i++) {
+            NSMutableDictionary *row = [kindSpecs[i] mutableCopy];
+            row[@"plays"] = @10;
+            row[@"idleDays"] = @30;
+            row[@"fav"] = @NO;
+            row[@"dislike"] = @NO;
+            row[@"year"] = @2024;
+            [lib addObject:row];
+        }
+        [lib addObject:@{@"id": @"RK1", @"title": @"Kind Rap One", @"artist": @"Rap Harness", @"album": @"", @"genre": @"Hip-Hop/Rap",
+                          @"plays": @5, @"idleDays": @30, @"fav": @NO, @"dislike": @NO, @"year": @2023}];
+        [c setValue:lib forKey:@"mixLibrary"];
+        NSDictionary *kindFixture = PlaylistFixture(@[kindSpecs[0], kindSpecs[1]], @[kindPaths[0], kindPaths[1]], @"kind:dance");
+        if (!kindFixture) Fail(__LINE__);
+        NSMutableDictionary *requests = [NSMutableDictionary dictionary];
+        [c setValue:requests forKey:@"offlineRequests"];
+        [c setValue:kindFixture[@"manifest"] forKey:@"offlineManifest"];
+        [c handleControlCommand:@"play dance"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0; }, 5)) Fail(__LINE__);
+        NSString *cause = [c valueForKey:@"playbackCause"];
+        if (![cause isEqual:@"kind"]) {
+            fprintf(stderr, "kind play cause=%s (want kind)\n", cause.UTF8String ?: "");
+            Fail(__LINE__);
+        }
+        NSString *lastKind = [NSUserDefaults.standardUserDefaults stringForKey:@"musicLastKind"];
+        if (![lastKind isEqual:@"dance"]) Fail(__LINE__);
+        AVURLAsset *asset = (AVURLAsset *)LocalPlayer(c).currentItem.asset;
+        NSDictionary *parsed = ParseLikedTrackFilename(asset.URL.lastPathComponent);
+        NSString *tid = parsed[@"trackID"];
+        if (![tid isEqual:@"DK1"] && ![tid isEqual:@"DK2"]) Fail(__LINE__);
+        [c handleControlCommand:@"pause"];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 1.0)) Fail(__LINE__);
+        NSInteger before = LocalIndex(c);
+        [c handleControlCommand:@"next"];
+        [c musicNext:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.35]);
+        if (LocalIndex(c) == before) Fail(__LINE__);
+        PlaybackController *kindCtl = (PlaybackController *)c;
+        [kindCtl remotePlay:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
+        [c tearDownLocalPlayer];
+        [c setValue:nil forKey:@"mixPlayingKey"];
+        [c setValue:@NO forKey:@"localMode"];
+        [NSUserDefaults.standardUserDefaults setObject:@"dance" forKey:@"musicLastKind"];
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"musicPlayKeyStartsMusic"];
+        [c updateIdleRemoteCommands];
+        [kindCtl remotePlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c) != nil; }, 5)) Fail(__LINE__);
+        AVURLAsset *idleAsset = (AVURLAsset *)LocalPlayer(c).currentItem.asset;
+        if (![idleAsset.URL.lastPathComponent containsString:@"DK"]) Fail(__LINE__);
+        [c tearDownLocalPlayer];
+        [c setValue:nil forKey:@"mixPlayingKey"];
+        [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"musicPlayKeyStartsMusic"];
+        [c updateIdleRemoteCommands];
+        AVQueuePlayer *stillIdle = LocalPlayer(c);
+        [kindCtl remotePlay:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.3]);
+        if (LocalPlayer(c) != stillIdle) Fail(__LINE__);
+        NSDictionary *emptyManifest = @{@"schemaVersion": @1, @"playlists": @[]};
+        [c setValue:requests forKey:@"offlineRequests"];
+        [c setValue:emptyManifest forKey:@"offlineManifest"];
+        AVQueuePlayer *beforeUnknown = LocalPlayer(c);
+        [c handleControlCommand:@"play bogus"];
+        if (LocalPlayer(c) != beforeUnknown) Fail(__LINE__);
+        BOOL rapNo = [c playKind:@"rap" cause:@"kind"];
+        if (rapNo) Fail(__LINE__);
+        if (LocalPlayer(c) != beforeUnknown) Fail(__LINE__);
+        fprintf(stderr, "Kind play: control handler, pause, next, idle Play key, unknown and empty kinds\n");
+
         // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
         [c tearDownLocalPlayer];
         [c setValue:@NO forKey:@"localMode"];

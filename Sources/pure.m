@@ -3592,6 +3592,71 @@ NSString *GenreFamily(NSString *genre) {
     return @"other";
 }
 
+NSString *MusicKindForGenre(NSString *genre) {
+    NSString *g = genre.lowercaseString ?: @"";
+    for (NSString *k in @[@"ambient", @"downtempo", @"chill", @"lo-fi", @"lofi", @"new age", @"classical", @"jazz",
+                          @"acoustic", @"singer", @"easy listening"])
+        if ([g containsString:k]) return @"chill";
+    NSString *family = GenreFamily(genre);
+    if ([family isEqual:@"pop"]) return @"alt";
+    if ([family isEqual:@"dance"] || [family isEqual:@"rap"] || [family isEqual:@"alt"]) return family;
+    return @"other";
+}
+
+static BOOL MusicKindMatches(NSString *kind, NSDictionary *track) {
+    if ([kind isEqual:@"any"]) return YES;
+    return [MusicKindForGenre(track[@"genre"]) isEqual:kind];
+}
+
+static NSUInteger MusicKindArtistCount(NSArray<NSString *> *ordered, NSDictionary<NSString *, NSDictionary *> *byId,
+                                       NSString *artist, NSUInteger window, NSUInteger tailStart) {
+    if (!artist.length) return 0;
+    NSUInteger start = tailStart > window ? tailStart - window : 0;
+    NSUInteger n = 0;
+    for (NSUInteger i = start; i < tailStart; i++) {
+        NSDictionary *t = byId[ordered[i]];
+        if ([[t[@"artist"] lowercaseString] isEqual:artist]) n++;
+    }
+    return n;
+}
+
+NSString *const GBControlUsageLine =
+    @"Usage: Glancebar --play [dance|alt|rap|chill|any|new|show] | --play | --pause | --next | --kind\n";
+
+GBControlCLIOutcome GBControlParseArgs(int argc, const char **argv) {
+    GBControlCLIOutcome out = {0, nil};
+    NSString *command = nil;
+    BOOL sawControl = NO;
+    static NSSet *playKinds;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        playKinds = [NSSet setWithArray:@[@"dance", @"alt", @"rap", @"chill", @"any", @"new", @"show"]];
+    });
+    for (int i = 1; i < argc; i++) {
+        BOOL isControl = strcmp(argv[i], "--pause") == 0 || strcmp(argv[i], "--next") == 0 ||
+                         strcmp(argv[i], "--play") == 0 || strcmp(argv[i], "--kind") == 0;
+        if (isControl && sawControl) { out.kind = 2; return out; }
+        if (strcmp(argv[i], "--pause") == 0) { sawControl = YES; command = @"pause"; }
+        else if (strcmp(argv[i], "--next") == 0) { sawControl = YES; command = @"next"; }
+        else if (strcmp(argv[i], "--kind") == 0) { out.kind = 3; return out; }
+        else if (strcmp(argv[i], "--play") == 0) {
+            sawControl = YES;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                NSString *arg = [NSString stringWithUTF8String:argv[++i]];
+                if (![playKinds containsObject:arg]) { out.kind = 2; return out; }
+                command = [NSString stringWithFormat:@"play %@", arg];
+            } else command = @"play";
+        } else if (sawControl) {
+            out.kind = 2;
+            return out;
+        }
+    }
+    if (!sawControl) return out;
+    out.kind = 1;
+    out.command = command ?: @"play";
+    return out;
+}
+
 // A small deterministic generator so seeds and fallback mixes are testable.
 static uint64_t MixNext(uint64_t *state) {
     *state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -3603,6 +3668,51 @@ static double MixTrackWeight(NSDictionary *t) {
     if ([t[@"fav"] boolValue]) w *= 2;
     else if ([t[@"everHeart"] boolValue]) w *= 1.15;   // once hearted in Glancebar, still a weak nudge
     return w;
+}
+
+NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *kind, NSUInteger count, uint64_t seed,
+                                    NSArray<NSString *> *recentIDs) {
+    if (!count || !tracks.count || !kind.length) return @[];
+    NSSet *recent = [NSSet setWithArray:recentIDs ?: @[]];
+    NSMutableDictionary<NSString *, NSDictionary *> *byId = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *pool = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *recents = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        byId[t[@"id"]] = t;
+        if (!MusicKindMatches(kind, t)) continue;
+        if ([recent containsObject:t[@"id"]]) [recents addObject:t];
+        else [pool addObject:t];
+    }
+    NSMutableArray<NSString *> *ordered = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *work = [pool mutableCopy];
+    NSUInteger mainTarget = count > recents.count ? count - recents.count : 0;
+    uint64_t state = seed ^ 0xA24BAED4963EE407ULL;
+    BOOL strictSpacing = YES;
+    while (ordered.count < mainTarget && work.count) {
+        double total = 0;
+        NSMutableArray<NSDictionary *> *eligible = [NSMutableArray array];
+        for (NSDictionary *t in work) {
+            NSString *artist = [t[@"artist"] lowercaseString];
+            NSUInteger maxPerWindow = strictSpacing ? 2 : NSUIntegerMax;
+            if (MusicKindArtistCount(ordered, byId, artist, 10, ordered.count) >= maxPerWindow) continue;
+            [eligible addObject:t];
+            total += MixTrackWeight(t);
+        }
+        if (!eligible.count && strictSpacing) { strictSpacing = NO; continue; }
+        if (!eligible.count) break;
+        double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
+        NSDictionary *pick = eligible.lastObject;
+        for (NSDictionary *t in eligible) { r -= MixTrackWeight(t); if (r <= 0) { pick = t; break; } }
+        [ordered addObject:pick[@"id"]];
+        [work removeObject:pick];
+        strictSpacing = YES;
+    }
+    for (NSDictionary *t in recents) {
+        if (ordered.count >= count) break;
+        [ordered addObject:t[@"id"]];
+    }
+    return ordered;
 }
 
 // Seeds are songs Ian will recognise: ones he has actually played here, weighted by plays and how

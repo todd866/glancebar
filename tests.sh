@@ -47,6 +47,11 @@ fi
 
 "$WORK_DIR/glancebar_tests"
 
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Tests/test_control_cli.m \
+    -framework Foundation \
+    -o "$WORK_DIR/glancebar_control_cli_tests"
+"$WORK_DIR/glancebar_control_cli_tests"
+
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Tests/test_battery_forecast.m \
     -framework Foundation -o "$WORK_DIR/glancebar_battery_tests"
 "$WORK_DIR/glancebar_battery_tests"
