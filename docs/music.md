@@ -193,7 +193,10 @@ carries the track, the position and the current output.
 system log whether each remote command came from a Bluetooth device. Causes: `click`,
 `click-next`, `click-previous`, `playlist`, `remote-pause`, `remote-play`, `remote-toggle`
 (a keyboard play/pause key sends toggle; headphones send a separate pause or play),
-`auto-advance`, `crossfade`, `drop`, `dislike`, `devices-changed`, `output-changed`, `sleep`.
+`auto-advance`, `crossfade`, `drop`, `devices-changed`, `output-changed`, `sleep`.
+The dislike button is logged as a `drop` event whose `reason` is `dislike` (the drop
+path names the cause), so the next `track` line reads `drop`, never `click-next`:
+a dislike is not counted as a skip.
 `unattributed` means the app did not ask for the change: read the events just before it.
 
 Found with the system log before this existed: on 12 Nov 2026 the music "cut in and out"

@@ -523,7 +523,10 @@ ENGINE_COMMANDS = {
     # Each takes the prompt on stdin and prints the model's reply. All read-only, no tools.
     "claude": [str(Path.home() / ".local/bin/claude"), "-p", "--tools", "", "--model", "haiku"],
     "codex": ["codex", "exec", "-s", "read-only"],
-    "cursor": ["cursor-opinion"],
+    # cursor-opinion gives up after 300 s by default, and the taste prompt has run past that
+    # (13 Nov: the scheduled run recorded exit 124 and acquired on the other sources only).
+    # It gets 540 s here, inside this tool's own 600 s limit.
+    "cursor": ["cursor-opinion", "--timeout", "540"],
 }
 
 
