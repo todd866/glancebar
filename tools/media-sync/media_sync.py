@@ -1108,28 +1108,35 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
         liked_with_video = sum(1 for t in merged.values() if has_like(t) and t.get("video"))
         st = "pass"
         fact = f"{liked_with_video} liked with video"
-        if log_path.is_file():
-            last_done: Optional[datetime] = None
-            try:
-                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        # The job writes `<ISO time>Z pass done` when a pass finishes. A job that stopped must
+        # not pass: no log, or no finished pass in it, is a warn.
+        last_done: Optional[float] = None
+        lines: List[str] = []
+        try:
+            if log_path.is_file():
+                lines = [ln for ln in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                         if ln.strip()]
+                for line in lines:
                     if "pass done" not in line:
                         continue
-                    stamp = line.split()[0] if line.strip() else ""
-                    try:
-                        dt = datetime.strptime(stamp, "%Y-%m-%d")
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        continue
-                    last_done = dt
-            except OSError:
-                last_done = None
-            if last_done:
-                age_h = (utc_now() - last_done).total_seconds() / 3600.0
-                if age_h > float(chk.get("tv_videos_fail_h", 96)):
-                    st = "fail"
-                elif age_h > float(chk.get("tv_videos_warn_h", 36)):
-                    st = "warn"
-                fact = f"{liked_with_video} liked with video; pass {age_fact(age_h * 3600)} ago"
+                    stamp = parse_iso(line.split()[0])
+                    if stamp:
+                        last_done = stamp.timestamp()
+                if last_done is None and lines and "pass done" in lines[-1]:
+                    # An older line format with no readable time: the file's own time.
+                    last_done = log_path.stat().st_mtime
+        except OSError:
+            last_done = None
+        if last_done is None:
+            st = "warn"
+            fact = f"{liked_with_video} liked with video; no finished pass recorded"
+        else:
+            age_h = max(0.0, (now - last_done) / 3600.0)
+            if age_h > float(chk.get("tv_videos_fail_h", 96)):
+                st = "fail"
+            elif age_h > float(chk.get("tv_videos_warn_h", 36)):
+                st = "warn"
+            fact = f"{liked_with_video} liked with video; pass {age_fact(age_h * 3600)} ago"
         rows.append(make_row("tv videos", st, fact, host))
 
     # tv likes

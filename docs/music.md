@@ -50,12 +50,51 @@ tracks, a sync failed, or nothing was acquired for a week: these are the hooks f
 morning check. `defaults write com.iantodd.glancebar musicSilentQA -bool YES` runs the player
 muted for verification.
 
-### One record of likes and Shazams
+## One record of likes and Shazams (14 Nov 2026)
 
-`tools/media-sync/` (`tools/media-sync/README.md`) merges hearts, favourites, YouTube and TV
-likes with Shazam recognitions into shared `signals-*.json` files and runs pipeline checks for
-Fleet and the menu-bar morning probe. **A Shazam is not a like** — only an explicit heart or
-favourite counts as a like; Shazam means “what is this song?”.
+Until this date each surface kept its own signals: a Shazam reached nothing, a heart in
+Glancebar never got a music video on the TV, and the TV's music-video job read a list of
+likes copied by hand on 5 Nov. Now every surface writes to one shared record and every
+consumer reads it. `tools/media-sync/` (`README.md` there) is the tool; the file contract is
+one `signals-<host>.json` per Mac in `~/.local/state/mac-sync/media/` (a folder the Macs
+already sync), each written only by its own Mac.
+
+Owner rule: **a Shazam is not a like.** It means "what is this?". Only a heart or a like is
+a like.
+
+| Signal | Read from (on the Mac that has it) |
+|---|---|
+| Shazam (phone and Mac; title, artist, Apple Music id; never the location) | the system's Shazam library, M5 |
+| Glancebar heart, thumbs-up | `~/.local/state/selector/hearts.json`, `heart-history.jsonl`, `mix/feedback.jsonl`, M5 |
+| Apple Music favourite | `liked-pulled.json`, M5 |
+| YouTube like | `~/Music/YouTube Liked/`, M5 |
+| Like pressed on the TV (music videos only) | the TV server's storage file, M2 |
+| "A master exists" / "the TV has a video" | the catalogue cache (M5) / the TV's music-video folder (M2) |
+
+What reads it:
+
+- **Scout** (`tools/music-scout`): a Shazam from the last 30 days, or a music video liked on
+  the TV, is ranked ahead of every other candidate, inside the normal weekly budget, and
+  shows in New music with its reason ("Shazamed 14 Nov"). Older Shazams are ordinary
+  candidates, five a night at most. Heart it and it is a favourite; leave it and it ages out
+  after `fresh_days`. A track is never offered again once it is rejected: a dislike, or
+  skipped with Next within the first 40% on two separate days in the New music playlist
+  without ever being played to the end (judged by the clock between track starts in
+  `playback.jsonl`). The scout refreshes the record itself before it reads candidates.
+- **TV music videos** (M2, `com.iantodd.selector-media`, 18:30Z): `export-likes` rewrites the
+  finder's `likes.json` from every like on every surface before each pass (it keeps the old
+  list if the new one is empty or under 80% of it). A Shazam alone gets no video.
+- **The check**: `media_sync.py check` prints `PASS|WARN|FAIL name: fact` and writes
+  `~/.local/state/media-sync/check.json`. Rows: `ledger`, `shazam` (fresh ones waiting more
+  than 3 days), `favourites`, `offload`, `scout`, `hot set`, `triple j` on the M5; `upload`,
+  `tv videos`, `tv likes` on the M2. Each Mac also publishes its own rows to the shared
+  folder, so either Mac's check shows the whole chain. It runs in the menu-bar morning check
+  (M5, 18:15Z) and at the end of the M2's music-video pass.
+- **Fleet**: `.fleet/check` names that result file; `fleet morning` reads it into a
+  `check glancebar` row of the digest (fleet `docs/morning.md`, "The result file").
+
+Site config is `~/.config/glancebar/media-sync.json` on each Mac (`host`; on the M2 also
+`tv_storage`, `tv_music_videos`, `tv_video_log`).
 
 ## Scout acquisition timeline (M5)
 

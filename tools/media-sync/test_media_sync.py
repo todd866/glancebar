@@ -313,6 +313,37 @@ class CheckRowsTest(MediaSyncTestBase):
         ledger = [r for r in doc["rows"] if r["name"] == "ledger"][0]
         self.assertEqual(ledger["status"], "fail")
 
+    def tv_row(self):
+        self.run_check()
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        return [r for r in doc["rows"] if r["name"] == "tv videos"][0]
+
+    def test_tv_videos_row_needs_a_finished_pass_and_reads_its_time(self):
+        log = self.root / "drive.log"
+        self.cfg["tv_video_log"] = str(log)
+        self.write_ledger()
+        # No log at all: a job that never ran is not a pass.
+        self.assertEqual(self.tv_row()["status"], "warn")
+        def stamp(hours_ago):
+            return ms.datetime.fromtimestamp(self.t0 - hours_ago * 3600, tz=ms.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.write_text(f"{stamp(100)} pass done\n{stamp(35)} pass done\n{stamp(1)} no drive\n", encoding="utf-8")
+        row = self.tv_row()
+        self.assertEqual(row["status"], "pass")
+        self.assertIn("35 h", row["value"] + row["detail"])
+        log.write_text(f"{stamp(37)} pass done\n", encoding="utf-8")
+        self.assertEqual(self.tv_row()["status"], "warn")
+        log.write_text(f"{stamp(97)} pass done\n", encoding="utf-8")
+        self.assertEqual(self.tv_row()["status"], "fail")
+        # Only refusals in the log: nothing finished.
+        log.write_text(f"{stamp(1)} no drive\n", encoding="utf-8")
+        self.assertEqual(self.tv_row()["status"], "warn")
+        # The older line format has no readable time: the file's own time is used.
+        log.write_text("Sat Nov 14 02:30:03 AWST 2026 pass done\n", encoding="utf-8")
+        os.utime(log, (self.t0 - 2 * 3600, self.t0 - 2 * 3600))
+        self.assertEqual(self.tv_row()["status"], "pass")
+        os.utime(log, (self.t0 - 40 * 3600, self.t0 - 40 * 3600))
+        self.assertEqual(self.tv_row()["status"], "warn")
+
     def test_shazam_waiting_warn(self):
         self.write_shazam_db()
         ms.cmd_collect(self.cfg)
