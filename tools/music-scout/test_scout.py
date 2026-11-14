@@ -375,6 +375,26 @@ class MediaShareTests(unittest.TestCase):
         self._playback(broken + self._skip_day(2, 10, "07. Short.m4a"))
         self.assertNotIn(other, scout.skip_rejected_keys(self.cfg, self.paths))
 
+    def test_candidates_refresh_the_shared_record_first_and_keep_going_when_that_fails(self):
+        calls = []
+
+        def collect_ok():
+            calls.append("collect")
+            return None
+
+        runners = scout.Runners(media_collect=collect_ok, ai_pick=lambda *a, **k: (75, ""),
+                                itunes_albums=lambda *a, **k: [], clock=lambda: "2026-11-14T12:00:00Z")
+        _, _, errors = scout.cmd_candidates(self.cfg, self.paths, runners)
+        self.assertEqual(calls, ["collect"])
+        self.assertFalse([e for e in errors if e.startswith("media-sync")])
+        failing = scout.Runners(media_collect=lambda: "collect exit 1: no sources", ai_pick=lambda *a, **k: (75, ""),
+                                itunes_albums=lambda *a, **k: [], clock=lambda: "2026-11-14T12:00:00Z")
+        rows, counts, errors = scout.cmd_candidates(self.cfg, self.paths, failing)
+        self.assertIn("media-sync: collect exit 1: no sources", errors)
+        self.assertIn("shazam", counts)
+        # A test's runners never run the real collector.
+        self.assertIsNone(scout.Runners().media_collect())
+
     def test_publish_omits_rejected(self):
         key = scout.track_key("Pub Reject", "Song")
         scout.append_jsonl(

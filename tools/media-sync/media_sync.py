@@ -820,7 +820,8 @@ def summarise_check(rows: List[CheckRow]) -> Dict[str, Any]:
         datum = "media"
         detail = ""
     else:
-        value = f"{counts['fail']} fail {counts['warn']} warn".strip()
+        # Only what is wrong: "2 warn", not "0 fail 2 warn".
+        value = " ".join(f"{counts[k]} {k}" for k in ("fail", "warn") if counts[k])
         fails = [r for r in rows if r["status"] == "fail"]
         warns = [r for r in rows if r["status"] == "warn"]
         head = fails[0] if fails else warns[0]

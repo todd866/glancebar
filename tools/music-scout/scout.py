@@ -437,6 +437,7 @@ class Runners:
         on_battery: Callable[[], bool] | None = None,
         clock: Callable[[], str] | None = None,
         sleep: Callable[[float], None] | None = None,
+        media_collect: Callable[[], str | None] | None = None,
     ):
         self.itunes_search = itunes_search or _default_itunes_search
         self.itunes_lookup = itunes_lookup or _default_itunes_lookup
@@ -449,6 +450,27 @@ class Runners:
         self.on_battery = on_battery or _default_on_battery
         self.clock = clock or iso_now
         self.sleep = sleep or time.sleep
+        # Refreshes this Mac's part of the shared media record. Off unless the command line
+        # turns it on, so a test never writes into the real shared folder.
+        self.media_collect = media_collect or (lambda: None)
+
+
+MEDIA_SYNC = Path(__file__).resolve().parent.parent / "media-sync" / "media_sync.py"
+
+
+def _default_media_collect() -> str | None:
+    """Bring this Mac's Shazams and likes into the shared record before candidates are read,
+    so a song Shazamed this evening is offered tonight. Returns what went wrong, or None."""
+    if not MEDIA_SYNC.is_file():
+        return None
+    try:
+        res = subprocess.run([sys.executable, str(MEDIA_SYNC), "collect"],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"collect: {exc}"
+    if res.returncode != 0:
+        return f"collect exit {res.returncode}: {(res.stderr or res.stdout).strip()}"
+    return None
 
 
 _ITUNES_LAST = 0.0
@@ -1243,6 +1265,9 @@ def cmd_candidates(
 ) -> tuple[list[dict], dict[str, int], list[str]]:
     errors: list[str] = []
     by_source: dict[str, list[dict]] = defaultdict(list)
+    collect_error = runners.media_collect()
+    if collect_error:
+        errors.append(f"media-sync: {collect_error}")
     rejected = rejected_keys(cfg, paths)
     _, universe_errors = load_universe(Path(cfg["media_share"]).expanduser())
     for msg in universe_errors:
@@ -1794,7 +1819,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     state = Path(args.state).expanduser() if args.state else DEFAULT_STATE
     paths = ScoutPaths(state)
-    runners = Runners()
+    runners = Runners(media_collect=_default_media_collect)
 
     if args.cmd == "candidates":
         with run_lock(paths.lock):
