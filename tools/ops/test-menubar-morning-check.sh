@@ -30,6 +30,7 @@ new_case() {
     "$home/.local/state/stash" \
     "$home/.config/remote-run" \
     "$home/Projects/glancebar" \
+    "$home/Projects/glancebar/tools/media-sync" \
     "$home/Projects/energybar" \
     "$work/unused-home" \
     "$apps/Glancebar.app/Contents/MacOS" \
@@ -126,6 +127,18 @@ exit 0
 EOF
   chmod +x "$bin/git" "$bin/pgrep" "$bin/ssh" "$bin/remote-run" "$bin/heavy-slot" "$bin/log" "$bin/osascript"
 
+  cat > "$home/Projects/glancebar/tools/media-sync/media_sync.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+if "collect" in sys.argv:
+    raise SystemExit(0)
+if "check" in sys.argv:
+    print("PASS ledger: quiet")
+    raise SystemExit(0)
+raise SystemExit(2)
+EOF
+  chmod +x "$home/Projects/glancebar/tools/media-sync/media_sync.py"
+
   print -r -- '# remote-run workers' > "$home/.config/remote-run/hosts"
   print -r -- 'm2' >> "$home/.config/remote-run/hosts"
   print -r -- '# m1 disabled' >> "$home/.config/remote-run/hosts"
@@ -181,7 +194,7 @@ run_script() {
 trace_has() { grep -q -- "$1" "$CASE_TRACE"; }
 trace_count() { grep -c -- "$1" "$CASE_TRACE" 2>/dev/null || true; }
 
-print "1..10"
+print "1..11"
 
 if [[ ! -f $SCRIPT ]]; then
   not_ok "script exists"
@@ -261,6 +274,7 @@ if (( CASE_RC == 0 )) && [[ ! -s $CASE_TRACE ]] \
   && grep -q 'Energybar tests' "$CASE_WORK/stdout" \
   && grep -q 'iDrive' "$CASE_WORK/stdout" \
   && grep -q 'stash' "$CASE_WORK/stdout" \
+  && grep -q 'media:' "$CASE_WORK/stdout" \
   && [[ ! -e "$(report)/latest.txt" ]]; then
   ok "--check prints probes and runs nothing"
 else
@@ -325,6 +339,30 @@ else
   not_ok "unknown option exits 2"
   print -r -- "rc=$CASE_RC"
 fi
+
+# --- media sync stub passes check lines through ---
+new_case
+mkdir -p "$CASE_HOME/Projects/glancebar/tools/media-sync"
+cat > "$CASE_HOME/stub-media-sync.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+if "collect" in sys.argv:
+    raise SystemExit(0)
+print("PASS ledger: 1 tracks, 1 likes, 0 shazams")
+print("WARN shazam: 1 waiting, oldest 4 d")
+EOF
+chmod +x "$CASE_HOME/stub-media-sync.py"
+export MORNING_MEDIA_SYNC="$CASE_HOME/stub-media-sync.py"
+export MORNING_GLANCEBAR_REPO="$CASE_HOME/Projects/glancebar"
+run_script
+if grep -q '^PASS media ledger:' "$(report)/latest.txt" \
+  && grep -q '^WARN media shazam:' "$(report)/latest.txt"; then
+  ok "media probe records PASS and WARN lines"
+else
+  not_ok "media probe records PASS and WARN lines"
+  cat "$(report)/latest.txt" 2>/dev/null >&2
+fi
+unset MORNING_MEDIA_SYNC
 
 if (( failures > 0 )); then
   print "$failures failed"

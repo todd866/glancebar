@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+"""media-sync — one shared record of music signals and health checks."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import sqlite3
+import sys
+import time
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+HOME = Path.home()
+_TOOL_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TOOL_DIR.parent
+_SCOUT_DIR = _REPO_ROOT / "music-scout"
+_OFFLINE_CACHE = _REPO_ROOT / "offline-cache"
+for _p in (_SCOUT_DIR, _OFFLINE_CACHE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+import offline_cache as oc  # noqa: E402
+import scout  # noqa: E402
+
+track_key = scout.track_key
+normal = scout.normal
+
+DEFAULT_HOST = socket.gethostname().split(".")[0].lower()
+
+DEFAULTS: Dict[str, Any] = {
+    "host": DEFAULT_HOST,
+    "share_dir": str(HOME / ".local/state/mac-sync/media"),
+    "state_dir": str(HOME / ".local/state/media-sync"),
+    "shazam_db": str(HOME / "Library/Application Support/com.apple.shazamd/ShazamLibrary.sqlite"),
+    "hearts_path": str(HOME / ".local/state/selector/hearts.json"),
+    "heart_history": str(HOME / ".local/state/selector/heart-history.jsonl"),
+    "glancebar_feedback": str(HOME / "Library/Application Support/Glancebar/mix/feedback.jsonl"),
+    "liked_pulled": str(HOME / ".local/state/glancebar-mix/liked-pulled.json"),
+    "yt_liked_dir": str(HOME / "Music/YouTube Liked"),
+    "music_sync_inventory": str(HOME / ".local/state/music-sync/inventory.json"),
+    "catalogue": str(HOME / ".local/state/glancebar-music-library/catalogue.json"),
+    "tv_storage": "",
+    "tv_music_videos": "",
+    "storefront": "au",
+    "mixpool_state": str(HOME / ".local/state/glancebar-mix"),
+    "apple_music_dir": str(HOME / "Music/Apple Music"),
+    "music_library_state": str(HOME / ".local/state/glancebar-music-library"),
+    "scout_state": str(HOME / ".local/state/glancebar-music-scout"),
+    "selector_state": str(HOME / ".local/state/selector"),
+    "tv_video_log": "",
+    "check": {
+        "ledger_warn_h": 30,
+        "ledger_fail_h": 72,
+        "shazam_fresh_days": 30,
+        "shazam_wait_d": 3,
+        "favourites_min_share": 0.90,
+        "favourites_warn_h": 14,
+        "favourites_fail_h": 48,
+        "offload_warn_h": 24,
+        "offload_fail_h": 96,
+        "upload_warn_h": 36,
+        "upload_fail_h": 72,
+        "scout_warn_h": 30,
+        "scout_fail_h": 72,
+        "hotset_warn_h": 30,
+        "hotset_fail_h": 96,
+        "triplej_warn_h": 30,
+        "triplej_fail_h": 72,
+        "tv_videos_warn_h": 36,
+        "tv_videos_fail_h": 96,
+        "peer_stale_h": 50,
+    },
+}
+
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+_AUDIO = {".m4a", ".mp3", ".flac", ".alac", ".aac", ".wav", ".aiff", ".aif"}
+_VIDEO = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
+
+_YT_NAME = re.compile(
+    r"^(?P<artist>.+?) - (?P<title>.+) \[(?P<vid>[A-Za-z0-9_-]+)\]\.m4a$",
+    re.IGNORECASE,
+)
+_VID_TAIL = re.compile(r" \[([A-Za-z0-9_-]+)\]$")
+_STRIP_DECOR = re.compile(
+    r"\s*[\(\[]"
+    r"(?:Official Video|Official Music Video|Official Audio|Visualiser|"
+    r"Lyric Video|4K Remaster)"
+    r"[\)\]]\s*",
+    re.IGNORECASE,
+)
+
+_clock_fn: Callable[[], float] = time.time
+
+
+def set_clock(fn: Callable[[], float]) -> None:
+    global _clock_fn
+    _clock_fn = fn
+
+
+def now_epoch() -> int:
+    return int(_clock_fn())
+
+
+def utc_now() -> datetime:
+    return datetime.fromtimestamp(_clock_fn(), tz=timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(value: str) -> Optional[datetime]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    p = path or (HOME / ".config/glancebar/media-sync.json")
+    if p.is_file():
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        for key, val in raw.items():
+            if key == "check" and isinstance(val, dict):
+                cfg["check"].update(val)
+            else:
+                cfg[key] = val
+    return cfg
+
+
+def expand(path: str) -> Path:
+    return Path(path).expanduser()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: Path, doc: Any) -> None:
+    atomic_write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+
+
+def age_fact(seconds: float) -> str:
+    hours = seconds / 3600.0
+    if hours < 48:
+        return f"{int(round(hours))} h"
+    days = hours / 24.0
+    return f"{int(round(days))} d"
+
+
+def source_status(ok: bool, count: int = 0, error: str = "") -> Dict[str, Any]:
+    return {"ok": ok, "count": count, "error": error}
+
+
+def read_json_file(path: Path) -> Tuple[Optional[Any], str]:
+    if not path.is_file():
+        return None, "missing"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), ""
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, str(exc)[:120]
+
+
+def empty_track(artist: str, title: str) -> Dict[str, Any]:
+    return {
+        "artist": artist,
+        "title": title,
+        "album": "",
+        "ids": {"apple_music": "", "isrc": "", "youtube": ""},
+        "signals": [],
+        "owned": False,
+        "video": "",
+    }
+
+
+def signal_key(sig: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (sig.get("kind") or "", sig.get("source") or "", sig.get("at") or "")
+
+
+def add_signal(track: Dict[str, Any], sig: Dict[str, Any]) -> None:
+    sk = signal_key(sig)
+    for existing in track.get("signals") or []:
+        if signal_key(existing) == sk:
+            return
+    track.setdefault("signals", []).append(sig)
+
+
+def merge_track(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for field in ("artist", "title", "album"):
+        if not out.get(field) and other.get(field):
+            out[field] = other[field]
+    ids = dict(out.get("ids") or {})
+    for key, val in (other.get("ids") or {}).items():
+        if val and not ids.get(key):
+            ids[key] = val
+    out["ids"] = ids
+    if other.get("owned"):
+        out["owned"] = True
+    if other.get("video") and not out.get("video"):
+        out["video"] = other["video"]
+    for sig in other.get("signals") or []:
+        add_signal(out, sig)
+    return out
+
+
+def strip_tv_decorations(title: str) -> str:
+    prev = None
+    text = title
+    while prev != text:
+        prev = text
+        text = _STRIP_DECOR.sub(" ", text).strip()
+    return " ".join(text.split())
+
+
+def parse_bracketed_name(name: str) -> Tuple[str, str, str]:
+    """Return artist, title, video id from a file base name (no extension)."""
+    vid = ""
+    m = _VID_TAIL.search(name)
+    if m:
+        vid = m.group(1)
+        name = name[: m.start()].strip()
+    if " - " in name:
+        artist, title = name.split(" - ", 1)
+        artist = artist.strip()
+        title = strip_tv_decorations(title.strip())
+    else:
+        artist = ""
+        title = strip_tv_decorations(name.strip())
+    return artist, title, vid
+
+
+def epoch_to_iso(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if num > 1e12:
+        num /= 1000.0
+    return datetime.fromtimestamp(num, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def shazam_seconds_to_iso(zdate: Any) -> str:
+    try:
+        secs = float(zdate)
+    except (TypeError, ValueError):
+        return ""
+    when = APPLE_EPOCH + timedelta(seconds=secs)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def collect_shazam(db_path: Path) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    if not db_path.is_file():
+        return source_status(False, 0, "missing"), tracks
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        cur = conn.execute(
+            "SELECT ZDATE, ZTITLE, ZSUBTITLE, ZALBUMNAME, ZAPPLEMUSICID, ZISRC "
+            "FROM ZSHTRACKMO"
+        )
+        count = 0
+        for zdate, title, artist, album, am_id, isrc in cur:
+            artist = str(artist or "").strip()
+            title = str(title or "").strip()
+            if not artist and not title:
+                continue
+            key = track_key(artist, title)
+            tr = tracks.setdefault(key, empty_track(artist, title))
+            tr["album"] = str(album or "") or tr.get("album") or ""
+            if am_id:
+                tr["ids"]["apple_music"] = str(am_id)
+            if isrc:
+                tr["ids"]["isrc"] = str(isrc)
+            add_signal(
+                tr,
+                {
+                    "kind": "shazam",
+                    "source": "shazam",
+                    "at": shazam_seconds_to_iso(zdate),
+                },
+            )
+            count += 1
+        conn.close()
+        return source_status(True, count), tracks
+    except (sqlite3.Error, OSError) as exc:
+        return source_status(False, 0, str(exc)[:120]), tracks
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return rows
+
+
+def collect_hearts(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    hearts_path = expand(cfg["hearts_path"])
+    doc, err = read_json_file(hearts_path)
+    if doc is None:
+        return source_status(False, 0, err), tracks
+    heart_keys = list((doc.get("tracks") or []))
+    latest_heart: Dict[str, str] = {}
+    for row in read_jsonl(expand(cfg["heart_history"])):
+        if row.get("action") != "heart":
+            continue
+        key = row.get("trackKey") or track_key(row.get("artist", ""), row.get("title", ""))
+        at = row.get("at")
+        if isinstance(at, (int, float)):
+            at_iso = epoch_to_iso(at)
+        else:
+            at_iso = str(at or "")
+        if key:
+            latest_heart[key] = at_iso
+    count = 0
+    for key in heart_keys:
+        if "|" not in key:
+            continue
+        artist, title = key.split("|", 1)
+        tr = tracks.setdefault(key, empty_track(artist, title))
+        add_signal(
+            tr,
+            {
+                "kind": "like",
+                "source": "glancebar",
+                "at": latest_heart.get(key, ""),
+            },
+        )
+        count += 1
+    fb_path = expand(cfg["glancebar_feedback"])
+    for row in read_jsonl(fb_path):
+        if not row.get("liked"):
+            continue
+        artist = str(row.get("artist") or "")
+        title = str(row.get("title") or "")
+        key = track_key(artist, title)
+        tr = tracks.setdefault(key, empty_track(artist, title))
+        add_signal(
+            tr,
+            {
+                "kind": "like",
+                "source": "glancebar",
+                "at": epoch_to_iso(row.get("at")) if not isinstance(row.get("at"), str) else row.get("at", ""),
+            },
+        )
+        count += 1
+    return source_status(True, count), tracks
+
+
+def collect_apple_music(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    path = expand(cfg["liked_pulled"])
+    doc, err = read_json_file(path)
+    if doc is None:
+        return source_status(False, 0, err), tracks
+    count = 0
+    for bucket in ("done", "failed", "no_match", "wrong_song"):
+        items = doc.get(bucket) or {}
+        if not isinstance(items, dict):
+            continue
+        for composite, meta in items.items():
+            if "|" not in composite:
+                continue
+            artist, title = composite.split("|", 1)
+            key = track_key(artist, title)
+            tr = tracks.setdefault(key, empty_track(artist, title))
+            add_signal(tr, {"kind": "like", "source": "apple-music", "at": ""})
+            if bucket == "done" and isinstance(meta, dict) and meta.get("track_id"):
+                tr["ids"]["apple_music"] = str(meta["track_id"])
+            count += 1
+    return source_status(True, count), tracks
+
+
+def collect_youtube(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    yt_dir = expand(cfg["yt_liked_dir"])
+    count = 0
+    used_inventory = False
+    if yt_dir.is_dir():
+        try:
+            names = [p.name for p in yt_dir.iterdir() if p.is_file()]
+        except OSError as exc:
+            return source_status(False, 0, str(exc)[:120]), tracks
+        if names:
+            for name in names:
+                m = _YT_NAME.match(name)
+                if not m:
+                    continue
+                artist = m.group("artist").strip()
+                title = m.group("title").strip()
+                vid = m.group("vid")
+                key = track_key(artist, title)
+                tr = tracks.setdefault(key, empty_track(artist, title))
+                tr["ids"]["youtube"] = vid
+                add_signal(tr, {"kind": "like", "source": "youtube", "at": ""})
+                count += 1
+            return source_status(True, count), tracks
+    inv_path = expand(cfg["music_sync_inventory"])
+    doc, err = read_json_file(inv_path)
+    if doc is None:
+        if not yt_dir.is_dir():
+            return source_status(False, 0, "missing"), tracks
+        return source_status(True, 0), tracks
+    used_inventory = True
+    for item in doc.get("yt") or []:
+        if not isinstance(item, dict):
+            continue
+        artist = str(item.get("artist") or "")
+        title = str(item.get("title") or "")
+        vid = str(item.get("videoId") or "")
+        key = track_key(artist, title)
+        tr = tracks.setdefault(key, empty_track(artist, title))
+        if vid:
+            tr["ids"]["youtube"] = vid
+        add_signal(tr, {"kind": "like", "source": "youtube", "at": ""})
+        count += 1
+    st = source_status(True, count)
+    if used_inventory and count == 0 and err:
+        st = source_status(False, 0, err)
+    return st, tracks
+
+
+def collect_tv_likes(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    storage = (cfg.get("tv_storage") or "").strip()
+    videos_root = (cfg.get("tv_music_videos") or "").strip()
+    if not storage:
+        return source_status(False, 0, "missing"), tracks
+    stor_path = expand(storage)
+    doc, err = read_json_file(stor_path)
+    if doc is None:
+        return source_status(False, 0, err or "missing"), tracks
+    raw = doc.get("onto.tv.likes")
+    if raw is None:
+        return source_status(False, 0, "no tv likes key"), tracks
+    if isinstance(raw, str):
+        try:
+            likes = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return source_status(False, 0, str(exc)[:120]), tracks
+    else:
+        likes = raw
+    if not isinstance(likes, dict):
+        return source_status(False, 0, "bad likes shape"), tracks
+    vroot = expand(videos_root) if videos_root else None
+    count = 0
+    for src, entry in likes.items():
+        if not isinstance(entry, dict):
+            continue
+        if vroot and not str(src).startswith(str(vroot)):
+            continue
+        base = Path(str(src)).stem
+        artist, title, _vid = parse_bracketed_name(base)
+        key = track_key(artist, title)
+        tr = tracks.setdefault(key, empty_track(artist, title))
+        sig = {
+            "kind": "like",
+            "source": "tv",
+            "at": epoch_to_iso(entry.get("at")),
+            "audience": str(entry.get("key") or ""),
+        }
+        add_signal(tr, sig)
+        count += 1
+    return source_status(True, count), tracks
+
+
+def collect_videos(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    tracks: Dict[str, Dict[str, Any]] = {}
+    root_s = (cfg.get("tv_music_videos") or "").strip()
+    if not root_s:
+        return source_status(False, 0, "missing"), tracks
+    root = expand(root_s)
+    if not root.is_dir():
+        return source_status(False, 0, "missing"), tracks
+    count = 0
+    try:
+        with os.scandir(root) as artists:
+            for artist_ent in artists:
+                if not artist_ent.is_dir(follow_symlinks=False):
+                    continue
+                with os.scandir(artist_ent.path) as files:
+                    for fent in files:
+                        if not fent.is_file(follow_symlinks=False):
+                            continue
+                        if Path(fent.name).suffix.lower() not in _VIDEO:
+                            continue
+                        artist, title, vid = parse_bracketed_name(Path(fent.name).stem)
+                        key = track_key(artist, title)
+                        tr = tracks.setdefault(key, empty_track(artist, title))
+                        if vid:
+                            tr["video"] = vid
+                        count += 1
+    except OSError as exc:
+        return source_status(False, 0, str(exc)[:120]), tracks
+    return source_status(True, count), tracks
+
+
+def build_catalogue_owned_index(catalogue_path: Path) -> Set[Tuple[str, str]]:
+    doc, _ = read_json_file(catalogue_path)
+    if not doc:
+        return set()
+    index: Set[Tuple[str, str]] = set()
+    for entry in doc.get("entries") or []:
+        tags = (entry or {}).get("tags") or {}
+        for pair in oc.catalogue_match_keys(tags.get("artist", ""), tags.get("title", "")):
+            index.add(pair)
+    return index
+
+
+def apply_owned(tracks: Dict[str, Dict[str, Any]], catalogue_path: Path) -> None:
+    if not catalogue_path.is_file():
+        return
+    index = build_catalogue_owned_index(catalogue_path)
+    if not index:
+        return
+    for tr in tracks.values():
+        keys = oc.catalogue_match_keys(tr.get("artist", ""), tr.get("title", ""))
+        if any(k in index for k in keys):
+            tr["owned"] = True
+
+
+def merge_track_dicts(parts: List[Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for part in parts:
+        for key, tr in part.items():
+            if key in merged:
+                merged[key] = merge_track(merged[key], tr)
+            else:
+                merged[key] = json.loads(json.dumps(tr))
+    return merged
+
+
+def load_signals_file(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
+    doc, err = read_json_file(path)
+    if doc is None:
+        return None, err
+    if not isinstance(doc.get("tracks"), dict):
+        return None, "bad tracks"
+    return doc, ""
+
+
+def merge_all_signals(share_dir: Path, host: Optional[str] = None) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    merged: Dict[str, Dict[str, Any]] = {}
+    if not share_dir.is_dir():
+        return merged, warnings
+    for path in sorted(share_dir.glob("signals-*.json")):
+        if host and path.stem == f"signals-{host}":
+            continue
+        doc, err = load_signals_file(path)
+        if doc is None:
+            warnings.append(f"{path.name}: {err}")
+            continue
+        for key, tr in (doc.get("tracks") or {}).items():
+            if key in merged:
+                merged[key] = merge_track(merged[key], tr)
+            else:
+                merged[key] = json.loads(json.dumps(tr))
+    return merged, warnings
+
+
+def merge_share_including_host(share_dir: Path) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    if not share_dir.is_dir():
+        return merged
+    for path in sorted(share_dir.glob("signals-*.json")):
+        doc, err = load_signals_file(path)
+        if doc is None:
+            continue
+        for key, tr in (doc.get("tracks") or {}).items():
+            if key in merged:
+                merged[key] = merge_track(merged[key], tr)
+            else:
+                merged[key] = json.loads(json.dumps(tr))
+    return merged
+
+
+def has_like(track: Dict[str, Any]) -> bool:
+    for sig in track.get("signals") or []:
+        if sig.get("kind") == "like":
+            return True
+    return False
+
+
+def has_dislike(track: Dict[str, Any]) -> bool:
+    for sig in track.get("signals") or []:
+        if sig.get("kind") == "dislike":
+            return True
+    return False
+
+
+def liked_export_rows(merged: Dict[str, Dict[str, Any]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for key in sorted(merged.keys()):
+        tr = merged[key]
+        if not has_like(tr) or has_dislike(tr):
+            continue
+        vid = (tr.get("ids") or {}).get("youtube") or ""
+        if not vid:
+            vid = f"key:{key}"
+        rows.append(
+            {
+                "videoId": vid,
+                "title": tr.get("title") or "",
+                "artist": tr.get("artist") or "",
+            }
+        )
+    return rows
+
+
+def cmd_collect(cfg: Dict[str, Any]) -> int:
+    parts: List[Dict[str, Dict[str, Any]]] = []
+    sources: Dict[str, Dict[str, Any]] = {}
+
+    st, tr = collect_shazam(expand(cfg["shazam_db"]))
+    sources["shazam"] = st
+    parts.append(tr)
+    print(f"shazam {st['count']} {st['ok']}")
+
+    st, tr = collect_hearts(cfg)
+    sources["glancebar"] = st
+    parts.append(tr)
+    print(f"glancebar {st['count']} {st['ok']}")
+
+    st, tr = collect_apple_music(cfg)
+    sources["apple-music"] = st
+    parts.append(tr)
+    print(f"apple-music {st['count']} {st['ok']}")
+
+    st, tr = collect_youtube(cfg)
+    sources["youtube"] = st
+    parts.append(tr)
+    print(f"youtube {st['count']} {st['ok']}")
+
+    st, tr = collect_tv_likes(cfg)
+    sources["tv"] = st
+    parts.append(tr)
+    print(f"tv {st['count']} {st['ok']}")
+
+    st, tr = collect_videos(cfg)
+    sources["video"] = st
+    parts.append(tr)
+    print(f"video {st['count']} {st['ok']}")
+
+    tracks = merge_track_dicts(parts)
+    apply_owned(tracks, expand(cfg["catalogue"]))
+
+    any_ok = any(s.get("ok") for s in sources.values())
+    if not any_ok and not tracks:
+        return 1
+
+    host = cfg.get("host") or DEFAULT_HOST
+    doc = {
+        "version": 1,
+        "host": host,
+        "generated": iso_now(),
+        "sources": sources,
+        "tracks": tracks,
+    }
+    share = expand(cfg["share_dir"])
+    out = share / f"signals-{host}.json"
+    try:
+        atomic_write_json(out, doc)
+    except OSError:
+        return 1
+    state = expand(cfg["state_dir"])
+    stamp = state / "last-collect.json"
+    try:
+        atomic_write_json(stamp, {"at": now_epoch(), "host": host, "sources": sources})
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_show(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    merged = merge_share_including_host(expand(cfg["share_dir"]))
+    since_dt: Optional[datetime] = None
+    if args.since is not None:
+        since_dt = utc_now() - timedelta(days=float(args.since))
+    for key in sorted(merged.keys()):
+        if args.key and key != args.key:
+            continue
+        tr = merged[key]
+        kinds: Set[str] = set()
+        newest: Optional[datetime] = None
+        for sig in tr.get("signals") or []:
+            kinds.add(sig.get("kind") or "")
+            if args.kind and sig.get("kind") != args.kind:
+                continue
+            at = parse_iso(sig.get("at") or "")
+            if at and (newest is None or at > newest):
+                newest = at
+        if args.kind and args.kind not in kinds:
+            continue
+        if since_dt and (newest is None or newest < since_dt):
+            continue
+        date_s = newest.strftime("%Y-%m-%d") if newest else "----"
+        kind_s = ",".join(sorted(k for k in kinds if k))
+        flags = []
+        if tr.get("owned"):
+            flags.append("owned")
+        if tr.get("video"):
+            flags.append("video")
+        flag_s = ",".join(flags) if flags else "-"
+        artist = tr.get("artist") or ""
+        title = tr.get("title") or ""
+        print(f"{date_s} {kind_s:12} {flag_s:10} {artist} — {title}")
+    return 0
+
+
+def cmd_export_likes(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    merged = merge_share_including_host(expand(cfg["share_dir"]))
+    rows = liked_export_rows(merged)
+    out = Path(args.out).expanduser()
+    old_count = 0
+    if out.is_file():
+        try:
+            old = json.loads(out.read_text(encoding="utf-8"))
+            if isinstance(old, list):
+                old_count = len(old)
+        except (OSError, json.JSONDecodeError):
+            old_count = 0
+    if not rows and not args.force:
+        print("export aborted: merged view has no liked tracks")
+        return 3
+    if old_count and len(rows) < old_count * 0.8 and not args.force:
+        print(
+            f"export aborted: new list {len(rows)} rows is below 80% of existing {old_count}"
+        )
+        return 3
+    try:
+        atomic_write_json(out, rows)
+    except OSError as exc:
+        print(f"export failed: {exc}")
+        return 1
+    return 0
+
+
+CheckRow = Dict[str, Any]
+
+
+def make_row(
+    name: str,
+    status: str,
+    fact: str,
+    host: str,
+    detail: str = "",
+) -> CheckRow:
+    datum = fact.split()[0] if fact else ""
+    return {
+        "key": f"media:{name}",
+        "status": status,
+        "name": name,
+        "host": host,
+        "value": fact,
+        "datum": datum,
+        "detail": detail or fact,
+    }
+
+
+def worst_status(rows: List[CheckRow]) -> str:
+    if any(r["status"] == "fail" for r in rows):
+        return "fail"
+    if any(r["status"] == "warn" for r in rows):
+        return "warn"
+    return "pass"
+
+
+def summarise_check(rows: List[CheckRow]) -> Dict[str, Any]:
+    counts = {"pass": 0, "warn": 0, "fail": 0}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    status = worst_status(rows)
+    if status == "pass":
+        value = "ok"
+        datum = "media"
+        detail = ""
+    else:
+        value = f"{counts['fail']} fail {counts['warn']} warn".strip()
+        fails = [r for r in rows if r["status"] == "fail"]
+        warns = [r for r in rows if r["status"] == "warn"]
+        head = fails[0] if fails else warns[0]
+        datum = head["name"]
+        parts = [f"{r['name']}: {r['detail']}" for r in fails + warns]
+        detail = "; ".join(parts)
+    return {
+        "status": status,
+        "value": value,
+        "datum": datum,
+        "detail": detail,
+        "counts": counts,
+    }
+
+
+def print_check_line(row: CheckRow) -> None:
+    tag = row["status"].upper()
+    if tag == "PASS":
+        print(f"PASS {row['name']}: {row['value']}")
+    elif tag == "WARN":
+        print(f"WARN {row['name']}: {row['value']}")
+    else:
+        print(f"FAIL {row['name']}: {row['value']}")
+
+
+def read_ledger_keys(scout_state: Path) -> Dict[str, Set[str]]:
+    ledger = scout_state / "ledger.jsonl"
+    out: Dict[str, Set[str]] = {}
+    for row in read_jsonl(ledger):
+        key = row.get("track_key") or ""
+        action = row.get("action") or ""
+        if not key or not action:
+            continue
+        out.setdefault(key, set()).add(action)
+    return out
+
+
+def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    host = cfg.get("host") or DEFAULT_HOST
+    chk = cfg.get("check") or {}
+    now = _clock_fn()
+    share = expand(cfg["share_dir"])
+    state_dir = expand(cfg["state_dir"])
+    rows: List[CheckRow] = []
+
+    # ledger
+    ledger_path = share / f"signals-{host}.json"
+    if ledger_path.is_file():
+        doc, err = load_signals_file(ledger_path)
+        st = "pass"
+        fact = ""
+        detail = ledger_path.name
+        if doc is None:
+            st = "fail"
+            fact = f"unreadable: {err}"
+        else:
+            tracks = doc.get("tracks") or {}
+            likes = sum(1 for t in tracks.values() if has_like(t))
+            shazams = sum(
+                1
+                for t in tracks.values()
+                for s in t.get("signals") or []
+                if s.get("kind") == "shazam"
+            )
+            fact = f"{len(tracks)} tracks, {likes} likes, {shazams} shazams"
+            try:
+                age_h = (now - ledger_path.stat().st_mtime) / 3600.0
+            except OSError:
+                age_h = 0
+            if age_h > float(chk.get("ledger_fail_h", 72)):
+                st = "fail"
+                fact = f"{fact}; stale {age_fact(age_h * 3600)}"
+            elif age_h > float(chk.get("ledger_warn_h", 30)):
+                st = "warn"
+                fact = f"{fact}; age {age_fact(age_h * 3600)}"
+            for name, src in (doc.get("sources") or {}).items():
+                if not src.get("ok") and src.get("error") not in ("", "missing", None):
+                    st = "warn" if st == "pass" else st
+                    fact = f"{fact}; {name}: {src.get('error')}"
+        rows.append(make_row("ledger", st, fact, host, detail))
+
+    # shazam handling
+    shazam_db = expand(cfg["shazam_db"])
+    if shazam_db.is_file():
+        merged = merge_share_including_host(share)
+        ledger = read_ledger_keys(expand(cfg["scout_state"]))
+        fresh_days = float(chk.get("shazam_fresh_days", 30))
+        wait_d = float(chk.get("shazam_wait_d", 3))
+        cutoff = utc_now() - timedelta(days=fresh_days)
+        fresh: List[Tuple[str, datetime]] = []
+        for key, tr in merged.items():
+            if tr.get("owned") or has_dislike(tr):
+                continue
+            for sig in tr.get("signals") or []:
+                if sig.get("kind") != "shazam":
+                    continue
+                at = parse_iso(sig.get("at") or "")
+                if at and at >= cutoff:
+                    fresh.append((key, at))
+        waiting = []
+        for key, at in fresh:
+            actions = ledger.get(key) or set()
+            handled = actions & {"acquired", "queued", "offered", "failed"}
+            if handled:
+                continue
+            age_d = (utc_now() - at).total_seconds() / 86400.0
+            if age_d > wait_d:
+                waiting.append((key, age_d))
+        if waiting:
+            oldest = max(w[1] for w in waiting)
+            fact = f"{len(waiting)} waiting, oldest {int(round(oldest))} d"
+            rows.append(make_row("shazam", "warn", fact, host))
+        else:
+            fact = f"{len(fresh)} in {int(fresh_days)} d, all handled"
+            rows.append(make_row("shazam", "pass", fact, host))
+
+    # favourites
+    liked_path = expand(cfg["liked_pulled"])
+    pull_log = expand(cfg["mixpool_state"]) / "logs/pull-liked.log"
+    if liked_path.is_file():
+        doc, err = read_json_file(liked_path)
+        st = "pass"
+        fact = "0 of 0 lossless"
+        if doc is None:
+            st = "fail"
+            fact = err
+        else:
+            done = doc.get("done") or {}
+            total = 0
+            for bucket in ("done", "failed", "no_match", "wrong_song"):
+                items = doc.get(bucket) or {}
+                if isinstance(items, dict):
+                    total += len(items)
+            fact = f"{len(done)} of {total} lossless"
+            share_ratio = (len(done) / total) if total else 1.0
+            if share_ratio < float(chk.get("favourites_min_share", 0.90)):
+                st = "warn"
+            if pull_log.is_file():
+                try:
+                    log_age = (now - pull_log.stat().st_mtime) / 3600.0
+                except OSError:
+                    log_age = 0
+                if log_age > float(chk.get("favourites_fail_h", 48)):
+                    st = "fail"
+                    fact = f"{fact}; log {age_fact(log_age * 3600)} old"
+                elif log_age > float(chk.get("favourites_warn_h", 14)):
+                    if st == "pass":
+                        st = "warn"
+                    fact = f"{fact}; log {age_fact(log_age * 3600)} old"
+        rows.append(make_row("favourites", st, fact, host))
+
+    # offload
+    am_dir = expand(cfg["apple_music_dir"])
+    if am_dir.is_dir():
+        files: List[float] = []
+        try:
+            for root, _dirs, names in os.walk(am_dir):
+                for name in names:
+                    p = Path(root) / name
+                    if p.suffix.lower() not in _AUDIO:
+                        continue
+                    try:
+                        files.append(p.stat().st_mtime)
+                    except OSError:
+                        continue
+        except OSError:
+            files = []
+        st = "pass"
+        if not files:
+            fact = "empty"
+        else:
+            oldest = min(files)
+            age_h = (now - oldest) / 3600.0
+            fact = f"{len(files)} files waiting"
+            if age_h > float(chk.get("offload_fail_h", 96)):
+                st = "fail"
+                fact = f"{len(files)} files, oldest {age_fact(age_h * 3600)}"
+            elif age_h > float(chk.get("offload_warn_h", 24)):
+                st = "warn"
+                fact = f"{len(files)} files, oldest {age_fact(age_h * 3600)}"
+        rows.append(make_row("offload", st, fact, host))
+
+    # upload
+    push_status = expand(cfg["music_library_state"]) / "push-status.json"
+    if push_status.is_file():
+        doc, err = read_json_file(push_status)
+        st = "pass"
+        fact = "ok"
+        if doc is None:
+            st = "fail"
+            fact = err
+        else:
+            if doc.get("ok") is False:
+                st = "fail"
+                err_s = str(doc.get("error") or "failed")
+                epoch = doc.get("epoch")
+                if isinstance(epoch, (int, float)):
+                    age_s = now - float(epoch)
+                else:
+                    age_s = now - push_status.stat().st_mtime
+                fact = f"{err_s} ({age_fact(age_s)} ago)"
+            else:
+                epoch = doc.get("epoch")
+                if isinstance(epoch, (int, float)):
+                    age_h = (now - float(epoch)) / 3600.0
+                else:
+                    age_h = (now - push_status.stat().st_mtime) / 3600.0
+                fact = f"ok, {age_fact(age_h * 3600)} ago"
+                if age_h > float(chk.get("upload_fail_h", 72)):
+                    st = "fail"
+                elif age_h > float(chk.get("upload_warn_h", 36)):
+                    st = "warn"
+        rows.append(make_row("upload", st, fact, host))
+
+    # scout
+    last_run = expand(cfg["scout_state"]) / "last-run.json"
+    if last_run.is_file():
+        doc, err = read_json_file(last_run)
+        st = "pass"
+        fact = "ok"
+        if doc is None:
+            st = "fail"
+            fact = err
+        else:
+            if doc.get("ok") is False:
+                st = "warn"
+                errs = doc.get("errors") or []
+                fact = str(errs[0]) if errs else "run failed"
+            at = parse_iso(doc.get("at") or "")
+            if at:
+                age_h = (utc_now() - at).total_seconds() / 3600.0
+                if age_h > float(chk.get("scout_fail_h", 72)):
+                    st = "fail"
+                    fact = f"{fact}; {age_fact(age_h * 3600)} old"
+                elif age_h > float(chk.get("scout_warn_h", 30)) and st == "pass":
+                    st = "warn"
+                    fact = f"{fact}; {age_fact(age_h * 3600)} old"
+        rows.append(make_row("scout", st, fact, host))
+
+    # hot set
+    last_status = expand(cfg["music_library_state"]) / "last-status.json"
+    if last_status.is_file():
+        doc, err = read_json_file(last_status)
+        st = "pass"
+        fact = "ok"
+        if doc is None:
+            st = "fail"
+            fact = err
+        else:
+            if doc.get("lastError"):
+                st = "warn"
+                fact = str(doc["lastError"])
+            sync_at = doc.get("lastSyncAt")
+            if isinstance(sync_at, (int, float)):
+                age_h = (now - float(sync_at)) / 3600.0
+                if age_h > float(chk.get("hotset_fail_h", 96)):
+                    st = "fail"
+                    fact = f"{fact}; {age_fact(age_h * 3600)} old"
+                elif age_h > float(chk.get("hotset_warn_h", 30)) and st == "pass":
+                    st = "warn"
+                    fact = f"{age_fact(age_h * 3600)} old"
+        rows.append(make_row("hot set", st, fact, host))
+
+    # triple j
+    station = expand(cfg["selector_state"]) / "station.json"
+    if station.is_file():
+        try:
+            age_h = (now - station.stat().st_mtime) / 3600.0
+        except OSError:
+            age_h = 0
+        st = "pass"
+        fact = f"{age_fact(age_h * 3600)} old"
+        if age_h > float(chk.get("triplej_fail_h", 72)):
+            st = "fail"
+        elif age_h > float(chk.get("triplej_warn_h", 30)):
+            st = "warn"
+        rows.append(make_row("triple j", st, fact, host))
+
+    # tv videos
+    tv_log = (cfg.get("tv_video_log") or "").strip()
+    if tv_log:
+        log_path = expand(tv_log)
+        merged = merge_share_including_host(share)
+        liked_with_video = sum(1 for t in merged.values() if has_like(t) and t.get("video"))
+        st = "pass"
+        fact = f"{liked_with_video} liked with video"
+        if log_path.is_file():
+            last_done: Optional[datetime] = None
+            try:
+                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if "pass done" not in line:
+                        continue
+                    stamp = line.split()[0] if line.strip() else ""
+                    try:
+                        dt = datetime.strptime(stamp, "%Y-%m-%d")
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+                    last_done = dt
+            except OSError:
+                last_done = None
+            if last_done:
+                age_h = (utc_now() - last_done).total_seconds() / 3600.0
+                if age_h > float(chk.get("tv_videos_fail_h", 96)):
+                    st = "fail"
+                elif age_h > float(chk.get("tv_videos_warn_h", 36)):
+                    st = "warn"
+                fact = f"{liked_with_video} liked with video; pass {age_fact(age_h * 3600)} ago"
+        rows.append(make_row("tv videos", st, fact, host))
+
+    # tv likes
+    tv_storage = (cfg.get("tv_storage") or "").strip()
+    if tv_storage:
+        path = expand(tv_storage)
+        st = "pass"
+        if not path.is_file():
+            st = "warn"
+            fact = "missing"
+        else:
+            doc, err = read_json_file(path)
+            if doc is None:
+                st = "warn"
+                fact = f"unreadable: {err}"
+            else:
+                merged = merge_share_including_host(share)
+                n = sum(
+                    1
+                    for t in merged.values()
+                    for s in t.get("signals") or []
+                    if s.get("source") == "tv" and s.get("kind") == "like"
+                )
+                fact = f"{n} music likes"
+        rows.append(make_row("tv likes", st, fact, host))
+
+    local_rows = list(rows)
+    peer_stale_h = float(chk.get("peer_stale_h", 50))
+    if share.is_dir():
+        for path in sorted(share.glob("check-*.json")):
+            peer_host = path.stem.replace("check-", "", 1)
+            if peer_host == host:
+                continue
+            try:
+                age_h = (now - path.stat().st_mtime) / 3600.0
+            except OSError:
+                age_h = peer_stale_h + 1
+            if age_h > peer_stale_h:
+                stale_date = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%d"
+                )
+                rows.append(
+                    make_row(
+                        f"{peer_host} check",
+                        "warn",
+                        f"stale since {stale_date}",
+                        peer_host,
+                    )
+                )
+                continue
+            doc, err = read_json_file(path)
+            if doc is None:
+                rows.append(
+                    make_row(f"{peer_host} check", "warn", f"unreadable: {err}", peer_host)
+                )
+                continue
+            for pr in doc.get("rows") or []:
+                if isinstance(pr, dict):
+                    rows.append(pr)
+
+    summary = summarise_check(rows)
+    doc_out = {
+        "version": 1,
+        "host": host,
+        "generated": now_epoch(),
+        "status": summary["status"],
+        "value": summary["value"],
+        "datum": summary["datum"],
+        "detail": summary["detail"],
+        "counts": summary["counts"],
+        "rows": rows,
+    }
+    share_out = {
+        **doc_out,
+        "rows": local_rows,
+    }
+    try:
+        atomic_write_json(state_dir / "check.json", doc_out)
+        atomic_write_json(share / f"check-{host}.json", share_out)
+    except OSError:
+        pass
+
+    for row in local_rows:
+        print_check_line(row)
+    for row in rows:
+        if row not in local_rows:
+            print_check_line(row)
+
+    if args.json:
+        print(json.dumps(doc_out, indent=2))
+    if args.strict and summary["status"] == "fail":
+        return 1
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Media signal sync and checks")
+    parser.add_argument("--config", type=Path, default=None, help="Config JSON path")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_collect = sub.add_parser("collect", help="Collect local sources into shared signals file")
+    p_collect.set_defaults(func=lambda a, c: cmd_collect(c))
+
+    p_show = sub.add_parser("show", help="Show merged track view")
+    p_show.add_argument("--key", default=None)
+    p_show.add_argument("--since", type=float, default=None)
+    p_show.add_argument("--kind", choices=("shazam", "like", "dislike"), default=None)
+    p_show.set_defaults(func=lambda a, c: cmd_show(c, a))
+
+    p_export = sub.add_parser("export-likes", help="Export liked tracks for TV video finder")
+    p_export.add_argument("--out", required=True)
+    p_export.add_argument("--force", action="store_true")
+    p_export.set_defaults(func=lambda a, c: cmd_export_likes(c, a))
+
+    p_check = sub.add_parser("check", help="Health checks for music pipeline")
+    p_check.add_argument("--json", action="store_true")
+    p_check.add_argument("--strict", action="store_true")
+    p_check.set_defaults(func=lambda a, c: cmd_check(c, a))
+
+    args = parser.parse_args(argv)
+    cfg = load_config(args.config)
+    return int(args.func(args, cfg))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

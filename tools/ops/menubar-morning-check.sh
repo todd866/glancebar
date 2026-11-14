@@ -43,6 +43,7 @@ print_plan() {
   print -r -- "workers: ssh -o BatchMode=yes -o ConnectTimeout=8 HOST for each host in $MORNING_HOME/.config/remote-run/hosts"
   print -r -- "iDrive: newest record in $MORNING_HOME/Library/Application Support/IDriveforMac/SessionLogsNew/LOGXML"
   print -r -- "stash: tail $MORNING_HOME/.local/state/stash/reclaim.log and reclaim.err"
+  print -r -- "media: media_sync.py collect then check ($MORNING_GLANCEBAR_REPO/tools/media-sync)"
 }
 
 if (( CHECK )); then
@@ -516,6 +517,47 @@ PY
   fi
 }
 
+probe_media() {
+  local script="${MORNING_MEDIA_SYNC:-$MORNING_GLANCEBAR_REPO/tools/media-sync/media_sync.py}"
+  if [[ ! -f $script ]]; then
+    record WARN "media" "media_sync.py missing"
+    return
+  fi
+  if ! run_timeout 120 /usr/bin/python3 "$script" collect >/dev/null 2>&1; then
+    record WARN "media" "collect failed"
+  fi
+  local out
+  out=$(mktemp)
+  run_timeout 120 /usr/bin/python3 "$script" check >"$out" 2>&1 || true
+  while IFS= read -r line; do
+  [[ -n $line ]] || continue
+    case $line in
+      PASS\ *:*)
+        local rest=${line#PASS }
+        local name=${rest%%:*}
+        local fact=${rest#*: }
+        fact=${fact# }
+        record PASS "media $name" "$fact"
+        ;;
+      WARN\ *:*)
+        local rest=${line#WARN }
+        local name=${rest%%:*}
+        local fact=${rest#*: }
+        fact=${fact# }
+        record WARN "media $name" "$fact"
+        ;;
+      FAIL\ *:*)
+        local rest=${line#FAIL }
+        local name=${rest%%:*}
+        local fact=${rest#*: }
+        fact=${fact# }
+        record FAIL "media $name" "$fact"
+        ;;
+    esac
+  done <"$out"
+  rm -f "$out"
+}
+
 probe_stash() {
   local now=$EPOCHSECONDS found=0 latest="" f fm line stamp epoch
   local files=(
@@ -564,4 +606,5 @@ probe_helper
 probe_workers
 probe_idrive
 probe_stash
+probe_media
 exit 0

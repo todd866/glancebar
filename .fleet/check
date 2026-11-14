@@ -1,0 +1,7 @@
+# Read by `fleet morning` (see the fleet repository, docs/morning.md).
+command = "tools/media-sync/media_sync.py check"
+max_runtime_s = 30
+where = "any"
+# The result this repo's own scheduled check writes; Fleet reads it instead of starting the command.
+result = "~/.local/state/media-sync/check.json"
+max_age_h = 30
