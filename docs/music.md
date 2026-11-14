@@ -203,6 +203,29 @@ Found with the system log before this existed: on 12 Nov 2026 the music "cut in 
 because the Bluetooth headphones were sending Pause and Play commands, and their link was
 dropping; the player had no stalls or errors.
 
+## Playing by kind
+
+Kinds: **dance**, **alt**, **rap**, **chill**, **any**. Genres map with chill checked first
+(ambient, downtempo, chill, lo-fi, jazz, classical, acoustic, singer-songwriter, easy listening, …),
+then dance / rap / alt as the mix families (pop counts as alt); everything else is **other** and only
+plays under **any**. A kind queue is a weighted shuffle of library tracks that match, never disliked,
+with tracks you just heard pushed to the back; only files on this Mac play (the rest sync in the
+background like any other offline playlist).
+
+Command (posts to the running app, then exits):
+
+```text
+Glancebar --play dance|alt|rap|chill|any
+Glancebar --play new|show
+Glancebar --play          # resume, or last kind, or any
+Glancebar --pause | --next | --kind
+```
+
+`musicPlayKeyStartsMusic` defaults to **YES**: when nothing is loaded, the keyboard Play key (or
+toggle) starts the last kind, else **any**. Set it NO to leave Play-key behaviour as before. macOS
+routes media keys to the app that last published now-playing information; Glancebar does not
+publish a fake title while idle.
+
 ## Radio shows (14 Nov 2026)
 
 Downloaded radio episodes live under `~/Music/Radio Shows` by default (`defaults` key

@@ -5576,6 +5576,11 @@ static CGFloat kDetailW = 600;
 // Identifies our observation of the status button's effectiveAppearance.
 static void *kBarAppearanceContext = &kBarAppearanceContext;
 static NSString *const kShowPopoverNotification = @"com.iantodd.glancebar.show-popover";
+static NSString *const kGlancebarControlNotification = @"com.iantodd.glancebar.control";
+
+static BOOL GBValidMusicKind(NSString *kind) {
+    return [@[@"dance", @"alt", @"rap", @"chill", @"any"] containsObject:kind];
+}
 static NSString *PopoverRequestObject(void) {
     return [NSString stringWithFormat:@"uid:%u", getuid()];
 }
@@ -5603,6 +5608,11 @@ static NSString *PopoverRequestObject(void) {
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
+- (BOOL)playKind:(NSString *)kind cause:(NSString *)cause;
+- (void)handleControlCommand:(NSString *)command;
+- (void)updateIdleRemoteCommands;
+- (BOOL)musicPlayKeyStartsMusic;
+- (BOOL)extendKindPlaylistIfNeeded;
 - (NSUInteger)coalescedSeekApplyCount;
 - (NSImage *)embeddedArtworkForPath:(NSString *)path;
 - (NSArray<NSImage *> *)stationMosaicCovers;
@@ -6097,6 +6107,9 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSMutableSet<NSString *> *_mixLiked;                       // track ids given a 👍 (mix/feedback.jsonl)
     NSMutableSet<NSString *> *_mixDisliked;                    // keys / track ids disliked (mix/feedback.jsonl)
     NSString *_mixPlayingKey, *_mixStartingKey;
+    NSString *_kindPlayingName;
+    uint64_t _kindPlaySeed;
+    NSMutableArray<NSString *> *_kindPlayedIDs;
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
     NSDictionary *_offlineManifest;
     BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain;
@@ -6362,6 +6375,8 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
     _musicSilentQA = MusicSilentQAEnabled();
     if (_musicSilentQA) GBLog("music: silent QA mode — player volume forced to 0");
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"musicPlayKeyStartsMusic": @YES}];
+    _kindPlayedIDs = [NSMutableArray array];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(playbackItemTrouble:)
                                                name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(playbackItemTrouble:)
@@ -6397,7 +6412,11 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(showPopoverRequested:)
         name:kShowPopoverNotification object:PopoverRequestObject()
         suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(glancebarControl:)
+        name:kGlancebarControlNotification object:PopoverRequestObject()
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
     if (self.showDestinationOnLaunch) [self showPopoverRequested:[NSNotification notificationWithName:kShowPopoverNotification object:PopoverRequestObject() userInfo:@{@"destination": self.showDestinationOnLaunch}]];
+    [self updateIdleRemoteCommands];
 }
 
 static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefresh]; }
@@ -7473,6 +7492,203 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     [self playLocalIndex:0];
     [self musicTimingMark:@"play"];
 }
+- (NSString *)kindDisplayTitle:(NSString *)kind {
+    if ([kind isEqual:@"any"]) return @"Any";
+    if ([kind isEqual:@"dance"]) return @"Dance";
+    if ([kind isEqual:@"alt"]) return @"Alt";
+    if ([kind isEqual:@"rap"]) return @"Rap";
+    if ([kind isEqual:@"chill"]) return @"Chill";
+    return kind.length ? [kind capitalizedString] : @"Any";
+}
+- (NSArray<NSDictionary *> *)mixTracksForIDs:(NSArray<NSString *> *)ids {
+    if (!ids.count || !_mixLibrary.count) return @[];
+    NSMutableDictionary *byId = [NSMutableDictionary dictionary];
+    for (NSDictionary *t in _mixLibrary) if ([t[@"id"] length]) byId[t[@"id"]] = t;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *i in ids) {
+        NSDictionary *t = byId[i];
+        if (t) [out addObject:t];
+    }
+    return out;
+}
+- (NSDictionary *)manifestRecordForTrackID:(NSString *)trackID {
+    if (!trackID.length) return nil;
+    NSDictionary *manifest = _offlineManifest;
+    if (![manifest[@"schemaVersion"] isEqual:@1] || ![manifest[@"playlists"] isKindOfClass:NSArray.class]) return nil;
+    for (id playlist in manifest[@"playlists"]) {
+        if (![playlist isKindOfClass:NSDictionary.class]) continue;
+        for (id record in [playlist[@"tracks"] isKindOfClass:NSArray.class] ? playlist[@"tracks"] : @[]) {
+            if (![record isKindOfClass:NSDictionary.class]) continue;
+            if ([trackID isEqual:record[@"id"]]) return record;
+        }
+    }
+    return nil;
+}
+// Kind playlists are built on demand; point the manifest at on-disk records already known.
+- (void)refreshKindManifestEntry:(NSString *)key tracks:(NSArray<NSDictionary *> *)tracks {
+    if (![key hasPrefix:@"kind:"] || !tracks.count) return;
+    NSMutableDictionary *manifest = [_offlineManifest isKindOfClass:NSDictionary.class] ? [_offlineManifest mutableCopy]
+                                                                                      : [@{@"schemaVersion": @1} mutableCopy];
+    NSMutableArray *playlists = [[manifest[@"playlists"] isKindOfClass:NSArray.class] ? manifest[@"playlists"] : @[] mutableCopy];
+    for (NSInteger i = playlists.count - 1; i >= 0; i--)
+        if ([playlists[i] isKindOfClass:NSDictionary.class] && [playlists[i][@"key"] isEqual:key]) [playlists removeObjectAtIndex:(NSUInteger)i];
+    NSMutableArray *records = [NSMutableArray array], *wanted = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || ![t[@"id"] length]) continue;
+        NSDictionary *rec = [self manifestRecordForTrackID:t[@"id"]];
+        if (!rec) continue;
+        [records addObject:rec];
+        NSMutableDictionary *identity = [NSMutableDictionary dictionary];
+        for (NSString *field in @[@"id", @"title", @"artist", @"album"]) identity[field] = [t[field] isKindOfClass:NSString.class] ? t[field] : @"";
+        [wanted addObject:identity];
+    }
+    if (!records.count) return;
+    [playlists addObject:@{@"key": key, @"requestedTracks": wanted, @"requestedTrackIDs": [wanted valueForKey:@"id"],
+                           @"tracks": records, @"ready": @YES}];
+    manifest[@"playlists"] = playlists;
+    _offlineManifest = manifest;
+    [self invalidateOfflineCoverageCache];
+}
+- (BOOL)playKind:(NSString *)kind cause:(NSString *)cause {
+    if (!_musicProbesEnabled || _musicOff || !GBValidMusicKind(kind)) return NO;
+    if (!_mixLibrary.count) [self ensureMixSeeds];
+    if (!_mixLibrary.count) {
+        GBLog("music: library not loaded; cannot play kind %{public}@", kind);
+        return NO;
+    }
+    if (!_kindPlayedIDs) _kindPlayedIDs = [NSMutableArray array];
+    _kindPlaySeed = (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000) ^ (uint64_t)arc4random();
+    _kindPlayingName = kind;
+    [_kindPlayedIDs removeAllObjects];
+    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, @[]);
+    if (!ids.count) {
+        GBLog("music: no %{public}@ tracks in library", kind);
+        return NO;
+    }
+    NSString *key = [NSString stringWithFormat:@"kind:%@", kind];
+    NSArray *tracks = [self mixTracksForIDs:ids];
+    if (!tracks.count) return NO;
+    _onDiskLibraryIDs = nil;
+    NSSet *onDisk = [self onDiskLibraryTrackIDs];
+    NSUInteger onDiskCount = 0;
+    for (NSString *tid in ids) if ([onDisk containsObject:tid]) onDiskCount++;
+    if (!onDiskCount) {
+        GBLog("music: no %{public}@ tracks on this Mac", kind);
+        return NO;
+    }
+    NSMutableArray *playTracks = [NSMutableArray array];
+    for (NSDictionary *t in tracks) if ([onDisk containsObject:t[@"id"]]) [playTracks addObject:t];
+    [self setOfflineRequest:key title:[self kindDisplayTitle:kind] tracks:playTracks];
+    [self refreshKindManifestEntry:key tracks:playTracks];
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSDictionary *coverage = OfflinePlaylistCoverage(_offlineRequests[key], _offlineManifest, root, NO);
+    if (![coverage[@"paths"] count]) {
+        GBLog("music: no %{public}@ tracks on this Mac", kind);
+        return NO;
+    }
+    [self playbackCause:cause ?: @"kind"];
+    [NSUserDefaults.standardUserDefaults setObject:kind forKey:@"musicLastKind"];
+    [self playOfflinePlaylist:key];
+    return YES;
+}
+- (BOOL)extendKindPlaylistIfNeeded {
+    if (!_mixPlayingKey.length || ![_mixPlayingKey hasPrefix:@"kind:"] || !_mixLibrary.count) return NO;
+    NSString *kind = [_mixPlayingKey substringFromIndex:5];
+    if (!GBValidMusicKind(kind)) return NO;
+    _kindPlaySeed = _kindPlaySeed * 6364136223846793005ULL + 1442695040888963407ULL;
+    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, _kindPlayedIDs);
+    if (!ids.count) return NO;
+    NSDictionary *request = _offlineRequests[_mixPlayingKey];
+    NSArray *existing = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
+    NSMutableSet *have = [NSMutableSet set];
+    for (NSDictionary *t in existing) if ([t[@"id"] length]) [have addObject:t[@"id"]];
+    NSMutableArray *merged = [existing mutableCopy];
+    for (NSDictionary *t in [self mixTracksForIDs:ids]) {
+        if (![have containsObject:t[@"id"]]) { [merged addObject:t]; [have addObject:t[@"id"]]; }
+    }
+    NSMutableArray *mergedOnDisk = [NSMutableArray array];
+    NSSet *onDisk = [self onDiskLibraryTrackIDs];
+    for (NSDictionary *t in merged) if ([onDisk containsObject:t[@"id"]]) [mergedOnDisk addObject:t];
+    [self setOfflineRequest:_mixPlayingKey title:[self kindDisplayTitle:kind] tracks:mergedOnDisk];
+    [self refreshKindManifestEntry:_mixPlayingKey tracks:mergedOnDisk];
+    _onDiskLibraryIDs = nil;
+    NSString *root = [GBHomeDirectory() stringByAppendingPathComponent:@"Music"];
+    NSDictionary *coverage = OfflinePlaylistCoverage(_offlineRequests[_mixPlayingKey], _offlineManifest, root, NO);
+    NSArray *paths = coverage[@"paths"];
+    if (!paths.count) return NO;
+    NSMutableSet *urlPaths = [NSMutableSet set];
+    for (NSURL *u in _localURLs) [urlPaths addObject:u.path ?: @""];
+    NSUInteger prior = _localURLs.count;
+    NSMutableArray<NSURL *> *urls = [_localURLs mutableCopy] ?: [NSMutableArray array];
+    for (NSString *path in paths) {
+        if (![urlPaths containsObject:path]) { [urls addObject:[NSURL fileURLWithPath:path]]; [urlPaths addObject:path]; }
+    }
+    _localURLs = urls;
+    [self maintainLocalPlayerQueue];
+    return _localURLs.count > prior;
+}
+- (void)glancebarControl:(NSNotification *)note {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *cmd = [note.userInfo[@"command"] isKindOfClass:NSString.class] ? note.userInfo[@"command"] : nil;
+        GBLog("control: %{public}@", cmd ?: @"");
+        [self handleControlCommand:cmd];
+    });
+}
+- (void)handleControlCommand:(NSString *)command {
+    if (!command.length || !_musicProbesEnabled || _musicOff) return;
+    NSArray<NSString *> *parts = [command componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    NSMutableArray *tokens = [NSMutableArray array];
+    for (NSString *p in parts) if (p.length) [tokens addObject:p];
+    if (!tokens.count) return;
+    NSString *verb = tokens[0];
+    if ([verb isEqual:@"pause"]) {
+        if (_localPlayer && _localPlayer.rate > 0) [self toggleLocalPlayback];
+        return;
+    }
+    if ([verb isEqual:@"next"]) {
+        [self musicNext:nil];
+        return;
+    }
+    if (![verb isEqual:@"play"]) return;
+    if (tokens.count == 1) {
+        if (_localPlayer) {
+            if (_localPlayer.rate == 0) [self toggleLocalPlayback];
+        } else if (_mixPlayingKey.length) {
+            [self playbackCause:@"kind"];
+            [self playOfflinePlaylist:_mixPlayingKey];
+        } else {
+            NSString *kind = [NSUserDefaults.standardUserDefaults stringForKey:@"musicLastKind"] ?: @"any";
+            [self playKind:kind cause:@"kind"];
+        }
+        return;
+    }
+    NSString *arg = tokens[1];
+    if ([arg isEqual:@"new"]) {
+        [self playbackCause:@"kind"];
+        [self playStation:nil];
+        return;
+    }
+    if ([arg isEqual:@"show"]) {
+        [self ensureShows];
+        if (_showOffered) {
+            [self playbackCause:@"kind"];
+            [self playShowEpisode:_showOffered];
+        }
+        return;
+    }
+    if (GBValidMusicKind(arg)) [self playKind:arg cause:@"kind"];
+    else GBLog("control: unknown kind %{public}@", arg);
+}
+- (BOOL)musicPlayKeyStartsMusic {
+    return ![NSUserDefaults.standardUserDefaults objectForKey:@"musicPlayKeyStartsMusic"]
+        || [NSUserDefaults.standardUserDefaults boolForKey:@"musicPlayKeyStartsMusic"];
+}
+- (void)updateIdleRemoteCommands {
+    if (_remoteCommandsOn || !_musicProbesEnabled || _musicOff || _localPlayer) return;
+    if (![self musicPlayKeyStartsMusic]) return;
+    _remoteCommandsOn = YES;
+    GlanceRemoteCommandsEnable(self);
+}
 - (void)playOfflinePlaylist:(NSString *)key {
     if (!_musicProbesEnabled) return;
     NSUInteger generation = ++_offlinePlayGeneration;
@@ -8054,6 +8270,8 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
         _localTitle = parsed[@"title"] ?: @"";
         _localArtist = parsed[@"artist"] ?: @"";
         _localTagsReady = NO;
+        if ([_mixPlayingKey hasPrefix:@"kind:"] && [parsed[@"trackID"] length] && _kindPlayedIDs)
+            [_kindPlayedIDs addObject:parsed[@"trackID"]];
     }
     _localHeartError = nil;
     _localHeartEpoch++;
@@ -8295,6 +8513,24 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     }
     NSInteger next = _localIndex + 1;
     if (next < 0 || next >= (NSInteger)_localURLs.count) {
+        if ([self extendKindPlaylistIfNeeded]) {
+            next = _localIndex + 1;
+            if (next >= 0 && next < (NSInteger)_localURLs.count) {
+                _localIndex = next;
+                _playbackKnown = YES;
+                _playbackPlaying = YES;
+                [self maintainLocalPlayerQueue];
+                [self maintainOfflineHashVerifyAhead];
+                if (!_localPlayer.currentItem && _localQueueEnd < (NSInteger)_localURLs.count) {
+                    [self extendLocalPlayerQueueIfNeeded];
+                    [_localPlayer play];
+                }
+                [self applyLocalItemURL:_localURLs[_localIndex]];
+                [self publishNowPlaying];
+                if (_popover.isShown) [self rebuildContent];
+                return;
+            }
+        }
         [self playLocalIndex:0];
         return;
     }
@@ -8504,6 +8740,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _playbackKnown = NO;
     _playbackPlaying = NO;
     [self disableRemoteCommands];
+    [self updateIdleRemoteCommands];
     if (_popover.isShown) [self rebuildContent];
 }
 // A keyboard play/pause key arrives as "toggle"; Bluetooth headphones send a separate Pause or Play.
@@ -8513,7 +8750,15 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
 }
 - (NSInteger)remotePlay:(id)event {
     [self noteRemote:@"play"];
-    (void)event; if (_localPlayer.rate == 0) [self toggleLocalPlayback];
+    (void)event;
+    if (!_localPlayer) {
+        if ([self musicPlayKeyStartsMusic]) {
+            NSString *kind = [NSUserDefaults.standardUserDefaults stringForKey:@"musicLastKind"] ?: @"any";
+            [self playKind:kind cause:@"remote-play"];
+        }
+        return 0;
+    }
+    if (_localPlayer.rate == 0) [self toggleLocalPlayback];
     return 0;
 }
 - (NSInteger)remotePause:(id)event {
@@ -8524,7 +8769,14 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
 }
 - (NSInteger)remoteToggle:(id)event {
     [self noteRemote:@"toggle"];
-    (void)event; [self toggleLocalPlayback]; return 0;
+    (void)event;
+    if (!_localPlayer && [self musicPlayKeyStartsMusic]) {
+        NSString *kind = [NSUserDefaults.standardUserDefaults stringForKey:@"musicLastKind"] ?: @"any";
+        [self playKind:kind cause:@"remote-play"];
+        return 0;
+    }
+    [self toggleLocalPlayback];
+    return 0;
 }
 - (NSInteger)remoteNext:(id)event {
     [self noteRemote:@"next"];
@@ -15529,6 +15781,32 @@ static int RelaunchGUIThroughLaunchServicesIfNeeded(BOOL alreadyRelaunched, NSSt
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        GBControlCLIOutcome control = GBControlParseArgs(argc, argv);
+        if (control.kind == 3) {
+            NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:@"musicLastKind"] ?: @"any";
+            printf("%s\n", UTF8(last));
+            return 0;
+        }
+        if (control.kind == 2) {
+            fputs(UTF8(GBControlUsageLine), stderr);
+            return 2;
+        }
+        if (control.kind == 1) {
+            NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"com.iantodd.glancebar";
+            BOOL found = NO;
+            for (NSRunningApplication *owner in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID]) {
+                if (owner.processIdentifier == getpid() || owner.isTerminated) continue;
+                [NSDistributedNotificationCenter.defaultCenter postNotificationName:kGlancebarControlNotification
+                    object:PopoverRequestObject() userInfo:@{@"command": control.command} deliverImmediately:YES];
+                found = YES;
+                break;
+            }
+            if (!found) {
+                fputs("Glancebar is not running\n", stderr);
+                return 3;
+            }
+            return 0;
+        }
         BOOL dump = NO, json = NO, strict = NO, onlineArgument = NO, alreadyRelaunched = NO, activityJSON = NO, sample = NO;
         NSString *showDestination = nil;
         NSUInteger destinationCount = 0;

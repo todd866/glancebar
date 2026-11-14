@@ -2433,6 +2433,41 @@ int main(void) {
                   [GenreFamily(@"Indie Rock") isEqual:@"alt"] && [GenreFamily(@"R&B/Soul") isEqual:@"rap"] &&
                   [GenreFamily(@"Pop") isEqual:@"pop"] && [GenreFamily(@"Soundtrack") isEqual:@"other"], @"mix: genre families");
 
+            check([MusicKindForGenre(@"Electronic/Downtempo") isEqual:@"chill"] &&
+                  [MusicKindForGenre(@"Electronic") isEqual:@"dance"] &&
+                  [MusicKindForGenre(@"Pop") isEqual:@"alt"] &&
+                  [MusicKindForGenre(@"") isEqual:@"other"] &&
+                  [MusicKindForGenre(nil) isEqual:@"other"], @"kind: mapping and chill-first");
+            check([MusicKindForGenre(@"Ambient Works") isEqual:@"chill"] &&
+                  [MusicKindForGenre(@"Hip-Hop/Rap") isEqual:@"rap"], @"kind: chill and rap");
+
+            NSMutableArray *kindLib = [NSMutableArray array];
+            for (int i = 0; i < 8; i++)
+                [kindLib addObject:T([NSString stringWithFormat:@"D%03d", i], [NSString stringWithFormat:@"House %d", i],
+                                        [NSString stringWithFormat:@"DJ %d", i % 4], @"", @"House", 2020, 5, 20, NO, NO)];
+            for (int i = 0; i < 4; i++)
+                [kindLib addObject:T([NSString stringWithFormat:@"A%03d", i], [NSString stringWithFormat:@"Alt %d", i], @"Alt Band", @"", @"Indie Rock", 2021, 3, 20, NO, NO)];
+            [kindLib addObject:T(@"DIS", @"Nope", @"X", @"", @"House", 2020, 1, 20, NO, YES)];
+            NSArray *danceQ = MusicKindQueue(kindLib, @"dance", 6, 99, @[@"D001"]);
+            check(danceQ.count == 6 && [danceQ.lastObject isEqual:@"D001"] && ![danceQ containsObject:@"DIS"], @"kind queue: filter, recents last, no dislikes");
+            check([danceQ isEqual:MusicKindQueue(kindLib, @"dance", 6, 99, @[@"D001"])], @"kind queue: deterministic for seed");
+            NSArray *shortQ = MusicKindQueue(@[kindLib[0]], @"dance", 10, 1, @[]);
+            check(shortQ.count == 1, @"kind queue: short pool returns what there is");
+            NSArray *anyQ = MusicKindQueue(kindLib, @"any", 20, 7, @[]);
+            check(anyQ.count == 12, @"kind queue: any is every track");
+            NSMutableDictionary *kindByID = [NSMutableDictionary dictionary];
+            for (NSDictionary *t in kindLib) kindByID[t[@"id"]] = t;
+            BOOL artistOk = YES;
+            for (NSUInteger w = 0; w + 10 <= danceQ.count; w++) {
+                NSMutableDictionary *counts = [NSMutableDictionary dictionary];
+                for (NSUInteger j = w; j < w + 10; j++) {
+                    NSString *a = [kindByID[danceQ[j]][@"artist"] lowercaseString];
+                    counts[a] = @([counts[a] integerValue] + 1);
+                    if ([counts[a] integerValue] > 2) artistOk = NO;
+                }
+            }
+            check(artistOk, @"kind queue: artist at most twice per ten");
+
             NSArray *seeds = ChooseMixSeeds(lib, @[], 4, 7);
             NSMutableSet *artists = [NSMutableSet set]; BOOL allSongs = YES, unplayed = NO, disliked = NO;
             for (NSDictionary *sd in seeds) {

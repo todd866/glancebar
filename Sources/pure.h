@@ -858,6 +858,19 @@ BOOL OutputVolumeLoud(double volume);
 // album, genre, year, plays, idleDays (days since last played; -1 never), fav, dislike.
 // A genre's family ("dance", "alt", "rap", "pop", "other") so near genres count together.
 NSString *GenreFamily(NSString *genre);
+// Playback kinds: dance, alt, rap, chill or other (pop folds into alt in MusicKindForGenre).
+NSString *MusicKindForGenre(NSString *genre);
+// Up to count track ids of kind (any = all genres); weighted, deterministic for seed;
+// recentIDs at the back; no dislikes; artist at most twice per sliding window of ten when possible.
+NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *kind, NSUInteger count,
+                                    uint64_t seed, NSArray<NSString *> *recentIDs);
+// One-shot CLI control flags. kind: 0 = not a control invocation, 1 = post command, 2 = usage error, 3 = print last kind.
+typedef struct {
+    int kind;
+    NSString *command;
+} GBControlCLIOutcome;
+GBControlCLIOutcome GBControlParseArgs(int argc, const char **argv);
+extern NSString *const GBControlUsageLine;
 // count seeds (songs and albums; an album needs 4+ tracks here), favourites first, spread
 // across families, none whose key is in recentKeys. Deterministic for a given salt. A seed:
 // key, kind ("song"/"album"), title, subtitle, trackID (cover and first track), artist,
