@@ -28,6 +28,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | Offline playlists (requests, manifest, verification) | `tools/offline-cache/`, `docs/offline-playlists.md` |
 | Hot set / cold tier (catalogue, push, plan, sync, status, touch) | `tools/music-library/` |
 | New-music scout (candidates, rank, acquire, publish, status) | `tools/music-scout/` |
+| Shared likes/Shazam ledger and pipeline checks | `tools/media-sync/` |
 | Lossless acquisition (amdl; M5 only) | `tools/mixpool/` |
 | Silent real-playback check | `tools/check-playback.m` (runs in `tests.sh`) |
 
@@ -48,6 +49,13 @@ R2 bucket and fetched as required. New music is found and acquired without being
 tracks, a sync failed, or nothing was acquired for a week: these are the hooks for the
 morning check. `defaults write com.iantodd.glancebar musicSilentQA -bool YES` runs the player
 muted for verification.
+
+### One record of likes and Shazams
+
+`tools/media-sync/` (`tools/media-sync/README.md`) merges hearts, favourites, YouTube and TV
+likes with Shazam recognitions into shared `signals-*.json` files and runs pipeline checks for
+Fleet and the menu-bar morning probe. **A Shazam is not a like** — only an explicit heart or
+favourite counts as a like; Shazam means “what is this song?”.
 
 ## Scout acquisition timeline (M5)
 
