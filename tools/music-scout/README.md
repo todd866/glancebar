@@ -19,6 +19,12 @@ stage is idempotent and safe to rerun.
 | `new_release_days` | 60 | iTunes new-release lookback |
 | `llm_suggestions` | 15 | Tracks requested from the taste LLM prompt |
 | `new_music_path` | state dir | Output playlist JSON for the app tile |
+| `media_share` | `~/.local/state/mac-sync/media` | Synced Shazam / like signals |
+| `shazam_fresh_days` | 30 | Shazam still counts as fresh |
+| `shazam_backlog_per_run` | 5 | Older Shazams offered per night |
+| `storefront` | `au` | Apple Music URLs |
+| `playback_log` | `~/Library/Logs/Glancebar/playback.jsonl` | Skip/reject heuristics |
+| `reject_skips` | 2 | Early skip days before reject |
 
 ## State (`~/.local/state/glancebar-music-scout/`)
 
@@ -45,7 +51,31 @@ python3 tools/music-scout/scout.py status           # exit 1 if unhealthy
 python3 tools/music-scout/scout.py run [--go]
 ```
 
-### Sources (`candidates`)
+### Shared media record (Shazam & TV likes)
+
+`candidates` also reads the synced media ledger at
+`~/.local/state/mac-sync/media/signals-*.json` (see repo `SCHEMA.md`).
+
+1. **shazam** — tracks with a Shazam signal that are not owned, not disliked, and
+   not rejected. Fresh Shazams (within `shazam_fresh_days`, default 30) are
+   **priority** candidates with a high score; older Shazams enter at most
+   `shazam_backlog_per_run` per night (newest first). `why` is e.g. `Shazamed 14 Nov`
+   (local date). Apple Music id → `track_id` / song URL when known (skips iTunes
+   search on acquire).
+2. **tv-like** — TV `like` signals (not owned / not rejected). Always priority;
+   `why` is e.g. `Liked on the TV 12 Nov`.
+
+In **rank**, rows with `priority: true` are placed above all novelty tiers
+(ordered by score), ignore `max_per_artist_week` and `owned_artist_share_max`, and
+do not count toward the taste-expansion share. They still respect weekly track/GB
+budgets and are dropped when already owned or hearted.
+
+**Rejection:** merged `dislike` signals; feedback whose last event is `dislike` or
+`less`; a permanent `rejected` ledger row; and (when playback logs allow) scout
+tracks skipped early via `click-next` on multiple days without ever finishing
+(`auto-advance`). Rejected keys are omitted from candidates, rank, and publish.
+
+### Other sources (`candidates`)
 
 1. **triple j** — reads `picks` from `~/.local/state/selector/station.json`
    (output of `triplej.py queue`; no ABC re-fetch).

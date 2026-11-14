@@ -17,6 +17,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scout
 
 
+def _media_signals(share: Path, host: str, tracks: dict) -> None:
+    share.mkdir(parents=True, exist_ok=True)
+    (share / f"signals-{host}.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "host": host,
+                "generated": "2026-11-14T10:00:00Z",
+                "sources": {},
+                "tracks": tracks,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _cfg(root: Path, **overrides) -> dict:
     base = dict(scout.DEFAULTS)
     base.update(
@@ -34,6 +50,418 @@ def _cfg(root: Path, **overrides) -> dict:
     )
     base.update(overrides)
     return base
+
+
+class MediaShareTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.share = self.root / "media"
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.paths = scout.ScoutPaths(self.state)
+        self.cfg = _cfg(self.root, media_share=str(self.share), playback_log=str(self.root / "playback.jsonl"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_universe_merge_and_broken_file(self):
+        key = scout.track_key("Merge Act", "Alpha Song")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key: {
+                    "artist": "Merge Act",
+                    "title": "Alpha Song",
+                    "ids": {"apple_music": "111", "isrc": "", "youtube": ""},
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2026-11-14T09:00:00Z"}],
+                    "owned": False,
+                }
+            },
+        )
+        _media_signals(
+            self.share,
+            "m2",
+            {
+                key: {
+                    "artist": "Merge Act",
+                    "title": "Alpha Song",
+                    "ids": {"apple_music": "", "isrc": "AU123", "youtube": ""},
+                    "signals": [{"kind": "like", "source": "glancebar", "at": "2026-11-13T09:00:00Z"}],
+                    "owned": True,
+                }
+            },
+        )
+        (self.share / "signals-broken.json").write_text("{ not json", encoding="utf-8")
+        merged, errors = scout.load_universe(self.share)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("broken", errors[0])
+        self.assertTrue(merged[key]["owned"])
+        self.assertEqual(merged[key]["ids"]["apple_music"], "111")
+        self.assertEqual(merged[key]["ids"]["isrc"], "AU123")
+        self.assertEqual(len(merged[key]["signals"]), 2)
+
+    def test_fresh_shazam_priority_and_url(self):
+        key = scout.track_key("Shazam Act", "Fresh Tune")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key: {
+                    "artist": "Shazam Act",
+                    "title": "Fresh Tune",
+                    "ids": {"apple_music": "424242", "isrc": "", "youtube": ""},
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2026-11-14T10:05:00Z"}],
+                    "owned": False,
+                }
+            },
+        )
+        runners = scout.Runners(clock=lambda: "2026-11-14T12:00:00Z")
+        rows = scout.source_shazam(self.cfg, runners, set())
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["priority"])
+        self.assertEqual(rows[0]["why"], "Shazamed 14 Nov")
+        self.assertEqual(rows[0]["track_id"], 424242)
+        self.assertEqual(rows[0]["url"], "https://music.apple.com/au/song/424242")
+
+    def test_shazam_earlier_year_in_why(self):
+        key = scout.track_key("Old Shazam", "Past Hit")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key: {
+                    "artist": "Old Shazam",
+                    "title": "Past Hit",
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2024-03-03T10:00:00Z"}],
+                    "owned": False,
+                }
+            },
+        )
+        runners = scout.Runners(clock=lambda: "2026-11-14T12:00:00Z")
+        rows = scout.source_shazam(self.cfg, runners, set())
+        self.assertEqual(rows[0]["why"], "Shazamed 3 Mar 2024")
+        self.assertNotIn("priority", rows[0])
+
+    def test_shazam_backlog_cap_newest_first(self):
+        tracks = {}
+        for i, day in enumerate((5, 1, 3, 2, 4)):
+            key = scout.track_key("Backlog Band", f"Song {i}")
+            tracks[key] = {
+                "artist": "Backlog Band",
+                "title": f"Song {i}",
+                "signals": [{"kind": "shazam", "source": "shazam", "at": f"2026-10-{day:02d}T10:00:00Z"}],
+                "owned": False,
+            }
+        _media_signals(self.share, "m5", tracks)
+        cfg = dict(self.cfg, shazam_backlog_per_run=2)
+        runners = scout.Runners(clock=lambda: "2026-11-14T12:00:00Z")
+        rows = scout.source_shazam(cfg, runners, set())
+        titles = [r["title"] for r in rows]
+        self.assertEqual(titles, ["Song 0", "Song 4"])
+
+    def test_shazam_skips_owned_and_disliked(self):
+        owned_k = scout.track_key("Skip Band", "Owned One")
+        hate_k = scout.track_key("Skip Band", "Hated One")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                owned_k: {
+                    "artist": "Skip Band",
+                    "title": "Owned One",
+                    "owned": True,
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2026-11-14T10:00:00Z"}],
+                },
+                hate_k: {
+                    "artist": "Skip Band",
+                    "title": "Hated One",
+                    "owned": False,
+                    "signals": [
+                        {"kind": "shazam", "source": "shazam", "at": "2026-11-14T10:00:00Z"},
+                        {"kind": "dislike", "source": "glancebar", "at": "2026-11-14T11:00:00Z"},
+                    ],
+                },
+            },
+        )
+        rows = scout.source_shazam(self.cfg, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"), set())
+        self.assertEqual(rows, [])
+
+    def test_tv_like_candidate(self):
+        key = scout.track_key("Tv Act", "Living Room")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key: {
+                    "artist": "Tv Act",
+                    "title": "Living Room",
+                    "ids": {"apple_music": "999", "isrc": "", "youtube": ""},
+                    "signals": [{"kind": "like", "source": "tv", "at": "2026-11-12T18:00:00Z", "audience": "x"}],
+                    "owned": False,
+                }
+            },
+        )
+        rows = scout.source_tv_likes(self.cfg, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"), set())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["why"], "Liked on the TV 13 Nov")
+        self.assertTrue(rows[0]["priority"])
+
+    def test_priority_beats_higher_scored_and_artist_cap(self):
+        for i in range(3):
+            scout.append_jsonl(
+                self.paths.ledger,
+                {
+                    "at": "2026-11-13T12:00:00Z",
+                    "action": "offered",
+                    "artist": "Cap Artist",
+                    "title": f"Old {i}",
+                },
+            )
+        candidates = [
+            {
+                "artist": "Cap Artist",
+                "title": "Shazam Pick",
+                "source": "shazam",
+                "why": "Shazamed",
+                "score_hint": 0.5,
+                "priority": True,
+            },
+            {
+                "artist": "Cap Artist",
+                "title": "Radio Pick",
+                "source": "triplej",
+                "why": "pick",
+                "score_hint": 1.0,
+            },
+        ]
+        self.paths.candidates.write_text(json.dumps({"candidates": candidates}), encoding="utf-8")
+        ranked = scout.cmd_rank(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"))
+        self.assertEqual(ranked[0]["title"], "Shazam Pick")
+
+    def test_rejected_dislike_feedback_and_ledger(self):
+        key = scout.track_key("Reject Band", "Angry Song")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key: {
+                    "artist": "Reject Band",
+                    "title": "Angry Song",
+                    "signals": [{"kind": "dislike", "source": "glancebar", "at": "2026-11-14T10:00:00Z"}],
+                }
+            },
+        )
+        self.assertIn(key, scout.rejected_keys(self.cfg, self.paths))
+        fb = self.root / "feedback.jsonl"
+        fb.write_text(
+            json.dumps(
+                {"artist": "Feedback", "title": "Nope", "event": "dislike", "track_key": scout.track_key("Feedback", "Nope")}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIn(scout.track_key("Feedback", "Nope"), scout.rejected_keys(self.cfg, self.paths))
+        ledger_key = scout.track_key("Reject Band", "Ledger Song")
+        scout.append_jsonl(
+            self.paths.ledger,
+            {
+                "at": "2026-11-14T10:00:00Z",
+                "action": "rejected",
+                "track_key": ledger_key,
+                "artist": "Reject Band",
+                "title": "Ledger Song",
+            },
+        )
+        self.assertIn(ledger_key, scout.rejected_keys(self.cfg, self.paths))
+
+    def _acquired(self, artist, title, **extra):
+        key = scout.track_key(artist, title)
+        row = {
+            "at": "2026-11-10T10:00:00Z",
+            "action": "acquired",
+            "artist": artist,
+            "title": title,
+            "track_key": key,
+            "duration_seconds": extra.get("duration_seconds", 200.0),
+            "local_path": extra.get("local_path", f"/tmp/{title.replace(' ', '_')}.m4a"),
+        }
+        scout.append_jsonl(self.paths.ledger, row)
+        return key
+
+    def _playback(self, events):
+        path = Path(self.cfg["playback_log"])
+        path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    def test_skip_rejection_two_days_not_one(self):
+        key = self._acquired("Skip Act", "Early Leave", duration_seconds=200.0)
+        day1 = [
+            {"event": "track", "cause": "start", "artist": "Skip Act", "title": "Early Leave", "t": "2026-11-01T10:00:00Z"},
+            {"event": "rate", "cause": "click-next", "artist": "Skip Act", "title": "Early Leave", "elapsed": 20, "t": "2026-11-01T10:01:00Z"},
+            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-01T10:01:01Z"},
+        ]
+        self._playback(day1)
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        day2 = day1 + [
+            {"event": "track", "cause": "start", "artist": "Skip Act", "title": "Early Leave", "t": "2026-11-02T10:00:00Z"},
+            {"event": "rate", "cause": "click-next", "artist": "Skip Act", "title": "Early Leave", "elapsed": 30, "t": "2026-11-02T10:01:00Z"},
+            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-02T10:01:01Z"},
+        ]
+        self._playback(day2)
+        self.assertIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+
+    def test_skip_not_rejected_late_or_completed(self):
+        key = self._acquired("Late Act", "Long Play", duration_seconds=100.0)
+        late = [
+            {"event": "track", "cause": "start", "artist": "Late Act", "title": "Long Play", "t": "2026-11-01T10:00:00Z"},
+            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 50, "t": "2026-11-01T10:01:00Z"},
+            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-01T10:01:01Z"},
+        ]
+        self._playback(late)
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+        completed = [
+            {"event": "track", "cause": "start", "artist": "Late Act", "title": "Long Play", "t": "2026-11-01T10:00:00Z"},
+            {"event": "track", "cause": "auto-advance", "artist": "Other", "title": "Next", "t": "2026-11-01T10:05:00Z"},
+            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 10, "t": "2026-11-02T10:01:00Z"},
+            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-02T10:01:01Z"},
+            {"event": "rate", "cause": "click-next", "artist": "Late Act", "title": "Long Play", "elapsed": 10, "t": "2026-11-03T10:01:00Z"},
+            {"event": "track", "cause": "click-next", "artist": "Other", "title": "Next", "t": "2026-11-03T10:01:01Z"},
+        ]
+        self._playback(completed)
+        self.assertNotIn(key, scout.skip_rejected_keys(self.cfg, self.paths))
+
+    def test_publish_omits_rejected(self):
+        key = scout.track_key("Pub Reject", "Song")
+        scout.append_jsonl(
+            self.paths.ledger,
+            {
+                "at": "2026-11-13T12:00:00Z",
+                "action": "acquired",
+                "artist": "Pub Reject",
+                "title": "Song",
+                "track_key": key,
+            },
+        )
+        scout.append_jsonl(
+            self.paths.ledger,
+            {"at": "2026-11-14T10:00:00Z", "action": "rejected", "track_key": key, "artist": "Pub Reject", "title": "Song"},
+        )
+        doc = scout.cmd_publish(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"))
+        self.assertEqual(doc["tracks"], [])
+
+    def test_media_like_bonus_capped(self):
+        key = scout.track_key("Like Act", "Bonus Track")
+        fb = {scout.normal(key): {"event": "like"}}
+        media = {key}
+        score = scout.score_candidate(
+            {"artist": "Like Act", "title": "Bonus Track", "score_hint": 0.5},
+            fb,
+            Counter(),
+            media_likes=media,
+        )
+        self.assertEqual(score, 0.9)
+
+    def test_shazam_acquire_uses_track_id_without_search(self):
+        searches = []
+
+        def fake_best(*args, **kwargs):
+            searches.append(args)
+            return {"trackId": 1}
+
+        self.paths.queue.write_text(
+            json.dumps(
+                {
+                    "tracks": [
+                        {
+                            "artist": "Am Act",
+                            "title": "Known",
+                            "track_key": scout.track_key("Am Act", "Known"),
+                            "track_id": 555,
+                            "url": "https://music.apple.com/au/song/555",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        runners = scout.Runners(
+            clock=lambda: "2026-11-14T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+            itunes_song_best=fake_best,
+        )
+        scout.cmd_acquire(self.cfg, self.paths, runners, go=False)
+        self.assertEqual(searches, [])
+
+    def test_priority_still_respects_weekly_budget(self):
+        now = scout.parse_iso("2026-11-10T12:00:00Z")
+        for i in range(20):
+            scout.append_jsonl(
+                self.paths.ledger,
+                {
+                    "at": "2026-11-09T12:00:00Z",
+                    "action": "acquired",
+                    "artist": "Full",
+                    "title": f"t{i}",
+                    "size_mb": 10,
+                },
+            )
+        self.paths.queue.write_text(
+            json.dumps(
+                {
+                    "tracks": [
+                        {
+                            "artist": "Priority",
+                            "title": "Extra",
+                            "track_key": scout.track_key("Priority", "Extra"),
+                            "track_id": 77,
+                            "priority": True,
+                            "source": "shazam",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = dict(self.cfg, tracks_per_week=20, gb_per_week=10.0)
+        runners = scout.Runners(
+            clock=lambda: "2026-11-10T12:00:00Z",
+            is_m5=lambda: True,
+            is_metered=lambda: False,
+            on_battery=lambda: False,
+            itunes_song_best=lambda *a, **k: {"trackId": 77, "trackTimeMillis": 180_000},
+        )
+        summary = scout.cmd_acquire(cfg, self.paths, runners, go=False)
+        self.assertEqual(summary["attempted"], 0)
+
+    def test_status_shazam_counts(self):
+        key_fresh = scout.track_key("Stat Band", "Fresh Shazam")
+        key_old = scout.track_key("Stat Band", "Old Shazam")
+        _media_signals(
+            self.share,
+            "m5",
+            {
+                key_fresh: {
+                    "artist": "Stat Band",
+                    "title": "Fresh Shazam",
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2026-11-10T10:00:00Z"}],
+                },
+                key_old: {
+                    "artist": "Stat Band",
+                    "title": "Old Shazam",
+                    "signals": [{"kind": "shazam", "source": "shazam", "at": "2026-09-01T10:00:00Z"}],
+                },
+            },
+        )
+        scout.append_jsonl(
+            self.paths.ledger,
+            {"at": "2026-11-09T10:00:00Z", "action": "offered", "artist": "Stat Band", "title": "Fresh Shazam"},
+        )
+        doc, _ = scout.cmd_status(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"))
+        self.assertEqual(doc["shazam"]["fresh"], 1)
+        self.assertEqual(doc["shazam"]["waiting"], 0)
 
 
 class ScoutLogicTests(unittest.TestCase):
