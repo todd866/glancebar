@@ -427,6 +427,27 @@ class MediaShareTests(unittest.TestCase):
         ranked = scout.cmd_rank(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"))
         self.assertNotIn(scout.track_key("Plain Act", "Song"), [r["track_key"] for r in ranked])
 
+    def test_publish_says_why_a_track_was_picked(self):
+        key = scout.track_key("Heard Act", "Radio Song")
+        base = {"artist": "Heard Act", "title": "Radio Song", "track_key": key}
+        scout.append_jsonl(self.paths.ledger, dict(base, at="2026-11-14T11:00:00Z", action="offered",
+                                                   source="new-release", why="New on 2026-10-02"))
+        scout.append_jsonl(self.paths.ledger, dict(base, at="2026-11-14T11:21:00Z", action="offered",
+                                                   source="shazam", why="Shazamed 14 Nov"))
+        # An acquired row written before the reason was copied onto it.
+        scout.append_jsonl(self.paths.ledger, dict(base, at=scout.iso_now(), action="acquired"))
+        other = scout.track_key("Tagged Act", "Own Reason")
+        scout.append_jsonl(self.paths.ledger, {"artist": "Tagged Act", "title": "Own Reason", "track_key": other,
+                                               "at": scout.iso_now(), "action": "acquired", "why": "Liked on the TV 12 Nov"})
+        bare = scout.track_key("Bare Act", "No Reason")
+        scout.append_jsonl(self.paths.ledger, {"artist": "Bare Act", "title": "No Reason", "track_key": bare,
+                                               "at": scout.iso_now(), "action": "acquired"})
+        doc = scout.cmd_publish(self.cfg, self.paths, scout.Runners())
+        why = {t["track_key"]: t["why"] for t in doc["tracks"]}
+        self.assertEqual(why[key], "Shazamed 14 Nov")
+        self.assertEqual(why[other], "Liked on the TV 12 Nov")
+        self.assertEqual(why[bare], "new acquisition")
+
     def test_publish_omits_rejected(self):
         key = scout.track_key("Pub Reject", "Song")
         scout.append_jsonl(

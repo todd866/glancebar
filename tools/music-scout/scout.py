@@ -1607,6 +1607,8 @@ def cmd_acquire(
                 "artist": artist,
                 "title": title,
                 "track_key": key,
+                "source": row.get("source") or "",
+                "why": row.get("why") or "",
                 "url": url,
                 "size_bytes": size_bytes,
                 "album": song.get("collectionName") or row.get("album") or "",
@@ -1671,7 +1673,15 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
     hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
     rejected = rejected_keys(cfg, paths)
     tracks: list[dict] = []
-    for row in read_jsonl_rows(paths.ledger):
+    ledger_rows = read_jsonl_rows(paths.ledger)
+    # Why it was picked ("Shazamed 14 Nov") is said when it is offered. Rows acquired before
+    # the reason was copied onto the acquired row take it from their latest offer.
+    offered_why: dict[str, str] = {}
+    for row in ledger_rows:
+        if row.get("action") in ("offered", "queued") and row.get("why"):
+            key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
+            offered_why[key] = row["why"]
+    for row in ledger_rows:
         if row.get("action") != "acquired":
             continue
         at = parse_iso(row.get("at") or "")
@@ -1686,7 +1696,7 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
             "title": row.get("title") or "",
             "album": row.get("album") or "",
             "duration_seconds": row.get("duration_seconds"),
-            "why": row.get("why") or "new acquisition",
+            "why": row.get("why") or offered_why.get(key) or "new acquisition",
             "acquired_at": row.get("at"),
         }
         if row.get("local_path"):
