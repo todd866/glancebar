@@ -463,6 +463,43 @@ class MediaShareTests(unittest.TestCase):
         ranked = scout.cmd_rank(self.cfg, self.paths, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"))
         self.assertNotIn(scout.track_key("Plain Act", "Song"), [r["track_key"] for r in ranked])
 
+    def test_a_failed_download_is_tried_again_for_a_few_nights_then_dropped(self):
+        key = scout.track_key("Stalled Act", "Good Song")
+        def fail(at):
+            scout.append_jsonl(self.paths.ledger, {"at": at, "action": "failed", "artist": "Stalled Act",
+                                                   "title": "Good Song", "track_key": key, "reason": "press Enter to try again"})
+        runners = scout.Runners(clock=lambda: "2026-11-15T19:10:00Z", ai_pick=lambda *a, **k: (75, ""),
+                                itunes_albums=lambda *a, **k: [])
+        fail("2026-11-14T19:14:00Z")
+        rows = scout.source_retries(self.cfg, self.paths, runners)
+        self.assertEqual([(r["artist"], r["title"], r["source"]) for r in rows], [("Stalled Act", "Good Song", "retry")])
+        # It survives ranking although its failed row is in the ledger.
+        self.paths.candidates.write_text(json.dumps({"candidates": rows}), encoding="utf-8")
+        self.assertIn(key, [r["track_key"] for r in scout.cmd_rank(self.cfg, self.paths, runners)])
+        # Acquired since: nothing to retry.
+        scout.append_jsonl(self.paths.ledger, {"at": "2026-11-15T19:00:00Z", "action": "acquired", "artist": "Stalled Act",
+                                               "title": "Good Song", "track_key": key})
+        self.assertEqual(scout.source_retries(self.cfg, self.paths, runners), [])
+        # Too old, or failed too often: dropped.
+        self.paths.ledger.write_text("", encoding="utf-8")
+        fail("2026-11-10T19:14:00Z")
+        self.assertEqual(scout.source_retries(self.cfg, self.paths, runners), [])
+        self.paths.ledger.write_text("", encoding="utf-8")
+        for day in (12, 13, 14, 15):
+            fail(f"2026-11-{day}T19:00:00Z")
+        self.assertEqual(scout.source_retries(self.cfg, self.paths, runners), [])
+
+    def test_the_run_refreshes_the_media_check_last(self):
+        order = []
+        runners = scout.Runners(clock=lambda: "2026-11-15T19:10:00Z", ai_pick=lambda *a, **k: (75, ""),
+                                itunes_albums=lambda *a, **k: [], is_m5=lambda: True, is_metered=lambda: False,
+                                on_battery=lambda: False, media_collect=lambda: order.append("collect"),
+                                media_check=lambda: order.append("check"))
+        scout.cmd_run(self.cfg, self.paths, runners, go=False)
+        self.assertEqual(order, ["collect", "check"])
+        self.assertTrue(self.paths.state.joinpath("last-run.json").is_file())
+        self.assertIsNone(scout.Runners().media_check())
+
     def test_publish_says_why_a_track_was_picked(self):
         key = scout.track_key("Heard Act", "Radio Song")
         base = {"artist": "Heard Act", "title": "Radio Song", "track_key": key}
