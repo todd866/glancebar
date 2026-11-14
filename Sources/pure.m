@@ -4631,3 +4631,226 @@ NSDictionary *PlaybackDeviceDiff(NSArray<NSDictionary *> *before, NSArray<NSDict
     [removed sortUsingSelector:@selector(compare:)];
     return @{@"added": added, @"removed": removed};
 }
+
+#pragma mark Radio shows
+
+static NSISO8601DateFormatter *ShowsISOFormatter(void) {
+    static NSISO8601DateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSISO8601DateFormatter new];
+        fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+    });
+    return fmt;
+}
+
+NSDictionary *ShowsStateFromJSON(NSData *json) {
+    if (!json.length) return nil;
+    id root = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if (![root isKindOfClass:NSDictionary.class]) return nil;
+    NSNumber *ver = root[@"version"];
+    if (![ver isKindOfClass:NSNumber.class] || ver.integerValue != 1) return nil;
+    id eps = root[@"episodes"];
+    if (eps && ![eps isKindOfClass:NSDictionary.class]) return nil;
+    return @{@"version": @1, @"episodes": [eps isKindOfClass:NSDictionary.class] ? eps : @{}};
+}
+
+NSData *ShowsStateToJSON(NSDictionary *state) {
+    if (![state isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableDictionary *doc = [NSMutableDictionary dictionary];
+    doc[@"version"] = @1;
+    id eps = state[@"episodes"];
+    doc[@"episodes"] = [eps isKindOfClass:NSDictionary.class] ? eps : @{};
+    return [NSJSONSerialization dataWithJSONObject:doc options:NSJSONWritingSortedKeys error:nil];
+}
+
+BOOL ShowsEpisodeFinished(double position, double duration, BOOL finishedFlag) {
+    if (finishedFlag) return YES;
+    if (!isfinite(duration) || duration <= 0) return NO;
+    if (!isfinite(position) || position < 0) return NO;
+    return position >= duration * 0.97 || position >= duration - 1.0;
+}
+
+static NSDictionary *ShowsEpisodeState(NSDictionary *state, NSString *path) {
+    if (!path.length || ![state isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *episodes = state[@"episodes"];
+    if (![episodes isKindOfClass:NSDictionary.class]) return nil;
+    id row = episodes[path];
+    return [row isKindOfClass:NSDictionary.class] ? row : nil;
+}
+
+BOOL ShowsEpisodeUnplayed(NSDictionary *epState, NSDictionary *episode) {
+    (void)episode;
+    if (!epState) return YES;
+    double pos = [epState[@"position"] doubleValue];
+    double dur = [epState[@"duration"] doubleValue];
+    BOOL fin = [epState[@"finished"] boolValue];
+    if (ShowsEpisodeFinished(pos, dur, fin)) return NO;
+    return pos < 30.0;
+}
+
+NSDictionary *ShowsPickOfferedEpisode(NSArray<NSDictionary *> *episodes, NSDictionary *state) {
+    if (!episodes.count) return nil;
+    NSDictionary *bestPart = nil;
+    NSDate *bestUpdated = nil;
+    for (NSDictionary *ep in episodes) {
+        if (![ep isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = ep[@"path"];
+        if (![path isKindOfClass:NSString.class] || !path.length) continue;
+        NSDictionary *st = ShowsEpisodeState(state, path);
+        if (!st) continue;
+        double pos = [st[@"position"] doubleValue];
+        double dur = [st[@"duration"] doubleValue];
+        BOOL fin = [st[@"finished"] boolValue];
+        if (ShowsEpisodeFinished(pos, dur, fin) || pos < 30.0) continue;
+        NSString *upd = [st[@"updated"] isKindOfClass:NSString.class] ? st[@"updated"] : @"";
+        NSDate *when = upd.length ? [ShowsISOFormatter() dateFromString:upd] : nil;
+        if (!when) when = [NSDate distantPast];
+        if (!bestPart || [when compare:bestUpdated] == NSOrderedDescending) {
+            bestPart = ep;
+            bestUpdated = when;
+        }
+    }
+    if (bestPart) return bestPart;
+    NSDictionary *bestNew = nil;
+    NSDate *bestDate = nil;
+    for (NSDictionary *ep in episodes) {
+        if (![ep isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = ep[@"path"];
+        if (![path isKindOfClass:NSString.class] || !path.length) continue;
+        NSDictionary *st = ShowsEpisodeState(state, path);
+        if (!ShowsEpisodeUnplayed(st, ep)) continue;
+        NSDate *when = [ep[@"sortDate"] isKindOfClass:NSDate.class] ? ep[@"sortDate"] : ep[@"broadcast"];
+        if (![when isKindOfClass:NSDate.class]) when = [NSDate distantPast];
+        if (!bestNew || [when compare:bestDate] == NSOrderedDescending) {
+            bestNew = ep;
+            bestDate = when;
+        }
+    }
+    return bestNew;
+}
+
+NSUInteger ShowsUnplayedBadgeCount(NSArray<NSDictionary *> *episodes, NSDictionary *state, NSString *offeredPath) {
+    NSUInteger count = 0;
+    for (NSDictionary *ep in episodes) {
+        if (![ep isKindOfClass:NSDictionary.class]) continue;
+        NSString *path = ep[@"path"];
+        if (![path isKindOfClass:NSString.class] || !path.length) continue;
+        if (offeredPath.length && [path isEqual:offeredPath]) continue;
+        NSDictionary *st = ShowsEpisodeState(state, path);
+        if (ShowsEpisodeUnplayed(st, ep)) count++;
+    }
+    return count;
+}
+
+double ShowsResumePosition(double savedPosition) {
+    if (!isfinite(savedPosition) || savedPosition <= 0) return 0;
+    return savedPosition > 5.0 ? savedPosition - 5.0 : 0;
+}
+
+NSString *ShowWeekdayShort(NSDate *date, NSTimeZone *zone) {
+    if (![date isKindOfClass:NSDate.class]) return @"";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"EEE";
+    });
+    @synchronized (fmt) {
+        fmt.timeZone = zone ?: NSTimeZone.localTimeZone;
+        return [fmt stringFromDate:date] ?: @"";
+    }
+}
+
+NSString *ShowPresenterFirstName(NSString *presenter) {
+    NSString *s = [presenter isKindOfClass:NSString.class] ? presenter : @"";
+    s = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!s.length) return @"";
+    NSRange sp = [s rangeOfCharacterFromSet:NSCharacterSet.whitespaceCharacterSet];
+    return sp.location == NSNotFound ? s : [s substringToIndex:sp.location];
+}
+
+NSString *ShowTileCaptionLine2(NSDate *broadcast, NSString *presenter, NSTimeZone *zone) {
+    NSString *day = ShowWeekdayShort(broadcast, zone);
+    NSString *name = ShowPresenterFirstName(presenter);
+    if (!day.length && !name.length) return @"";
+    if (!day.length) return name;
+    if (!name.length) return day;
+    return [NSString stringWithFormat:@"%@ · %@", day, name];
+}
+
+NSString *ShowNowPlayingSubtitle(NSDate *broadcast, NSString *presenter, NSTimeZone *zone) {
+    if (![broadcast isKindOfClass:NSDate.class]) return presenter ?: @"";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"EEE d MMM";
+    });
+    NSString *pres = [presenter isKindOfClass:NSString.class] ? presenter : @"";
+    @synchronized (fmt) {
+        fmt.timeZone = zone ?: NSTimeZone.localTimeZone;
+        NSString *date = [fmt stringFromDate:broadcast] ?: @"";
+        if (!date.length) return pres;
+        if (!pres.length) return date;
+        return [NSString stringWithFormat:@"%@ · %@", date, pres];
+    }
+}
+
+static NSString *ShowTooltipClock(double seconds) {
+    if (!isfinite(seconds) || seconds < 0) return @"";
+    int whole = (int)seconds;
+    int h = whole / 3600, m = (whole % 3600) / 60, s = whole % 60;
+    if (h > 0) return [NSString stringWithFormat:@"%d:%02d:%02d", h, m, s];
+    return [NSString stringWithFormat:@"%d:%02d", m, s];
+}
+
+NSString *ShowEpisodeTooltip(NSString *showName, NSDate *broadcast, NSString *presenter,
+                              double position, double duration, BOOL unplayed, NSTimeZone *zone) {
+    NSString *show = [showName isKindOfClass:NSString.class] ? showName : @"";
+    NSString *pres = [presenter isKindOfClass:NSString.class] ? presenter : @"";
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"EEE d MMM";
+    });
+    NSMutableArray *parts = [NSMutableArray array];
+    if (show.length) [parts addObject:show];
+    if ([broadcast isKindOfClass:NSDate.class]) {
+        @synchronized (fmt) {
+            fmt.timeZone = zone ?: NSTimeZone.localTimeZone;
+            NSString *d = [fmt stringFromDate:broadcast];
+            if (d.length) [parts addObject:d];
+        }
+    }
+    if (pres.length) [parts addObject:pres];
+    NSString *head = [parts componentsJoinedByString:@" · "];
+    if (unplayed) return head.length ? [head stringByAppendingString:@" · unplayed"] : @"unplayed";
+    NSString *elapsed = ShowTooltipClock(position);
+    NSString *total = ShowTooltipClock(duration);
+    if (!elapsed.length || !total.length) return head;
+    return [NSString stringWithFormat:@"%@ · %@ of %@", head, elapsed, total];
+}
+
+NSDate *ShowDateFromFilename(NSString *filename, NSTimeZone *zone) {
+    NSString *name = [filename isKindOfClass:NSString.class] ? filename : @"";
+    if (name.length < 10) return nil;
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd";
+    });
+    NSString *prefix = [name substringToIndex:10];
+    if (prefix.length != 10 || [prefix characterAtIndex:4] != '-' || [prefix characterAtIndex:7] != '-') return nil;
+    @synchronized (fmt) {
+        fmt.timeZone = zone ?: NSTimeZone.localTimeZone;
+        return [fmt dateFromString:prefix];
+    }
+}
+

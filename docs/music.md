@@ -200,6 +200,19 @@ Found with the system log before this existed: on 12 Nov 2026 the music "cut in 
 because the Bluetooth headphones were sending Pause and Play commands, and their link was
 dropping; the player had no stalls or errors.
 
+## Radio shows (14 Nov 2026)
+
+Downloaded radio episodes live under `~/Music/Radio Shows` by default (`defaults` key
+`musicShowsRoot`). Each immediate subfolder is one show; each `.m4a` inside is an episode (tags:
+artist = presenter, date or a leading `YYYY-MM-DD` in the file name = broadcast day, embedded art).
+
+Playback position is stored in `~/Library/Application Support/Glancebar/mix/shows.json` (version 1,
+atomic writes). A part-played episode resumes from five seconds before the saved position; finished
+means 97% or played to the end. The popover tile shows the offered episode's cover, a waveform type
+mark, caption (`House Party` / `Sat · Latifa`), badge count of other unplayed episodes, and a
+progress bar when mid-episode. New music keeps its station slot but uses a 2×2 cover mosaic when
+four station files have art.
+
 ## Metadata and cover art are kept with every download (12 Nov 2026)
 
 Owner rule: every downloaded song keeps its metadata, album art included, and that record
