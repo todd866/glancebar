@@ -54,6 +54,8 @@ run; rc=$?
   && ok "nothing installed: tests, then deploy" || not_ok "nothing installed: tests, then deploy (rc $rc, calls '$(calls)')"
 : > "$CASE/calls"; run
 [ -z "$(calls)" ] && ok "in sync: nothing runs" || not_ok "in sync: nothing runs ('$(calls)')"
+status_is() { /usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if (d["state"], d["behind"]) == (sys.argv[2], int(sys.argv[3])) else 1)' "$CASE/update-state/status.json" "$1" "$2" 2>/dev/null; }
+status_is ok 0 && ok "in sync: status file says ok, 0 behind" || not_ok "in sync: status file says ok, 0 behind ($(cat "$CASE/update-state/status.json" 2>/dev/null))"
 advance two; : > "$CASE/calls"; run
 [ "$(calls)" = "tests deploy" ] && [ "$(installed)" = "$(origin_head)" ] \
   && ok "origin moved: checkout fast-forwards and deploys" || not_ok "origin moved: checkout fast-forwards and deploys ('$(calls)')"

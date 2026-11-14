@@ -78,6 +78,8 @@ DEFAULTS: dict[str, Any] = {
     "storefront": "au",
     "playback_log": str(HOME / "Library/Logs/Glancebar/playback.jsonl"),
     "reject_skips": 2,
+    "retry_days": 3,
+    "retry_max": 3,
     "station_playlist": "station:triplej",
 }
 
@@ -438,6 +440,7 @@ class Runners:
         clock: Callable[[], str] | None = None,
         sleep: Callable[[float], None] | None = None,
         media_collect: Callable[[], str | None] | None = None,
+        media_check: Callable[[], str | None] | None = None,
     ):
         self.itunes_search = itunes_search or _default_itunes_search
         self.itunes_lookup = itunes_lookup or _default_itunes_lookup
@@ -453,6 +456,9 @@ class Runners:
         # Refreshes this Mac's part of the shared media record. Off unless the command line
         # turns it on, so a test never writes into the real shared folder.
         self.media_collect = media_collect or (lambda: None)
+        # Rewrites the media check's result after a run, so what the morning digest reads is
+        # about tonight's run and not last night's. Off unless the command line turns it on.
+        self.media_check = media_check or (lambda: None)
 
 
 MEDIA_SYNC = Path(__file__).resolve().parent.parent / "media-sync" / "media_sync.py"
@@ -471,6 +477,17 @@ def _default_media_collect() -> str | None:
     if res.returncode != 0:
         return f"collect exit {res.returncode}: {(res.stderr or res.stdout).strip()}"
     return None
+
+
+def _default_media_check() -> str | None:
+    if not MEDIA_SYNC.is_file():
+        return None
+    try:
+        res = subprocess.run([sys.executable, str(MEDIA_SYNC), "check"],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"check: {exc}"
+    return None if res.returncode == 0 else f"check exit {res.returncode}"
 
 
 _ITUNES_LAST = 0.0
@@ -1060,6 +1077,38 @@ def source_tv_likes(cfg: dict[str, Any], runners: Runners, rejected: set[str]) -
     return out
 
 
+def source_retries(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[dict]:
+    """Downloads that failed in the last few nights are tried again.
+
+    A failed download says nothing about the song (the downloader stalled, the network
+    dropped), and the source that suggested it may not suggest it twice, so without this a
+    pick was lost for good. A track is retried while its latest ledger row is `failed`, for
+    `retry_days` nights and at most `retry_max` failures.
+    """
+    now = parse_iso(runners.clock()) or utc_now()
+    cutoff = now - timedelta(days=int(cfg.get("retry_days", DEFAULTS["retry_days"])))
+    limit = int(cfg.get("retry_max", DEFAULTS["retry_max"]))
+    latest: dict[str, dict] = {}
+    failures: Counter[str] = Counter()
+    for row in read_jsonl_rows(paths.ledger):
+        key = row.get("track_key") or track_key(row.get("artist", ""), row.get("title", ""))
+        if not key or row.get("action") in ("offered", "queued"):
+            continue
+        latest[key] = row
+        if row.get("action") == "failed":
+            failures[key] += 1
+    out: list[dict] = []
+    for key, row in latest.items():
+        at = parse_iso(row.get("at") or "")
+        if row.get("action") != "failed" or not at or at < cutoff or failures[key] > limit:
+            continue
+        if not (row.get("artist") and row.get("title")):
+            continue
+        out.append({"artist": row["artist"], "title": row["title"], "album": row.get("album") or "",
+                    "source": "retry", "why": row.get("why") or "new acquisition", "score_hint": 0.8})
+    return out
+
+
 def source_triplej(cfg: dict[str, Any]) -> list[dict]:
     station = Path(cfg["triplej_state"]).expanduser() / "station.json"
     if not station.is_file():
@@ -1281,6 +1330,7 @@ def cmd_candidates(
         ("new-release", lambda: source_new_releases(cfg, runners)),
         ("shazam", lambda: source_shazam(cfg, runners, rejected)),
         ("tv-like", lambda: source_tv_likes(cfg, runners, rejected)),
+        ("retry", lambda: source_retries(cfg, paths, runners)),
     ):
         try:
             rows = fn()
@@ -1400,7 +1450,9 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
         # `owned` also holds everything the scout has ever offered, so it does not repeat
         # itself. A Shazam or a TV like is his own signal: only a real copy (or a search
         # that found nothing) stops it, not a dry-run offer from last week.
-        if key in (really_owned if c.get("priority") else owned):
+        # A retry is in the ledger by definition (its failed row), so it too is judged by what
+        # is really here.
+        if key in (really_owned if (c.get("priority") or c.get("source") == "retry") else owned):
             continue
         scored = dict(c)
         scored["score"] = score_candidate(
@@ -1412,7 +1464,9 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
             media_likes=media_likes,
         )
         scored["track_key"] = key
-        if c.get("priority"):
+        # A retry was already chosen once (it is last night's pick that failed to download), so
+        # it is not put through the caps a second time: it goes ahead with the priority rows.
+        if c.get("priority") or c.get("source") == "retry":
             priority_pool.append(scored)
         elif c.get("source") == "taste-expansion":
             explore_pool.append(scored)
@@ -1806,6 +1860,7 @@ def cmd_run(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: boo
                         "publish_tracks": len(publish.get("tracks") or [])},
                 clock=runners.clock(),
             )
+            runners.media_check()
             return 0
         except SystemExit as exc:
             record_last_run(paths, ok=False, stage="run", detail={"exit": exc.code}, clock=runners.clock())
@@ -1841,7 +1896,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     state = Path(args.state).expanduser() if args.state else DEFAULT_STATE
     paths = ScoutPaths(state)
-    runners = Runners(media_collect=_default_media_collect)
+    runners = Runners(media_collect=_default_media_collect, media_check=_default_media_check)
 
     if args.cmd == "candidates":
         with run_lock(paths.lock):
