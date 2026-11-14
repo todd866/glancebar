@@ -3885,6 +3885,44 @@ NSSet<NSString *> *MixLikedIDs(NSString *jsonl) {
     return liked;
 }
 
+NSString *MixDislikeLine(NSString *trackID, NSString *trackKey, NSString *title, NSString *artist, BOOL disliked, NSDate *at) {
+    NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
+    NSMutableDictionary *o =
+        [@{@"at": [f stringFromDate:at ?: NSDate.date], @"trackID": trackID ?: @"", @"track_key": trackKey ?: @"",
+           @"title": title ?: @"", @"artist": artist ?: @"", @"event": disliked ? @"dislike" : @"undislike"} mutableCopy];
+    if (disliked) o[@"liked"] = @NO;
+    NSData *d = [NSJSONSerialization dataWithJSONObject:o options:NSJSONWritingSortedKeys error:nil];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+}
+
+NSSet<NSString *> *MixDislikedKeys(NSString *jsonl) {
+    NSMutableDictionary<NSString *, NSNumber *> *byID = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSNumber *> *byKey = [NSMutableDictionary dictionary];
+    for (NSString *line in [jsonl ?: @"" componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if (!line.length) continue;
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![o isKindOfClass:NSDictionary.class]) continue;
+        NSString *event = [o[@"event"] isKindOfClass:NSString.class] ? o[@"event"] : @"";
+        NSString *trackID = [o[@"trackID"] isKindOfClass:NSString.class] ? o[@"trackID"] : @"";
+        NSString *trackKey = [o[@"track_key"] isKindOfClass:NSString.class] ? o[@"track_key"] : @"";
+        if (!trackKey.length && [o[@"artist"] isKindOfClass:NSString.class] && [o[@"title"] isKindOfClass:NSString.class])
+            trackKey = SelectorTrackKey(o[@"artist"], o[@"title"]);
+        NSNumber *mark = nil;
+        if ([event isEqual:@"dislike"]) mark = @YES;
+        else if ([event isEqual:@"undislike"]) mark = @NO;
+        else if ([o[@"liked"] boolValue]) mark = @NO;
+        if (!mark) continue;
+        BOOL on = mark.boolValue;
+        if (trackID.length) byID[trackID] = @(on);
+        if (trackKey.length) byKey[trackKey] = @(on);
+    }
+    NSMutableSet *out = [NSMutableSet set];
+    for (NSString *k in byID) if ([byID[k] boolValue]) [out addObject:k];
+    for (NSString *k in byKey) if ([byKey[k] boolValue]) [out addObject:k];
+    return out;
+}
+
 // A seed's cover when Music has none on this Mac (streamed tracks report artwork "downloaded: false"):
 // Apple's public iTunes search, no account.
 NSURL *MixArtSearchURL(NSString *artist, NSString *title) {

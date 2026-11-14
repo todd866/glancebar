@@ -867,6 +867,8 @@ NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray
 NSURL *MixArtSearchURL(NSString *artist, NSString *title);
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at);
 NSSet<NSString *> *MixLikedIDs(NSString *jsonl);
+NSString *MixDislikeLine(NSString *trackID, NSString *trackKey, NSString *title, NSString *artist, BOOL disliked, NSDate *at);
+NSSet<NSString *> *MixDislikedKeys(NSString *jsonl);
 // Selector identity: normalise(artist) + "|" + normalise(title). Letters, digits and
 // underscores stay; everything else becomes a space. "Jamie xx" / "I Don't Know"
 // → "jamie xx|i don t know". Empty when either side normalises to nothing.

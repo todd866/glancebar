@@ -1370,8 +1370,27 @@ int main(int argc, const char **argv) {
             if (!SoundRow(root, @"Midnight City", @"M83 · 1:23 / 4:03", YES) || !FitsChildren(root) ||
                 ![playingOut.accessibilityHelp containsString:@"click for"] ||
                 ![playingOut.accessibilityLabel isEqual:@"Sound output, MacBook Air Speakers"] ||
-                !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
+                !FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup") ||
+                !FindIdentifier(root, @"popover.music.thumbsdown"))
                 return Fail(__LINE__);
+            const char *musicRowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (musicRowPNG && musicRowPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:musicRowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"dislike-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"dislike-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+                NSString *fakeTrack = [fixtureMusic stringByAppendingPathComponent:@"midnight.m4a"];
+                [@"silent" writeToFile:fakeTrack atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [c setValue:@[[NSURL fileURLWithPath:fakeTrack]] forKey:@"localURLs"];
+                [c setValue:@[@{@"id": @"m83|midnight city", @"title": @"Midnight City", @"artist": @"M83",
+                                 @"album": @"", @"local_path": fakeTrack}] forKey:@"stationTracks"];
+                [c setValue:[NSMutableSet setWithObject:@"m83|midnight city"] forKey:@"mixDisliked"];
+                [c rebuildContent];
+                root = p.contentViewController.view;
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"dislike-on-light.png"], NSAppearanceNameAqua))
+                    return Fail(__LINE__);
+            }
         } else if (musicState && strcmp(musicState, "idle") == 0) {
             [c setValue:@NO forKey:@"localMode"];
             [c setValue:@NO forKey:@"playbackKnown"];
@@ -1423,11 +1442,15 @@ int main(int argc, const char **argv) {
                 FindIdentifier(root, @"popover.music.shuffle") ||
                 FindIdentifier(root, @"popover.music.open"))
                 return Fail(__LINE__);
-            {   // 👍 sits just left of ♥ and doesn't crowd the title.
+            {   // 👎👍♥ sit at the row's right edge and don't crowd the title.
                 NSView *thumb = FindIdentifier(root, @"popover.music.thumbsup");
+                NSView *thumbsdown = FindIdentifier(root, @"popover.music.thumbsdown");
                 NSView *title = FindIdentifier(root, @"popover.music.title");
-                if (!thumb || NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame) ||
-                    ![thumb.accessibilityLabel hasPrefix:@"Thumbs-up"]) return Fail(__LINE__);
+                if (!thumb || !thumbsdown || NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 ||
+                    NSMaxX(thumbsdown.frame) > NSMinX(thumb.frame) + 0.5 ||
+                    NSMaxX(title.frame) > NSMinX(thumbsdown.frame) - 6 + 0.5 ||
+                    ![thumb.accessibilityLabel hasPrefix:@"Thumbs-up"] ||
+                    ![thumbsdown.accessibilityLabel isEqual:@"Dislike: skip this and never play it again"]) return Fail(__LINE__);
             }
             if (argc > 1) {
                 NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
@@ -1472,14 +1495,19 @@ int main(int argc, const char **argv) {
             root = p.contentViewController.view;
             NSButton *heart = (NSButton *)FindIdentifier(root, @"popover.music.favorite");
             NSButton *thumb = (NSButton *)FindIdentifier(root, @"popover.music.thumbsup");
+            NSButton *thumbsdown = (NSButton *)FindIdentifier(root, @"popover.music.thumbsdown");
             NSView *title = FindIdentifier(root, @"popover.music.title");
             if (!SoundRow(root, @"Kiss from a Rose", @"Tame Impala · 1:23 / 4:03", YES) || !FitsChildren(root) ||
                 ![heart isKindOfClass:NSButton.class] || ![thumb isKindOfClass:NSButton.class] ||
+                ![thumbsdown isKindOfClass:NSButton.class] ||
                 ![heart.accessibilityLabel isEqual:@"Add to Favourites"] ||
                 ![thumb.accessibilityLabel isEqual:@"Thumbs-up: mixes should play more like this"] ||
+                ![thumbsdown.accessibilityLabel isEqual:@"Dislike: skip this and never play it again"] ||
                 fabs(NSWidth(heart.frame) - 22) > 0.5 || fabs(NSHeight(heart.frame) - 22) > 0.5 ||
                 fabs(NSWidth(thumb.frame) - 22) > 0.5 || fabs(NSHeight(thumb.frame) - 22) > 0.5 ||
-                NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(title.frame) > NSMinX(thumb.frame))
+                fabs(NSWidth(thumbsdown.frame) - 22) > 0.5 || fabs(NSHeight(thumbsdown.frame) - 22) > 0.5 ||
+                NSMaxX(thumb.frame) > NSMinX(heart.frame) + 0.5 || NSMaxX(thumbsdown.frame) > NSMinX(thumb.frame) + 0.5 ||
+                NSMaxX(title.frame) > NSMinX(thumbsdown.frame) - 6 + 0.5)
                 return Fail(__LINE__);
             [c setValue:[NSMutableSet setWithObject:@"tame impala|kiss from a rose"] forKey:@"heartedKeys"];
             [c rebuildContent];
@@ -1490,13 +1518,15 @@ int main(int argc, const char **argv) {
             [c setValue:@"song:SEED" forKey:@"mixPlayingKey"];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup"))
+            if (!FindIdentifier(root, @"popover.music.favorite") || !FindIdentifier(root, @"popover.music.thumbsup") ||
+                !FindIdentifier(root, @"popover.music.thumbsdown"))
                 return Fail(__LINE__);
             [c setValue:@NO forKey:@"localMode"];
             [c setValue:@"" forKey:@"mixPlayingKey"];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup"))
+            if (FindIdentifier(root, @"popover.music.favorite") || FindIdentifier(root, @"popover.music.thumbsup") ||
+                FindIdentifier(root, @"popover.music.thumbsdown"))
                 return Fail(__LINE__);
             [c setValue:@YES forKey:@"localMode"];
             [c setValue:@"station:triplej" forKey:@"mixPlayingKey"];
@@ -1520,6 +1550,58 @@ int main(int argc, const char **argv) {
             [c setValue:oldUID forKey:@"defaultOutputUID"];
             [c rebuildContent];
             root = p.contentViewController.view;
+        } else if (musicState && strcmp(musicState, "dislike") == 0) {
+            NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];
+            NSString *trackB = [fixtureMusic stringByAppendingPathComponent:@"dislike-b.m4a"];
+            [@"silent a" writeToFile:trackA atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"silent b" writeToFile:trackB atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSString *dKey = @"faux pilot|wing one";
+            NSString *fbPath = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/feedback.jsonl"];
+            [NSFileManager.defaultManager createDirectoryAtPath:[fbPath stringByDeletingLastPathComponent]
+                                    withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"" writeToFile:fbPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [c setValue:@YES forKey:@"musicProbesEnabled"];
+            [c setValue:@YES forKey:@"musicSilentQA"];
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@YES forKey:@"playbackPlaying"];
+            [c setValue:@"Wing One" forKey:@"localTitle"];
+            [c setValue:@"Faux Pilot" forKey:@"localArtist"];
+            [c setValue:@0 forKey:@"localIndex"];
+            [c setValue:@[[NSURL fileURLWithPath:trackA], [NSURL fileURLWithPath:trackB]] forKey:@"localURLs"];
+            [c setValue:@[
+                @{@"file": trackA, @"artist": @"Faux Pilot", @"title": @"Wing One", @"key": dKey},
+                @{@"file": trackB, @"artist": @"Faux Pilot", @"title": @"Wing Two", @"key": @"faux pilot|wing two"}
+            ] forKey:@"stationTracks"];
+            [c setValue:@YES forKey:@"localTagsReady"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSButton *thumbsdown = (NSButton *)FindIdentifier(root, @"popover.music.thumbsdown");
+            NSButton *thumb = (NSButton *)FindIdentifier(root, @"popover.music.thumbsup");
+            NSView *title = FindIdentifier(root, @"popover.music.title");
+            if (!thumbsdown || !thumb || NSMaxX(thumbsdown.frame) > NSMinX(thumb.frame) + 0.5 ||
+                NSMaxX(title.frame) > NSMinX(thumbsdown.frame) - 6 + 0.5)
+                return Fail(__LINE__);
+            [c musicThumbsDown:nil];
+            NSString *fb = [NSString stringWithContentsOfFile:fbPath encoding:NSUTF8StringEncoding error:nil];
+            if (![fb containsString:@"\"event\":\"dislike\""]) return Fail(__LINE__);
+            NSArray *urls = [c valueForKey:@"localURLs"];
+            if (urls.count != 1 || ![[urls[0] path] isEqual:trackB] ||
+                [[c valueForKey:@"localIndex"] integerValue] != 0)
+                return Fail(__LINE__);
+            [c setValue:@[
+                @{@"file": trackA, @"artist": @"Faux Pilot", @"title": @"Wing One", @"key": dKey},
+                @{@"file": trackB, @"artist": @"Faux Pilot", @"title": @"Wing Two", @"key": @"faux pilot|wing two"}
+            ] forKey:@"stationTracks"];
+            [c setValue:@[[NSURL fileURLWithPath:trackA], [NSURL fileURLWithPath:trackB]] forKey:@"localURLs"];
+            [c setValue:@0 forKey:@"localIndex"];
+            [c setValue:@"Wing One" forKey:@"localTitle"];
+            [c setValue:@YES forKey:@"localTagsReady"];
+            [c playLocalIndex:0];
+            [c rebuildContent];
+            [c musicThumbsDown:nil];
+            fb = [NSString stringWithContentsOfFile:fbPath encoding:NSUTF8StringEncoding error:nil];
+            if (![fb containsString:@"\"event\":\"undislike\""]) return Fail(__LINE__);
         }
         if (!ActionableMenuImages([c moreMenu])) return Fail(__LINE__);
         // Toolbar tabs, built but not ordered front. Every tab keeps its identifier and a symbol.

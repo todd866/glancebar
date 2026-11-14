@@ -263,6 +263,42 @@ class MediaShareTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertIn(scout.track_key("Feedback", "Nope"), scout.rejected_keys(self.cfg, self.paths))
+        key2 = scout.track_key("Gauge Band", "Needle Song")
+        fb.write_text(
+            fb.read_text(encoding="utf-8")
+            + json.dumps(
+                {
+                    "artist": "Gauge Band",
+                    "at": "2026-11-14T11:00:00Z",
+                    "event": "dislike",
+                    "liked": False,
+                    "title": "Needle Song",
+                    "trackID": "N1",
+                    "track_key": key2,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertIn(key2, scout.rejected_keys(self.cfg, self.paths))
+        fb.write_text(
+            fb.read_text(encoding="utf-8")
+            + json.dumps(
+                {
+                    "artist": "Gauge Band",
+                    "at": "2026-11-14T12:00:00Z",
+                    "event": "undislike",
+                    "title": "Needle Song",
+                    "trackID": "N1",
+                    "track_key": key2,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertNotIn(key2, scout.rejected_keys(self.cfg, self.paths))
         ledger_key = scout.track_key("Reject Band", "Ledger Song")
         scout.append_jsonl(
             self.paths.ledger,

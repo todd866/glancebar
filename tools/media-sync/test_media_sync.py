@@ -110,6 +110,102 @@ class CollectTests(MediaSyncTestBase):
         doc2 = json.loads((self.share / "signals-testhost.json").read_text(encoding="utf-8"))
         self.assertNotIn(key, doc2["tracks"])
 
+    def test_feedback_dislike_and_thumbs(self):
+        key = ms.track_key("Faux Pilot", "Wing Song")
+        Path(self.cfg["hearts_path"]).write_text(json.dumps({"tracks": []}), encoding="utf-8")
+        lines = [
+            json.dumps(
+                {
+                    "artist": "Faux Pilot",
+                    "title": "Wing Song",
+                    "trackID": "W1",
+                    "track_key": key,
+                    "event": "dislike",
+                    "liked": False,
+                    "at": "2026-11-14T08:00:00Z",
+                },
+                sort_keys=True,
+            ),
+        ]
+        Path(self.cfg["glancebar_feedback"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _st, tr = ms.collect_hearts(self.cfg)
+        self.assertTrue(ms.has_dislike(tr[key]))
+        self.assertFalse(ms.has_like(tr[key]))
+        lines.append(
+            json.dumps(
+                {
+                    "artist": "Faux Pilot",
+                    "title": "Wing Song",
+                    "trackID": "W1",
+                    "track_key": key,
+                    "event": "undislike",
+                    "at": "2026-11-14T09:00:00Z",
+                },
+                sort_keys=True,
+            )
+        )
+        Path(self.cfg["glancebar_feedback"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _st2, tr2 = ms.collect_hearts(self.cfg)
+        self.assertNotIn(key, tr2)
+        lines.append(
+            json.dumps(
+                {
+                    "artist": "Faux Pilot",
+                    "title": "Wing Song",
+                    "trackID": "W1",
+                    "track_key": key,
+                    "event": "dislike",
+                    "liked": False,
+                    "at": "2026-11-14T10:00:00Z",
+                },
+                sort_keys=True,
+            )
+        )
+        lines.append(
+            json.dumps(
+                {
+                    "artist": "Faux Pilot",
+                    "title": "Wing Song",
+                    "trackID": "W1",
+                    "track_key": key,
+                    "liked": True,
+                    "at": "2026-11-14T11:00:00Z",
+                },
+                sort_keys=True,
+            )
+        )
+        Path(self.cfg["glancebar_feedback"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _st3, tr3 = ms.collect_hearts(self.cfg)
+        self.assertFalse(ms.has_dislike(tr3.get(key, {})))
+        self.assertTrue(ms.has_like(tr3[key]))
+
+    def test_export_likes_skips_disliked(self):
+        key = ms.track_key("Skip Me", "Disliked Tune")
+        Path(self.cfg["hearts_path"]).write_text(json.dumps({"tracks": [key]}), encoding="utf-8")
+        Path(self.cfg["glancebar_feedback"]).write_text(
+            json.dumps(
+                {
+                    "artist": "Skip Me",
+                    "title": "Disliked Tune",
+                    "track_key": key,
+                    "event": "dislike",
+                    "liked": False,
+                    "at": "2026-11-14T10:00:00Z",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        ms.cmd_collect(self.cfg)
+        doc = json.loads((self.share / "signals-testhost.json").read_text(encoding="utf-8"))
+        self.assertTrue(ms.has_dislike(doc["tracks"][key]))
+        out = self.root / "likes.json"
+        out.write_text("[]", encoding="utf-8")
+        rc = ms.cmd_export_likes(self.cfg, argparse_namespace(out=str(out), force=True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8")), [])
+
     def test_wrong_song_like_without_apple_id(self):
         Path(self.cfg["liked_pulled"]).write_text(
             json.dumps(

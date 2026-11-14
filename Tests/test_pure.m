@@ -2458,6 +2458,22 @@ int main(void) {
                               MixFeedbackLine(@"A", @"Song A", @"X", NO, nil)] componentsJoinedByString:@"\n"];
             check([MixLikedIDs(fb) isEqual:[NSSet setWithObject:@"B"]] && [MixFeedbackLine(@"A", @"t", @"a", YES, [NSDate dateWithTimeIntervalSince1970:0]) containsString:@"\"liked\":true"],
                   @"mix feedback: last line per track wins; junk lines ignored");
+            NSString *dis = MixDislikeLine(@"Z1", @"zed test|crank song", @"Crank Song", @"Zed Test", YES,
+                                             [NSDate dateWithTimeIntervalSince1970:0]);
+            check([dis hasPrefix:@"{"] && [dis containsString:@"\"event\":\"dislike\""] && [dis containsString:@"\"liked\":false"] &&
+                  [dis containsString:@"\"track_key\":\"zed test|crank song\""],
+                  @"mix dislike: sorted JSON with liked false");
+            NSString *undis = MixDislikeLine(@"Z1", @"zed test|crank song", @"Crank Song", @"Zed Test", NO, nil);
+            check([undis containsString:@"\"event\":\"undislike\""] && ![undis containsString:@"liked"],
+                  @"mix dislike: undislike has no liked key");
+            NSString *dj = [@[dis,
+                               MixDislikeLine(@"Z1", @"zed test|crank song", @"Crank Song", @"Zed Test", NO, nil),
+                               MixDislikeLine(@"Z1", @"zed test|crank song", @"Crank Song", @"Zed Test", YES, nil),
+                               MixFeedbackLine(@"Z1", @"Crank Song", @"Zed Test", YES, nil), @"", @"not json"]
+                              componentsJoinedByString:@"\n"];
+            check(![MixDislikedKeys(dj) containsObject:@"Z1"] && [MixLikedIDs(dj) containsObject:@"Z1"],
+                  @"mix dislike: last event wins; liked clears; torn lines ignored");
+            check([MixDislikedKeys(@"") count] == 0, @"mix dislike: empty file");
             NSMutableArray *thumbLib = [NSMutableArray array];
             for (NSDictionary *tr in lib) { NSMutableDictionary *m = [tr mutableCopy]; if ([tr[@"id"] isEqual:@"NEVER"]) m[@"thumb"] = @YES; [thumbLib addObject:m]; }
             NSMutableSet *thumbWide = [NSMutableSet set];
