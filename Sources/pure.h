@@ -1139,13 +1139,13 @@ NSUInteger ShowsUnplayedBadgeCount(NSArray<NSDictionary *> *episodes, NSDictiona
 double ShowsResumePosition(double savedPosition);
 // Short weekday in the local zone: "Sat".
 NSString *ShowWeekdayShort(NSDate *date, NSTimeZone *zone);
-// Presenter's first word: "Latifa Tee" → "Latifa".
+// Presenter's first word: "Marita Lee" → "Marita".
 NSString *ShowPresenterFirstName(NSString *presenter);
-// Tile caption line 2: "Sat · Latifa".
+// Tile caption line 2: "Sat · Marita".
 NSString *ShowTileCaptionLine2(NSDate *broadcast, NSString *presenter, NSTimeZone *zone);
-// Now-playing artist line: "Sat 14 Nov · Latifa Tee".
+// Now-playing artist line: "Sat 14 Nov · Marita Lee".
 NSString *ShowNowPlayingSubtitle(NSDate *broadcast, NSString *presenter, NSTimeZone *zone);
-// Tooltip: "House Party · Sat 14 Nov · Latifa Tee · 1:12 of 4:00" or "· unplayed".
+// Tooltip: "House Party · Sat 14 Nov · Marita Lee · 1:12 of 4:00" or "· unplayed".
 NSString *ShowEpisodeTooltip(NSString *showName, NSDate *broadcast, NSString *presenter,
                               double position, double duration, BOOL unplayed, NSTimeZone *zone);
 // Leading YYYY-MM-DD in a file name, else nil.

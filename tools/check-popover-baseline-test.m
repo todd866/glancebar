@@ -1571,9 +1571,9 @@ int main(int argc, const char **argv) {
                 [[NSColor systemTealColor] setFill]; NSRectFill(r); return YES;
             }];
             NSArray *episodes = @[
-                @{@"path": epA, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240},
-                @{@"path": epB, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240},
-                @{@"path": epC, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @240}];
+                @{@"path": epA, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                @{@"path": epB, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240},
+                @{@"path": epC, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @240}];
             NSDictionary *offer = ShowsPickOfferedEpisode(episodes, showsState);
             [c setValue:@YES forKey:@"showsLoaded"];
             [c setValue:episodes forKey:@"showEpisodes"];

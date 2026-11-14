@@ -212,7 +212,7 @@ artist = presenter, date or a leading `YYYY-MM-DD` in the file name = broadcast 
 Playback position is stored in `~/Library/Application Support/Glancebar/mix/shows.json` (version 1,
 atomic writes). A part-played episode resumes from five seconds before the saved position; finished
 means 97% or played to the end. The popover tile shows the offered episode's cover, a waveform type
-mark, caption (`House Party` / `Sat · Latifa`), badge count of other unplayed episodes, and a
+mark, caption (`House Party` / `Sat · Marita`), badge count of other unplayed episodes, and a
 progress bar when mid-episode. New music keeps its station slot but uses a 2×2 cover mosaic when
 four station files have art.
 

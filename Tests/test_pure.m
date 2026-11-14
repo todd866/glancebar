@@ -3144,9 +3144,9 @@ int main(void) {
             check(parsed && [parsed[@"version"] isEqual:@1], @"shows.json round trip version");
             NSString *pathA = @"/tmp/show-a.m4a", *pathB = @"/tmp/show-b.m4a", *pathC = @"/tmp/show-c.m4a";
             NSDate *day = [NSDate dateWithTimeIntervalSince1970:1700000000];
-            NSArray *eps = @[@{@"path": pathA, @"show": @"House Party", @"presenter": @"Latifa Tee",
+            NSArray *eps = @[@{@"path": pathA, @"show": @"House Party", @"presenter": @"Marita Lee",
                                @"sortDate": day, @"broadcast": day},
-                             @{@"path": pathB, @"show": @"House Party", @"presenter": @"Latifa Tee",
+                             @{@"path": pathB, @"show": @"House Party", @"presenter": @"Marita Lee",
                                @"sortDate": [NSDate dateWithTimeIntervalSince1970:1699900000],
                                @"broadcast": [NSDate dateWithTimeIntervalSince1970:1699900000]},
                              @{@"path": pathC, @"show": @"Other", @"presenter": @"Host Name",
@@ -3166,16 +3166,16 @@ int main(void) {
             check(!ShowsEpisodeFinished(100, 240, NO), @"not finished mid-way");
             check(ShowsResumePosition(72) == 67, @"resume backs up 5 seconds");
             check(ShowsResumePosition(3) == 0, @"resume not below zero");
-            check([ShowPresenterFirstName(@"Latifa Tee") isEqual:@"Latifa"], @"presenter first word");
-            check([ShowTileCaptionLine2(day, @"Latifa Tee", nil) hasPrefix:@"Sat"] ||
-                  [ShowTileCaptionLine2(day, @"Latifa Tee", nil) length] > 0,
+            check([ShowPresenterFirstName(@"Marita Lee") isEqual:@"Marita"], @"presenter first word");
+            check([ShowTileCaptionLine2(day, @"Marita Lee", nil) hasPrefix:@"Sat"] ||
+                  [ShowTileCaptionLine2(day, @"Marita Lee", nil) length] > 0,
                   @"tile caption line 2 weekday");
-            check([[ShowNowPlayingSubtitle(day, @"Latifa Tee", nil) componentsSeparatedByString:@" · "] count] >= 2,
+            check([[ShowNowPlayingSubtitle(day, @"Marita Lee", nil) componentsSeparatedByString:@" · "] count] >= 2,
                   @"now playing subtitle has date and presenter");
-            NSString *tip = ShowEpisodeTooltip(@"House Party", day, @"Latifa Tee", 72, 240, NO, nil);
+            NSString *tip = ShowEpisodeTooltip(@"House Party", day, @"Marita Lee", 72, 240, NO, nil);
             check([tip containsString:@"House Party"] && [tip containsString:@"1:12"] && [tip containsString:@"4:00"],
                   @"tooltip elapsed and duration");
-            NSString *unplayedTip = ShowEpisodeTooltip(@"House Party", day, @"Latifa Tee", 0, 0, YES, nil);
+            NSString *unplayedTip = ShowEpisodeTooltip(@"House Party", day, @"Marita Lee", 0, 0, YES, nil);
             check([unplayedTip hasSuffix:@"unplayed"], @"tooltip unplayed");
             check([FormatTrackClock(3725, 14428) isEqual:@"1:02:05"], @"seek clock hours on elapsed");
             check([FormatTrackClock(14428, 14428) isEqual:@"4:00:28"], @"seek clock hours on duration");

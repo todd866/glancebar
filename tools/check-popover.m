@@ -1665,9 +1665,9 @@ int main(int argc, const char **argv) {
             NSString *epA = [showDir stringByAppendingPathComponent:@"2026-11-14-ep1.m4a"];
             NSString *epB = [showDir stringByAppendingPathComponent:@"2026-11-07-ep2.m4a"];
             NSString *epC = [showDir stringByAppendingPathComponent:@"2026-11-01-ep3.m4a"];
-            if (!WriteSilentM4A(epA, @"Latifa Tee", FixtureCoverPNG(0.52), 120) ||
-                !WriteSilentM4A(epB, @"Latifa Tee", FixtureCoverPNG(0.56), 120) ||
-                !WriteSilentM4A(epC, @"Latifa Tee", FixtureCoverPNG(0.48), 120))
+            if (!WriteSilentM4A(epA, @"Marita Lee", FixtureCoverPNG(0.52), 120) ||
+                !WriteSilentM4A(epB, @"Marita Lee", FixtureCoverPNG(0.56), 120) ||
+                !WriteSilentM4A(epC, @"Marita Lee", FixtureCoverPNG(0.48), 120))
                 return Fail(__LINE__);
             NSMutableArray *pickPaths = [NSMutableArray array];
             for (NSUInteger i = 0; i < 4; i++) {
@@ -1709,9 +1709,9 @@ int main(int argc, const char **argv) {
             NSString *showsPath = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/shows.json"];
             [ShowsStateToJSON(showsState) writeToFile:showsPath atomically:YES];
             NSArray *episodes = @[
-                @{@"path": epA, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
-                @{@"path": epB, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
-                @{@"path": epC, @"show": @"House Party", @"presenter": @"Latifa Tee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)}];
+                @{@"path": epA, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
+                @{@"path": epB, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)},
+                @{@"path": epC, @"show": @"House Party", @"presenter": @"Marita Lee", @"broadcast": day, @"sortDate": day, @"duration": @(savedDur)}];
             NSDictionary *offer = ShowsPickOfferedEpisode(episodes, showsState);
             [c setValue:@YES forKey:@"musicProbesEnabled"];
             [c setValue:@YES forKey:@"musicSilentQA"];
@@ -1744,7 +1744,7 @@ int main(int argc, const char **argv) {
             if (NSMinX(show.frame) <= NSMaxX(seed2.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)
                 return Fail(__LINE__);
             if (![showCap.stringValue isEqual:@"House Party"] || ![nmCap.stringValue isEqual:@"New music"] ||
-                ![ShowTileCaptionLine2(day, @"Latifa Tee", utc) isEqual:showSub.stringValue])
+                ![ShowTileCaptionLine2(day, @"Marita Lee", utc) isEqual:showSub.stringValue])
                 return Fail(__LINE__);
             if (!CaptionFits(showCap) || !CaptionFits(showSub) || !CaptionFits(nmCap)) return Fail(__LINE__);
             // The label's own test for "clipped" sets a tooltip with the full text: none here.
@@ -1818,7 +1818,7 @@ int main(int argc, const char **argv) {
                 [c setValue:@YES forKey:@"playbackPlaying"];
                 [c setValue:@"show:episode" forKey:@"mixPlayingKey"];
                 [c setValue:@"House Party" forKey:@"localTitle"];
-                [c setValue:ShowNowPlayingSubtitle(day, @"Latifa Tee", utc) forKey:@"localArtist"];
+                [c setValue:ShowNowPlayingSubtitle(day, @"Marita Lee", utc) forKey:@"localArtist"];
                 [c setValue:@[[NSURL fileURLWithPath:epA]] forKey:@"localURLs"];
                 [c setValue:@0 forKey:@"localIndex"];
                 [c playShow:show];
