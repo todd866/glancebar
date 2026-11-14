@@ -77,6 +77,10 @@ DEFAULTS: Dict[str, Any] = {
     "picks_max": 300,
     "tv_channel_scores": "",
     "tv_src_prefix": "music",
+    # Optional: the output of `ls -R <tv_music_videos>`, used instead of walking the drive
+    # when it is fresh, so a busy drive does not hold the score file up.
+    "tv_video_listing": "",
+    "tv_video_listing_max_h": 36,
     "check": {
         "ledger_warn_h": 30,
         "ledger_fail_h": 72,
@@ -708,7 +712,47 @@ def tv_catalogue_src(prefix: str, rel_path: str) -> str:
     return f"{p}/{rel_path}".replace("\\", "/")
 
 
+def videos_from_listing(text: str) -> List[Tuple[str, str, str, str, str]]:
+    """The same rows `iter_music_videos` yields, read from the output of `ls -R <folder>`.
+
+    A listing is a light read that does not need the drive to itself, so the score file can
+    be built while a long job (a backup verify, a migration) holds the drive. The first
+    header line names the root; files one folder below it are the videos."""
+    root = ""
+    folder: Optional[str] = None
+    rows: List[Tuple[str, str, str, str, str]] = []
+    for line in text.splitlines():
+        if line.endswith(":") and line.startswith("/"):
+            path = line[:-1]
+            if not root:
+                root = path.rstrip("/")
+                folder = None
+                continue
+            rel = path[len(root):].strip("/") if path.startswith(root) else ""
+            folder = rel if rel and "/" not in rel else None
+            continue
+        name = line.strip()
+        if not name or folder is None:
+            continue
+        if Path(name).suffix.lower() not in _VIDEO:
+            continue
+        artist, title, vid = parse_bracketed_name(Path(name).stem)
+        rows.append((folder, artist, title, vid, f"{folder}/{name}"))
+    return rows
+
+
 def list_walked_videos(cfg: Dict[str, Any]) -> List[Tuple[str, str, str, str, str]]:
+    listing_s = (cfg.get("tv_video_listing") or "").strip()
+    if listing_s:
+        listing = expand(listing_s)
+        max_h = float(cfg.get("tv_video_listing_max_h") or 36)
+        try:
+            if listing.is_file() and (_clock_fn() - listing.stat().st_mtime) <= max_h * 3600:
+                rows = videos_from_listing(listing.read_text(encoding="utf-8", errors="replace"))
+                if rows:
+                    return rows
+        except OSError:
+            pass
     root_s = (cfg.get("tv_music_videos") or "").strip()
     if not root_s:
         return []

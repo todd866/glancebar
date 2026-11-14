@@ -526,6 +526,34 @@ class CheckRowsTest(MediaSyncTestBase):
         self.assertEqual(rc, 0)
 
 
+class ListingTest(MediaSyncTestBase):
+    # The score file must be buildable from a plain `ls -R` listing when the drive is busy.
+    LISTING = (
+        "/drive/videos:\nAct One\nAct Two\nnotes.txt\n\n"
+        "/drive/videos/Act One:\nAct One - First Song (Official Video) [abc123].mp4\ncover.jpg\n\n"
+        "/drive/videos/Act One/extras:\nAct One - Hidden [zzz999].mp4\n\n"
+        "/drive/videos/Act Two:\nAct Two - Second Song [def456].mkv\n"
+    )
+
+    def test_listing_gives_the_same_rows_as_a_walk(self):
+        rows = ms.videos_from_listing(self.LISTING)
+        self.assertEqual([(r[0], r[1], r[2], r[3], r[4]) for r in rows], [
+            ("Act One", "Act One", "First Song", "abc123", "Act One/Act One - First Song (Official Video) [abc123].mp4"),
+            ("Act Two", "Act Two", "Second Song", "def456", "Act Two/Act Two - Second Song [def456].mkv"),
+        ])
+        self.assertEqual(ms.videos_from_listing(""), [])
+
+    def test_a_fresh_listing_is_used_and_a_stale_one_is_not(self):
+        listing = self.root / "videos.ls"
+        listing.write_text(self.LISTING, encoding="utf-8")
+        os.utime(listing, (self.t0 - 3600, self.t0 - 3600))
+        self.cfg["tv_video_listing"] = str(listing)
+        self.cfg["tv_music_videos"] = str(self.root / "no-such-folder")
+        self.assertEqual(len(ms.list_walked_videos(self.cfg)), 2)
+        os.utime(listing, (self.t0 - 40 * 3600, self.t0 - 40 * 3600))
+        self.assertEqual(ms.list_walked_videos(self.cfg), [])   # stale, and the folder is absent
+
+
 class MatchingSpeedTest(unittest.TestCase):
     # 300 picks against 1,200 videos took more than ten minutes when every pair was compared
     # and both sides' keys were recomputed each time. Indexed, it is well under a second.
