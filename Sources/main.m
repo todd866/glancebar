@@ -4974,20 +4974,17 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
 @end
 @implementation GBRecoverableTextField
 - (void)updateClippedTextHelp {
-    if (!self.cell) return;
-    NSLineBreakMode mode = self.lineBreakMode;
-    BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
-                     mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
-    BOOL clipped = truncates && self.stringValue.length &&
-        // Known gap (14 Nov 2026): AppKit truncates a label below text + 8, so a label within
-        // 4 to 8 pt of its field is cut with no tooltip. Using 8 here flags labels across the
-        // popover and fails its fit check, so it needs its own pass. Tile captions do not
-        // depend on this: they are sized with kLabelPad.
-        self.attributedStringValue.size.width + 4 > NSWidth(self.bounds);
-    if (self.maximumNumberOfLines > 1 && self.stringValue.length && self.font)   // a wrapping label clips past its last line
-        clipped = NSHeight([self.stringValue boundingRectWithSize:NSMakeSize(NSWidth(self.bounds) - 4, 1000)
-                                                          options:NSStringDrawingUsesLineFragmentOrigin
-                                                       attributes:@{NSFontAttributeName: self.font}]) > NSHeight(self.bounds) + 0.5;
+    if (!self.cell || !self.stringValue.length) {
+        [super setToolTip:nil];
+        return;
+    }
+    BOOL clipped = !NSIsEmptyRect([self.cell expansionFrameWithFrame:self.bounds inView:self]);
+    if (clipped && self.maximumNumberOfLines <= 1) {
+        NSLineBreakMode mode = self.lineBreakMode;
+        BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
+                         mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
+        if (!truncates) clipped = NO;
+    }
     [super setToolTip:clipped ? self.stringValue : nil];
 }
 - (void)setStringValue:(NSString *)value { [super setStringValue:value]; [self updateClippedTextHelp]; }

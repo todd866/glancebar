@@ -89,12 +89,6 @@ static BOOL HasText(NSView *view, NSString *text) {
     return NO;
 }
 // Recovery of clipped text is required; unsolicited explanatory popups stay off.
-// The height a wrapping field's text needs at its width (its own paragraph style truncates).
-static CGFloat WrappedHeight(NSTextField *field) {
-    return NSHeight([field.stringValue boundingRectWithSize:NSMakeSize(NSWidth(field.bounds) - 4, 1000)
-                                                    options:NSStringDrawingUsesLineFragmentOrigin
-                                                 attributes:@{NSFontAttributeName: field.font}]);
-}
 // The Next control's hover text is the gesture. Anything else with a tooltip is still a miss.
 // A container row that cannot show every volume name, and a host disk that has a
 // disk image on it, keep the full names in the row tooltip.
@@ -113,14 +107,29 @@ static BOOL IntendedControlTip(NSView *view) {
     NSString *prefix = [kMusicNextTip stringByAppendingString:@" — "];
     return [tip hasPrefix:prefix] && tip.length > prefix.length;
 }
+static BOOL AppKitTruncatesLabel(NSTextField *field) {
+    if (!field.cell || !field.stringValue.length || field.hidden) return NO;
+    return !NSIsEmptyRect([field.cell expansionFrameWithFrame:field.bounds inView:field]);
+}
+static BOOL RecoverableLabelOK(NSTextField *field) {
+    if (![field isKindOfClass:GBRecoverableTextField.class]) return YES;
+    if (AppKitTruncatesLabel(field) && !field.toolTip.length) {
+        fprintf(stderr, "clipped recoverable label %s: \"%s\" in %.1fx%.1f\n",
+                field.accessibilityIdentifier.UTF8String, field.stringValue.UTF8String,
+                field.bounds.size.width, field.bounds.size.height);
+        return NO;
+    }
+    if (AppKitTruncatesLabel(field) && field.toolTip.length && ![field.toolTip isEqual:field.stringValue]) {
+        fprintf(stderr, "recoverable label %s tooltip mismatch: \"%s\"\n",
+                field.accessibilityIdentifier.UTF8String, field.toolTip.UTF8String);
+        return NO;
+    }
+    return YES;
+}
 static BOOL RecoveryTip(NSView *view) {
     if (![view isKindOfClass:NSTextField.class]) return NO;
     NSTextField *field = (NSTextField *)view;
-    if (field.maximumNumberOfLines > 1)   // a wrapping caption that two lines can't hold
-        return [view.toolTip isEqual:field.stringValue] &&
-            WrappedHeight(field) > NSHeight(field.bounds);
-    return [view.toolTip isEqual:field.stringValue] &&
-        field.attributedStringValue.size.width + 4 > NSWidth(field.bounds);
+    return [view.toolTip isEqual:field.stringValue] && AppKitTruncatesLabel(field);
 }
 static NSView *WordyTip(NSView *view) {
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view)) return view;
@@ -224,6 +233,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
            FindIdentifier(root, @"popover.sound.name") == nil;
 }
 static BOOL FitsChildren(NSView *view) {
+    if ([view isKindOfClass:GBRecoverableTextField.class] && !RecoverableLabelOK((NSTextField *)view)) return NO;
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
@@ -241,25 +251,23 @@ static BOOL FitsChildren(NSView *view) {
         if (!FitsChildren(child)) return NO;
         // No cut-off text anywhere: every label's whole string fits its frame.
         if ([child isKindOfClass:NSTextField.class] && !child.hidden && ((NSTextField *)child).maximumNumberOfLines > 1) {
-            // A wrapping caption fits if its lines fit its height, or it carries the full text as a tip.
             NSTextField *field = (NSTextField *)child;
-            CGFloat need = WrappedHeight(field);
-            if (need > NSHeight(field.bounds) + 0.5 && ![field.toolTip isEqual:field.stringValue]) {
-                fprintf(stderr, "truncated %s: \"%s\" needs %.1f high of %.1f\n", field.accessibilityIdentifier.UTF8String,
-                        field.stringValue.UTF8String, need, NSHeight(field.bounds));
+            if (AppKitTruncatesLabel(field) && ![field.toolTip isEqual:field.stringValue]) {
+                fprintf(stderr, "truncated %s: \"%s\" in %.1fx%.1f high without recovery\n",
+                        field.accessibilityIdentifier.UTF8String, field.stringValue.UTF8String,
+                        NSWidth(field.bounds), NSHeight(field.bounds));
                 return NO;
             }
         } else if ([child isKindOfClass:NSTextField.class] && !child.hidden) {
             NSTextField *field = (NSTextField *)child;
-            CGFloat need = field.attributedStringValue.length
-                ? field.attributedStringValue.size.width
-                : [field.stringValue sizeWithAttributes:@{NSFontAttributeName: field.font}].width;
-            // A one-line label clipped at the tail is recoverable only when it carries the full text as a tip.
-            BOOL recoverable = [field.toolTip isEqual:field.stringValue] && field.lineBreakMode == NSLineBreakByTruncatingTail;
-            if (need > field.bounds.size.width - 4 && !recoverable) {
-                fprintf(stderr, "truncated %s: \"%s\" needs %.1f of %.1f\n", field.accessibilityIdentifier.UTF8String,
-                        field.stringValue.UTF8String, need, field.bounds.size.width - 4);
-                return NO;
+            if (AppKitTruncatesLabel(field)) {
+                BOOL recoverable = [field.toolTip isEqual:field.stringValue] && field.lineBreakMode == NSLineBreakByTruncatingTail;
+                if (!recoverable) {
+                    fprintf(stderr, "truncated %s: \"%s\" in %.1fpt without recovery\n",
+                            field.accessibilityIdentifier.UTF8String, field.stringValue.UTF8String,
+                            field.bounds.size.width);
+                    return NO;
+                }
             }
         }
     }
