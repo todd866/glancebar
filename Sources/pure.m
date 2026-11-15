@@ -1,3 +1,4 @@
+#import <sys/sysctl.h>
 #import "pure.h"
 #import <math.h>
 #import <limits.h>
@@ -3713,6 +3714,90 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
         [ordered addObject:t[@"id"]];
     }
     return ordered;
+}
+
+NSArray<NSDictionary *> *ParseMixLibraryColumns(NSString *text) {
+    if (![text isKindOfClass:NSString.class] || !text.length) return @[];
+    NSString *us = [NSString stringWithFormat:@"%C", (unichar)31], *rs = [NSString stringWithFormat:@"%C", (unichar)30];
+    // osascript ends its output with one newline; a title may end with a space, so nothing else is trimmed.
+    if ([text hasSuffix:@"\n"]) text = [text substringToIndex:text.length - 1];
+    NSArray<NSString *> *columns = [text componentsSeparatedByString:rs];
+    if (columns.count != 10) return @[];
+    NSMutableArray<NSArray<NSString *> *> *cols = [NSMutableArray arrayWithCapacity:10];
+    for (NSString *column in columns) [cols addObject:[column componentsSeparatedByString:us]];
+    NSUInteger n = cols[0].count;
+    for (NSArray *column in cols) if (column.count != n) return @[];
+    NSMutableArray *tracks = [NSMutableArray arrayWithCapacity:n];
+    for (NSUInteger i = 0; i < n; i++) {
+        if (![cols[0][i] length]) continue;
+        [tracks addObject:@{@"id": cols[0][i], @"title": cols[1][i], @"artist": cols[2][i], @"album": cols[3][i],
+                            @"genre": cols[4][i], @"year": @([cols[5][i] integerValue]), @"plays": @([cols[6][i] integerValue]),
+                            @"idleDays": @([cols[7][i] integerValue]), @"fav": @([cols[8][i] isEqual:@"true"]),
+                            @"dislike": @([cols[9][i] isEqual:@"true"])}];
+    }
+    return tracks;
+}
+
+BOOL ProcessIsStopped(pid_t pid) {
+    if (pid <= 0) return NO;
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+    memset(&info, 0, sizeof(info));
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0) return NO;
+    return info.kp_proc.p_stat == SSTOP;
+}
+
+BOOL MixLibraryReadShouldWait(CFAbsoluteTime now, CFAbsoluteTime failedAt, double retrySec) {
+    if (failedAt <= 0) return NO;
+    double since = now - failedAt;
+    return since >= 0 && since < retrySec;   // a clock set back does not hold the read off for ever
+}
+
+static NSDictionary *MixLibraryCacheRow(id row, NSInteger addIdleDays) {
+    if (![row isKindOfClass:NSDictionary.class]) return nil;
+    NSString *tid = row[@"id"];
+    if (![tid isKindOfClass:NSString.class] || !tid.length) return nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:tid forKey:@"id"];
+    for (NSString *field in @[@"title", @"artist", @"album", @"genre"])
+        out[field] = [row[field] isKindOfClass:NSString.class] ? row[field] : @"";
+    for (NSString *field in @[@"year", @"plays", @"idleDays"])
+        out[field] = [row[field] isKindOfClass:NSNumber.class] ? @([row[field] integerValue]) : @0;
+    for (NSString *field in @[@"fav", @"dislike"])
+        out[field] = @([row[field] isKindOfClass:NSNumber.class] && [row[field] boolValue]);
+    if (addIdleDays > 0) out[@"idleDays"] = @([out[@"idleDays"] integerValue] + addIdleDays);
+    return out;
+}
+
+NSData *MixLibraryCacheData(NSArray<NSDictionary *> *tracks, NSTimeInterval savedAt) {
+    if (![tracks isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:tracks.count];
+    for (id t in tracks) {
+        NSDictionary *row = MixLibraryCacheRow(t, 0);
+        if (row) [rows addObject:row];
+    }
+    if (!rows.count) return nil;
+    return [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"savedAt": @(floor(savedAt)), @"tracks": rows}
+                                           options:0 error:nil];
+}
+
+NSArray<NSDictionary *> *MixLibraryFromCacheData(NSData *data, NSTimeInterval now, NSTimeInterval *savedAt) {
+    if (savedAt) *savedAt = 0;
+    if (![data isKindOfClass:NSData.class] || !data.length) return nil;
+    id doc = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![doc isKindOfClass:NSDictionary.class] || ![doc[@"schemaVersion"] isEqual:@1] ||
+        ![doc[@"tracks"] isKindOfClass:NSArray.class] || ![doc[@"savedAt"] isKindOfClass:NSNumber.class]) return nil;
+    NSTimeInterval saved = [doc[@"savedAt"] doubleValue];
+    // A file dated in the future says nothing about how long ago it was true: no days added.
+    NSInteger days = (saved > 0 && now > saved) ? (NSInteger)floor((now - saved) / 86400.0) : 0;
+    NSMutableArray *tracks = [NSMutableArray array];
+    for (id row in doc[@"tracks"]) {
+        NSDictionary *t = MixLibraryCacheRow(row, days);
+        if (t) [tracks addObject:t];
+    }
+    if (!tracks.count) return nil;
+    if (savedAt) *savedAt = saved;
+    return tracks;
 }
 
 NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path) {

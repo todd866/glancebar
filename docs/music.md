@@ -213,10 +213,18 @@ the cover, the kind name, and an on-disk **song count**. Clicking a kind starts 
 an accent border on its tile and caption. There is no refresh or **New picks** control — kinds come from
 `mixLibrary` and the offline manifest, not saved seed mixes.
 
+The library is read from Music, and only while Music is open and not stopped (scripting it would launch it; a stopped Music answers nothing, so a script waits out its limit). A read that fails is not tried again for 15 minutes. Each read
+is also kept in `<mix dir>/library.json`, and that copy is what the tiles and play-by-kind use when
+Music has not been read in this run: after a relaunch, or with Music closed. A copy older than six
+hours is replaced the next time Music is open. Marks that come from this Mac (a thumb, a dislike, a
+heart once given) are not in the copy; they are put on the library each time it is loaded, so a
+dislike given here survives a relaunch and the next read from Music.
+
 Harness ids: `popover.music.kind.{dance|alt|rap|chill}`, `.caption`, `.songs`, `.typemark`; station
 unchanged (`popover.mix.station`, captions `popover.mix.caption.4` / `popover.mix.artist.4`). With a show
 offered the row uses six 50pt tiles; otherwise five at 54pt. `tools/check-popover.m` exercises layout and
-counts with `GLANCEBAR_MUSIC_STATE` modes `kinds-render`, `kinds-five`, and `kinds-empty`.
+counts with `GLANCEBAR_MUSIC_STATE` modes `kinds-render`, `kinds-five`, `kinds-empty`, and `kinds-cached`
+(the library from its copy on disk).
 
 ## Playing by kind
 

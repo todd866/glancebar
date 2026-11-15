@@ -5651,6 +5651,8 @@ static NSString *PopoverRequestObject(void) {
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
+- (void)loadMixLibraryCacheIfNeeded;
+- (NSString *)mixLibraryCachePath;
 - (void)ensureKindTileSnapshot;
 - (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk
                               cachedKeys:(NSSet<NSString *> *)cachedKeys;
@@ -5897,8 +5899,13 @@ static NSString *const kAppleMusicBundleID = @"com.apple.Music";
 static NSString *const kSpotifyBundleID = @"com.spotify.client";
 static NSString *const kPlayerOutputUIDKey = @"playerOutputUID";
 static NSString *const kPlayerOutputNameKey = @"playerOutputName";
+// Running means able to answer. A Music that has been stopped (SIGSTOP; found so on 15 Nov 2026,
+// by what is not known) is not running for us: every script to it waited out its whole time
+// limit, the library read was retried every 105 s, and the kind tiles had nothing to count.
 static BOOL AppleMusicIsRunning(void) {
-    return [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID].count > 0;
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID])
+        if (!app.terminated && !ProcessIsStopped(app.processIdentifier)) return YES;
+    return NO;
 }
 static const int kVolumeScriptSec = 10;
 static int RunAppleScriptBlocking(NSString *source, int seconds, BOOL hardKill,
@@ -5955,7 +5962,13 @@ static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSSt
 #pragma mark - Seed mixes (Apple Music)
 
 // One bulk read of the library: per track, id, title, artist, album, genre, year, plays,
-// days since played (-1 never), favourite, dislike; unit/record separators between.
+// days since played (-1 never), favourite, dislike. It returns ten columns (ParseMixLibraryColumns).
+// The script must stay linear in the number of tracks. `item i of someList` on a plain list
+// walks the list, so the loop that used to build one line per track took 5 s for 4,000 tracks
+// and 34 s for 8,000 (measured 15 Nov 2026); with the library grown past that it never finished
+// inside the time limit and the kind tiles had nothing to count. The only loop left reads the
+// played dates through a script property, which is the form AppleScript indexes directly, and
+// the columns are joined by `as text`. (`idle` cannot be a property name: it is a handler.)
 static NSString *const kMixLibraryScript =
     @"tell application \"Music\"\n"
      "set lib to library playlist 1\n"
@@ -5970,29 +5983,24 @@ static NSString *const kMixLibraryScript =
      "set fs to favorited of every track of lib\n"
      "set ds to disliked of every track of lib\n"
      "end tell\n"
+     "script L\n"
+     "property playedDates : {}\n"
+     "property idleDays : {}\n"
+     "end script\n"
+     "set L's playedDates to pds\n"
      "set nowDate to current date\n"
-     "set us to character id 31\n"
-     "set out to {}\n"
      "repeat with i from 1 to count of ids\n"
-     "set pd to item i of pds\n"
-     "if pd is missing value then\nset daysIdle to -1\nelse\nset daysIdle to ((nowDate - pd) div 86400)\nend if\n"
-     "set end of out to (item i of ids) & us & (item i of ns) & us & (item i of ars) & us & (item i of als) & us & (item i of gs) & us & ((item i of ys) as text) & us & ((item i of pcs) as text) & us & (daysIdle as text) & us & ((item i of fs) as text) & us & ((item i of ds) as text)\n"
+     "set pd to item i of L's playedDates\n"
+     "if pd is missing value then\nset end of L's idleDays to -1\nelse\nset end of L's idleDays to ((nowDate - pd) div 86400)\nend if\n"
      "end repeat\n"
+     "set AppleScript's text item delimiters to (character id 31)\n"
+     "set cols to {ids as text, ns as text, ars as text, als as text, gs as text, ys as text, pcs as text, (L's idleDays) as text, fs as text, ds as text}\n"
      "set AppleScript's text item delimiters to (character id 30)\n"
-     "return out as text\n";
-
-static NSArray<NSDictionary *> *ParseMixLibrary(NSString *text) {
-    NSMutableArray *tracks = [NSMutableArray array];
-    NSString *us = [NSString stringWithFormat:@"%C", (unichar)31], *rs = [NSString stringWithFormat:@"%C", (unichar)30];
-    for (NSString *record in [[text stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsSeparatedByString:rs]) {
-        NSArray *f = [record componentsSeparatedByString:us];
-        if (f.count < 10 || ![f[0] length]) continue;
-        [tracks addObject:@{@"id": f[0], @"title": f[1], @"artist": f[2], @"album": f[3], @"genre": f[4],
-                            @"year": @([f[5] integerValue]), @"plays": @([f[6] integerValue]), @"idleDays": @([f[7] integerValue]),
-                            @"fav": @([f[8] isEqual:@"true"]), @"dislike": @([f[9] isEqual:@"true"])}];
-    }
-    return tracks;
-}
+     "return cols as text\n";
+static const int kMixLibraryScriptSec = 150;
+// After a read that failed or came back empty, the next try waits: each one keeps Music and a
+// script busy for as long as it runs, and an open popover asked again within seconds.
+static const double kMixLibraryRetrySec = 15 * 60;
 
 static NSString *MixDirectory(NSString *sub) {
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:
@@ -6158,6 +6166,9 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     BOOL _volumeRebuildPending;
     NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
     CFAbsoluteTime _mixLibraryAt;
+    BOOL _mixLibraryCacheTried;
+    BOOL _appLaunched;   // set by applicationDidFinishLaunching; the test harnesses never run it
+    CFAbsoluteTime _mixLibraryFailedAt;
     BOOL _mixLibraryLoading, _mixFrozen, _audioFrozen;   // frozen: tests set seeds / own the volume reading, no live reads
     NSArray<NSDictionary *> *_mixSeeds;        // the four tiles
     NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
@@ -6334,6 +6345,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
+    _appLaunched = YES;
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
     dispatch_async(dispatch_get_main_queue(), ^{ GBFineVolumeStart(); });
@@ -6474,6 +6486,10 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _coverMissesLoaded = NO;
     _showsQueue = dispatch_queue_create("com.iantodd.glancebar.shows", DISPATCH_QUEUE_SERIAL);
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
+    // The library is loaded once the launch is out of the way (its copy on disk, then a fresh
+    // read if Music is open and the copy is old), so the first popover does not pay for it and
+    // the Play key works before the popover has ever been opened.
+    dispatch_async(dispatch_get_main_queue(), ^{ [self ensureMixSeeds]; });
     (void)[self offlineTracksWorkQueue];
     _remote = [NSMutableDictionary dictionary];
     _remoteInFlight = [NSMutableSet set];
@@ -6697,8 +6713,62 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 #pragma mark Seed mixes
 
 // The library is read in the background when the popover first needs tiles, then every 6 h.
+// Marks that come from this Mac's own records (a thumb, a heart once given, a dislike) are put
+// on whatever library was read, fresh from Music or from the copy on disk. A dislike given here
+// used to be marked only in memory, so the song came back after a relaunch or the next read.
+- (NSArray<NSDictionary *> *)markedMixLibrary:(NSArray<NSDictionary *> *)tracks {
+    NSSet *liked = [self mixLiked], *disliked = [self mixDisliked];
+    NSString *hist =
+        [NSString stringWithContentsOfFile:[GBHomeDirectory() stringByAppendingPathComponent:
+                                           @".local/state/selector/heart-history.jsonl"]
+                                encoding:NSUTF8StringEncoding
+                                   error:nil];
+    NSSet *everHearted = HeartHistoryEverHeartedKeys(hist);
+    NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
+    for (NSDictionary *t in tracks) {
+        NSMutableDictionary *m = [t mutableCopy];
+        if ([liked containsObject:t[@"id"]]) m[@"thumb"] = @YES;
+        NSString *selKey = SelectorTrackKey(t[@"artist"], t[@"title"]);
+        if (selKey.length && [everHearted containsObject:selKey] && ![m[@"fav"] boolValue])
+            m[@"everHeart"] = @YES;
+        if ([disliked containsObject:t[@"id"]] || (selKey.length && [disliked containsObject:selKey])) {
+            m[@"dislike"] = @YES;
+            m[@"thumb"] = @NO;
+        }
+        [marked addObject:m];
+    }
+    return marked;
+}
+// The library is read from Music, and only while Music is open (scripting it would launch it).
+// Kind tiles and play-by-kind need it whether Music is open or not, and straight after a
+// relaunch, so the last read is kept in <mix dir>/library.json and used until a newer one arrives.
+- (NSString *)mixLibraryCachePath {
+    return [MixDirectory(nil) stringByAppendingPathComponent:@"library.json"];
+}
+- (void)saveMixLibraryCache:(NSArray<NSDictionary *> *)tracks {
+    NSString *path = [self mixLibraryCachePath];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSData *data = MixLibraryCacheData(tracks, now);
+        if (data.length) [data writeToFile:path atomically:YES];
+    });
+}
+- (void)loadMixLibraryCacheIfNeeded {
+    if (_mixLibrary.count || _mixLibraryCacheTried) return;
+    _mixLibraryCacheTried = YES;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970, savedAt = 0;
+    NSArray *tracks = MixLibraryFromCacheData([NSData dataWithContentsOfFile:[self mixLibraryCachePath]], now, &savedAt);
+    if (!tracks.count) return;
+    _mixLibrary = [self markedMixLibrary:tracks];
+    // Its age counts: a copy older than six hours is replaced as soon as Music is open.
+    _mixLibraryAt = CFAbsoluteTimeGetCurrent() - MAX(0, now - savedAt);
+    _kindTileAt = 0;
+    [self scheduleCoverCacheWarm];
+    GBLog("music: library of %lu tracks from the copy on disk, %.0f h old", (unsigned long)tracks.count, MAX(0, now - savedAt) / 3600.0);
+}
 - (void)ensureMixSeeds {
     if (_mixFrozen || _musicOff) return;
+    [self loadMixLibraryCacheIfNeeded];
     // Today's tiles stay up when Music is closed, the Mac is offline, or the library read fails.
     // The read used to be the only place saved seeds were applied, so the row vanished (5 Nov 2026).
     if (!_mixSeeds.count) {
@@ -6716,33 +6786,27 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;
     // Scripting Music launches it: read the library only while it is already open. On a Mac with an
     // empty library this retried and relaunched Music (1 Nov 2026).
-    BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
-    if (stale && !_mixLibraryLoading) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL stale = !_mixLibrary || now - _mixLibraryAt > 6 * 3600;
+    if (stale && !_mixLibraryLoading && !MixLibraryReadShouldWait(now, _mixLibraryFailedAt, kMixLibraryRetrySec)) {
         _mixLibraryLoading = YES;
-        RunAppleScriptTimed(kMixLibraryScript, 90, ^(NSString *output, __unused NSString *errorText, int status) {
+        RunAppleScriptTimed(kMixLibraryScript, kMixLibraryScriptSec, ^(NSString *output, NSString *errorText, int status) {
             self->_mixLibraryLoading = NO;
-            NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
-            if (tracks.count < 20) return;   // Music closed, or permission not given yet
-            NSSet *liked = [self mixLiked];
-            NSString *hist =
-                [NSString stringWithContentsOfFile:[GBHomeDirectory() stringByAppendingPathComponent:
-                                                   @".local/state/selector/heart-history.jsonl"]
-                                        encoding:NSUTF8StringEncoding
-                                           error:nil];
-            NSSet *everHearted = HeartHistoryEverHeartedKeys(hist);
-            NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
-            for (NSDictionary *t in tracks) {
-                NSMutableDictionary *m = [t mutableCopy];
-                if ([liked containsObject:t[@"id"]]) m[@"thumb"] = @YES;
-                NSString *selKey = SelectorTrackKey(t[@"artist"], t[@"title"]);
-                if (selKey.length && [everHearted containsObject:selKey] && ![m[@"fav"] boolValue])
-                    m[@"everHeart"] = @YES;
-                [marked addObject:m];
+            double took = CFAbsoluteTimeGetCurrent() - now;
+            NSArray *tracks = status == 0 ? ParseMixLibraryColumns(output) : nil;
+            if (tracks.count < 20) {   // Music closed, permission not given yet, or the read ran out of time
+                self->_mixLibraryFailedAt = CFAbsoluteTimeGetCurrent();
+                GBLog("music: library read failed after %.0f s (status %d, %lu tracks): %{public}@", took, status,
+                      (unsigned long)tracks.count, errorText.length > 200 ? [errorText substringToIndex:200] : errorText);
+                return;
             }
-            self->_mixLibrary = marked;
+            self->_mixLibraryFailedAt = 0;
+            GBLog("music: library of %lu tracks read from Music in %.0f s", (unsigned long)tracks.count, took);
+            self->_mixLibrary = [self markedMixLibrary:tracks];
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             self->_kindTileAt = 0;
             [self scheduleCoverCacheWarm];
+            [self saveMixLibraryCache:tracks];
             [self chooseMixSeeds:NO];
         });
         return;
@@ -7140,7 +7204,9 @@ static NSImage *GBImageFromJPEGData(NSData *jpeg) {
         return GBCoverFetchURLDefault(u);
     };
     NSString *artist = req[@"artist"], *title = req[@"title"], *path = req[@"path"], *trackID = req[@"trackID"];
-    BOOL musicRunning = AppleMusicIsRunning();
+    // Step 7 scripts Music. Only the launched app may: a test harness on a Mac where Music is open
+    // asked the real Music for a fixture track's artwork (15 Nov 2026), and the script outlived it.
+    BOOL musicRunning = _appLaunched && AppleMusicIsRunning();
     __weak Controller *weak = self;
     dispatch_block_t work = ^{
         // Steps 4 → 6 → 7. Arguments only; hop once to main with the result.
@@ -7643,6 +7709,7 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (_kindTileSnapshot && _kindTileStamp == stamp && now - _kindTileAt < 60) return;
     if (_kindTileBusy) return;
+    if (!_mixLibrary.count) [self loadMixLibraryCacheIfNeeded];
     if (!_mixLibrary.count) {
         _kindTileSnapshot = @{};
         _kindTileStamp = stamp;
@@ -8407,6 +8474,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 }
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause {
     if (!_musicProbesEnabled || _musicOff || !GBValidMusicKind(kind)) return NO;
+    if (!_mixLibrary.count) [self loadMixLibraryCacheIfNeeded];
     if (!_mixLibrary.count) [self ensureMixSeeds];
     if (!_mixLibrary.count) {
         GBLog("music: library not loaded; cannot play kind %{public}@", kind);
