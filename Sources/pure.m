@@ -3715,6 +3715,52 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
     return ordered;
 }
 
+static NSDictionary *MixLibraryCacheRow(id row, NSInteger addIdleDays) {
+    if (![row isKindOfClass:NSDictionary.class]) return nil;
+    NSString *tid = row[@"id"];
+    if (![tid isKindOfClass:NSString.class] || !tid.length) return nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithObject:tid forKey:@"id"];
+    for (NSString *field in @[@"title", @"artist", @"album", @"genre"])
+        out[field] = [row[field] isKindOfClass:NSString.class] ? row[field] : @"";
+    for (NSString *field in @[@"year", @"plays", @"idleDays"])
+        out[field] = [row[field] isKindOfClass:NSNumber.class] ? @([row[field] integerValue]) : @0;
+    for (NSString *field in @[@"fav", @"dislike"])
+        out[field] = @([row[field] isKindOfClass:NSNumber.class] && [row[field] boolValue]);
+    if (addIdleDays > 0) out[@"idleDays"] = @([out[@"idleDays"] integerValue] + addIdleDays);
+    return out;
+}
+
+NSData *MixLibraryCacheData(NSArray<NSDictionary *> *tracks, NSTimeInterval savedAt) {
+    if (![tracks isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:tracks.count];
+    for (id t in tracks) {
+        NSDictionary *row = MixLibraryCacheRow(t, 0);
+        if (row) [rows addObject:row];
+    }
+    if (!rows.count) return nil;
+    return [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"savedAt": @(floor(savedAt)), @"tracks": rows}
+                                           options:0 error:nil];
+}
+
+NSArray<NSDictionary *> *MixLibraryFromCacheData(NSData *data, NSTimeInterval now, NSTimeInterval *savedAt) {
+    if (savedAt) *savedAt = 0;
+    if (![data isKindOfClass:NSData.class] || !data.length) return nil;
+    id doc = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![doc isKindOfClass:NSDictionary.class] || ![doc[@"schemaVersion"] isEqual:@1] ||
+        ![doc[@"tracks"] isKindOfClass:NSArray.class] || ![doc[@"savedAt"] isKindOfClass:NSNumber.class]) return nil;
+    NSTimeInterval saved = [doc[@"savedAt"] doubleValue];
+    // A file dated in the future says nothing about how long ago it was true: no days added.
+    NSInteger days = (saved > 0 && now > saved) ? (NSInteger)floor((now - saved) / 86400.0) : 0;
+    NSMutableArray *tracks = [NSMutableArray array];
+    for (id row in doc[@"tracks"]) {
+        NSDictionary *t = MixLibraryCacheRow(row, days);
+        if (t) [tracks addObject:t];
+    }
+    if (!tracks.count) return nil;
+    if (savedAt) *savedAt = saved;
+    return tracks;
+}
+
 NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path) {
     if (![manifest isKindOfClass:NSDictionary.class] || ![path isKindOfClass:NSString.class] || !path.length) return nil;
     NSArray *playlists = [manifest[@"playlists"] isKindOfClass:NSArray.class] ? manifest[@"playlists"] : @[];

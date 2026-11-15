@@ -1965,6 +1965,74 @@ int main(int argc, const char **argv) {
                         return Fail(__LINE__);
                 }
             }
+        } else if (musicState && strcmp(musicState, "kinds-cached") == 0) {
+            // Music has not been read in this run (it is closed, or the app has only just
+            // started): the tiles come from the library's copy on disk.
+            NSArray<NSDictionary *> *fixtureLibrary = [c valueForKey:@"mixLibrary"];
+            NSString *cachePath = [c mixLibraryCachePath];
+            NSString *mixDir = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix"];
+            if (fixtureLibrary.count < 7 || ![cachePath isEqual:[mixDir stringByAppendingPathComponent:@"library.json"]])
+                return Fail(__LINE__);
+            NSMutableArray *picks8 = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 8; i++)
+                [picks8 addObject:@{@"title": [NSString stringWithFormat:@"Pick %lu", (unsigned long)i],
+                                   @"artist": @"Scout", @"reason": @"scout", @"file": @""}];
+            [c setValue:picks8 forKey:@"stationPicks"];
+            [c setValue:nil forKey:@"showOffered"];
+            [c setValue:@[] forKey:@"showEpisodes"];
+            [c setValue:@NO forKey:@"showsLoaded"];
+            NSView *(^relaunched)(void) = ^NSView *{
+                [c setValue:nil forKey:@"mixLibrary"];
+                [c setValue:@NO forKey:@"mixLibraryCacheTried"];
+                [c setValue:nil forKey:@"mixDisliked"];
+                [c setValue:nil forKey:@"_onDiskLibraryIDs"];
+                [c setValue:nil forKey:@"_kindTileSnapshot"];
+                [c rebuildContent];
+                return p.contentViewController.view;
+            };
+            NSDictionary *none = @{@"dance": @0, @"alt": @0, @"rap": @0, @"chill": @0};
+            NSDictionary *all = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
+            // No copy on disk, then a broken one: nothing to play, and no crash.
+            root = relaunched();
+            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 5, 54, none, nil)) return Fail(__LINE__);
+            [@"{not json" writeToFile:cachePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            root = relaunched();
+            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 5, 54, none, nil)) return Fail(__LINE__);
+            // A copy saved an hour ago: the same tiles as with the library in memory.
+            NSData *saved = MixLibraryCacheData(fixtureLibrary, NSDate.date.timeIntervalSince1970 - 3600);
+            if (![saved writeToFile:cachePath atomically:YES]) return Fail(__LINE__);
+            root = relaunched();
+            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 5, 54, all, nil) ||
+                !FitsChildren(root))
+                return Fail(__LINE__);
+            // It is read once, not at every rebuild.
+            [@"{not json" writeToFile:cachePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 5, 54, all, nil))
+                return Fail(__LINE__);
+            if (![saved writeToFile:cachePath atomically:YES]) return Fail(__LINE__);
+            // A dislike given on this Mac is in its own record, not in the copy of the library:
+            // after a relaunch that song is still out.
+            NSDictionary *dance = nil;
+            for (NSDictionary *t in fixtureLibrary)
+                if ([MusicKindForGenre(t[@"genre"]) isEqual:@"dance"]) { dance = t; break; }
+            if (!dance) return Fail(__LINE__);
+            NSString *line = MixDislikeLine(dance[@"id"], SelectorTrackKey(dance[@"artist"], dance[@"title"]), dance[@"title"],
+                                            dance[@"artist"], YES, NSDate.date);
+            NSString *fbPath = [mixDir stringByAppendingPathComponent:@"feedback.jsonl"];
+            if (!line.length || ![[line stringByAppendingString:@"\n"] writeToFile:fbPath atomically:YES encoding:NSUTF8StringEncoding error:nil])
+                return Fail(__LINE__);
+            root = relaunched();
+            if (!KindMixRowOK(root, 5, 54, @{@"dance": @1, @"alt": @2, @"rap": @2, @"chill": @1}, nil)) return Fail(__LINE__);
+            for (NSDictionary *t in [c valueForKey:@"mixLibrary"])
+                if ([t[@"id"] isEqual:dance[@"id"]] && ![t[@"dislike"] boolValue]) return Fail(__LINE__);
+            // Play by kind needs no popover and no Music either: it loads the copy itself.
+            [c setValue:nil forKey:@"mixLibrary"];
+            [c setValue:@NO forKey:@"mixLibraryCacheTried"];
+            [c loadMixLibraryCacheIfNeeded];
+            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count) return Fail(__LINE__);
+            fprintf(stderr, "Library copy: tiles without Music, read once, a local dislike kept\n");
         } else if (musicState && strcmp(musicState, "dislike") == 0) {
             NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];
             NSString *trackB = [fixtureMusic stringByAppendingPathComponent:@"dislike-b.m4a"];

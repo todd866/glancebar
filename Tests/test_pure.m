@@ -2462,6 +2462,31 @@ int main(void) {
             }
             check(playingNeverFirst, @"kind queue: the playing song goes last for every seed");
             check([MusicKindQueue(@[kindLib[0]], @"dance", 60, 5, @[@"D000"]) isEqual:@[@"D000"]], @"kind queue: the only song still plays");
+            // The library kept on disk: what was read comes back, junk does not.
+            NSArray *cacheIn = @[kindLib[0], kindLib[9], @{@"title": @"no id"}, @"junk",
+                                 @{@"id": @"ODD", @"title": @7, @"plays": @"many", @"fav": @"yes", @"extra": NSNull.null}];
+            NSData *cacheData = MixLibraryCacheData(cacheIn, 1000000.9);
+            NSTimeInterval cacheSaved = -1;
+            NSArray *cacheOut = MixLibraryFromCacheData(cacheData, 1000000 + 3 * 86400 + 5, &cacheSaved);
+            check(cacheOut.count == 3 && cacheSaved == 1000000, @"library cache: rows with an id come back, with the time it was saved");
+            check([cacheOut[0][@"id"] isEqual:kindLib[0][@"id"]] && [cacheOut[0][@"genre"] isEqual:@"House"] &&
+                  [cacheOut[0][@"plays"] isEqual:kindLib[0][@"plays"]] && [cacheOut[0][@"fav"] isEqual:@NO] &&
+                  [cacheOut[0][@"idleDays"] integerValue] == [kindLib[0][@"idleDays"] integerValue] + 3 &&
+                  [MusicKindForGenre(cacheOut[1][@"genre"]) isEqual:@"alt"],
+                  @"library cache: fields survive and idle days grow by the days since it was saved");
+            check([cacheOut[2][@"title"] isEqual:@""] && [cacheOut[2][@"plays"] isEqual:@0] && [cacheOut[2][@"fav"] isEqual:@NO] &&
+                  cacheOut[2][@"extra"] == nil, @"library cache: a wrong type becomes the empty value, unknown fields are dropped");
+            NSArray *cacheEarly = MixLibraryFromCacheData(cacheData, 999000, NULL);
+            check([cacheEarly[0][@"idleDays"] isEqual:kindLib[0][@"idleDays"]], @"library cache: a file from the future adds no idle days");
+            check(MixLibraryCacheData(@[], 1) == nil && MixLibraryCacheData((id)@[@"junk"], 1) == nil &&
+                  MixLibraryCacheData((id)@"junk", 1) == nil, @"library cache: nothing to save is no file");
+            NSTimeInterval junkSaved = 5;
+            check(MixLibraryFromCacheData(nil, 1, &junkSaved) == nil && junkSaved == 0 &&
+                  MixLibraryFromCacheData([@"not json" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil &&
+                  MixLibraryFromCacheData([@"[1,2]" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil &&
+                  MixLibraryFromCacheData([@"{\"schemaVersion\":2,\"savedAt\":1,\"tracks\":[{\"id\":\"A\"}]}" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil &&
+                  MixLibraryFromCacheData([@"{\"schemaVersion\":1,\"savedAt\":1,\"tracks\":[]}" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil,
+                  @"library cache: a missing, broken, other-version or empty file reads as nothing");
             NSDictionary *idManifest = @{@"schemaVersion": @1, @"playlists": @[
                 @{@"key": @"a", @"tracks": @[@{@"id": @"LIB1", @"path": @"/m/Artist - Song [ytVideoId01].m4a"},
                                                @{@"id": @"", @"path": @"/m/no-id.m4a"}, @"junk"]},

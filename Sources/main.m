@@ -5650,6 +5650,8 @@ static NSString *PopoverRequestObject(void) {
 - (void)outputVolumeChanged;
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
+- (void)loadMixLibraryCacheIfNeeded;
+- (NSString *)mixLibraryCachePath;
 - (void)ensureKindTileSnapshot;
 - (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk;
 - (NSArray<NSImage *> *)kindMosaicCoversForIDs:(NSArray<NSString *> *)ids;
@@ -6145,6 +6147,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     BOOL _volumeRebuildPending;
     NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
     CFAbsoluteTime _mixLibraryAt;
+    BOOL _mixLibraryCacheTried;
     BOOL _mixLibraryLoading, _mixFrozen, _audioFrozen;   // frozen: tests set seeds / own the volume reading, no live reads
     NSArray<NSDictionary *> *_mixSeeds;        // the four tiles
     NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
@@ -6442,6 +6445,10 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _stationCoverCache = [NSMutableDictionary dictionary];
     _showsQueue = dispatch_queue_create("com.iantodd.glancebar.shows", DISPATCH_QUEUE_SERIAL);
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
+    // The library is loaded once the launch is out of the way (its copy on disk, then a fresh
+    // read if Music is open and the copy is old), so the first popover does not pay for it and
+    // the Play key works before the popover has ever been opened.
+    dispatch_async(dispatch_get_main_queue(), ^{ [self ensureMixSeeds]; });
     (void)[self offlineTracksWorkQueue];
     _remote = [NSMutableDictionary dictionary];
     _remoteInFlight = [NSMutableSet set];
@@ -6665,8 +6672,61 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
 #pragma mark Seed mixes
 
 // The library is read in the background when the popover first needs tiles, then every 6 h.
+// Marks that come from this Mac's own records (a thumb, a heart once given, a dislike) are put
+// on whatever library was read, fresh from Music or from the copy on disk. A dislike given here
+// used to be marked only in memory, so the song came back after a relaunch or the next read.
+- (NSArray<NSDictionary *> *)markedMixLibrary:(NSArray<NSDictionary *> *)tracks {
+    NSSet *liked = [self mixLiked], *disliked = [self mixDisliked];
+    NSString *hist =
+        [NSString stringWithContentsOfFile:[GBHomeDirectory() stringByAppendingPathComponent:
+                                           @".local/state/selector/heart-history.jsonl"]
+                                encoding:NSUTF8StringEncoding
+                                   error:nil];
+    NSSet *everHearted = HeartHistoryEverHeartedKeys(hist);
+    NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
+    for (NSDictionary *t in tracks) {
+        NSMutableDictionary *m = [t mutableCopy];
+        if ([liked containsObject:t[@"id"]]) m[@"thumb"] = @YES;
+        NSString *selKey = SelectorTrackKey(t[@"artist"], t[@"title"]);
+        if (selKey.length && [everHearted containsObject:selKey] && ![m[@"fav"] boolValue])
+            m[@"everHeart"] = @YES;
+        if ([disliked containsObject:t[@"id"]] || (selKey.length && [disliked containsObject:selKey])) {
+            m[@"dislike"] = @YES;
+            m[@"thumb"] = @NO;
+        }
+        [marked addObject:m];
+    }
+    return marked;
+}
+// The library is read from Music, and only while Music is open (scripting it would launch it).
+// Kind tiles and play-by-kind need it whether Music is open or not, and straight after a
+// relaunch, so the last read is kept in <mix dir>/library.json and used until a newer one arrives.
+- (NSString *)mixLibraryCachePath {
+    return [MixDirectory(nil) stringByAppendingPathComponent:@"library.json"];
+}
+- (void)saveMixLibraryCache:(NSArray<NSDictionary *> *)tracks {
+    NSString *path = [self mixLibraryCachePath];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSData *data = MixLibraryCacheData(tracks, now);
+        if (data.length) [data writeToFile:path atomically:YES];
+    });
+}
+- (void)loadMixLibraryCacheIfNeeded {
+    if (_mixLibrary.count || _mixLibraryCacheTried) return;
+    _mixLibraryCacheTried = YES;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970, savedAt = 0;
+    NSArray *tracks = MixLibraryFromCacheData([NSData dataWithContentsOfFile:[self mixLibraryCachePath]], now, &savedAt);
+    if (!tracks.count) return;
+    _mixLibrary = [self markedMixLibrary:tracks];
+    // Its age counts: a copy older than six hours is replaced as soon as Music is open.
+    _mixLibraryAt = CFAbsoluteTimeGetCurrent() - MAX(0, now - savedAt);
+    _kindTileAt = 0;
+    GBLog("music: library of %lu tracks from the copy on disk, %.0f h old", (unsigned long)tracks.count, MAX(0, now - savedAt) / 3600.0);
+}
 - (void)ensureMixSeeds {
     if (_mixFrozen || _musicOff) return;
+    [self loadMixLibraryCacheIfNeeded];
     // Today's tiles stay up when Music is closed, the Mac is offline, or the library read fails.
     // The read used to be the only place saved seeds were applied, so the row vanished (5 Nov 2026).
     if (!_mixSeeds.count) {
@@ -6691,25 +6751,10 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             self->_mixLibraryLoading = NO;
             NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
             if (tracks.count < 20) return;   // Music closed, or permission not given yet
-            NSSet *liked = [self mixLiked];
-            NSString *hist =
-                [NSString stringWithContentsOfFile:[GBHomeDirectory() stringByAppendingPathComponent:
-                                                   @".local/state/selector/heart-history.jsonl"]
-                                        encoding:NSUTF8StringEncoding
-                                           error:nil];
-            NSSet *everHearted = HeartHistoryEverHeartedKeys(hist);
-            NSMutableArray *marked = [NSMutableArray arrayWithCapacity:tracks.count];
-            for (NSDictionary *t in tracks) {
-                NSMutableDictionary *m = [t mutableCopy];
-                if ([liked containsObject:t[@"id"]]) m[@"thumb"] = @YES;
-                NSString *selKey = SelectorTrackKey(t[@"artist"], t[@"title"]);
-                if (selKey.length && [everHearted containsObject:selKey] && ![m[@"fav"] boolValue])
-                    m[@"everHeart"] = @YES;
-                [marked addObject:m];
-            }
-            self->_mixLibrary = marked;
+            self->_mixLibrary = [self markedMixLibrary:tracks];
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             self->_kindTileAt = 0;
+            [self saveMixLibraryCache:tracks];
             [self chooseMixSeeds:NO];
         });
         return;
@@ -6948,6 +6993,7 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (_kindTileSnapshot && _kindTileStamp == stamp && now - _kindTileAt < 60) return;
     if (_kindTileBusy) return;
+    if (!_mixLibrary.count) [self loadMixLibraryCacheIfNeeded];
     if (!_mixLibrary.count) {
         _kindTileSnapshot = @{};
         _kindTileStamp = stamp;
@@ -7678,6 +7724,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 }
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause {
     if (!_musicProbesEnabled || _musicOff || !GBValidMusicKind(kind)) return NO;
+    if (!_mixLibrary.count) [self loadMixLibraryCacheIfNeeded];
     if (!_mixLibrary.count) [self ensureMixSeeds];
     if (!_mixLibrary.count) {
         GBLog("music: library not loaded; cannot play kind %{public}@", kind);

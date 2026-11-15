@@ -866,6 +866,12 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
                                     uint64_t seed, NSArray<NSString *> *recentIDs);
 // Tracks of kind that are on this Mac (onDiskIDs non-empty ⇒ require membership; empty ⇒ count all matches).
 NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind);
+// The music library as last read from Music, kept on disk so the kind tiles and play-by-kind
+// work while Music is closed and straight after a relaunch. Only the fields the app reads are
+// kept; a row without an id is dropped. `now` and `savedAt` are seconds since 1970. Reading
+// adds the whole days since it was saved to each track's idleDays.
+NSData *MixLibraryCacheData(NSArray<NSDictionary *> *tracks, NSTimeInterval savedAt);
+NSArray<NSDictionary *> *MixLibraryFromCacheData(NSData *data, NSTimeInterval now, NSTimeInterval *savedAt);
 // The library id of the file at `path`, from the offline manifest's records. A file's name does
 // not carry it: a YouTube like has the video's id in its brackets and a lossless file has none.
 NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path);
