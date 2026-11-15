@@ -1,12 +1,35 @@
 #import "nowplaying.h"
 #import <MediaPlayer/MediaPlayer.h>
+#import <AppKit/AppKit.h>
 
 void GlanceNowPlayingSet(NSString *title, NSString *artist, double rate, double elapsed) {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
+    NSDictionary *prev = MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo;
     if (title.length) info[MPMediaItemPropertyTitle] = title;
     if (artist.length) info[MPMediaItemPropertyArtist] = artist;
     info[MPNowPlayingInfoPropertyPlaybackRate] = @(rate);
     info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(elapsed);
+    id art = prev[MPMediaItemPropertyArtwork];
+    if (art) info[MPMediaItemPropertyArtwork] = art;
+    MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo = info;
+}
+
+void GlanceNowPlayingSetArtworkJPEG(NSData *jpeg) {
+    NSMutableDictionary *info = [NSMutableDictionary dictionaryWithDictionary:
+                                 MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo ?: @{}];
+    if (jpeg.length) {
+        NSImage *img = [[NSImage alloc] initWithData:jpeg];
+        if (img) {
+            MPMediaItemArtwork *art = [[MPMediaItemArtwork alloc] initWithBoundsSize:img.size
+                                                                      requestHandler:^NSImage *(CGSize size) {
+                (void)size;
+                return img;
+            }];
+            info[MPMediaItemPropertyArtwork] = art;
+        }
+    } else {
+        [info removeObjectForKey:MPMediaItemPropertyArtwork];
+    }
     MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo = info;
 }
 

@@ -2635,6 +2635,54 @@ int main(void) {
                   MixArtURLFromSearch([@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding], @"X", 300) == nil &&
                   MixArtURLFromSearch(nil, @"X", 300) == nil, @"mix art: first result otherwise; nothing from an empty reply");
 
+            check(AlbumArtLooksSquare(CGSizeMake(100, 100)) && AlbumArtLooksSquare(CGSizeMake(99, 101)) &&
+                  !AlbumArtLooksSquare(CGSizeMake(100, 50)), @"cover: square aspect test");
+            NSRect crop = AlbumArtCenterCropRect(CGSizeMake(320, 180));
+            check(crop.size.width == 180 && crop.size.height == 180 && crop.origin.x == 70, @"cover: centre crop");
+            check([YouTubeVideoIDFromFilename(@"Song Title [dQw4w9WgXcQ].m4a") isEqual:@"dQw4w9WgXcQ"] &&
+                  YouTubeVideoIDFromFilename(@"plain.m4a") == nil, @"cover: youtube id from filename");
+            check([TrackCoverCacheKey(@"ABC", @"/x/a.m4a") isEqual:@"ABC"] && TrackCoverCacheKey(nil, @"/x/a.m4a").length == 64,
+                  @"cover: cache key");
+            NSString *art = @"/tmp/art";
+            check([[TrackCoverCacheJPEGPath(art, @"tid") lastPathComponent] isEqual:@"tid.jpg"] &&
+                  [[TrackCoverProvisionalMarkerPath(@"/a/b.jpg") lastPathComponent] isEqual:@"b.jpg.provisional"],
+                  @"cover: cache paths");
+            MusicCoverNetworkState net; MusicCoverNetworkStateInit(&net);
+            CFAbsoluteTime t0 = 1000, readyAt = 0;
+            check(!MusicCoverNetworkAllowsCatalogue(&net, t0, NO, NO, nil) &&
+                  !MusicCoverNetworkAllowsCatalogue(&net, t0, YES, YES, nil), @"cover net: offline and metered");
+            check(MusicCoverNetworkCatalogueGate(&net, t0, NO, NO, nil, &readyAt) == MusicCoverNetBlocked &&
+                  MusicCoverNetworkCatalogueGate(&net, t0, YES, YES, nil, &readyAt) == MusicCoverNetBlocked,
+                  @"cover net: gate blocks offline and metered");
+            check(MusicCoverNetworkAllowsCatalogue(&net, t0, YES, NO, nil), @"cover net: catalogue spacing start");
+            MusicCoverNetworkNoteCatalogue(&net, t0);
+            check(!MusicCoverNetworkAllowsCatalogue(&net, t0 + 1, YES, NO, nil) &&
+                  MusicCoverNetworkAllowsCatalogue(&net, t0 + 3, YES, NO, nil), @"cover net: catalogue 3s");
+            // Not-allowed-yet is Wait (retry at last+3), not a miss: missUntil stays empty.
+            check(MusicCoverNetworkCatalogueGate(&net, t0 + 1, YES, NO, @"track-a", &readyAt) == MusicCoverNetWait &&
+                  readyAt == t0 + 3.0 && net.missUntil[@"track-a"] == nil,
+                  @"cover net: not allowed yet means wait, not miss");
+            check(MusicCoverNetworkCatalogueGate(&net, t0 + 3, YES, NO, @"track-a", &readyAt) == MusicCoverNetReady,
+                  @"cover net: ready after spacing");
+            MusicCoverNetworkNoteMiss(&net, @"k", t0);
+            check(!MusicCoverNetworkAllowsThumb(&net, t0 + 10, YES, NO, @"k"), @"cover net: miss memory 1h");
+            check(MusicCoverNetworkThumbGate(&net, t0 + 10, YES, NO, @"k", &readyAt) == MusicCoverNetBlocked &&
+                  readyAt == t0 + 3600.0, @"cover net: miss gate blocked until retry");
+            NSData *missJSON = MusicCoverMissesToJSON(net.missUntil, t0 + 10);
+            NSMutableDictionary *reloaded = MusicCoverMissesFromJSON(missJSON, t0 + 10);
+            check([reloaded[@"k"] isEqual:@(t0 + 3600.0)], @"cover net: miss file round-trip");
+            check(MusicCoverMissesFromJSON(missJSON, t0 + 3601).count == 0, @"cover net: miss file prunes expired");
+            check(MusicCoverNetRequestCompare(@{@"plays": @5, @"fav": @NO, @"cacheKey": @"a"},
+                                              @{@"plays": @3, @"fav": @YES, @"cacheKey": @"b"}) == NSOrderedAscending &&
+                  MusicCoverNetRequestCompare(@{@"plays": @3, @"fav": @YES, @"cacheKey": @"a"},
+                                              @{@"plays": @3, @"fav": @NO, @"cacheKey": @"b"}) == NSOrderedAscending,
+                  @"cover net: queue order plays then fav");
+            NSArray *withCov = MusicKindMosaicTrackIDsWithCovers(kindLib, onDiskKind, @"dance", ^BOOL(NSString *tid, __unused NSDictionary *tr) {
+                return [tid isEqual:@"D000"];
+            });
+            check(withCov.count == 4 && [withCov[0] isEqual:@"D000"] && [withCov[3] isEqual:@"D000"],
+                  @"cover mosaic: repeat to fill four");
+
             NSDictionary *songSeed = @{@"key": @"song:FRED", @"kind": @"song", @"trackID": @"FRED", @"title": @"Delilah",
                                        @"artist": @"Fred again..", @"album": @"Actual Life 3", @"family": @"dance"};
             NSArray *cands = MixCandidates(lib, songSeed, 3, 50);

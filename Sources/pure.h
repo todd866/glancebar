@@ -888,6 +888,53 @@ NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path);
 // Up to four track ids: heaviest on this Mac by mix weight, different albums where possible.
 NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
                                              NSString *kind);
+// Same as MusicKindMosaicTrackIDs but only ids where hasCover returns YES; repeats to fill four.
+NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                                        NSString *kind, BOOL (^hasCover)(NSString *trackID, NSDictionary *track));
+// Embedded album art is roughly square (aspect 0.9…1.1).
+BOOL AlbumArtLooksSquare(CGSize size);
+// Centre square crop for a non-square picture.
+NSRect AlbumArtCenterCropRect(CGSize size);
+// Eleven-character YouTube id from "Title [dQw4w9WgXcQ].ext".
+NSString *YouTubeVideoIDFromFilename(NSString *filename);
+// Persistent id when present, else lower-case hex SHA-256 of the standardized file path.
+NSString *TrackCoverCacheKey(NSString *trackID, NSString *path);
+NSString *TrackCoverCacheJPEGPath(NSString *artDir, NSString *cacheKey);
+NSString *TrackCoverProvisionalMarkerPath(NSString *jpegPath);
+NSArray<NSString *> *AlbumFolderCoverFileNames(void);
+NSString *AlbumFolderCoverBesidePath(NSString *trackPath);
+typedef struct {
+    CFAbsoluteTime lastCatalogue;
+    CFAbsoluteTime lastThumb;
+    NSMutableDictionary<NSString *, NSNumber *> *missUntil;
+} MusicCoverNetworkState;
+// Pacing vs hard block: Wait means try again at *outReadyAt (not a miss); Blocked is
+// offline/metered/remembered miss; Ready means the lookup may run now.
+typedef NS_ENUM(NSInteger, MusicCoverNetGate) {
+    MusicCoverNetBlocked = 0,
+    MusicCoverNetWait = 1,
+    MusicCoverNetReady = 2,
+};
+void MusicCoverNetworkStateInit(MusicCoverNetworkState *state);
+MusicCoverNetGate MusicCoverNetworkCatalogueGate(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online,
+                                                 BOOL metered, NSString *missKey, CFAbsoluteTime *outReadyAt);
+MusicCoverNetGate MusicCoverNetworkThumbGate(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online,
+                                             BOOL metered, NSString *missKey, CFAbsoluteTime *outReadyAt);
+BOOL MusicCoverNetworkAllowsCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
+                                      NSString *missKey);
+BOOL MusicCoverNetworkAllowsThumb(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
+                                  NSString *missKey);
+void MusicCoverNetworkNoteCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now);
+void MusicCoverNetworkNoteThumb(MusicCoverNetworkState *state, CFAbsoluteTime now);
+void MusicCoverNetworkNoteMiss(MusicCoverNetworkState *state, NSString *missKey, CFAbsoluteTime now);
+// Persistent miss list under the art directory (key → absolute time when a retry is allowed).
+NSString *TrackCoverMissesPath(NSString *artDir);
+// Load misses; drop entries whose retry time is already past `now`.
+NSMutableDictionary<NSString *, NSNumber *> *MusicCoverMissesFromJSON(NSData *data, CFAbsoluteTime now);
+// Serialize misses, pruning expired entries at `now`.
+NSData *MusicCoverMissesToJSON(NSDictionary<NSString *, NSNumber *> *missUntil, CFAbsoluteTime now);
+// Network queue order: higher plays first, then favourites, then cache key.
+NSComparisonResult MusicCoverNetRequestCompare(NSDictionary *a, NSDictionary *b);
 // One-shot CLI control flags. kind: 0 = not a control invocation, 1 = post command, 2 = usage error, 3 = print last kind.
 typedef struct {
     int kind;

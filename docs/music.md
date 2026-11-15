@@ -262,6 +262,26 @@ mark, caption (`House Party` / `Sat · Marita`), badge count of other unplayed e
 progress bar when mid-episode. New music keeps its station slot but uses a 2×2 cover mosaic when
 four station files have art.
 
+## Covers (15 Nov 2026)
+
+Every tile, mosaic quarter, show cover, and the now-playing row use one resolver. For a track
+(id, artist, title, local path) it tries, in order: the on-disk cache under `mix/art/`; a square
+picture inside the file; `cover.jpg` / `cover.png` / `folder.jpg` beside the file; Apple's
+catalogue (artist and title search); a non-square embedded picture centre-cropped; a YouTube
+`hqdefault` thumbnail when the file name carries an eleven-character video id; Music.app's
+artwork only when Music is already running; another cover by the same artist, then the same album.
+Fills from steps five upward are marked provisional so a later pass can replace them.
+
+Hits are stored as a JPEG of at most 600 px on the long side (cropped square only when the step
+says to crop), keyed by persistent id or by a hash of the path when there is no id. Steps five to
+eight are provisional and may be replaced by a later catalogue hit. Network work is a single
+FIFO (most-played first) drained by one worker that waits for the pacing clocks (one catalogue
+search every three seconds, one thumbnail per second). A miss is written to `mix/art/misses.json`
+only after a lookup runs and finds nothing, and is not retried for an hour. Nothing is queued or
+fetched when `~/.local/state/METERED_LINK` exists or the Mac is offline (the queue is emptied).
+After the library or offline manifest loads, a background pass warms local steps for every on-disk
+track, then enqueues network steps for gaps; it yields for two seconds around a track change.
+
 ## Metadata and cover art are kept with every download (12 Nov 2026)
 
 Owner rule: every downloaded song keeps its metadata, album art included, and that record
