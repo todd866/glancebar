@@ -209,7 +209,7 @@ The mix row under the player is **Dance · Alt · Rap · Chill**, an offered **r
 exists, and **New music** (station) on the right. Each kind tile shows a 2×2 mosaic of covers for
 tracks on this Mac (placeholder letter when the kind is empty), a note **typemark** at the top-left of
 the cover, the kind name, and an on-disk **song count**. Clicking a kind starts that kind queue
-(`cause: click` in `playback.jsonl`); clicking the same kind again reshuffles it. The playing kind gets
+(`cause: click` in `playback.jsonl`); clicking the same kind again reshuffles it and starts a different song (the one that was playing goes to the back). The playing kind gets
 an accent border on its tile and caption. There is no refresh or **New picks** control — kinds come from
 `mixLibrary` and the offline manifest, not saved seed mixes.
 

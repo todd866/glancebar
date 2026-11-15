@@ -22,6 +22,7 @@ setup() {
   cat > "$CASE/bin/deploy" <<EOF
 #!/bin/bash
 echo deploy >> "$CASE/calls"
+printf '%s\n' "\${GLANCEBAR_TESTS_GREEN:-none}" > "$CASE/deploy-green"
 [ -f "$CASE/deploy-fails" ] && { echo "publish failed: boom"; exit 1; }
 /usr/bin/git -C "\$1" rev-parse HEAD > "$CASE/update-state/installed"
 EOF
@@ -52,6 +53,8 @@ setup behind
 run; rc=$?
 [ $rc = 0 ] && [ "$(calls)" = "tests deploy" ] && [ "$(installed)" = "$(origin_head)" ] \
   && ok "nothing installed: tests, then deploy" || not_ok "nothing installed: tests, then deploy (rc $rc, calls '$(calls)')"
+[ "$(cat "$CASE/deploy-green" 2>/dev/null)" = "$(origin_head)" ] \
+  && ok "deploy is told the suite passed for this commit" || not_ok "deploy is told the suite passed for this commit ('$(cat "$CASE/deploy-green" 2>/dev/null)')"
 : > "$CASE/calls"; run
 [ -z "$(calls)" ] && ok "in sync: nothing runs" || not_ok "in sync: nothing runs ('$(calls)')"
 status_is() { /usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if (d["state"], d["behind"]) == (sys.argv[2], int(sys.argv[3])) else 1)' "$CASE/update-state/status.json" "$1" "$2" 2>/dev/null; }

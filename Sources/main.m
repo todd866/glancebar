@@ -8028,15 +8028,21 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         return NO;
     }
     if (!_kindPlayedIDs) _kindPlayedIDs = [NSMutableArray array];
+    NSString *key = [NSString stringWithFormat:@"kind:%@", kind];
+    // A click on the kind that is already playing asks for something else. The song that is
+    // playing goes to the back of the new shuffle, so the click never starts it again unless
+    // it is the only one. (A shuffle alone repeats the same first song one time in N.)
+    NSString *playingID = nil;
+    if (_localMode && [_mixPlayingKey isEqual:key] && _localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count)
+        playingID = OfflineManifestTrackIDForPath(_offlineManifest, _localURLs[_localIndex].path);
     _kindPlaySeed = (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000) ^ (uint64_t)arc4random();
     _kindPlayingName = kind;
     [_kindPlayedIDs removeAllObjects];
-    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, @[]);
+    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, playingID.length ? @[playingID] : @[]);
     if (!ids.count) {
         GBLog("music: no %{public}@ tracks in library", kind);
         return NO;
     }
-    NSString *key = [NSString stringWithFormat:@"kind:%@", kind];
     NSArray *tracks = [self mixTracksForIDs:ids];
     if (!tracks.count) return NO;
     _onDiskLibraryIDs = nil;
@@ -8720,8 +8726,11 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
         _localTitle = parsed[@"title"] ?: @"";
         _localArtist = parsed[@"artist"] ?: @"";
         _localTagsReady = NO;
-        if ([_mixPlayingKey hasPrefix:@"kind:"] && [parsed[@"trackID"] length] && _kindPlayedIDs)
-            [_kindPlayedIDs addObject:parsed[@"trackID"]];
+        // What a kind has already played is kept by LIBRARY id, through the manifest. The id in
+        // a file's name is not it (15 Nov 2026: 0 of 331 playable files; 80 carried a video id
+        // and 251 none), so a list kept from names pushed nothing to the back of the next shuffle.
+        NSString *playedID = [_mixPlayingKey hasPrefix:@"kind:"] ? OfflineManifestTrackIDForPath(_offlineManifest, url.path) : nil;
+        if (playedID.length && _kindPlayedIDs && ![_kindPlayedIDs containsObject:playedID]) [_kindPlayedIDs addObject:playedID];
     }
     _localHeartError = nil;
     _localHeartEpoch++;

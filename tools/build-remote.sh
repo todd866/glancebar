@@ -8,8 +8,14 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 
+# The worker gets none of this shell's environment, so what the build must know goes in the
+# command. A release snapshot whose commit already passed the suite says so (see build.sh).
+BUILD_ENV='GLANCEBAR_ADHOC=1'
+if [[ "${GLANCEBAR_SNAPSHOT_TESTS_GREEN:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    BUILD_ENV+=" GLANCEBAR_SNAPSHOT_TESTS_GREEN=$GLANCEBAR_SNAPSHOT_TESTS_GREEN"
+fi
 remote-run "$@" --pull build/Glancebar.app -- \
-    zsh -c 'GLANCEBAR_ADHOC=1 ./build.sh'
+    zsh -c "$BUILD_ENV ./build.sh"
 
 APP=build/Glancebar.app
 [[ -d "$APP" ]] || { echo "build-remote: no $APP came back" >&2; exit 1; }

@@ -23,8 +23,13 @@ trap 'exit 143' TERM
 # misses for reasons that are not the app's. GLANCEBAR_TESTS_GREEN=<commit> skips the local run
 # when the full suite already passed for exactly this commit on a worker
 # (remote-run -- ./tests.sh); anything else runs it here.
+# A release snapshot has no git to check that against. tools/ops/glancebar-release sets
+# GLANCEBAR_SNAPSHOT_TESTS_GREEN=<commit> on a snapshot it copied from exactly that commit, and
+# only when its caller vouched for the same commit (glancebar-sync, which had just run the suite).
 if [[ -n "${GLANCEBAR_TESTS_GREEN:-}" && "$(git rev-parse HEAD 2>/dev/null)" == "${GLANCEBAR_TESTS_GREEN}"* && -z "$(git status --porcelain -- Sources Tests tools tests.sh 2>/dev/null)" ]]; then
     echo "build.sh: suite already green for $(git rev-parse --short HEAD) on a worker; not re-running it here"
+elif [[ "${GLANCEBAR_SNAPSHOT_TESTS_GREEN:-}" =~ ^[0-9a-f]{40}$ && ! -e .git ]]; then
+    echo "build.sh: release snapshot of ${GLANCEBAR_SNAPSHOT_TESTS_GREEN:0:7}, suite already green for it; not re-running it here"
 else
     ./tests.sh
 fi

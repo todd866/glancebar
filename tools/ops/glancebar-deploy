@@ -38,7 +38,12 @@ else
 fi
 err=$(mktemp)
 if ! dest=$("$release_bin" publish "$repo" 2>"$err"); then
-  echo "publish failed: $(head -n 1 "$err")"
+  # The reason is the LAST line (the release tool's own verdict); everything above it is the
+  # build's and the suite's output. Reporting the first line gave "publish failed: shazam
+  # off" on 15 Nov 2026 (a line a test prints) and threw the real cause away. The whole
+  # output is kept in the caller's deploy log.
+  cat "$err"
+  echo "publish failed: $(grep -v '^[[:space:]]*$' "$err" | tail -n 1)"
   rm -f "$err"
   exit 1
 fi

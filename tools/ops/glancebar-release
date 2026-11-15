@@ -6,7 +6,8 @@ INPUTS, in publish and fetch alike, so an untracked or ignored file cannot
 change it. publish refuses tracked edits, and refuses unless HEAD is
 origin/main (--allow-unpushed overrides only that). The build is
 tools/build-remote.sh from the source snapshot; exit 75 or no reachable
-worker falls back to heavy-slot -- ./build.sh.
+worker falls back to heavy-slot -- ./build.sh. The build runs the test suite
+unless GLANCEBAR_TESTS_GREEN is the full commit being published.
 """
 import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
 
@@ -136,6 +137,15 @@ def main(argv=None):
             env['GLANCEBAR_CODESIGN_IDENTITY'] = CODESIGN
             env['GLANCEBAR_TIMESTAMP'] = '1'
             env['HEAVY_SLOT_LABEL'] = 'glancebar-release'
+            # The snapshot build runs the whole suite again unless the caller has just run it
+            # green for exactly this commit and says so (GLANCEBAR_TESTS_GREEN=<full commit>,
+            # set by glancebar-sync). The second run can find nothing the first did not, and
+            # on 15 Nov 2026 it failed a release on a worker that was running another suite.
+            head = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+            env.pop('GLANCEBAR_SNAPSHOT_TESTS_GREEN', None)
+            if len(head) == 40 and env.get('GLANCEBAR_TESTS_GREEN') == head:
+                env['GLANCEBAR_SNAPSHOT_TESTS_GREEN'] = head
+                print(f'suite already green for {head[:7]}: the build will not re-run it', file=sys.stderr)
             build_snapshot(src, env)
             app = src / 'build' / 'Glancebar.app'
             verify(app)
