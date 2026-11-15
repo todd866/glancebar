@@ -9490,11 +9490,17 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         }
     });
 }
-- (void)loudnessScheduleQueueAhead {
-    if (!_localURLs.count || _localIndex < 0) return;
-    NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    NSInteger end = MIN((NSInteger)_localURLs.count, _localIndex + kLocalPlayerQueueAhead);
-    for (NSInteger i = _localIndex; i < end; i++) [paths addObject:_localURLs[i].path];
+// Measure the whole playlist from `index` on, wrapping, so a song is measured before it starts.
+// Only the first kLocalPlayerQueueAhead used to be measured, and songs after them started at unity
+// until their own measurement landed (15 Nov 2026: tracks 9 and 10 of a kind played unmeasured).
+- (void)loudnessScheduleFromIndex:(NSInteger)index {
+    NSInteger n = (NSInteger)_localURLs.count;
+    if (!n || index < 0) return;
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+    for (NSInteger k = 0; k < n; k++) {
+        NSString *p = _localURLs[(index + k) % n].path;
+        if (p.length) [paths addObject:p];
+    }
     [self loudnessScheduleMeasure:paths];
 }
 - (void)loudnessSweepOfflineTracks {
@@ -9520,7 +9526,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     for (NSInteger i = index; i < end; i++)
         [items addObject:[self localPlayerItemForURL:_localURLs[i]]];
     _localQueueEnd = end;
-    [self loudnessScheduleQueueAhead];
+    [self loudnessScheduleFromIndex:index];
     return items;
 }
 - (void)extendLocalPlayerQueueIfNeeded {
