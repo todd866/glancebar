@@ -1045,5 +1045,61 @@ class TvChannelCheckTests(MediaSyncTestBase):
         self.assertEqual(self.row()["status"], "warn")
 
 
+class GlancebarAppCheckTests(MediaSyncTestBase):
+    def rows(self):
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        return {r["name"]: r for r in doc["rows"]}
+
+    def setUp(self):
+        super().setUp()
+        self.mix = self.root / "mix"
+        self.crash = self.root / "crash"
+        self.mix.mkdir()
+        self.crash.mkdir()
+        self.cfg["glancebar_mix_dir"] = str(self.mix)
+        self.cfg["crash_dir"] = str(self.crash)
+        self._states = ms.music_app_states
+        self.addCleanup(setattr, ms, "music_app_states", self._states)
+
+    def test_off_by_default(self):
+        ms.music_app_states = lambda: ["T"]
+        names = self.rows()
+        self.assertNotIn("music app", names)
+        self.assertNotIn("app crashes", names)
+
+    def test_music_app_states(self):
+        self.cfg["glancebar_app"] = True
+        for states, status, value in ((["S"], "pass", "running"), ([], "pass", "closed"),
+                                      (["T"], "warn", "stopped"), (["T", "S"], "pass", "running")):
+            ms.music_app_states = lambda s=states: s
+            row = self.rows()["music app"]
+            self.assertEqual(row["status"], status, states)
+            self.assertTrue(row["value"].startswith(value), row["value"])
+
+    def test_library_and_crashes(self):
+        self.cfg["glancebar_app"] = True
+        ms.music_app_states = lambda: ["S"]
+        rows = self.rows()
+        self.assertEqual(rows["library"]["status"], "warn")
+        self.assertEqual((rows["app crashes"]["status"], rows["app crashes"]["value"]), ("pass", "0 in 24 h"))
+        lib = self.mix / "library.json"
+        lib.write_text("{}", encoding="utf-8")
+        os.utime(lib, (self.t0 - 3600, self.t0 - 3600))
+        old = self.crash / "Glancebar-2026-11-01-000000.ips"
+        new = self.crash / "Glancebar-2026-11-15-000000.ips"
+        harness = self.crash / "glancebar_playback_tests-2026-11-15.ips"
+        for f in (old, new, harness):
+            f.write_text("x", encoding="utf-8")
+        os.utime(old, (self.t0 - 10 * 86400, self.t0 - 10 * 86400))
+        for f in (new, harness):
+            os.utime(f, (self.t0 - 600, self.t0 - 600))
+        rows = self.rows()
+        self.assertEqual(rows["library"]["status"], "pass")
+        self.assertEqual((rows["app crashes"]["status"], rows["app crashes"]["value"]), ("warn", "1 in 24 h"))
+        os.utime(lib, (self.t0 - 100 * 3600, self.t0 - 100 * 3600))
+        self.assertEqual(self.rows()["library"]["status"], "warn")
+
+
 if __name__ == "__main__":
     unittest.main()

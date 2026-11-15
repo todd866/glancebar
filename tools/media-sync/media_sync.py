@@ -1192,6 +1192,16 @@ def cmd_tv_scores(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
 CheckRow = Dict[str, Any]
 
 
+def music_app_states() -> List[str]:
+    """The `ps` state of every Music.app process (T = stopped); [] when Music is not running."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "state=,comm="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.split(None, 1)[0] for line in out.splitlines()
+            if line.strip().endswith("/Music.app/Contents/MacOS/Music")]
+
+
 def make_row(
     name: str,
     status: str,
@@ -1611,6 +1621,45 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 elif all_zero and parts:
                     st = "warn"
         rows.append(make_row("tv channel", st, fact, host))
+
+    # The Mac that runs the Glancebar app (config `glancebar_app: true`) also answers for the
+    # app's own music inputs. On 15 Nov 2026 Music.app had been stopped (SIGSTOP) since the day
+    # before, the library could not be read, the kind tiles were empty, and no check said so.
+    if cfg.get("glancebar_app"):
+        states = music_app_states()
+        if not states:
+            rows.append(make_row("music app", "pass", "closed", host))
+        elif all(st.startswith("T") for st in states):
+            rows.append(make_row("music app", "warn", "stopped (SIGSTOP): Glancebar cannot read the library", host,
+                                 "Music.app's process is stopped; quit and reopen Music, or `kill -CONT` it"))
+        else:
+            rows.append(make_row("music app", "pass", "running", host))
+
+        mix = expand(cfg.get("glancebar_mix_dir") or "~/Library/Application Support/Glancebar/mix")
+        lib = mix / "library.json"
+        warn_h = float(chk.get("library_warn_h", 72))
+        if not lib.is_file():
+            rows.append(make_row("library", "warn", "never read from Music: kind tiles use the files' genres", host))
+        else:
+            try:
+                age_h = (now - lib.stat().st_mtime) / 3600.0
+            except OSError:
+                age_h = 0
+            st = "warn" if age_h > warn_h else "pass"
+            rows.append(make_row("library", st, f"read from Music {age_fact(age_h * 3600)} ago", host))
+
+        crash_dir = expand(cfg.get("crash_dir") or "~/Library/Logs/DiagnosticReports")
+        crashes = 0
+        if crash_dir.is_dir():
+            for f in crash_dir.glob("Glancebar-*"):
+                try:
+                    if now - f.stat().st_mtime < 24 * 3600:
+                        crashes += 1
+                except OSError:
+                    pass
+        rows.append(make_row("app crashes", "warn" if crashes else "pass",
+                             f"{crashes} in 24 h", host,
+                             f"{crashes} Glancebar crash reports in {crash_dir} (the test harnesses' are named differently)"))
 
     # `check.rows` names the rows this Mac answers for; the default is every row whose input
     # exists here. (A Mac can hold a leftover file that belongs to another Mac's job.)

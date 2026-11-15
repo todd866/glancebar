@@ -70,3 +70,9 @@ Default thresholds live under `check` in config (hours/days as in the brief).
 - `<tv_channel_scores>` — TV channel membership and scores (M2 when set)
 - `<share>/check-<host>.json` — this Mac’s check rows for peers
 - `<state_dir>/check.json` — local rows plus fresh peer rows
+## Glancebar's own music inputs (`glancebar_app: true`)
+
+On the Mac that runs the app, `check` also writes three rows: **music app** (running, closed, or
+stopped: a stopped Music cannot be read, warn), **library** (age of the last read from Music in
+`<mix dir>/library.json`; none or older than `check.library_warn_h`, 72 h, warns), and **app
+crashes** (Glancebar crash reports in the last 24 h). Paths: `glancebar_mix_dir`, `crash_dir`.
