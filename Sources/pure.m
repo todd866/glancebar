@@ -3715,6 +3715,25 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
     return ordered;
 }
 
+NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path) {
+    if (![manifest isKindOfClass:NSDictionary.class] || ![path isKindOfClass:NSString.class] || !path.length) return nil;
+    NSArray *playlists = [manifest[@"playlists"] isKindOfClass:NSArray.class] ? manifest[@"playlists"] : @[];
+    // Exact text first (the usual case, and cheap); only then the same file spelt differently.
+    for (int pass = 0; pass < 2; pass++) {
+        NSString *want = pass ? path.stringByStandardizingPath : path;
+        for (id playlist in playlists) {
+            if (![playlist isKindOfClass:NSDictionary.class]) continue;
+            for (id record in [playlist[@"tracks"] isKindOfClass:NSArray.class] ? playlist[@"tracks"] : @[]) {
+                if (![record isKindOfClass:NSDictionary.class]) continue;
+                NSString *recordPath = record[@"path"], *tid = record[@"id"];
+                if (![recordPath isKindOfClass:NSString.class] || ![tid isKindOfClass:NSString.class] || !tid.length) continue;
+                if ([(pass ? recordPath.stringByStandardizingPath : recordPath) isEqualToString:want]) return tid;
+            }
+        }
+    }
+    return nil;
+}
+
 NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind) {
     if (!kind.length || !tracks.count) return 0;
     NSUInteger n = 0;

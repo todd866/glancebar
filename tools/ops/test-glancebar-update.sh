@@ -168,6 +168,7 @@ EOF
 #!/bin/bash
 code=\$(cat "$rel/remote-exit")
 echo "build-remote \$code" >> "$rel/trace"
+echo "green=\${GLANCEBAR_SNAPSHOT_TESTS_GREEN:-none}" >> "$rel/trace"
 if [ "\$code" != 0 ]; then
   if [ "\$code" = 9 ]; then echo "remote-run: no worker reachable" >&2; fi
   exit "\$code"
@@ -212,6 +213,18 @@ EOF
   printf 'still-ignored\n' > "$src/Sources/untracked.c"
   mkdir -p "$rel/fetched3"
   if python3 "$RELEASE" fetch "$src" "$rel/fetched3/Glancebar.app" >"$rel/fout3" 2>"$rel/ferr3"; then ok "release: fetch ignores untracked files"; else not_ok "release: fetch ignores untracked files"; fi
+  # The build re-runs the suite unless the caller vouches for exactly the commit being published.
+  if grep -q '^green=none$' "$rel/trace"; then ok "release: no vouch, the build runs the suite"; else not_ok "release: no vouch, the build runs the suite"; fi
+  rhead=$(gitc -C "$src" rev-parse HEAD)
+  green_after() { : > "$rel/trace"; env "$@" python3 "$RELEASE" publish "$src" >"$rel/out" 2>"$rel/err"; grep '^green=' "$rel/trace"; }
+  g=$(green_after GLANCEBAR_TESTS_GREEN="$rhead")
+  if [ "$g" = "green=$rhead" ]; then ok "release: a vouch for this commit reaches the build"; else not_ok "release: a vouch for this commit reaches the build ($g)"; fi
+  g=$(green_after GLANCEBAR_TESTS_GREEN=0000000000000000000000000000000000000000)
+  if [ "$g" = "green=none" ]; then ok "release: a vouch for another commit is ignored"; else not_ok "release: a vouch for another commit is ignored ($g)"; fi
+  g=$(green_after GLANCEBAR_TESTS_GREEN="${rhead:0:7}")
+  if [ "$g" = "green=none" ]; then ok "release: a short commit is not a vouch"; else not_ok "release: a short commit is not a vouch ($g)"; fi
+  g=$(green_after GLANCEBAR_SNAPSHOT_TESTS_GREEN="$rhead")
+  if [ "$g" = "green=none" ]; then ok "release: the build's own flag cannot be set from outside"; else not_ok "release: the build's own flag cannot be set from outside ($g)"; fi
   rm -rf "$published"
   printf '75\n' > "$rel/remote-exit"
   : > "$rel/trace"
@@ -237,6 +250,41 @@ EOF
   if python3 "$RELEASE" --allow-unpushed publish "$src" >"$rel/out" 2>"$rel/err"; then not_ok "release: --allow-unpushed still refuses a dirty tree"; else ok "release: --allow-unpushed still refuses a dirty tree"; fi
   unset HOME GLANCEBAR_RELEASE_STORE
 fi
+
+# --- the vouch reaches the worker, and the build honours it only in a snapshot ----------
+# build-remote.sh puts it in the worker's command (the worker gets no environment); a
+# stand-in remote-run records the command and stops the script there.
+brbin="$WORK/br-bin"; mkdir -p "$brbin"
+cat > "$brbin/remote-run" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" > "$WORK/br-args"
+exit 3
+EOF
+chmod +x "$brbin/remote-run"
+vouch=1234567890abcdef1234567890abcdef12345678
+br() { : > "$WORK/br-args"; env PATH="$brbin:/usr/bin:/bin:/usr/sbin:/sbin" "$@" /bin/zsh "$here/../build-remote.sh" >/dev/null 2>&1; cat "$WORK/br-args"; }
+a=$(br GLANCEBAR_SNAPSHOT_TESTS_GREEN="$vouch")
+case "$a" in *"GLANCEBAR_ADHOC=1 GLANCEBAR_SNAPSHOT_TESTS_GREEN=$vouch ./build.sh"*) ok "build-remote: the vouch is in the worker's command" ;; *) not_ok "build-remote: the vouch is in the worker's command ($a)" ;; esac
+a=$(br GLANCEBAR_UNRELATED=1)
+case "$a" in *"zsh -c GLANCEBAR_ADHOC=1 ./build.sh"*) ok "build-remote: no vouch, the plain build command" ;; *) not_ok "build-remote: no vouch, the plain build command ($a)" ;; esac
+a=$(br GLANCEBAR_SNAPSHOT_TESTS_GREEN='abc; echo injected')
+case "$a" in *SNAPSHOT*|*injected*) not_ok "build-remote: anything but a full commit is dropped ($a)" ;; *"GLANCEBAR_ADHOC=1 ./build.sh"*) ok "build-remote: anything but a full commit is dropped" ;; *) not_ok "build-remote: anything but a full commit is dropped ($a)" ;; esac
+
+# build.sh decides about the suite before it compiles anything; a copy with a stand-in
+# tests.sh and no Info.plist stops right after that decision.
+bs="$WORK/build-snap"; mkdir -p "$bs"
+cp "$here/../../build.sh" "$bs/build.sh"
+printf '#!/bin/sh\ntouch "$SUITE_MARK"\n' > "$bs/tests.sh"; chmod +x "$bs/tests.sh"
+snap() { mark="$bs/suite-ran-$1"; shift; env CC=/usr/bin/true SDKROOT=/ SUITE_MARK="$mark" "$@" /bin/zsh "$bs/build.sh" > "$bs/out" 2>&1; }
+snap vouched GLANCEBAR_SNAPSHOT_TESTS_GREEN="$vouch"
+if [ ! -e "$mark" ] && grep -q 'suite already green' "$bs/out"; then ok "build: a vouched snapshot does not re-run the suite"; else not_ok "build: a vouched snapshot does not re-run the suite ($(head -n 2 "$bs/out" | tr '\n' ' '))"; fi
+snap plain GLANCEBAR_UNRELATED=1
+if [ -e "$mark" ]; then ok "build: no vouch, the suite runs"; else not_ok "build: no vouch, the suite runs"; fi
+snap short GLANCEBAR_SNAPSHOT_TESTS_GREEN=1234567
+if [ -e "$mark" ]; then ok "build: a short commit is not a vouch"; else not_ok "build: a short commit is not a vouch"; fi
+mkdir "$bs/.git"
+snap checkout GLANCEBAR_SNAPSHOT_TESTS_GREEN="$vouch"
+if [ -e "$mark" ]; then ok "build: a checkout ignores the snapshot flag"; else not_ok "build: a checkout ignores the snapshot flag"; fi
 
 # --- glancebar-deploy -------------------------------------------------------
 if [ ! -f "$DEPLOY" ]; then

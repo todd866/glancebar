@@ -2453,6 +2453,30 @@ int main(void) {
             check([danceQ isEqual:MusicKindQueue(kindLib, @"dance", 6, 99, @[@"D001"])], @"kind queue: deterministic for seed");
             NSArray *shortQ = MusicKindQueue(@[kindLib[0]], @"dance", 10, 1, @[]);
             check(shortQ.count == 1, @"kind queue: short pool returns what there is");
+            // A second click on the playing kind: the playing song is the one "recent", so it
+            // comes last whatever the seed, and never first while there is another.
+            BOOL playingNeverFirst = YES;
+            for (uint64_t seed = 1; seed <= 200; seed++) {
+                NSArray *q = MusicKindQueue(kindLib, @"dance", 60, seed, @[@"D003"]);
+                if (q.count != 8 || [q.firstObject isEqual:@"D003"] || ![q.lastObject isEqual:@"D003"]) playingNeverFirst = NO;
+            }
+            check(playingNeverFirst, @"kind queue: the playing song goes last for every seed");
+            check([MusicKindQueue(@[kindLib[0]], @"dance", 60, 5, @[@"D000"]) isEqual:@[@"D000"]], @"kind queue: the only song still plays");
+            NSDictionary *idManifest = @{@"schemaVersion": @1, @"playlists": @[
+                @{@"key": @"a", @"tracks": @[@{@"id": @"LIB1", @"path": @"/m/Artist - Song [ytVideoId01].m4a"},
+                                               @{@"id": @"", @"path": @"/m/no-id.m4a"}, @"junk"]},
+                @"junk",
+                @{@"key": @"b", @"tracks": @[@{@"id": @"LIB2", @"path": @"/m/sub/../Plain Name.m4a"}]}]};
+            check([OfflineManifestTrackIDForPath(idManifest, @"/m/Artist - Song [ytVideoId01].m4a") isEqual:@"LIB1"],
+                  @"manifest id for path: the library id, not the one in the file name");
+            check([OfflineManifestTrackIDForPath(idManifest, @"/m/Plain Name.m4a") isEqual:@"LIB2"],
+                  @"manifest id for path: the same file spelt differently");
+            check(OfflineManifestTrackIDForPath(idManifest, @"/m/no-id.m4a") == nil &&
+                  OfflineManifestTrackIDForPath(idManifest, @"/m/other.m4a") == nil &&
+                  OfflineManifestTrackIDForPath(idManifest, @"") == nil &&
+                  OfflineManifestTrackIDForPath(nil, @"/m/x.m4a") == nil &&
+                  OfflineManifestTrackIDForPath((id)@"junk", @"/m/x.m4a") == nil,
+                  @"manifest id for path: nothing for an unknown path or a bad manifest");
             NSArray *anyQ = MusicKindQueue(kindLib, @"any", 20, 7, @[]);
             check(anyQ.count == 12, @"kind queue: any is every track");
             NSMutableDictionary *kindByID = [NSMutableDictionary dictionary];

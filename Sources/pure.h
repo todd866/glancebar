@@ -866,6 +866,9 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
                                     uint64_t seed, NSArray<NSString *> *recentIDs);
 // Tracks of kind that are on this Mac (onDiskIDs non-empty ⇒ require membership; empty ⇒ count all matches).
 NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind);
+// The library id of the file at `path`, from the offline manifest's records. A file's name does
+// not carry it: a YouTube like has the video's id in its brackets and a lossless file has none.
+NSString *OfflineManifestTrackIDForPath(NSDictionary *manifest, NSString *path);
 // Up to four track ids: heaviest on this Mac by mix weight, different albums where possible.
 NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
                                              NSString *kind);
