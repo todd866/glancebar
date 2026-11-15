@@ -3759,6 +3759,143 @@ NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NS
     return picked;
 }
 
+NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                                        NSString *kind, BOOL (^hasCover)(NSString *trackID, NSDictionary *track)) {
+    if (!kind.length || !tracks.count || !hasCover) return @[];
+    NSMutableArray<NSDictionary *> *eligible = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        if (!MusicKindMatches(kind, t)) continue;
+        if (onDiskIDs.count && ![onDiskIDs containsObject:t[@"id"]]) continue;
+        if (!hasCover(t[@"id"], t)) continue;
+        [eligible addObject:t];
+    }
+    if (!eligible.count) return @[];
+    [eligible sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult r = [@(MixTrackWeight(b)) compare:@(MixTrackWeight(a))];
+        return r != NSOrderedSame ? r : [a[@"id"] compare:b[@"id"]];
+    }];
+    NSMutableArray<NSString *> *picked = [NSMutableArray array];
+    NSMutableSet<NSString *> *albums = [NSMutableSet set];
+    for (NSDictionary *t in eligible) {
+        if (picked.count >= 4) break;
+        NSString *albumKey = [[NSString stringWithFormat:@"%@|%@", t[@"artist"] ?: @"", t[@"album"] ?: @""] lowercaseString];
+        if (albumKey.length > 1 && [albums containsObject:albumKey]) continue;
+        [picked addObject:t[@"id"]];
+        if (albumKey.length > 1) [albums addObject:albumKey];
+    }
+    for (NSDictionary *t in eligible) {
+        if (picked.count >= 4) break;
+        if ([picked containsObject:t[@"id"]]) continue;
+        [picked addObject:t[@"id"]];
+    }
+    if (!picked.count) return @[];
+    NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:4];
+  for (NSUInteger i = 0; i < 4; i++) [out addObject:picked[i % picked.count]];
+    return out;
+}
+
+BOOL AlbumArtLooksSquare(CGSize size) {
+    if (size.width <= 0 || size.height <= 0) return NO;
+    double ratio = size.width / size.height;
+    return ratio >= 0.9 && ratio <= 1.1;
+}
+
+NSRect AlbumArtCenterCropRect(CGSize size) {
+    if (size.width <= 0 || size.height <= 0) return NSZeroRect;
+    CGFloat side = MIN(size.width, size.height);
+    return NSMakeRect((size.width - side) / 2.0, (size.height - side) / 2.0, side, side);
+}
+
+NSString *YouTubeVideoIDFromFilename(NSString *filename) {
+    if (!filename.length) return nil;
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"\\[([A-Za-z0-9_-]{11})\\]" options:0 error:nil];
+    });
+    NSTextCheckingResult *m = [re firstMatchInString:filename options:0 range:NSMakeRange(0, filename.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    return [filename substringWithRange:[m rangeAtIndex:1]];
+}
+
+NSString *TrackCoverCacheKey(NSString *trackID, NSString *path) {
+    if ([trackID isKindOfClass:NSString.class] && trackID.length) return trackID;
+    NSString *std = path.length ? path.stringByStandardizingPath.lowercaseString : @"";
+    if (!std.length) return @"";
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    NSData *bytes = [std dataUsingEncoding:NSUTF8StringEncoding];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
+
+NSString *TrackCoverCacheJPEGPath(NSString *artDir, NSString *cacheKey) {
+    if (!artDir.length || !cacheKey.length) return nil;
+    return [artDir stringByAppendingPathComponent:[cacheKey stringByAppendingPathExtension:@"jpg"]];
+}
+
+NSString *TrackCoverProvisionalMarkerPath(NSString *jpegPath) {
+    return jpegPath.length ? [jpegPath stringByAppendingString:@".provisional"] : nil;
+}
+
+NSArray<NSString *> *AlbumFolderCoverFileNames(void) {
+    return @[@"cover.jpg", @"cover.jpeg", @"cover.png", @"folder.jpg"];
+}
+
+NSString *AlbumFolderCoverBesidePath(NSString *trackPath) {
+    if (!trackPath.length) return nil;
+    NSString *dir = trackPath.stringByDeletingLastPathComponent;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *name in AlbumFolderCoverFileNames()) {
+        NSString *p = [dir stringByAppendingPathComponent:name];
+        if ([fm fileExistsAtPath:p]) return p;
+    }
+    return nil;
+}
+
+void MusicCoverNetworkStateInit(MusicCoverNetworkState *state) {
+    if (!state) return;
+    state->lastCatalogue = 0;
+    state->lastThumb = 0;
+    state->missUntil = [NSMutableDictionary dictionary];
+}
+
+BOOL MusicCoverNetworkAllowsCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
+                                      NSString *missKey) {
+    if (!online || metered || !state) return NO;
+    if (missKey.length) {
+        NSNumber *until = state->missUntil[missKey];
+        if (until && now < until.doubleValue) return NO;
+    }
+    return now - state->lastCatalogue >= 3.0;
+}
+
+BOOL MusicCoverNetworkAllowsThumb(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
+                                  NSString *missKey) {
+    if (!online || metered || !state) return NO;
+    if (missKey.length) {
+        NSNumber *until = state->missUntil[missKey];
+        if (until && now < until.doubleValue) return NO;
+    }
+    return now - state->lastThumb >= 1.0;
+}
+
+void MusicCoverNetworkNoteCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now) {
+    if (state) state->lastCatalogue = now;
+}
+
+void MusicCoverNetworkNoteThumb(MusicCoverNetworkState *state, CFAbsoluteTime now) {
+    if (state) state->lastThumb = now;
+}
+
+void MusicCoverNetworkNoteMiss(MusicCoverNetworkState *state, NSString *missKey, CFAbsoluteTime now) {
+    if (!state || !missKey.length) return;
+    if (!state->missUntil) state->missUntil = [NSMutableDictionary dictionary];
+    state->missUntil[missKey] = @(now + 3600.0);
+}
+
 // Seeds are songs Ian will recognise: ones he has actually played here, weighted by plays and how
 // recently. Favourites alone mean little (1,240 of 1,412 were bulk-imported YouTube likes, 30 Oct 2026),
 // so they only fill in when too few played songs are left.

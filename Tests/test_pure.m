@@ -2539,6 +2539,34 @@ int main(void) {
                   MixArtURLFromSearch([@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding], @"X", 300) == nil &&
                   MixArtURLFromSearch(nil, @"X", 300) == nil, @"mix art: first result otherwise; nothing from an empty reply");
 
+            check(AlbumArtLooksSquare(CGSizeMake(100, 100)) && AlbumArtLooksSquare(CGSizeMake(99, 101)) &&
+                  !AlbumArtLooksSquare(CGSizeMake(100, 50)), @"cover: square aspect test");
+            NSRect crop = AlbumArtCenterCropRect(CGSizeMake(320, 180));
+            check(crop.size.width == 180 && crop.size.height == 180 && crop.origin.x == 70, @"cover: centre crop");
+            check([YouTubeVideoIDFromFilename(@"Song Title [dQw4w9WgXcQ].m4a") isEqual:@"dQw4w9WgXcQ"] &&
+                  YouTubeVideoIDFromFilename(@"plain.m4a") == nil, @"cover: youtube id from filename");
+            check([TrackCoverCacheKey(@"ABC", @"/x/a.m4a") isEqual:@"ABC"] && TrackCoverCacheKey(nil, @"/x/a.m4a").length == 64,
+                  @"cover: cache key");
+            NSString *art = @"/tmp/art";
+            check([[TrackCoverCacheJPEGPath(art, @"tid") lastPathComponent] isEqual:@"tid.jpg"] &&
+                  [[TrackCoverProvisionalMarkerPath(@"/a/b.jpg") lastPathComponent] isEqual:@"b.jpg.provisional"],
+                  @"cover: cache paths");
+            MusicCoverNetworkState net; MusicCoverNetworkStateInit(&net);
+            CFAbsoluteTime t0 = 1000;
+            check(!MusicCoverNetworkAllowsCatalogue(&net, t0, NO, NO, nil) &&
+                  !MusicCoverNetworkAllowsCatalogue(&net, t0, YES, YES, nil), @"cover net: offline and metered");
+            check(MusicCoverNetworkAllowsCatalogue(&net, t0, YES, NO, nil), @"cover net: catalogue spacing start");
+            MusicCoverNetworkNoteCatalogue(&net, t0);
+            check(!MusicCoverNetworkAllowsCatalogue(&net, t0 + 1, YES, NO, nil) &&
+                  MusicCoverNetworkAllowsCatalogue(&net, t0 + 3, YES, NO, nil), @"cover net: catalogue 3s");
+            MusicCoverNetworkNoteMiss(&net, @"k", t0);
+            check(!MusicCoverNetworkAllowsThumb(&net, t0 + 10, YES, NO, @"k"), @"cover net: miss memory 1h");
+            NSArray *withCov = MusicKindMosaicTrackIDsWithCovers(kindLib, onDiskKind, @"dance", ^BOOL(NSString *tid, __unused NSDictionary *tr) {
+                return [tid isEqual:@"D000"];
+            });
+            check(withCov.count == 4 && [withCov[0] isEqual:@"D000"] && [withCov[3] isEqual:@"D000"],
+                  @"cover mosaic: repeat to fill four");
+
             NSDictionary *songSeed = @{@"key": @"song:FRED", @"kind": @"song", @"trackID": @"FRED", @"title": @"Delilah",
                                        @"artist": @"Fred again..", @"album": @"Actual Life 3", @"family": @"dance"};
             NSArray *cands = MixCandidates(lib, songSeed, 3, 50);

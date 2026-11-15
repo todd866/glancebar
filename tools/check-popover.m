@@ -222,6 +222,21 @@ static BOOL Afconvert(NSString *wav, NSString *m4a) {
     [task waitUntilExit];
     return task.terminationStatus == 0 && [NSFileManager.defaultManager fileExistsAtPath:m4a];
 }
+static NSData *FixtureCoverWidePNG(CGFloat hue) {
+    const CGFloat w = 320, h = 180;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:w pixelsHigh:h
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+        bytesPerRow:0 bitsPerPixel:0];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:rep]];
+    NSGradient *g = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedHue:hue saturation:0.65 brightness:0.5 alpha:1]
+                                                   endingColor:[NSColor colorWithCalibratedHue:hue + 0.12 saturation:0.45 brightness:0.82 alpha:1]];
+    [g drawInRect:NSMakeRect(0, 0, w, h) angle:0];
+    [[NSColor whiteColor] setFill];
+    [[NSBezierPath bezierPathWithRect:NSMakeRect(20, 40, 80, 50)] fill];
+    [NSGraphicsContext restoreGraphicsState];
+    return [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+}
 static NSData *FixtureCoverPNG(CGFloat hue) {
     const CGFloat side = 200;
     NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:side pixelsHigh:side
@@ -1964,6 +1979,72 @@ int main(int argc, const char **argv) {
                     if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"kind-tiles-empty-light.png"], NSAppearanceNameAqua))
                         return Fail(__LINE__);
                 }
+            }
+        } else if (musicState && strcmp(musicState, "art-resolver") == 0) {
+            [c setValue:@YES forKey:@"mixFrozen"];
+            NSString *pa = [fixtureMusic stringByAppendingPathComponent:@"resolver-square.m4a"];
+            NSString *pb = [fixtureMusic stringByAppendingPathComponent:@"resolver-wide.m4a"];
+            NSString *folderAlbum = [fixtureMusic stringByAppendingPathComponent:@"resolver-folder-album"];
+            NSString *lone = [fixtureMusic stringByAppendingPathComponent:@"resolver-none-dir"];
+            [NSFileManager.defaultManager createDirectoryAtPath:folderAlbum withIntermediateDirectories:YES attributes:nil error:nil];
+            [NSFileManager.defaultManager createDirectoryAtPath:lone withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *pc = [folderAlbum stringByAppendingPathComponent:@"track.m4a"];
+            NSString *pd = [lone stringByAppendingPathComponent:@"track.m4a"];
+            if (!WriteSilentM4A(pa, @"Fix Artist A", FixtureCoverPNG(0.2), 0.12) ||
+                !WriteSilentM4A(pb, @"Fix Artist B", FixtureCoverWidePNG(0.35), 0.12) ||
+                !WriteSilentM4A(pc, @"Fix Artist C", nil, 0.12) ||
+                !WriteSilentM4A(pd, @"Fix Artist D", nil, 0.12))
+                return Fail(__LINE__);
+            if (![FixtureCoverPNG(0.42) writeToFile:[folderAlbum stringByAppendingPathComponent:@"cover.jpg"] atomically:YES])
+                return Fail(__LINE__);
+            NSImage *ia = [c trackCoverImageForTrackID:@"RA" artist:@"Fix Artist A" title:@"Square" album:@"" path:pa];
+            NSImage *ib = [c trackCoverImageForTrackID:@"RB" artist:@"Fix Artist B" title:@"Wide" album:@"" path:pb];
+            NSImage *ic = [c trackCoverImageForTrackID:@"RC" artist:@"Fix Artist C" title:@"Folder" album:@"" path:pc];
+            NSImage *id_ = [c trackCoverImageForTrackID:@"RD" artist:@"Fix Artist D" title:@"None" album:@"" path:pd];
+            if (!ia || !ib || !ic || id_) return Fail(__LINE__);
+            if (fabs(ia.size.width - ia.size.height) > 2 || fabs(ib.size.width - ib.size.height) > 2) return Fail(__LINE__);
+            NSString *keyA = TrackCoverCacheKey(@"RA", pa);
+            NSString *artDir = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/art"];
+            if (![NSFileManager.defaultManager fileExistsAtPath:TrackCoverCacheJPEGPath(artDir, keyA)]) return Fail(__LINE__);
+            NSUInteger readsAfter = [c trackCoverEmbeddedReadCount];
+            NSImage *ia2 = [c trackCoverImageForTrackID:@"RA" artist:@"Fix Artist A" title:@"Square" album:@"" path:pa];
+            if (!ia2 || ![NSFileManager.defaultManager fileExistsAtPath:TrackCoverCacheJPEGPath(artDir, keyA)]) return Fail(__LINE__);
+            if ([c trackCoverEmbeddedReadCount] != readsAfter) return Fail(__LINE__);
+            MusicCoverNetworkState net; MusicCoverNetworkStateInit(&net);
+            if (MusicCoverNetworkAllowsCatalogue(&net, 0, YES, YES, nil)) return Fail(__LINE__);
+            NSDictionary *kindPack = KindHarnessTracks(fixtureMusic, YES);
+            if (!kindPack) return Fail(__LINE__);
+            [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
+            [c setValue:ManifestReplacingKindHarness([c valueForKey:@"offlineManifest"], kindPack[@"manifest"]) forKey:@"offlineManifest"];
+            [c setValue:nil forKey:@"_onDiskLibraryIDs"];
+            [c setValue:nil forKey:@"_kindTileSnapshot"];
+            NSArray *mosaic = [c kindMosaicCoversForIDs:@[@"KD1", @"KD2", @"KA1", @"KR1"]];
+            if (mosaic.count < 4) return Fail(__LINE__);
+        } else if (musicState && strcmp(musicState, "art-tiles-render") == 0) {
+            NSDictionary *kindPack = KindHarnessTracks(fixtureMusic, YES);
+            if (!kindPack) return Fail(__LINE__);
+            [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
+            [c setValue:ManifestReplacingKindHarness([c valueForKey:@"offlineManifest"], kindPack[@"manifest"]) forKey:@"offlineManifest"];
+            [c setValue:nil forKey:@"_onDiskLibraryIDs"];
+            [c setValue:nil forKey:@"_kindTileSnapshot"];
+            NSMutableArray *stationTracks = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 4; i++) {
+                NSString *p = [fixtureMusic stringByAppendingPathComponent:[NSString stringWithFormat:@"render-pick-%lu.m4a", (unsigned long)i]];
+                if (!WriteSilentM4A(p, @"Render Picks", FixtureCoverPNG(0.05 + 0.17 * i), 0.1)) return Fail(__LINE__);
+                [stationTracks addObject:@{@"id": [NSString stringWithFormat:@"RP%lu", (unsigned long)i], @"title": @"Pick",
+                                          @"artist": @"Render", @"album": @"", @"local_path": p}];
+            }
+            [c setValue:stationTracks forKey:@"stationTracks"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if ([c stationMosaicCovers].count < 4) return Fail(__LINE__);
+            const char *rowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (rowPNG && rowPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:rowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"art-tiles-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"art-tiles-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
             }
         } else if (musicState && strcmp(musicState, "dislike") == 0) {
             NSString *trackA = [fixtureMusic stringByAppendingPathComponent:@"dislike-a.m4a"];

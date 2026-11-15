@@ -29,6 +29,7 @@
 #import <math.h>
 #import <Security/Security.h>
 #import <sqlite3.h>
+#import <ImageIO/ImageIO.h>
 #import "pure.h"
 #import "nowplaying.h"
 #import "activity.h"
@@ -5662,6 +5663,12 @@ static NSString *PopoverRequestObject(void) {
 - (NSUInteger)coalescedSeekApplyCount;
 - (NSImage *)embeddedArtworkForPath:(NSString *)path;
 - (NSArray<NSImage *> *)stationMosaicCovers;
+- (NSImage *)trackCoverImageForTrackID:(NSString *)trackID artist:(NSString *)artist title:(NSString *)title
+                                 album:(NSString *)album path:(NSString *)path;
+- (NSUInteger)trackCoverEmbeddedReadCount;
+- (BOOL)trackCoverHasCachedImageForTrackID:(NSString *)trackID path:(NSString *)path;
+- (void)setCoverTestCatalogueJSON:(NSData *)data;
+- (void)setCoverTestThumbData:(NSData *)data;
 - (void)saveShowPositionNow;
 - (void)performMusicNextCutNow;
 - (NSString *)showsJSONPath;
@@ -6211,6 +6218,14 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSDictionary *_showsState;
     NSMutableDictionary<NSString *, NSImage *> *_showCoverCache;
     NSMutableDictionary<NSString *, NSImage *> *_stationCoverCache;
+    dispatch_queue_t _coverQueue;
+    MusicCoverNetworkState _coverNetwork;
+    NSMutableSet<NSString *> *_coverResolving;
+    BOOL _coverWarmBusy;
+    CFAbsoluteTime _coverPopoverRebuildAt;
+    NSUInteger _coverEmbeddedReads;
+    NSData *_coverTestCatalogueJSON;
+    NSData *_coverTestThumbData;
     NSDictionary<NSString *, NSDictionary *> *_kindTileSnapshot;
     CFAbsoluteTime _kindTileAt;
     NSUInteger _kindTileStamp;
@@ -6440,6 +6455,8 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _mixArt = [NSMutableDictionary dictionary];
     _showCoverCache = [NSMutableDictionary dictionary];
     _stationCoverCache = [NSMutableDictionary dictionary];
+    MusicCoverNetworkStateInit(&_coverNetwork);
+    _coverResolving = [NSMutableSet set];
     _showsQueue = dispatch_queue_create("com.iantodd.glancebar.shows", DISPATCH_QUEUE_SERIAL);
     _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
     (void)[self offlineTracksWorkQueue];
@@ -6710,6 +6727,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             self->_mixLibrary = marked;
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             self->_kindTileAt = 0;
+            [self scheduleCoverCacheWarm];
             [self chooseMixSeeds:NO];
         });
         return;
@@ -6759,42 +6777,360 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     for (NSDictionary *seed in _mixSeeds) { [self loadMixArt:seed]; [self prepareMix:seed then:nil]; }
     if (_popover.isShown) [self rebuildContent];
 }
+- (dispatch_queue_t)coverQueue {
+    if (!_coverQueue) _coverQueue = dispatch_queue_create("com.iantodd.glancebar.covers", DISPATCH_QUEUE_SERIAL);
+    return _coverQueue;
+}
+- (void)scheduleCoverPopoverRebuild {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_popover.isShown && now - _coverPopoverRebuildAt >= 1.0) {
+        _coverPopoverRebuildAt = now;
+        [self rebuildContent];
+    }
+}
+- (NSString *)trackCoverCacheKeyForTrackID:(NSString *)trackID path:(NSString *)path {
+    return TrackCoverCacheKey(trackID, path);
+}
+- (BOOL)trackCoverIsProvisionalFile:(NSString *)jpgPath {
+    return jpgPath.length && [NSFileManager.defaultManager fileExistsAtPath:TrackCoverProvisionalMarkerPath(jpgPath)];
+}
+- (void)trackCoverStoreImage:(NSImage *)img cacheKey:(NSString *)cacheKey provisional:(BOOL)provisional {
+    if (!img || !cacheKey.length) return;
+    NSString *artDir = MixDirectory(@"art");
+    [NSFileManager.defaultManager createDirectoryAtPath:artDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *jpgPath = TrackCoverCacheJPEGPath(artDir, cacheKey);
+    if (!provisional) [NSFileManager.defaultManager removeItemAtPath:TrackCoverProvisionalMarkerPath(jpgPath) error:nil];
+    NSBitmapImageRep *rep = nil;
+    for (NSImageRep *r in img.representations) if ([r isKindOfClass:NSBitmapImageRep.class]) { rep = (NSBitmapImageRep *)r; break; }
+    if (!rep) {
+        NSInteger side = MAX((NSInteger)img.size.width, 1);
+        rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:side pixelsHigh:side bitsPerSample:8
+                                                  samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+                                                      bytesPerRow:0 bitsPerPixel:0];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:rep]];
+        [img drawInRect:NSMakeRect(0, 0, side, side) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
+              fraction:1 respectFlipped:NO hints:nil];
+        [NSGraphicsContext restoreGraphicsState];
+    }
+    if (![rep isKindOfClass:NSBitmapImageRep.class]) return;
+    CGFloat side = MIN(rep.pixelsWide, rep.pixelsHigh);
+    if (side > 600) {
+        CGFloat scale = 600.0 / side;
+        NSBitmapImageRep *scaled = [[NSBitmapImageRep alloc]
+            initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(rep.pixelsWide * scale)
+                          pixelsHigh:(NSInteger)(rep.pixelsHigh * scale) bitsPerSample:8 samplesPerPixel:4
+                             hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:scaled]];
+        [img drawInRect:NSMakeRect(0, 0, scaled.pixelsWide, scaled.pixelsHigh) fromRect:NSZeroRect
+              operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:NO hints:nil];
+        [NSGraphicsContext restoreGraphicsState];
+        rep = scaled;
+    }
+    NSData *jpeg = [rep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{NSImageCompressionFactor: @0.9}];
+    if (![jpeg writeToFile:jpgPath atomically:YES]) return;
+    if (provisional) [@"" writeToFile:TrackCoverProvisionalMarkerPath(jpgPath) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSImage *stored = [[NSImage alloc] initWithContentsOfFile:jpgPath] ?: img;
+    void (^publish)(void) = ^{
+        self->_mixArt[cacheKey] = stored;
+        [self scheduleCoverPopoverRebuild];
+    };
+    if ([NSThread isMainThread]) publish();
+    else dispatch_async(dispatch_get_main_queue(), publish);
+}
+static NSImage *GBImageFromArtData(NSData *data, BOOL centerCrop) {
+    if (!data.length) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!src) return nil;
+    CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cg) return nil;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+  NSImage *img = nil;
+    if (centerCrop && !AlbumArtLooksSquare(CGSizeMake(w, h))) {
+        NSRect crop = AlbumArtCenterCropRect(CGSizeMake(w, h));
+        CGImageRef cut = CGImageCreateWithImageInRect(cg, CGRectMake(crop.origin.x, crop.origin.y, crop.size.width, crop.size.height));
+        if (cut) { img = [[NSImage alloc] initWithCGImage:cut size:NSMakeSize(crop.size.width, crop.size.height)]; CGImageRelease(cut); }
+    } else img = [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(w, h)];
+    CGImageRelease(cg);
+    return img;
+}
+- (NSDictionary *)trackCoverEmbeddedAtPath:(NSString *)path {
+    if (!path.length) return nil;
+    ++_coverEmbeddedReads;
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    NSData *(^pick)(NSArray<AVMetadataItem *> *) = ^NSData *(NSArray<AVMetadataItem *> *items) {
+        for (AVMetadataItem *item in items) {
+            BOOL art = item.commonKey == AVMetadataCommonKeyArtwork;
+            NSString *ident = [item.identifier isKindOfClass:NSString.class] ? item.identifier : @"";
+            if (!art && ![ident containsString:@"covr"]) continue;
+            if ([item.dataValue isKindOfClass:NSData.class] && [(NSData *)item.dataValue length]) return item.dataValue;
+        }
+        return nil;
+    };
+    NSData *data = pick(asset.commonMetadata);
+    if (!data) {
+        for (NSString *fmt in asset.availableMetadataFormats) if ((data = pick([asset metadataForFormat:fmt]))) break;
+    }
+    if (!data.length) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    CGSize dim = CGSizeZero;
+    if (src) {
+        NSDictionary *props = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(src, 0, NULL);
+        NSNumber *pw = props[(__bridge NSString *)kCGImagePropertyPixelWidth];
+        NSNumber *ph = props[(__bridge NSString *)kCGImagePropertyPixelHeight];
+        if (pw && ph) dim = CGSizeMake(pw.doubleValue, ph.doubleValue);
+        CFRelease(src);
+    }
+    return @{@"data": data, @"size": [NSValue valueWithSize:dim]};
+}
+- (NSImage *)trackCoverCachedImageForKey:(NSString *)cacheKey {
+    if (!cacheKey.length) return nil;
+    NSImage *mem = _mixArt[cacheKey];
+    if (mem) return mem;
+    NSString *jpg = TrackCoverCacheJPEGPath(MixDirectory(@"art"), cacheKey);
+    if ([NSFileManager.defaultManager fileExistsAtPath:jpg]) {
+        mem = [[NSImage alloc] initWithContentsOfFile:jpg];
+        if (mem) _mixArt[cacheKey] = mem;
+    }
+    return mem;
+}
+- (BOOL)trackCoverHasCachedImageForTrackID:(NSString *)trackID path:(NSString *)path {
+    NSString *key = [self trackCoverCacheKeyForTrackID:trackID path:path];
+    return key.length && ([self trackCoverCachedImageForKey:key] != nil ||
+                          [NSFileManager.defaultManager fileExistsAtPath:TrackCoverCacheJPEGPath(MixDirectory(@"art"), key)]);
+}
+- (NSImage *)trackCoverResolveLocalStepsForTrackID:(NSString *)trackID artist:(NSString *)artist title:(NSString *)title
+                                             album:(NSString *)album path:(NSString *)path provisional:(BOOL *)provisional {
+    NSString *cacheKey = [self trackCoverCacheKeyForTrackID:trackID path:path];
+    if (!cacheKey.length) return nil;
+    NSString *jpgPath = TrackCoverCacheJPEGPath(MixDirectory(@"art"), cacheKey);
+    if ([NSFileManager.defaultManager fileExistsAtPath:jpgPath]) {
+        NSImage *cached = [self trackCoverCachedImageForKey:cacheKey];
+        if (provisional) *provisional = [self trackCoverIsProvisionalFile:jpgPath];
+        return cached;
+    }
+    if (path.length) {
+        NSDictionary *emb = [self trackCoverEmbeddedAtPath:path];
+        if (emb) {
+            CGSize dim = [emb[@"size"] isKindOfClass:NSValue.class] ? [(NSValue *)emb[@"size"] sizeValue] : CGSizeZero;
+            NSData *data = emb[@"data"];
+            if (AlbumArtLooksSquare(dim)) {
+                NSImage *img = GBImageFromArtData(data, NO);
+                if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:NO]; return img; }
+            }
+        }
+        NSString *folder = AlbumFolderCoverBesidePath(path);
+        if (folder) {
+            NSData *fileData = [NSData dataWithContentsOfFile:folder];
+            NSImage *img = GBImageFromArtData(fileData, NO);
+            if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:NO]; return img; }
+        }
+    }
+    return nil;
+}
+- (NSImage *)trackCoverFallbackArtistAlbum:(NSString *)artist album:(NSString *)album excluding:(NSString *)cacheKey {
+    NSString *wantArtist = artist.lowercaseString ?: @"";
+    NSString *wantAlbum = album.lowercaseString ?: @"";
+    NSString *artDir = MixDirectory(@"art");
+    for (NSDictionary *t in _mixLibrary) {
+        if (![t[@"id"] isKindOfClass:NSString.class]) continue;
+        NSString *tid = t[@"id"];
+        NSString *key = [self trackCoverCacheKeyForTrackID:tid path:nil];
+        if ([key isEqual:cacheKey]) continue;
+        if (wantAlbum.length) {
+            if (![[t[@"album"] lowercaseString] isEqual:wantAlbum] || ![[t[@"artist"] lowercaseString] isEqual:wantArtist]) continue;
+        } else if (![[t[@"artist"] lowercaseString] isEqual:wantArtist]) continue;
+        NSImage *img = [self trackCoverCachedImageForKey:key];
+        if (!img) continue;
+        if ([self trackCoverIsProvisionalFile:TrackCoverCacheJPEGPath(artDir, key)]) continue;
+        return img;
+    }
+    return nil;
+}
+- (void)trackCoverResolveFullForTrackID:(NSString *)trackID artist:(NSString *)artist title:(NSString *)title
+                                  album:(NSString *)album path:(NSString *)path {
+    NSString *cacheKey = [self trackCoverCacheKeyForTrackID:trackID path:path];
+    if (!cacheKey.length || [_coverResolving containsObject:cacheKey]) return;
+    if ([self trackCoverCachedImageForKey:cacheKey] && ![self trackCoverIsProvisionalFile:TrackCoverCacheJPEGPath(MixDirectory(@"art"), cacheKey)]) return;
+    [_coverResolving addObject:cacheKey];
+    BOOL online = _networkKnown ? _networkOnline : YES;
+    BOOL metered = [self meteredLinkActive];
+    NSString *missKey = [NSString stringWithFormat:@"cover:%@", cacheKey];
+    __weak Controller *weak = self;
+    dispatch_async([self coverQueue], ^{
+        Controller *self = weak;
+        if (!self) return;
+        BOOL provisional = NO;
+        __block NSImage *img = [self trackCoverResolveLocalStepsForTrackID:trackID artist:artist title:title album:album path:path
+                                                                provisional:&provisional];
+        if (img && !provisional) { [self->_coverResolving removeObject:cacheKey]; return; }
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (path.length && !img) {
+            NSDictionary *emb = [self trackCoverEmbeddedAtPath:path];
+            if (emb && !AlbumArtLooksSquare([emb[@"size"] isKindOfClass:NSValue.class] ? [(NSValue *)emb[@"size"] sizeValue] : CGSizeZero)) {
+                img = GBImageFromArtData(emb[@"data"], YES);
+                if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; [self->_coverResolving removeObject:cacheKey]; return; }
+            }
+            NSString *yt = YouTubeVideoIDFromFilename(path.lastPathComponent);
+            if (yt.length && !emb) {
+                if (MusicCoverNetworkAllowsThumb(&self->_coverNetwork, now, online, metered, missKey)) {
+                    NSData *thumb = self->_coverTestThumbData;
+                    if (!thumb && !self->_mixFrozen) {
+                        MusicCoverNetworkNoteThumb(&self->_coverNetwork, now);
+                        NSString *ytURL = [NSString stringWithFormat:@"https://i.ytimg.com/vi/%@/hqdefault.jpg", yt];
+                        dispatch_semaphore_t semY = dispatch_semaphore_create(0);
+                        __block NSData *ytJpg = nil;
+                        [[NSURLSession.sharedSession dataTaskWithURL:[NSURL URLWithString:ytURL]
+                            completionHandler:^(NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+                            ytJpg = d; dispatch_semaphore_signal(semY);
+                        }] resume];
+                        if (dispatch_semaphore_wait(semY, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0 && ytJpg.length > 1000)
+                            thumb = ytJpg;
+                    }
+                    if (thumb.length) {
+                        if (self->_coverTestThumbData) MusicCoverNetworkNoteThumb(&self->_coverNetwork, now);
+                        img = GBImageFromArtData(thumb, YES);
+                        if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; [self->_coverResolving removeObject:cacheKey]; return; }
+                    }
+                }
+            }
+        }
+        if (!img && artist.length && title.length &&
+            MusicCoverNetworkAllowsCatalogue(&self->_coverNetwork, now, online, metered, missKey)) {
+            if (self->_coverTestCatalogueJSON) {
+                MusicCoverNetworkNoteCatalogue(&self->_coverNetwork, now);
+                if (MixArtURLFromSearch(self->_coverTestCatalogueJSON, artist, 600).length && self->_coverTestThumbData.length)
+                    img = GBImageFromArtData(self->_coverTestThumbData, NO);
+                if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; [self->_coverResolving removeObject:cacheKey]; return; }
+            } else if (!self->_mixFrozen) {
+                MusicCoverNetworkNoteCatalogue(&self->_coverNetwork, now);
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                __block NSData *reply = nil;
+                [[NSURLSession.sharedSession dataTaskWithURL:MixArtSearchURL(artist, title)
+                    completionHandler:^(NSData *data, __unused NSURLResponse *r, __unused NSError *e) { reply = data; dispatch_semaphore_signal(sem); }] resume];
+                if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0 && reply.length) {
+                    NSString *artURL = MixArtURLFromSearch(reply, artist, 600);
+                    if (artURL.length && MusicCoverNetworkAllowsThumb(&self->_coverNetwork, CFAbsoluteTimeGetCurrent(), online, metered, missKey)) {
+                        MusicCoverNetworkNoteThumb(&self->_coverNetwork, CFAbsoluteTimeGetCurrent());
+                        dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
+                        __block NSData *jpg = nil;
+                        [[NSURLSession.sharedSession dataTaskWithURL:[NSURL URLWithString:artURL]
+                            completionHandler:^(NSData *d, __unused NSURLResponse *r2, __unused NSError *e2) { jpg = d; dispatch_semaphore_signal(sem2); }] resume];
+                        if (dispatch_semaphore_wait(sem2, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) == 0 && jpg.length)
+                            img = GBImageFromArtData(jpg, NO);
+                    }
+                }
+                if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; [self->_coverResolving removeObject:cacheKey]; return; }
+            }
+        }
+        if (!img && trackID.length && AppleMusicIsRunning()) {
+            NSString *jpgPath = TrackCoverCacheJPEGPath(MixDirectory(@"art"), cacheKey);
+            NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
+                "set t to (first track of library playlist 1 whose persistent ID is %@)\n"
+                "set a to raw data of artwork 1 of t\nend tell\n"
+                "set fh to open for access (POSIX file %@) with write permission\nset eof fh to 0\nwrite a to fh\nclose access fh\nreturn \"ok\"",
+                AppleScriptQuoted(trackID), AppleScriptQuoted(jpgPath)];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            RunAppleScriptTimed(script, 20, ^(__unused NSString *output, __unused NSString *errorText, int status) {
+                if (status == 0) img = [[NSImage alloc] initWithContentsOfFile:jpgPath];
+                else [NSFileManager.defaultManager removeItemAtPath:jpgPath error:nil];
+                dispatch_semaphore_signal(sem);
+            });
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC));
+            if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; [self->_coverResolving removeObject:cacheKey]; return; }
+        }
+        if (!img) img = [self trackCoverFallbackArtistAlbum:artist album:album excluding:cacheKey];
+        if (!img && album.length) img = [self trackCoverFallbackArtistAlbum:artist album:@"" excluding:cacheKey];
+        if (img) [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES];
+        else MusicCoverNetworkNoteMiss(&self->_coverNetwork, missKey, CFAbsoluteTimeGetCurrent());
+        [self->_coverResolving removeObject:cacheKey];
+    });
+}
+- (NSImage *)trackCoverResolveOfflineStepsForTrackID:(NSString *)trackID artist:(NSString *)artist title:(NSString *)title
+                                                album:(NSString *)album path:(NSString *)path cacheKey:(NSString *)cacheKey {
+    NSImage *img = nil;
+    if (path.length) {
+        NSDictionary *emb = [self trackCoverEmbeddedAtPath:path];
+        if (emb && !AlbumArtLooksSquare([emb[@"size"] isKindOfClass:NSValue.class] ? [(NSValue *)emb[@"size"] sizeValue] : CGSizeZero)) {
+            img = GBImageFromArtData(emb[@"data"], YES);
+            if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; return img; }
+        }
+        NSString *yt = YouTubeVideoIDFromFilename(path.lastPathComponent);
+        if (yt.length && _coverTestThumbData.length) {
+            img = GBImageFromArtData(_coverTestThumbData, YES);
+            if (img) { [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES]; return img; }
+        }
+    }
+    if (!img) img = [self trackCoverFallbackArtistAlbum:artist album:album excluding:cacheKey];
+    if (!img && album.length) img = [self trackCoverFallbackArtistAlbum:artist album:@"" excluding:cacheKey];
+    if (img) [self trackCoverStoreImage:img cacheKey:cacheKey provisional:YES];
+    return img;
+}
+- (NSImage *)trackCoverImageForTrackID:(NSString *)trackID artist:(NSString *)artist title:(NSString *)title
+                                 album:(NSString *)album path:(NSString *)path {
+    NSString *cacheKey = [self trackCoverCacheKeyForTrackID:trackID path:path];
+    NSString *jpgPath = TrackCoverCacheJPEGPath(MixDirectory(@"art"), cacheKey);
+    if (cacheKey.length && [NSFileManager.defaultManager fileExistsAtPath:jpgPath]) {
+        NSImage *hit = [self trackCoverCachedImageForKey:cacheKey];
+        if (hit) return hit;
+    }
+    BOOL provisional = NO;
+    NSImage *img = [self trackCoverResolveLocalStepsForTrackID:trackID artist:artist title:title album:album path:path
+                                                    provisional:&provisional];
+    if (img && !provisional) return img;
+    BOOL skipNet = _mixFrozen || [self meteredLinkActive] || (_networkKnown && !_networkOnline);
+    if (!img && skipNet) {
+        img = [self trackCoverResolveOfflineStepsForTrackID:trackID artist:artist title:title album:album path:path cacheKey:cacheKey];
+        return img;
+    }
+    if (img && !provisional) return img;
+    if (!skipNet && (!img || provisional)) [self trackCoverResolveFullForTrackID:trackID artist:artist title:title album:album path:path];
+    return img ?: [self trackCoverCachedImageForKey:cacheKey];
+}
+- (NSUInteger)trackCoverEmbeddedReadCount { return _coverEmbeddedReads; }
+- (void)setCoverTestCatalogueJSON:(NSData *)data { _coverTestCatalogueJSON = data; }
+- (void)setCoverTestThumbData:(NSData *)data { _coverTestThumbData = data; }
+- (NSDictionary *)trackCoverRequestForSeed:(NSDictionary *)seed {
+    NSString *tid = seed[@"trackID"];
+    NSString *path = nil;
+    NSDictionary *rec = tid.length ? [self manifestRecordForTrackID:tid] : nil;
+    if ([rec[@"path"] isKindOfClass:NSString.class]) path = rec[@"path"];
+    return @{@"trackID": tid ?: @"", @"artist": seed[@"artist"] ?: @"", @"title": seed[@"title"] ?: @"",
+             @"album": seed[@"album"] ?: @"", @"path": path ?: @""};
+}
 - (void)loadMixArt:(NSDictionary *)seed {
-    NSString *trackID = seed[@"trackID"];
-    if (!trackID.length || _mixArt[trackID]) return;
-    NSString *path = [MixDirectory(@"art") stringByAppendingPathComponent:[trackID stringByAppendingPathExtension:@"jpg"]];
-    NSImage *cached = [NSFileManager.defaultManager fileExistsAtPath:path] ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
-    if (cached) { _mixArt[trackID] = cached; return; }
-    BOOL musicOpen = AppleMusicIsRunning();   // asking a closed Music for artwork would launch it
-    void (^show)(void) = ^{
-        NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
-        if (!img) return;
-        self->_mixArt[trackID] = img;
-        if (self->_popover.isShown) [self rebuildContent];
-    };
-    // Streamed tracks have no artwork data on this Mac, so fall back to Apple's catalogue cover.
-    void (^fromCatalogue)(void) = ^{
-        NSURLSession *session = NSURLSession.sharedSession;
-        [[session dataTaskWithURL:MixArtSearchURL(seed[@"artist"], seed[@"title"])
-                completionHandler:^(NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
-            NSString *art = MixArtURLFromSearch(data, seed[@"artist"], 600);   // sharp at the hover size
-            if (!art) return;
-            [[session dataTaskWithURL:[NSURL URLWithString:art] completionHandler:^(NSData *jpg, __unused NSURLResponse *r, __unused NSError *e) {
-                if (jpg.length < 1000 || ![jpg writeToFile:path atomically:YES]) return;
-                dispatch_async(dispatch_get_main_queue(), show);
-            }] resume];
-        }] resume];
-    };
-    NSString *script = [NSString stringWithFormat:@"tell application \"Music\"\n"
-        "set t to (first track of library playlist 1 whose persistent ID is %@)\n"
-        "set a to raw data of artwork 1 of t\n"
-        "end tell\n"
-        "set fh to open for access (POSIX file %@) with write permission\n"
-        "set eof fh to 0\nwrite a to fh\nclose access fh\nreturn \"ok\"", AppleScriptQuoted(trackID), AppleScriptQuoted(path)];
-    if (!musicOpen) { fromCatalogue(); return; }
-    RunAppleScriptTimed(script, 20, ^(__unused NSString *output, __unused NSString *errorText, int status) {
-        if (status == 0 && [[NSImage alloc] initWithContentsOfFile:path]) show();
-        else { [NSFileManager.defaultManager removeItemAtPath:path error:nil]; fromCatalogue(); }
+    NSDictionary *req = [self trackCoverRequestForSeed:seed];
+    [self trackCoverImageForTrackID:req[@"trackID"] artist:req[@"artist"] title:req[@"title"] album:req[@"album"] path:req[@"path"]];
+}
+- (void)scheduleCoverCacheWarm {
+    if (_coverWarmBusy || _mixFrozen || !_offlineManifest) return;
+    _coverWarmBusy = YES;
+    NSArray *library = _mixLibrary ?: @[];
+    NSSet *onDisk = [self onDiskLibraryTrackIDs];
+    __weak Controller *weak = self;
+    dispatch_async([self coverQueue], ^{
+        Controller *self = weak;
+        if (!self) return;
+        for (NSDictionary *t in library) {
+            if (self->_localMode && self->_playbackPlaying) break;
+            if (![onDisk containsObject:t[@"id"]]) continue;
+            NSString *tid = t[@"id"];
+            NSDictionary *rec = [self manifestRecordForTrackID:tid];
+            NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : @"";
+            NSString *key = [self trackCoverCacheKeyForTrackID:tid path:path];
+            NSString *jpg = TrackCoverCacheJPEGPath(MixDirectory(@"art"), key);
+            if ([NSFileManager.defaultManager fileExistsAtPath:jpg] && ![self trackCoverIsProvisionalFile:jpg]) continue;
+            BOOL prov = NO;
+            (void)[self trackCoverResolveLocalStepsForTrackID:tid artist:t[@"artist"] title:t[@"title"] album:t[@"album"] path:path
+                                                   provisional:&prov];
+            if (prov || ![NSFileManager.defaultManager fileExistsAtPath:jpg])
+                [self trackCoverResolveFullForTrackID:tid artist:t[@"artist"] title:t[@"title"] album:t[@"album"] path:path];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_coverWarmBusy = NO;
+        });
     });
 }
 // Requests are durable, fixed playlist snapshots. Play uses verified on-disk files in order;
@@ -6937,7 +7273,16 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     for (NSDictionary *def in GBKindTileOrder()) {
         NSString *kind = def[@"kind"];
         NSUInteger count = MusicKindOnMacCount(library, onDisk, kind);
-        NSArray *ids = count ? MusicKindMosaicTrackIDs(library, onDisk, kind) : @[];
+        NSArray *ids = count ? MusicKindMosaicTrackIDsWithCovers(library, onDisk, kind, ^BOOL(NSString *trackID, NSDictionary *track) {
+            NSDictionary *rec = [self manifestRecordForTrackID:trackID];
+            NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : @"";
+            if ([self trackCoverHasCachedImageForTrackID:trackID path:path]) return YES;
+            if (AlbumFolderCoverBesidePath(path)) return YES;
+            if (!path.length) return NO;
+            BOOL prov = NO;
+            return [self trackCoverResolveLocalStepsForTrackID:trackID artist:track[@"artist"] title:track[@"title"]
+                                                         album:track[@"album"] path:path provisional:&prov] != nil;
+        }) : @[];
         out[kind] = @{@"count": @(count), @"ids": ids};
     }
     return out;
@@ -6980,18 +7325,16 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     NSMutableArray *covers = [NSMutableArray array];
     for (NSString *tid in ids) {
         if (covers.count >= 4) break;
-        if (_mixArt[tid]) { [covers addObject:_mixArt[tid]]; continue; }
         NSDictionary *rec = [self manifestRecordForTrackID:tid];
-        NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : nil;
-        if (!path.length) continue;
-        if (_stationCoverCache[path]) { [covers addObject:_stationCoverCache[path]]; continue; }
-        NSImage *img = [self embeddedArtworkForPath:path];
-        if (img) {
-            _stationCoverCache[path] = img;
-            _mixArt[tid] = img;
-            [covers addObject:img];
-        }
+        NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : @"";
+        NSDictionary *track = nil;
+        for (NSDictionary *t in _mixLibrary) if ([t[@"id"] isEqual:tid]) { track = t; break; }
+        NSImage *img = [self trackCoverImageForTrackID:tid artist:track[@"artist"] title:track[@"title"]
+                                                 album:track[@"album"] path:path];
+        if (img) [covers addObject:img];
+        else if (covers.count) [covers addObject:covers[covers.count - 1]];
     }
+    while (covers.count < 4 && covers.count) [covers addObject:covers.lastObject];
     return covers;
 }
 
@@ -7285,6 +7628,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             self->_offlineCacheBusy = NO;
             if (manifest) {
                 self->_offlineManifest = manifest;
+                [self scheduleCoverCacheWarm];
                 [self invalidateOfflineCoverageCache];
                 [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
                 [self retryUnpreparedMixSeeds];
@@ -7939,32 +8283,12 @@ static NSString *const kShowMixKey = @"show:episode";
     return [_mixPlayingKey isEqual:kShowMixKey];
 }
 - (NSImage *)embeddedArtworkForPath:(NSString *)path {
-    if (!path.length) return nil;
-    if (_showCoverCache[path]) return _showCoverCache[path];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    NSImage *(^scan)(NSArray<AVMetadataItem *> *) = ^NSImage *(NSArray<AVMetadataItem *> *items) {
-        if (!items.count) return nil;
-        for (AVMetadataItem *item in items) {
-            BOOL art = item.commonKey == AVMetadataCommonKeyArtwork;
-            NSString *ident = [item.identifier isKindOfClass:NSString.class] ? item.identifier : @"";
-            if (!art && ![ident containsString:@"covr"]) continue;
-            NSData *d = [item.dataValue isKindOfClass:NSData.class] ? item.dataValue : nil;
-            NSImage *img = d.length ? [[NSImage alloc] initWithData:d] : nil;
-            if (img) return img;
-        }
-        return nil;
-    };
-    NSImage *found = scan(asset.commonMetadata);
-    if (!found) {
-        for (NSString *fmt in asset.availableMetadataFormats)
-            if ((found = scan([asset metadataForFormat:fmt]))) break;
-    }
-    if (found) { _showCoverCache[path] = found; return found; }
-    return nil;
+    return [self trackCoverImageForTrackID:@"" artist:@"" title:@"" album:@"" path:path];
 }
 - (NSImage *)showCoverForEpisode:(NSDictionary *)episode episodes:(NSArray *)all {
     NSString *path = episode[@"path"];
-    NSImage *cover = path.length ? [self embeddedArtworkForPath:path] : nil;
+    NSImage *cover = path.length ? [self trackCoverImageForTrackID:@"" artist:episode[@"presenter"] ?: @""
+                                                                title:episode[@"show"] ?: @"" album:@"" path:path] : nil;
     if (cover) return cover;
     NSString *show = episode[@"show"];
     NSDate *best = nil;
@@ -7972,7 +8296,7 @@ static NSString *const kShowMixKey = @"show:episode";
     for (NSDictionary *ep in all) {
         if (![ep[@"show"] isEqual:show]) continue;
         NSString *p = ep[@"path"];
-        NSImage *img = p.length ? [self embeddedArtworkForPath:p] : nil;
+        NSImage *img = p.length ? [self trackCoverImageForTrackID:@"" artist:ep[@"presenter"] title:ep[@"show"] album:@"" path:p] : nil;
         if (!img) continue;
         NSDate *when = ep[@"sortDate"] ?: ep[@"broadcast"];
         if (!fallback || (when && best && [when compare:best] == NSOrderedDescending)) {
@@ -7983,17 +8307,9 @@ static NSString *const kShowMixKey = @"show:episode";
     return GBShowInitialsImage(show, NSMakeSize(54, 54));
 }
 - (NSImage *)seedCoverForSeed:(NSDictionary *)seed {
-    NSString *tid = seed[@"trackID"];
-    NSImage *cover = tid.length ? _mixArt[tid] : nil;
-    if (cover) return cover;
-    NSString *artist = [seed[@"artist"] isKindOfClass:NSString.class] ? seed[@"artist"] : @"";
-    if (!artist.length) return nil;
-    for (NSDictionary *track in _mixLibrary) {
-        if (![track[@"artist"] isEqual:artist]) continue;
-        NSImage *img = _mixArt[track[@"id"]];
-        if (img) return img;
-    }
-    return nil;
+    NSDictionary *req = [self trackCoverRequestForSeed:seed];
+    return [self trackCoverImageForTrackID:req[@"trackID"] artist:req[@"artist"] title:req[@"title"]
+                                     album:req[@"album"] path:req[@"path"]];
 }
 - (NSArray<NSDictionary *> *)scanShowEpisodesAtPath:(NSString *)root {
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -8164,10 +8480,13 @@ static NSString *const kShowMixKey = @"show:episode";
         } else if ([t[@"path"] isKindOfClass:NSString.class] && [(NSString *)t[@"path"] length])
             path = t[@"path"];
         if (!path.length) continue;
-        if (_stationCoverCache[path]) { [covers addObject:_stationCoverCache[path]]; continue; }
-        NSImage *img = [self embeddedArtworkForPath:path];
-        if (img) { _stationCoverCache[path] = img; [covers addObject:img]; }
+        NSString *tid = [t[@"id"] isKindOfClass:NSString.class] ? t[@"id"] : @"";
+        NSImage *img = [self trackCoverImageForTrackID:tid artist:t[@"artist"] title:t[@"title"]
+                                                 album:t[@"album"] path:path];
+        if (img) [covers addObject:img];
+        else if (covers.count) [covers addObject:covers.lastObject];
     }
+    while (covers.count < 4 && covers.count) [covers addObject:covers.lastObject];
     return covers;
 }
 
