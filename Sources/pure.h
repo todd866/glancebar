@@ -42,6 +42,12 @@ double PowerFlowIntensity(BatteryState b);
 // Plugged in with a measured input, and the battery is still carrying part of the load
 // (a weak port, or a charger delivering nothing). The popover then names the charger.
 BOOL ChargerFallsShort(BatteryState b);
+// The Charger row's state, with hysteresis. It turns on at once when the battery is clearly
+// carrying load behind the charger (a net drain of 2 W or more), and off at once when the battery
+// charges (0.5 W or more), otherwise only after the net drain has stayed under 1 W for 30 s. At a charge limit the battery idles a few tenths of a
+// watt either side of zero; a single threshold at 0.5 W made the row (and the rows under it)
+// jump in and out every few seconds (15 Nov 2026). `calmSince` is kept by the caller (0 = not calm).
+BOOL ChargerShortLatched(BOOL latched, BatteryState b, double now, double *calmSince);
 
 // Battery power in watts, signed: + charging, − discharging. NAN when not measurable.
 double BatteryWatts(BatteryState b);
@@ -876,6 +882,12 @@ NSArray<NSDictionary *> *ParseMixLibraryColumns(NSString *text);
 BOOL ProcessIsStopped(pid_t pid);
 // YES while a read that failed `failedAt` (0 for none) is younger than `retrySec`.
 BOOL MixLibraryReadShouldWait(CFAbsoluteTime now, CFAbsoluteTime failedAt, double retrySec);
+// A library built from the files on this Mac when Music cannot be read: one row per manifest
+// record (id, title, artist, album from the record or its tags), genre from `genreByPath`, no
+// plays or favourites. Records without an id are dropped; an id appears once.
+NSArray<NSDictionary *> *MixLibraryFromManifest(NSDictionary *manifest, NSDictionary<NSString *, NSString *> *genreByPath);
+// Every distinct file path in the manifest's records.
+NSArray<NSString *> *OfflineManifestPaths(NSDictionary *manifest);
 // The music library as last read from Music, kept on disk so the kind tiles and play-by-kind
 // work while Music is closed and straight after a relaunch. Only the fields the app reads are
 // kept; a row without an id is dropped. `now` and `savedAt` are seconds since 1970. Reading

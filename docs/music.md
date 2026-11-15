@@ -220,6 +220,10 @@ hours is replaced the next time Music is open. Marks that come from this Mac (a 
 heart once given) are not in the copy; they are put on the library each time it is loaded, so a
 dislike given here survives a relaunch and the next read from Music.
 
+With no read from Music and no copy (Music closed or stopped since the app was installed), the library
+is built from the files on this Mac: the offline manifest's records, with each file's genre from
+Spotlight's metadata. It has no play counts, is never saved, and is replaced by the first read from Music.
+
 Harness ids: `popover.music.kind.{dance|alt|rap|chill}`, `.caption`, `.songs`, `.typemark`; station
 unchanged (`popover.mix.station`, captions `popover.mix.caption.4` / `popover.mix.artist.4`). With a show
 offered the row uses six 50pt tiles; otherwise five at 54pt. `tools/check-popover.m` exercises layout and

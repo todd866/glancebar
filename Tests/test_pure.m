@@ -2534,6 +2534,40 @@ int main(void) {
                   MixLibraryFromCacheData([@"{\"schemaVersion\":2,\"savedAt\":1,\"tracks\":[{\"id\":\"A\"}]}" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil &&
                   MixLibraryFromCacheData([@"{\"schemaVersion\":1,\"savedAt\":1,\"tracks\":[]}" dataUsingEncoding:NSUTF8StringEncoding], 1, NULL) == nil,
                   @"library cache: a missing, broken, other-version or empty file reads as nothing");
+            {
+                NSDictionary *fm = @{@"schemaVersion": @1, @"playlists": @[
+                    @{@"tracks": @[@{@"id": @"F1", @"path": @"/m/a.m4a", @"title": @"", @"embeddedTags": @{@"title": @"Tagged", @"artist": @"Ann"}},
+                                   @{@"id": @"F2", @"path": @"/m/b.m4a", @"title": @"Bee", @"artist": @"Bo", @"album": @"LP"},
+                                   @{@"id": @"", @"path": @"/m/c.m4a"}, @"junk"]},
+                    @{@"tracks": @[@{@"id": @"F1", @"path": @"/m/a.m4a"}, @{@"id": @"F3", @"path": @"/m/d.m4a"}]}]};
+                NSArray *fl = MixLibraryFromManifest(fm, @{@"/m/a.m4a": @"Electronic", @"/m/b.m4a": @"Hip-Hop/Rap"});
+                check(fl.count == 3 && [fl[0][@"title"] isEqual:@"Tagged"] && [fl[0][@"artist"] isEqual:@"Ann"] &&
+                      [MusicKindForGenre(fl[0][@"genre"]) isEqual:@"dance"] && [MusicKindForGenre(fl[1][@"genre"]) isEqual:@"rap"] &&
+                      [fl[1][@"album"] isEqual:@"LP"] && [fl[2][@"genre"] isEqual:@""] && [fl[2][@"plays"] isEqual:@0],
+                      @"files library: one row per id, tags fill blanks, genre from the file");
+                check([OfflineManifestPaths(fm) isEqual:(@[@"/m/a.m4a", @"/m/b.m4a", @"/m/c.m4a", @"/m/d.m4a"])] &&
+                      MixLibraryFromManifest(nil, nil).count == 0 && OfflineManifestPaths((id)@"x").count == 0,
+                      @"files library: every path once; nothing from a bad manifest");
+                BatteryState cb = {0};
+                cb.valid = YES; cb.acConnected = YES; cb.voltage_mV = 12000; cb.systemPowerIn_mW = 20000;
+                double calm = 0; BOOL on = NO, flicker = NO;
+                // At a charge limit the battery idles around zero: never a Charger row.
+                int idle[] = {-19, 20, -45, -40, 10, -48, -30};
+                for (int i = 0; i < 7; i++) { cb.amperage_mA = idle[i]; on = ChargerShortLatched(on, cb, 100 + i * 5, &calm); flicker |= on; }
+                check(!flicker, @"charger row: a battery idling at its limit never shows it");
+                cb.amperage_mA = -700; on = ChargerShortLatched(on, cb, 200, &calm);
+                check(on, @"charger row: a clear shortfall shows it at once");
+                cb.amperage_mA = -20; BOOL held = YES;
+                for (int t = 205; t < 230; t += 5) held &= ChargerShortLatched(on, cb, t, &calm);
+                check(held && !ChargerShortLatched(YES, cb, 236, &calm), @"charger row: stays 30 s after the drain stops, then goes");
+                calm = 0; cb.amperage_mA = -110;   // 1.3 W: still short, a little
+                check(ChargerShortLatched(YES, cb, 300, &calm) && ChargerShortLatched(YES, cb, 400, &calm) && calm == 0,
+                      @"charger row: a small remaining shortfall keeps it");
+                cb.amperage_mA = 300;
+                check(!ChargerShortLatched(YES, cb, 402, &calm), @"charger row: a charging battery hides it at once");
+                cb.acConnected = NO;
+                check(!ChargerShortLatched(YES, cb, 401, &calm), @"charger row: unplugged hides it at once");
+            }
             NSDictionary *idManifest = @{@"schemaVersion": @1, @"playlists": @[
                 @{@"key": @"a", @"tracks": @[@{@"id": @"LIB1", @"path": @"/m/Artist - Song [ytVideoId01].m4a"},
                                                @{@"id": @"", @"path": @"/m/no-id.m4a"}, @"junk"]},

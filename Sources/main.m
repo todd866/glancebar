@@ -30,6 +30,7 @@
 #import <Security/Security.h>
 #import <sqlite3.h>
 #import <ImageIO/ImageIO.h>
+#import <CoreServices/CoreServices.h>
 #import "pure.h"
 #import "nowplaying.h"
 #import "activity.h"
@@ -5652,6 +5653,7 @@ static NSString *PopoverRequestObject(void) {
 - (void)audioDefaultChanged;
 - (void)ensureMixSeeds;
 - (void)loadMixLibraryCacheIfNeeded;
+- (void)ensureFilesLibraryIfNeeded;
 - (NSString *)mixLibraryCachePath;
 - (void)ensureKindTileSnapshot;
 - (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk
@@ -6111,6 +6113,8 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSInteger _activitySort;
     BOOL _popoverPrepared, _popoverPreparePending;
     BOOL _chargerRowShown;   // the popover has a Charger row (plugged in, still draining)
+    BOOL _chargerShort;      // ChargerShortLatched: the row's state, with hysteresis
+    double _chargerCalmSince;
     NSString *_storageNotice;
     NSDictionary *_storageResult, *_storageUndo, *_storageProgress;
     NSMutableDictionary *_storageBlocked;
@@ -6167,6 +6171,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
     CFAbsoluteTime _mixLibraryAt;
     BOOL _mixLibraryCacheTried;
+    BOOL _filesLibraryBusy, _mixLibraryFromFiles;
     BOOL _appLaunched;   // set by applicationDidFinishLaunching; the test harnesses never run it
     CFAbsoluteTime _mixLibraryFailedAt;
     BOOL _mixLibraryLoading, _mixFrozen, _audioFrozen;   // frozen: tests set seeds / own the volume reading, no live reads
@@ -6766,9 +6771,53 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     [self scheduleCoverCacheWarm];
     GBLog("music: library of %lu tracks from the copy on disk, %.0f h old", (unsigned long)tracks.count, MAX(0, now - savedAt) / 3600.0);
 }
+// When Music cannot be read (closed, stopped, no permission) and there is no copy of an earlier
+// read, the kind tiles were four dimmed letters (15 Nov 2026). The files on this Mac carry their
+// genre (330 of 331 then, in Spotlight's metadata), so the library is built from the manifest
+// and those genres instead. It has no play counts, so it is a stand-in: never saved, and
+// replaced by the first read from Music.
+static NSDictionary<NSString *, NSString *> *GBGenresForPaths(NSArray<NSString *> *paths) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *path in paths) {
+        @autoreleasepool {
+            MDItemRef item = MDItemCreate(kCFAllocatorDefault, (__bridge CFStringRef)path);
+            if (!item) continue;
+            id genre = CFBridgingRelease(MDItemCopyAttribute(item, kMDItemMusicalGenre));
+            CFRelease(item);
+            if ([genre isKindOfClass:NSString.class] && [genre length]) out[path] = genre;
+        }
+    }
+    return out;
+}
+- (void)ensureFilesLibraryIfNeeded {
+    if (_mixFrozen || _musicOff) return;
+    [self loadMixLibraryCacheIfNeeded];   // a copy of a real read beats a stand-in
+    if (_mixLibrary.count || _filesLibraryBusy) return;
+    NSDictionary *manifest = _offlineManifest;
+    NSArray *paths = OfflineManifestPaths(manifest);
+    if (!paths.count) return;
+    _filesLibraryBusy = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *genres = GBGenresForPaths(paths);
+        NSArray *rows = MixLibraryFromManifest(manifest, genres);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_filesLibraryBusy = NO;
+            if (self->_mixLibrary.count || !rows.count) return;
+            self->_mixLibrary = [self markedMixLibrary:rows];
+            self->_mixLibraryFromFiles = YES;
+            self->_mixLibraryAt = 0;   // stale: the next chance to read Music still takes it
+            self->_kindTileAt = 0;
+            [self scheduleCoverCacheWarm];
+            GBLog("music: library of %lu tracks from the files on this Mac (%lu with a genre)",
+                  (unsigned long)rows.count, (unsigned long)genres.count);
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
 - (void)ensureMixSeeds {
     if (_mixFrozen || _musicOff) return;
     [self loadMixLibraryCacheIfNeeded];
+    [self ensureFilesLibraryIfNeeded];
     // Today's tiles stay up when Music is closed, the Mac is offline, or the library read fails.
     // The read used to be the only place saved seeds were applied, so the row vanished (5 Nov 2026).
     if (!_mixSeeds.count) {
@@ -6803,6 +6852,7 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
             self->_mixLibraryFailedAt = 0;
             GBLog("music: library of %lu tracks read from Music in %.0f s", (unsigned long)tracks.count, took);
             self->_mixLibrary = [self markedMixLibrary:tracks];
+            self->_mixLibraryFromFiles = NO;
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             self->_kindTileAt = 0;
             [self scheduleCoverCacheWarm];
@@ -8081,6 +8131,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
             if (manifest) {
                 self->_offlineManifest = manifest;
                 [self scheduleCoverCacheWarm];
+                [self ensureFilesLibraryIfNeeded];
                 [self invalidateOfflineCoverageCache];
                 [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:@"offline-manifest.metadata.json"] error:nil];
                 [self retryUnpreparedMixSeeds];
@@ -8155,6 +8206,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"offline-manifest.json"]];
         id manifest = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
         if ([manifest isKindOfClass:NSDictionary.class]) _offlineManifest = manifest;
+        [self ensureFilesLibraryIfNeeded];
         [self prepareOfflineCache];
     }
     // The existing exporter provides a named playlist snapshot without launching Music,
@@ -12101,8 +12153,9 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     if (!popover && !details) { [self stopPowerTick]; return; }
     BatteryState fresh = ReadBattery();
     if (!fresh.valid) { _bat = fresh; [self batteryForecast]; [self refreshVisibleSurfaces]; return; }
+    BOOL shortNow = [self chargerShortFor:fresh];
     BOOL stateChanged = fresh.acConnected != _bat.acConnected || fresh.isCharging != _bat.isCharging ||
-                        fresh.percent != _bat.percent || ChargerFallsShort(fresh) != _chargerRowShown;
+                        fresh.percent != _bat.percent || shortNow != _chargerRowShown;
     BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
                         fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
     BOOL wasOnAC = _bat.acConnected;
@@ -12175,7 +12228,13 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
 // Burn attribution runs whenever the battery is carrying load: on battery, or behind a
 // charger that falls short of the Mac's draw.
 - (BOOL)burnActive {
-    return _bat.valid && (!_bat.acConnected || ChargerFallsShort(_bat));
+    return _bat.valid && (!_bat.acConnected || [self chargerShortFor:_bat]);
+}
+// The one place the Charger row's state is decided; everything that asks "is the charger
+// falling short" asks this, so the row, the burn list and the forecast agree.
+- (BOOL)chargerShortFor:(BatteryState)b {
+    _chargerShort = ChargerShortLatched(_chargerShort, b, CFAbsoluteTimeGetCurrent(), &_chargerCalmSince);
+    return _chargerShort;
 }
 
 - (void)noteEnergyBaseline:(BOOL)wasOnAC {
@@ -13127,7 +13186,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     // Behind a short charger only the net drain empties the pack; quitting an app that
     // costs more than that turns the drain into a charge.
     BOOL turnsToCharge = NO;
-    if (ChargerFallsShort(_bat)) {
+    if ([self chargerShortFor:_bat]) {
         double net = -BatteryWatts(_bat), fullWh = BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV);
         int minutes = _bat.percent > 20 && fullWh > 0 && net > 0
             ? (int)lround((_bat.percent - 20) / 100.0 * fullWh / net * 60.0) : -1;
@@ -13613,7 +13672,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     batteryRow.frame = NSMakeRect(0, y, kW, kRowH);
     [root addSubview:batteryRow];
     y += kRowH;
-    _chargerRowShown = ChargerFallsShort(_bat);
+    _chargerRowShown = [self chargerShortFor:_bat];
     if (_chargerRowShown) {
         NSView *charger = [self chargerInstrumentRow];
         charger.frame = NSMakeRect(0, y, kW, kRowH);

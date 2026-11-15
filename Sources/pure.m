@@ -3169,6 +3169,20 @@ BOOL ChargerFallsShort(BatteryState b) {
         !isnan(w) && w < -0.5;
 }
 
+BOOL ChargerShortLatched(BOOL latched, BatteryState b, double now, double *calmSince) {
+    double w = BatteryWatts(b);
+    if (!b.valid || !b.acConnected || b.systemPowerIn_mW == LONG_MIN || b.systemPowerIn_mW < 0 || isnan(w)) {
+        if (calmSince) *calmSince = 0;
+        return NO;
+    }
+    if (w <= -2.0) { if (calmSince) *calmSince = 0; return YES; }
+    if (!latched || w >= 0.5) { if (calmSince) *calmSince = 0; return NO; }   // charging: not short, at once
+    if (w < -1.0) { if (calmSince) *calmSince = 0; return YES; }   // still short, a little
+    if (!calmSince) return NO;
+    if (*calmSince <= 0 || now < *calmSince) *calmSince = now;
+    return now - *calmSince < 30.0;
+}
+
 double PowerFlowIntensity(BatteryState b) {
     double w = BatteryWatts(b);
     if (isnan(w)) return 0;
@@ -3752,6 +3766,40 @@ BOOL MixLibraryReadShouldWait(CFAbsoluteTime now, CFAbsoluteTime failedAt, doubl
     if (failedAt <= 0) return NO;
     double since = now - failedAt;
     return since >= 0 && since < retrySec;   // a clock set back does not hold the read off for ever
+}
+
+NSArray<NSString *> *OfflineManifestPaths(NSDictionary *manifest) {
+    if (![manifest isKindOfClass:NSDictionary.class] || ![manifest[@"playlists"] isKindOfClass:NSArray.class]) return @[];
+    NSMutableOrderedSet *paths = [NSMutableOrderedSet orderedSet];
+    for (id pl in manifest[@"playlists"]) {
+        if (![pl isKindOfClass:NSDictionary.class] || ![pl[@"tracks"] isKindOfClass:NSArray.class]) continue;
+        for (id r in pl[@"tracks"])
+            if ([r isKindOfClass:NSDictionary.class] && [r[@"path"] isKindOfClass:NSString.class] && [r[@"path"] length])
+                [paths addObject:r[@"path"]];
+    }
+    return paths.array;
+}
+
+NSArray<NSDictionary *> *MixLibraryFromManifest(NSDictionary *manifest, NSDictionary<NSString *, NSString *> *genreByPath) {
+    if (![manifest isKindOfClass:NSDictionary.class] || ![manifest[@"playlists"] isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *rows = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    NSString *(^str)(id) = ^NSString *(id v) { return [v isKindOfClass:NSString.class] ? v : @""; };
+    for (id pl in manifest[@"playlists"]) {
+        if (![pl isKindOfClass:NSDictionary.class] || ![pl[@"tracks"] isKindOfClass:NSArray.class]) continue;
+        for (id r in pl[@"tracks"]) {
+            if (![r isKindOfClass:NSDictionary.class]) continue;
+            NSString *tid = str(r[@"id"]);
+            if (!tid.length || [seen containsObject:tid]) continue;
+            [seen addObject:tid];
+            NSDictionary *tags = [r[@"embeddedTags"] isKindOfClass:NSDictionary.class] ? r[@"embeddedTags"] : @{};
+            NSString *(^field)(NSString *) = ^NSString *(NSString *k) { return str(r[k]).length ? str(r[k]) : str(tags[k]); };
+            NSString *genre = [genreByPath isKindOfClass:NSDictionary.class] ? str(genreByPath[str(r[@"path"])]) : @"";
+            [rows addObject:@{@"id": tid, @"title": field(@"title"), @"artist": field(@"artist"), @"album": field(@"album"),
+                              @"genre": genre, @"year": @0, @"plays": @0, @"idleDays": @0, @"fav": @NO, @"dislike": @NO}];
+        }
+    }
+    return rows;
 }
 
 static NSDictionary *MixLibraryCacheRow(id row, NSInteger addIdleDays) {
