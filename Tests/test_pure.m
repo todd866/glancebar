@@ -3363,6 +3363,107 @@ int main(void) {
                   @"deck mix: the flash paints accent, and dips off when the button is already accent");
         }
 
+        {   // --- Loudness (Sound Check) ---
+            double kDb = LoudnessKWeightGainDBAt1kHz(48000.0);
+            check(isfinite(kDb) && kDb > 0.5 && kDb < 1.0, @"K-weight ~0.69 dB at 1 kHz / 48 kHz");
+            GBLoudnessMeter m;
+            NSUInteger frames = 48000 * 4;
+            float *buf = calloc(frames * 2, sizeof(float));
+            double amp = pow(10.0, -20.0 / 20.0);
+            for (NSUInteger i = 0; i < frames; i++) {
+                float s = (float)(amp * sin(2.0 * M_PI * 997.0 * (double)i / 48000.0));
+                buf[2 * i] = s;
+                buf[2 * i + 1] = s;
+            }
+            GBLoudnessMeterInit(&m, 48000);
+            GBLoudnessMeterFeed(&m, buf, frames);
+            check(m.lastPushedMeanSquare > 0.0105, @"block mean square reflects K-weighting");
+            double lufs48 = GBLoudnessMeterFinish(&m);
+            GBLoudnessMeterFree(&m);
+            check(isfinite(lufs48) && fabs(lufs48 - (-20.0)) < 0.1, @"loudness 997 Hz -20 dBFS at 48 kHz");
+            GBLoudnessMeterInit(&m, 44100);
+            frames = 44100 * 4;
+            free(buf);
+            buf = calloc(frames * 2, sizeof(float));
+            for (NSUInteger i = 0; i < frames; i++) {
+                float s = (float)(amp * sin(2.0 * M_PI * 997.0 * (double)i / 44100.0));
+                buf[2 * i] = s;
+                buf[2 * i + 1] = s;
+            }
+            GBLoudnessMeterFeed(&m, buf, frames);
+            double lufs44 = GBLoudnessMeterFinish(&m);
+            GBLoudnessMeterFree(&m);
+            check(isfinite(lufs44) && fabs(lufs44 - (-20.0)) < 0.1, @"loudness 997 Hz -20 dBFS at 44.1 kHz");
+            GBLoudnessMeterInit(&m, 48000);
+            GBLoudnessMeterFeed(&m, buf, 0);
+            check(isnan(GBLoudnessMeterFinish(&m)), @"silence returns gated NAN");
+            GBLoudnessMeterFree(&m);
+            NSUInteger half = 48000 * 2;
+            GBLoudnessMeterInit(&m, 48000);
+            for (NSUInteger i = 0; i < half; i++) {
+                float s = (float)(0.1 * sin(2.0 * M_PI * 997.0 * (double)i / 48000.0));
+                buf[2 * i] = s;
+                buf[2 * i + 1] = s;
+            }
+            for (NSUInteger i = half; i < frames; i++) {
+                buf[2 * i] = 1e-7f;
+                buf[2 * i + 1] = 1e-7f;
+            }
+            GBLoudnessMeterFeed(&m, buf, frames);
+            double mix = GBLoudnessMeterFinish(&m);
+            GBLoudnessMeterInit(&m, 48000);
+            GBLoudnessMeterFeed(&m, buf, half);
+            double loudOnly = GBLoudnessMeterFinish(&m);
+            GBLoudnessMeterFree(&m);
+            check(isfinite(mix) && isfinite(loudOnly) && fabs(mix - loudOnly) < 0.5,
+                  @"gating: loud half dominates integrated loudness");
+            check(LoudnessGainDB(-22.2, -6.1) == 10.0, @"gain toward -11 LUFS clamped at +10 dB");
+            check(LoudnessGainDB(NAN, 0) == 0, @"unmeasured gain is 0 dB");
+            check(LoudnessGainDB(-5.0, 0) == -6.0, @"gain clamped at -12 dB");
+            check(LoudnessGainDB(-30.0, 0) == 10.0, @"gain clamped at +10 dB");
+            NSDictionary *cache = LoudnessCacheMergeEntry(nil, @"/a.m4a", -9.0, -1.0, 100, 1);
+            NSData *j = LoudnessCacheToJSON(cache);
+            NSDictionary *back = LoudnessCacheFromJSON(j);
+            NSDictionary *hit = LoudnessCacheLookup(back, @"/a.m4a", 100, 1);
+            check(hit && [hit[@"lufs"] doubleValue] == -9.0, @"loudness cache round trip");
+            check(!LoudnessCacheLookup(back, @"/a.m4a", 99, 1), @"cache entry invalid when size changes");
+            GBLoudnessLimiter lim;
+            GBLoudnessLimiterInit(&lim, 48000, -1.0, 150.0);
+            float tone[8];
+            float pk = powf(10.f, -6.f / 20.f);
+            for (int i = 0; i < 4; i++) { tone[2*i] = pk; tone[2*i+1] = pk; }
+            float cur = 1.f;
+            GBLoudnessProcess(tone, tone + 1, 2, 4, &cur, LoudnessGainLinear(10.0), 0, 48000, &lim);
+            float maxOut = 0;
+            for (int i = 0; i < 4; i++) {
+                maxOut = fmaxf(maxOut, fmaxf(fabsf(tone[2*i]), fabsf(tone[2*i+1])));
+            }
+            check(maxOut <= powf(10.f, -1.f/20.f) + 1e-5f, @"+10 dB limited to -1 dBFS");
+            float quiet[4] = {-0.001f, 0.001f, -0.0005f, 0.0005f};
+            float qcopy[4];
+            memcpy(qcopy, quiet, sizeof(quiet));
+            GBLoudnessLimiterInit(&lim, 48000, -1.0, 150.0);
+            cur = 1.f;
+            GBLoudnessProcess(qcopy, qcopy + 1, 2, 2, &cur, 1.0, 0, 48000, &lim);
+            check(fabsf(qcopy[0] - quiet[0]) < 1e-6f && fabsf(qcopy[1] - quiet[1]) < 1e-6f,
+                  @"0 dB gain quiet passthrough");
+            // The gain is applied once: +10 dB on a quiet signal is x3.162, not x10 or x31.6.
+            float sepL[3] = {0.01f, 0.01f, 0.01f}, sepR[3] = {-0.01f, -0.01f, -0.01f};
+            GBLoudnessLimiterInit(&lim, 48000, -1.0, 150.0);
+            cur = LoudnessGainLinear(10.0);
+            GBLoudnessProcess(sepL, sepR, 1, 3, &cur, LoudnessGainLinear(10.0), 2.0, 48000, &lim);
+            check(fabsf(sepL[2] - 0.031623f) < 1e-4f && fabsf(sepR[2] + 0.031623f) < 1e-4f,
+                  @"+10 dB applied exactly once (separate buffers)");
+            // A late measurement ramps from unity toward the new gain, never past it.
+            float rampL[4800], rampR[4800];
+            for (int i = 0; i < 4800; i++) { rampL[i] = 0.01f; rampR[i] = 0.01f; }
+            cur = 1.f;
+            GBLoudnessProcess(rampL, rampR, 1, 4800, &cur, LoudnessGainLinear(10.0), 2.0, 48000, &lim);
+            check(cur > 1.f && cur < LoudnessGainLinear(10.0) && rampL[4799] < 0.0317f,
+                  @"gain ramps toward a new target over 2 s");
+            free(buf);
+        }
+
         {   // --- Radio shows ---
             NSData *empty = ShowsStateToJSON(@{@"episodes": @{}});
             NSDictionary *parsed = ShowsStateFromJSON(empty);

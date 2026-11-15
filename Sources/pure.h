@@ -1247,3 +1247,66 @@ NSString *ShowEpisodeTooltip(NSString *showName, NSDate *broadcast, NSString *pr
 // Leading YYYY-MM-DD in a file name, else nil.
 NSDate *ShowDateFromFilename(NSString *filename, NSTimeZone *zone);
 
+// --- Loudness (Sound Check): ITU-R BS.1770-4 helpers, cache, gain, limiter (no AppKit) ---
+BOOL MusicLevelLoudnessEnabled(void);
+
+typedef struct {
+    double b0, b1, b2, a1, a2;
+    double x1, x2, y1, y2;
+} GBLoudnessBiquad;
+
+typedef struct {
+    double sampleRate;
+    int blockSamples;
+    int hopSamples;
+    GBLoudnessBiquad shelfL, shelfR, hpL, hpR;
+    double *ring;
+    int ringFill;
+    int ringPos;
+    double *blockLUFS;
+    NSUInteger blockCount;
+    NSUInteger blockCap;
+    double sumSquare;
+    int hopAccum;
+    double peakLinear;
+    BOOL sawSignal;
+    double lastPushedMeanSquare;
+    int warmupBlocksRemaining;
+} GBLoudnessMeter;
+
+void GBLoudnessMeterInit(GBLoudnessMeter *m, double sampleRate);
+void GBLoudnessMeterFree(GBLoudnessMeter *m);
+// Interleaved stereo float (L,R,L,R…). Returns integrated LUFS, or NAN when gated away (silence).
+double GBLoudnessMeterFinish(GBLoudnessMeter *m);
+void GBLoudnessMeterFeed(GBLoudnessMeter *m, const float *interleaved, NSUInteger frameCount);
+// RMS ratio (dB) of K-weighted vs dry 1 kHz sine; for self-tests.
+double LoudnessKWeightGainDBAt1kHz(double sampleRate);
+double GBLoudnessMeterInOutRatioDB(GBLoudnessMeter *m, const float *interleaved, NSUInteger frameCount);
+
+// Target -11 LUFS; clamp [-12, +10] dB. NAN lufs → 0 dB gain (caller applies unity).
+double LoudnessGainDB(double lufs, double peak);
+// Linear gain from dB.
+double LoudnessGainLinear(double gainDB);
+
+// Cache: @{@"v":@1, @"tracks": @{path: @{lufs, peak, size, mtime}}}.
+NSDictionary *LoudnessCacheFromJSON(NSData *data);
+NSData *LoudnessCacheToJSON(NSDictionary *cache);
+NSDictionary *LoudnessCacheMergeEntry(NSDictionary *cache, NSString *path, double lufs, double peak,
+                                      unsigned long long size, long mtime);
+BOOL LoudnessCacheEntryValid(NSDictionary *entry, unsigned long long size, long mtime);
+NSDictionary *LoudnessCacheLookup(NSDictionary *cache, NSString *path, unsigned long long size, long mtime);
+
+typedef struct {
+    float env;
+    float ceilingLinear;
+    float releaseCoeff;
+} GBLoudnessLimiter;
+
+void GBLoudnessLimiterInit(GBLoudnessLimiter *l, double sampleRate, double ceilingDBFS, double releaseMs);
+// Stereo float in place, left and right `stride` floats apart (2 = interleaved, 1 = separate
+// buffers). The gain is applied exactly once: *currentGain, ramping toward targetGainLinear over
+// rampSeconds (≤0 = jump), then a linked peak limiter.
+void GBLoudnessProcess(float *left, float *right, UInt32 stride, UInt32 frames, float *currentGain,
+                       float targetGainLinear, double rampSeconds, double sampleRate,
+                       GBLoudnessLimiter *lim);
+

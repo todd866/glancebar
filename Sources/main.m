@@ -32,6 +32,7 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
 #import "pure.h"
+#import "music_loudness.h"
 #import "nowplaying.h"
 #import "activity.h"
 #import "storage_scan.h"
@@ -6292,6 +6293,13 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     dispatch_queue_t _offlineTracksQueue;
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineCoverageCache;
     NSInteger _localQueueEnd;
+    NSDictionary *_loudnessCache;
+    NSMutableSet<NSString *> *_loudnessPending;
+    dispatch_queue_t _loudnessQueue;
+    NSHashTable<AVPlayerItem *> *_loudnessItems;   // weak: items carrying a level tap
+    BOOL _loudnessDirty;
+    double _localLoudnessGainDB;
+    NSString *_localLoudnessDetail;
     double _trackElapsed, _trackDuration;
     CFAbsoluteTime _trackSampledAt;
     NSTimer *_trackTick;
@@ -6470,7 +6478,8 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     _musicOff = [musicPrefs objectForKey:@"musicEnabled"] && ![musicPrefs boolForKey:@"musicEnabled"];
     _musicSilentQA = MusicSilentQAEnabled();
     if (_musicSilentQA) GBLog("music: silent QA mode — player volume forced to 0");
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"musicPlayKeyStartsMusic": @YES}];
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"musicPlayKeyStartsMusic": @YES, @"musicLevelLoudness": @YES}];
+    if (_musicProbesEnabled && !_musicOff) [self loudnessLoadCache];
     _kindPlayedIDs = [NSMutableArray array];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(playbackItemTrouble:)
                                                name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
@@ -8300,9 +8309,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSDictionary *coverage = [self offlineCoverage:key verifyHash:NO];
     NSString *path = [coverage[@"paths"] isKindOfClass:NSArray.class] ? [coverage[@"paths"] firstObject] : nil;
     if (!path.length) return;
-    NSDictionary *assetOpts = @{AVURLAssetPreferPreciseDurationAndTimingKey: @NO};
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:assetOpts];
-    AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
+    AVPlayerItem *item = [self localPlayerItemForURL:[NSURL fileURLWithPath:path]];
     item.preferredForwardBufferDuration = 2;
     _preparedPlaylistKey = [key copy];
     _preparedFirstItem = item;
@@ -9189,6 +9196,7 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     _offlineTracks = paths;
     _offlineTracksAt = CFAbsoluteTimeGetCurrent();
     _offlineTracksReady = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{ [self loudnessSweepOfflineTracks]; });
     return paths ?: @[];
 }
 - (NSArray<NSString *> *)offlineTrackPaths {
@@ -9229,9 +9237,24 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
 }
 - (void)applyLocalItemURL:(NSURL *)url {
     [self coverNoteTrackChange];
-    [self notePlayback:@"track" fields:@{@"file": url.lastPathComponent ?: @"", @"title": @"", @"artist": @"",
+    double peak = NAN;
+    double gainDB = [self loudnessApplyGainForPath:url.path peakOut:&peak];
+    NSDictionary *loud = [self loudnessEntryForPath:url.path];
+    NSMutableDictionary *trackFields = [@{@"file": url.lastPathComponent ?: @"", @"title": @"", @"artist": @"",
         @"cause": [PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt) isEqual:@"unattributed"]
-            ? @"auto-advance" : _playbackCause}];
+            ? @"auto-advance" : _playbackCause} mutableCopy];
+    if (loud) {
+        trackFields[@"lufs"] = loud[@"lufs"];
+        trackFields[@"peak"] = loud[@"peak"];
+        trackFields[@"gainDB"] = @(gainDB);
+    } else {
+        trackFields[@"loudness"] = @"unmeasured";
+    }
+    _localLoudnessGainDB = gainDB;
+    _localLoudnessDetail = (gainDB != 0 && MusicLevelLoudnessEnabled())
+        ? [NSString stringWithFormat:@"level %+.0f dB", gainDB] : nil;
+    [self notePlayback:@"track" fields:trackFields];
+    [self loudnessScheduleMeasure:@[url.path ?: @""]];
     [self touchMusicLibraryFile:url.path];
     NSDictionary *showEp = nil;
     for (NSDictionary *ep in _showEpisodes)
@@ -9358,8 +9381,9 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     });
 }
 - (void)detachLocalObservers {
-    for (AVPlayerItem *item in _localObservedItems)
+    for (AVPlayerItem *item in _localObservedItems) {
         [NSNotificationCenter.defaultCenter removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    }
     _localObservedItems = nil;
 }
 - (void)attachLocalObservers:(NSArray<AVPlayerItem *> *)items {
@@ -9370,18 +9394,139 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
                                                    name:AVPlayerItemDidPlayToEndTimeNotification object:item];
 }
 static const NSInteger kLocalPlayerQueueAhead = 8;
+- (NSString *)loudnessCachePath {
+    return [MixDirectory(nil) stringByAppendingPathComponent:@"loudness.json"];
+}
+- (void)loudnessLoadCache {
+    GBAssertMain();
+    NSData *data = [NSData dataWithContentsOfFile:[self loudnessCachePath]];
+    NSDictionary *c = LoudnessCacheFromJSON(data);
+    _loudnessCache = c ?: @{@"v": @1, @"tracks": @{}};
+}
+- (void)loudnessSaveCacheIfNeeded {
+    GBAssertMain();
+    if (!_loudnessDirty || !_loudnessCache) return;
+    NSData *json = LoudnessCacheToJSON(_loudnessCache);
+    if (json) [json writeToFile:[self loudnessCachePath] atomically:YES];
+    _loudnessDirty = NO;
+}
+- (NSDictionary *)loudnessEntryForPath:(NSString *)path {
+    if (!_loudnessCache) [self loudnessLoadCache];
+    if (!path.length) return nil;
+    struct stat st;
+    if (stat(path.fileSystemRepresentation, &st)) return nil;
+    return LoudnessCacheLookup(_loudnessCache, path, (unsigned long long)st.st_size, st.st_mtimespec.tv_sec);
+}
+- (double)loudnessApplyGainForPath:(NSString *)path peakOut:(double *)peakOut {
+    if (!MusicLevelLoudnessEnabled()) return 0;
+    NSDictionary *e = [self loudnessEntryForPath:path];
+    if (peakOut) *peakOut = e ? [e[@"peak"] doubleValue] : NAN;
+    if (!e) return 0;
+    return LoudnessGainDB([e[@"lufs"] doubleValue], [e[@"peak"] doubleValue]);
+}
+- (void)loudnessUpdateTapForPath:(NSString *)path gainDB:(double)gainDB {
+    GBAssertMain();
+    if (!path.length || !_loudnessItems.count) return;
+    float lin = MusicLevelLoudnessEnabled() ? (float)LoudnessGainLinear(gainDB) : 1.f;
+    for (AVPlayerItem *item in _loudnessItems.allObjects) {
+        NSURL *u = [item.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)item.asset).URL : nil;
+        if ([u.path isEqual:path]) [GBLoudnessHandleForItem(item) setTargetLinear:lin];
+    }
+}
+- (dispatch_queue_t)loudnessMeasureQueue {
+    if (!_loudnessQueue) {
+        _loudnessQueue = dispatch_queue_create("glancebar.loudness", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(_loudnessQueue, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    }
+    return _loudnessQueue;
+}
+- (void)loudnessScheduleMeasure:(NSArray<NSString *> *)paths {
+    if (!_musicProbesEnabled || _musicOff || !paths.count) return;
+    if (!_loudnessPending) _loudnessPending = [NSMutableSet set];
+    NSMutableArray<NSString *> *work = [NSMutableArray array];
+    for (NSString *p in paths) {
+        if (!p.length || [_loudnessPending containsObject:p]) continue;
+        if ([self loudnessEntryForPath:p]) continue;
+        [_loudnessPending addObject:p];
+        [work addObject:p];
+    }
+    if (!work.count) return;
+    NSArray<NSString *> *batch = [work copy];
+    __weak Controller *weak = self;
+    dispatch_async([self loudnessMeasureQueue], ^{
+        for (NSString *path in batch) {
+            double lufs = NAN, peak = NAN;
+            GBMeasureLoudnessAtURL([NSURL fileURLWithPath:path], &lufs, &peak, NULL);
+            struct stat st;
+            if (stat(path.fileSystemRepresentation, &st)) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    Controller *self = weak;
+                    if (self) [self->_loudnessPending removeObject:path];
+                });
+                continue;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                Controller *self = weak;
+                if (!self) return;
+                GBAssertMain();
+                [self->_loudnessPending removeObject:path];
+                if (isfinite(lufs)) {
+                    if (!self->_loudnessCache) [self loudnessLoadCache];
+                    self->_loudnessCache = LoudnessCacheMergeEntry(self->_loudnessCache, path, lufs, peak,
+                        (unsigned long long)st.st_size, st.st_mtimespec.tv_sec);
+                    self->_loudnessDirty = YES;
+                    double g = LoudnessGainDB(lufs, peak);
+                    [self loudnessUpdateTapForPath:path gainDB:g];
+                    if (self->_localURLs.count && self->_localIndex >= 0
+                        && self->_localIndex < (NSInteger)self->_localURLs.count
+                        && [self->_localURLs[self->_localIndex].path isEqual:path]) {
+                        self->_localLoudnessGainDB = g;
+                        self->_localLoudnessDetail = (g != 0 && MusicLevelLoudnessEnabled())
+                            ? [NSString stringWithFormat:@"level %+.0f dB", g] : nil;
+                    }
+                }
+                [self loudnessSaveCacheIfNeeded];
+            });
+        }
+    });
+}
+- (void)loudnessScheduleQueueAhead {
+    if (!_localURLs.count || _localIndex < 0) return;
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    NSInteger end = MIN((NSInteger)_localURLs.count, _localIndex + kLocalPlayerQueueAhead);
+    for (NSInteger i = _localIndex; i < end; i++) [paths addObject:_localURLs[i].path];
+    [self loudnessScheduleMeasure:paths];
+}
+- (void)loudnessSweepOfflineTracks {
+    if (!_offlineTracksReady) return;
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *p in [self offlineTrackPaths])
+        if (p.length && ![self loudnessEntryForPath:p]) [paths addObject:p];
+    if (paths.count) [self loudnessScheduleMeasure:paths];
+}
+- (AVPlayerItem *)localPlayerItemForURL:(NSURL *)url {
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    double gainDB = [self loudnessApplyGainForPath:url.path peakOut:NULL];
+    float lin = MusicLevelLoudnessEnabled() ? (float)LoudnessGainLinear(gainDB) : 1.f;
+    if (GBLoudnessAttachToPlayerItem(item, lin)) {
+        if (!_loudnessItems) _loudnessItems = [NSHashTable weakObjectsHashTable];
+        [_loudnessItems addObject:item];
+    }
+    return item;
+}
 - (NSArray<AVPlayerItem *> *)localItemsFromIndex:(NSInteger)index {
     NSMutableArray<AVPlayerItem *> *items = [NSMutableArray array];
     NSInteger end = MIN((NSInteger)_localURLs.count, index + kLocalPlayerQueueAhead);
     for (NSInteger i = index; i < end; i++)
-        [items addObject:[AVPlayerItem playerItemWithURL:_localURLs[i]]];
+        [items addObject:[self localPlayerItemForURL:_localURLs[i]]];
     _localQueueEnd = end;
+    [self loudnessScheduleQueueAhead];
     return items;
 }
 - (void)extendLocalPlayerQueueIfNeeded {
     if (!_localPlayer || !_localURLs.count || _localQueueEnd >= (NSInteger)_localURLs.count) return;
     NSURL *url = _localURLs[_localQueueEnd];
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    AVPlayerItem *item = [self localPlayerItemForURL:url];
     [_localPlayer insertItem:item afterItem:nil];
     NSMutableArray *observed = [_localObservedItems mutableCopy] ?: [NSMutableArray array];
     [observed addObject:item];
@@ -10522,6 +10667,12 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
                                     at:NSMakeRect(textX, textBottom, textW, subtitleH) align:NSTextAlignmentLeft];
     subtitle.accessibilityIdentifier = @"popover.music.subtitle";
     subtitle.accessibilityLabel = subtitleText;
+    if (_localMode && _localLoudnessDetail.length) {
+        NSString *tip = _localLoudnessDetail;
+        if (subtitleText.length) tip = [NSString stringWithFormat:@"%@ · %@", subtitleText, _localLoudnessDetail];
+        subtitle.toolTip = tip;
+        subtitle.accessibilityHelp = tip;
+    }
     [row addSubview:subtitle];
     [root addSubview:row];
     y += kSoundH;

@@ -74,10 +74,10 @@ fi
 
 # Stateful filesystem/incremental-reader coverage. The harness imports the private app
 # shell so it exercises the production AIReader without publishing a test-only API.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_ai_reader.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_ai_reader.m \
     -framework Cocoa -framework Carbon \
     -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox \
     -framework IOKit \
     -framework DiskArbitration \
     -framework ServiceManagement -framework Security -lsqlite3 \
@@ -86,39 +86,39 @@ fi
 "$WORK_DIR/glancebar_ai_reader_tests"
 
 # Exact offline requests, no partial playback and intercepted source/player boundaries.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_offline.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_offline.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_offline_tests"
 "$WORK_DIR/glancebar_offline_tests"
 
 # Music-library sync storm regression (intercepted helpers, no subprocess I/O).
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_music_library_storm.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_music_library_storm.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_music_library_storm_tests"
 "$WORK_DIR/glancebar_music_library_storm_tests"
 
 # Metered-link transport and persistence coverage. The harness imports the private monitor
 # but stubs both interface counters and NSURLSession-facing tick paths.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_metered.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_metered.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_metered_tests"
 "$WORK_DIR/glancebar_metered_tests"
 
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_activity_ui.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_activity_ui.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_activity_ui_tests"
 "$WORK_DIR/glancebar_activity_ui_tests"
 if [[ -n "${GLANCEBAR_ACTIVITY_HARNESS_OUT:-}" ]]; then
     cp "$WORK_DIR/glancebar_activity_ui_tests" "$GLANCEBAR_ACTIVITY_HARNESS_OUT"
 fi
 
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Tests/test_storage_ui.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m Tests/test_storage_ui.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_storage_ui_tests"
 "$WORK_DIR/glancebar_storage_ui_tests"
 if [[ -n "${GLANCEBAR_STORAGE_HARNESS_OUT:-}" ]]; then
@@ -126,9 +126,9 @@ if [[ -n "${GLANCEBAR_STORAGE_HARNESS_OUT:-}" ]]; then
 fi
 
 # Production AppKit layout, rendered without creating any visible windows.
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m tools/check-popover.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m tools/check-popover.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_popover_tests"
 "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_MUSIC_STATE=playing "$WORK_DIR/glancebar_popover_tests"
@@ -151,9 +151,9 @@ if [[ -n "${GLANCEBAR_POPOVER_HARNESS_OUT:-}" ]]; then
 fi
 
 # Real AVQueuePlayer playback in silent QA (isolated home, no app launch).
-"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m tools/check-playback.m \
+"$CC" "${TEST_FLAGS[@]}" Sources/pure.m Sources/activity.m Sources/storage_scan.m Sources/storage_cleanup.m Sources/storage_index.m Sources/nowplaying.m Sources/volume_step.m Sources/fine_volume.m Sources/music_loudness.m tools/check-playback.m \
     -framework Cocoa -framework Carbon -framework AVFoundation -framework CoreMedia -framework MediaPlayer -framework Network -framework SystemConfiguration \
-    -framework CoreAudio -framework AudioToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
+    -framework CoreAudio -framework AudioToolbox -framework MediaToolbox -framework IOKit -framework DiskArbitration -framework ServiceManagement -framework Security -lsqlite3 \
     -o "$WORK_DIR/glancebar_playback_tests"
 /usr/bin/python3 -c "
 import subprocess, sys

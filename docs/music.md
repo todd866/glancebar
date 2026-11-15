@@ -286,6 +286,18 @@ fetched when `~/.local/state/METERED_LINK` exists or the Mac is offline (the que
 After the library or offline manifest loads, a background pass warms local steps for every on-disk
 track, then enqueues network steps for gaps; it yields for two seconds around a track change.
 
+## Loudness (Sound Check)
+
+Tracks play at the level they were uploaded. **Sound Check** measures each file once
+(ITU-R BS.1770-4 integrated loudness and sample peak), caches results in
+`~/Library/Application Support/Glancebar/mix/loudness.json`, and applies per-track gain
+toward **-11 LUFS** (clamped **-12…+10 dB**) through an `MTAudioProcessingTap`, with a
+**-1 dBFS** peak limiter after the gain. Unmeasured tracks play at unity until a
+background pass finishes. Default **on** (`musicLevelLoudness`; set NO to disable).
+Measurement runs on a utility serial queue, queue-ahead first, then a slow sweep of
+offline paths. Playback logs each start with `lufs`, `gainDB`, or `loudness: unmeasured`
+in `playback.jsonl`.
+
 ## Metadata and cover art are kept with every download (12 Nov 2026)
 
 Owner rule: every downloaded song keeps its metadata, album art included, and that record

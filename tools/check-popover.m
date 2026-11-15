@@ -108,6 +108,11 @@ static BOOL VolumeNamesTip(NSView *view) {
     if ([ident hasPrefix:@"details.overview.row.storage."]) return YES;
     return [ident hasPrefix:@"popover.remote."] && [ident containsString:@".volume."];
 }
+static BOOL MusicLoudnessSubtitleTip(NSView *view) {
+    if (![view.accessibilityIdentifier isEqual:@"popover.music.subtitle"]) return NO;
+    NSString *tip = view.toolTip ?: @"";
+    return tip.length && [tip isEqual:view.accessibilityHelp] && [tip containsString:@"level "];
+}
 static BOOL IntendedControlTip(NSView *view) {
     if (![view.accessibilityIdentifier isEqual:@"popover.music.next"]) return NO;
     NSString *tip = view.toolTip ?: @"";
@@ -127,7 +132,7 @@ static BOOL RecoveryTip(NSView *view) {
 }
 static NSView *WordyTip(NSView *view) {
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
-        !KindTileTip(view) && !ShowTileTip(view))
+        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view))
         return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
@@ -507,7 +512,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
 static BOOL FitsChildren(NSView *view) {
     if ([view isKindOfClass:GBRecoverableTextField.class] && !RecoverableLabelOK((NSTextField *)view)) return NO;
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
-        !KindTileTip(view) && !ShowTileTip(view)) {
+        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
     }

@@ -5357,3 +5357,276 @@ NSDate *ShowDateFromFilename(NSString *filename, NSTimeZone *zone) {
     }
 }
 
+// --- Loudness (Sound Check) ---
+BOOL MusicLevelLoudnessEnabled(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if ([d objectForKey:@"musicLevelLoudness"] == nil) return YES;
+    return [d boolForKey:@"musicLevelLoudness"];
+}
+
+static void LoudnessKWeightSetCoeffs(GBLoudnessBiquad *s,
+                                     double b0, double b1, double b2, double a1, double a2) {
+    s->b0 = b0;
+    s->b1 = b1;
+    s->b2 = b2;
+    s->a1 = a1;
+    s->a2 = a2;
+    s->x1 = s->x2 = s->y1 = s->y2 = 0;
+}
+
+static void LoudnessKWeightDesign(GBLoudnessBiquad *s, double fs, int stage) {
+    if (fabs(fs - 48000.0) < 1.0) {
+        if (stage == 0)
+            LoudnessKWeightSetCoeffs(s, 1.53512485958697, -2.69169618940638, 1.19839281285285,
+                                     -1.69065929318241, 0.73248077421585);
+        else
+            LoudnessKWeightSetCoeffs(s, 1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621);
+        return;
+    }
+    const double f0 = stage == 0 ? 1681.974450955533 : 38.135470876024;
+    const double G = stage == 0 ? 3.999843853970339 : 0;
+    const double Q = stage == 0 ? 0.707175572470168 : 0.500327002919;
+    const double K = tan(M_PI * f0 / fs);
+    if (stage == 0) {
+        const double Vh = pow(10.0, G / 20.0);
+        const double Vb = pow(Vh, 0.5);
+        double a0 = 1.0 + K / Q + K * K;
+        LoudnessKWeightSetCoeffs(s, (Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0,
+                                 (Vh - Vb * K / Q + K * K) / a0, 2.0 * (K * K - 1.0) / a0,
+                                 (1.0 - K / Q + K * K) / a0);
+    } else {
+        double a0 = 1.0 + K / Q + K * K;
+        LoudnessKWeightSetCoeffs(s, 1.0 / a0, -2.0 / a0, 1.0 / a0, 2.0 * (K * K - 1.0) / a0,
+                                 (1.0 - K / Q + K * K) / a0);
+    }
+}
+
+static double LoudnessBiquad(GBLoudnessBiquad *s, double x) {
+    double y = s->b0 * x + s->b1 * s->x1 + s->b2 * s->x2 - s->a1 * s->y1 - s->a2 * s->y2;
+    s->x2 = s->x1;
+    s->x1 = x;
+    s->y2 = s->y1;
+    s->y1 = y;
+    return y;
+}
+
+void GBLoudnessMeterInit(GBLoudnessMeter *m, double sampleRate) {
+    memset(m, 0, sizeof(*m));
+    if (!isfinite(sampleRate) || sampleRate < 8000) sampleRate = 48000;
+    m->sampleRate = sampleRate;
+    m->blockSamples = (int)lrint(0.4 * sampleRate);
+    m->hopSamples = (int)lrint(0.1 * sampleRate);
+    if (m->blockSamples < 1) m->blockSamples = 1;
+    if (m->hopSamples < 1) m->hopSamples = 1;
+    LoudnessKWeightDesign(&m->shelfL, sampleRate, 0);
+    LoudnessKWeightDesign(&m->shelfR, sampleRate, 0);
+    LoudnessKWeightDesign(&m->hpL, sampleRate, 1);
+    LoudnessKWeightDesign(&m->hpR, sampleRate, 1);
+    m->ring = calloc((size_t)m->blockSamples, sizeof(double));
+    m->blockCap = 4096;
+    m->blockLUFS = calloc(m->blockCap, sizeof(double));
+    m->warmupBlocksRemaining = 5;
+}
+
+void GBLoudnessMeterFree(GBLoudnessMeter *m) {
+    free(m->ring);
+    free(m->blockLUFS);
+    memset(m, 0, sizeof(*m));
+}
+
+static void LoudnessPushBlock(GBLoudnessMeter *m, double meanSquare) {
+    if (meanSquare <= 0 || !isfinite(meanSquare)) return;
+    if (m->warmupBlocksRemaining > 0) { m->warmupBlocksRemaining--; return; }
+    m->lastPushedMeanSquare = meanSquare;
+    if (m->blockCount >= m->blockCap) {
+        m->blockCap *= 2;
+        m->blockLUFS = realloc(m->blockLUFS, m->blockCap * sizeof(double));
+    }
+    m->blockLUFS[m->blockCount++] = meanSquare;
+}
+
+double GBLoudnessMeterInOutRatioDB(GBLoudnessMeter *m, const float *interleaved, NSUInteger frameCount) {
+    if (!m || !interleaved || !frameCount) return NAN;
+    double inE = 0, outE = 0;
+    for (NSUInteger i = 0; i < frameCount; i++) {
+        double l = interleaved[2 * i];
+        double lw = LoudnessBiquad(&m->hpL, LoudnessBiquad(&m->shelfL, l));
+        inE += l * l;
+        outE += lw * lw;
+    }
+    if (inE <= 0 || outE <= 0) return NAN;
+    return 10.0 * log10(outE / inE);
+}
+
+double LoudnessKWeightGainDBAt1kHz(double sampleRate) {
+    GBLoudnessBiquad shelf, hp;
+    LoudnessKWeightDesign(&shelf, sampleRate, 0);
+    LoudnessKWeightDesign(&hp, sampleRate, 1);
+    int n = (int)lrint(sampleRate);
+    double inE = 0, outE = 0;
+    for (int i = 0; i < n; i++) {
+        double x = sin(2.0 * M_PI * 1000.0 * (double)i / sampleRate);
+        double y = LoudnessBiquad(&hp, LoudnessBiquad(&shelf, x));
+        inE += x * x;
+        outE += y * y;
+    }
+    if (inE <= 0 || outE <= 0) return NAN;
+    return 10.0 * log10(outE / inE);
+}
+
+void GBLoudnessMeterFeed(GBLoudnessMeter *m, const float *interleaved, NSUInteger frameCount) {
+    if (!m || !interleaved || !frameCount) return;
+    for (NSUInteger i = 0; i < frameCount; i++) {
+        double l = interleaved[2 * i], r = interleaved[2 * i + 1];
+        double al = fabs(l), ar = fabs(r);
+        if (al > m->peakLinear) m->peakLinear = (float)al;
+        if (ar > m->peakLinear) m->peakLinear = (float)ar;
+        if (al > 1e-9 || ar > 1e-9) m->sawSignal = YES;
+        double lw = LoudnessBiquad(&m->hpL, LoudnessBiquad(&m->shelfL, l));
+        double rw = LoudnessBiquad(&m->hpR, LoudnessBiquad(&m->shelfR, r));
+        double z = lw * lw + rw * rw;
+        if (m->ringFill < m->blockSamples) {
+            m->ring[m->ringFill++] = z;
+            m->sumSquare += z;
+        } else {
+            m->sumSquare += z - m->ring[m->ringPos];
+            m->ring[m->ringPos] = z;
+            m->ringPos = (m->ringPos + 1) % m->blockSamples;
+        }
+        if (++m->hopAccum >= m->hopSamples) {
+            m->hopAccum = 0;
+            if (m->ringFill >= m->blockSamples)
+                LoudnessPushBlock(m, m->sumSquare / (double)m->blockSamples);
+        }
+    }
+}
+
+static double LoudnessMsToLUFS(double meanSquare) {
+    if (meanSquare <= 0) return NAN;
+    return -0.691 + 10.0 * log10(meanSquare);
+}
+
+static double LoudnessIntegratedMeanSquare(double *meanSquares, NSUInteger count, double threshLUFS) {
+    double thresh = pow(10.0, (threshLUFS + 0.691) / 10.0);
+    double sum = 0;
+    NSUInteger n = 0;
+    for (NSUInteger i = 0; i < count; i++) {
+        if (meanSquares[i] >= thresh) { sum += meanSquares[i]; n++; }
+    }
+    if (!n) return NAN;
+    return LoudnessMsToLUFS(sum / (double)n);
+}
+
+static double LoudnessGateIntegrated(double *meanSquares, NSUInteger count) {
+    if (!count) return NAN;
+    double pre = LoudnessIntegratedMeanSquare(meanSquares, count, -70.0);
+    if (!isfinite(pre)) return NAN;
+    return LoudnessIntegratedMeanSquare(meanSquares, count, pre - 10.0);
+}
+
+double GBLoudnessMeterFinish(GBLoudnessMeter *m) {
+    if (!m) return NAN;
+    if (m->ringFill >= m->blockSamples && m->hopAccum > 0)
+        LoudnessPushBlock(m, m->sumSquare / (double)m->blockSamples);
+    if (!m->sawSignal || !m->blockCount) return NAN;
+    return LoudnessGateIntegrated(m->blockLUFS, m->blockCount);
+}
+
+double LoudnessGainDB(double lufs, double peak) {
+    (void)peak;
+    if (!isfinite(lufs)) return 0;
+    const double target = -11.0;
+    double g = target - lufs;
+    if (g < -12.0) g = -12.0;
+    if (g > 10.0) g = 10.0;
+    return g;
+}
+
+double LoudnessGainLinear(double gainDB) {
+    if (!isfinite(gainDB)) return 1.0;
+    return pow(10.0, gainDB / 20.0);
+}
+
+NSDictionary *LoudnessCacheFromJSON(NSData *data) {
+    if (![data isKindOfClass:NSData.class] || !data.length) return nil;
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![root isKindOfClass:NSDictionary.class]) return nil;
+    if (![root[@"v"] isEqual:@1]) return nil;
+    id tracks = root[@"tracks"];
+    if (tracks && ![tracks isKindOfClass:NSDictionary.class]) return nil;
+    return root;
+}
+
+NSData *LoudnessCacheToJSON(NSDictionary *cache) {
+    if (![cache isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableDictionary *root = [cache mutableCopy];
+    if (!root[@"v"]) root[@"v"] = @1;
+    if (![root[@"tracks"] isKindOfClass:NSDictionary.class]) root[@"tracks"] = @{};
+    return [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
+}
+
+BOOL LoudnessCacheEntryValid(NSDictionary *entry, unsigned long long size, long mtime) {
+    if (![entry isKindOfClass:NSDictionary.class]) return NO;
+    NSNumber *sz = entry[@"size"], *mt = entry[@"mtime"];
+    return [sz isKindOfClass:NSNumber.class] && [mt isKindOfClass:NSNumber.class]
+        && sz.unsignedLongLongValue == size && mt.longValue == mtime;
+}
+
+NSDictionary *LoudnessCacheMergeEntry(NSDictionary *cache, NSString *path, double lufs, double peak,
+                                      unsigned long long size, long mtime) {
+    NSMutableDictionary *root = [cache isKindOfClass:NSDictionary.class] ? [cache mutableCopy] : [NSMutableDictionary new];
+    if (!root[@"v"]) root[@"v"] = @1;
+    NSMutableDictionary *tracks = [[root[@"tracks"] isKindOfClass:NSDictionary.class] ? root[@"tracks"] : @{} mutableCopy];
+    tracks[path ?: @""] = @{@"lufs": @(lufs), @"peak": @(peak), @"size": @(size), @"mtime": @(mtime)};
+    root[@"tracks"] = tracks;
+    return root;
+}
+
+NSDictionary *LoudnessCacheLookup(NSDictionary *cache, NSString *path, unsigned long long size, long mtime) {
+    if (!path.length || ![cache isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *tracks = cache[@"tracks"];
+    if (![tracks isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *entry = tracks[path];
+    return LoudnessCacheEntryValid(entry, size, mtime) ? entry : nil;
+}
+
+void GBLoudnessLimiterInit(GBLoudnessLimiter *l, double sampleRate, double ceilingDBFS, double releaseMs) {
+    memset(l, 0, sizeof(*l));
+    l->ceilingLinear = pow(10.0, ceilingDBFS / 20.0);
+    if (!isfinite(sampleRate) || sampleRate < 1) sampleRate = 48000;
+    double tau = releaseMs / 1000.0;
+    l->releaseCoeff = (float)exp(-1.0 / (tau * sampleRate));
+    l->env = 1.f;
+}
+
+void GBLoudnessProcess(float *left, float *right, UInt32 stride, UInt32 frames, float *currentGain,
+                       float targetGainLinear, double rampSeconds, double sampleRate,
+                       GBLoudnessLimiter *lim) {
+    if (!left || !right || !frames || !stride) return;
+    float cg = currentGain && *currentGain > 0 ? *currentGain : 1.f;
+    float tg = targetGainLinear > 0 ? targetGainLinear : 1.f;
+    float rampStep = 0.f;
+    if (rampSeconds > 0 && sampleRate > 0) rampStep = (tg - cg) / (float)(rampSeconds * sampleRate);
+    float ceilL = lim ? lim->ceilingLinear : 0.891f;
+    float rel = lim ? lim->releaseCoeff : 0.f;
+    float env = lim ? lim->env : 1.f;
+    for (UInt32 i = 0; i < frames; i++) {
+        if (rampStep > 0) cg = fminf(cg + rampStep, tg);
+        else if (rampStep < 0) cg = fmaxf(cg + rampStep, tg);
+        else cg = tg;
+        float l = left[i * stride] * cg;
+        float r = right[i * stride] * cg;
+        if (lim) {
+            float peak = fmaxf(fabsf(l), fabsf(r));
+            float want = (peak > ceilL && peak > 0) ? (ceilL / peak) : 1.f;
+            if (want < env) env = want;
+            else env = env * rel + want * (1.f - rel);
+            if (env < 1.f) { l *= env; r *= env; }
+        }
+        left[i * stride] = l;
+        right[i * stride] = r;
+    }
+    if (currentGain) *currentGain = cg;
+    if (lim) lim->env = env;
+}
+
