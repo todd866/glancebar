@@ -1,4 +1,7 @@
 // Unit tests for Glancebar's pure functions (Sources/pure.m). Run via ./tests.sh.
+#import <signal.h>
+#import <sys/wait.h>
+#import <unistd.h>
 #import <Foundation/Foundation.h>
 #import <math.h>
 #import <string.h>
@@ -2462,6 +2465,50 @@ int main(void) {
             }
             check(playingNeverFirst, @"kind queue: the playing song goes last for every seed");
             check([MusicKindQueue(@[kindLib[0]], @"dance", 60, 5, @[@"D000"]) isEqual:@[@"D000"]], @"kind queue: the only song still plays");
+            // The library as the script returns it: ten columns, zipped into tracks.
+            NSString *US = [NSString stringWithFormat:@"%C", (unichar)31], *RS = [NSString stringWithFormat:@"%C", (unichar)30];
+            NSArray *libCols = @[@[@"A1", @"B2", @"C3"], @[@"One", @"", @"Three "], @[@"Ann", @"Bo", @"Cy"], @[@"LP", @"", @"EP"],
+                                 @[@"House", @"", @"Indie Rock"], @[@"2020", @"0", @"1999"], @[@"7", @"0", @"12"],
+                                 @[@"3", @"-1", @"400"], @[@"true", @"false", @"false"], @[@"false", @"false", @"true"]];
+            NSString *(^joined)(NSArray *) = ^NSString *(NSArray *cols) {
+                NSMutableArray *parts = [NSMutableArray array];
+                for (NSArray *col in cols) [parts addObject:[col componentsJoinedByString:US]];
+                return [[parts componentsJoinedByString:RS] stringByAppendingString:@"\n"];
+            };
+            NSArray *libRows = ParseMixLibraryColumns(joined(libCols));
+            check(libRows.count == 3 && [libRows[0] isEqual:@{@"id": @"A1", @"title": @"One", @"artist": @"Ann", @"album": @"LP",
+                      @"genre": @"House", @"year": @2020, @"plays": @7, @"idleDays": @3, @"fav": @YES, @"dislike": @NO}],
+                  @"library columns: a track is one value from each column");
+            check([libRows[1][@"title"] isEqual:@""] && [libRows[1][@"idleDays"] isEqual:@(-1)] &&
+                  [libRows[2][@"title"] isEqual:@"Three "] && [libRows[2][@"dislike"] isEqual:@YES] && [libRows[2][@"plays"] isEqual:@12],
+                  @"library columns: empty values, a never-played track and the last column's last value survive");
+            NSMutableArray *shortCols = [libCols mutableCopy];
+            shortCols[6] = @[@"7", @"0"];
+            check(ParseMixLibraryColumns(joined(shortCols)).count == 0, @"library columns: columns of different lengths are refused whole");
+            check(ParseMixLibraryColumns(joined([libCols subarrayWithRange:NSMakeRange(0, 9)])).count == 0 &&
+                  ParseMixLibraryColumns(@"").count == 0 && ParseMixLibraryColumns(nil).count == 0 &&
+                  ParseMixLibraryColumns(@"osascript timed out").count == 0, @"library columns: anything but ten columns is nothing");
+            NSMutableArray *noIDCols = [libCols mutableCopy];
+            noIDCols[0] = @[@"A1", @"", @"C3"];
+            check(ParseMixLibraryColumns(joined(noIDCols)).count == 2, @"library columns: a track without an id is dropped");
+            {
+                pid_t child = fork();
+                if (child == 0) { pause(); _exit(0); }
+                BOOL runningBefore = child > 0 && !ProcessIsStopped(child);
+                BOOL stopped = NO, resumed = NO;
+                if (child > 0 && kill(child, SIGSTOP) == 0) {
+                    for (int i = 0; i < 200 && !(stopped = ProcessIsStopped(child)); i++) usleep(5000);
+                    kill(child, SIGCONT);
+                    for (int i = 0; i < 200 && !(resumed = !ProcessIsStopped(child)); i++) usleep(5000);
+                }
+                if (child > 0) { kill(child, SIGKILL); waitpid(child, NULL, 0); }
+                check(runningBefore && stopped && resumed && !ProcessIsStopped(child) && !ProcessIsStopped(0) && !ProcessIsStopped(-1),
+                      @"stopped process: seen while stopped, not before or after, not once gone");
+            }
+            check(!MixLibraryReadShouldWait(1000, 0, 900) && MixLibraryReadShouldWait(1000, 900, 900) &&
+                  MixLibraryReadShouldWait(1799, 900, 900) && !MixLibraryReadShouldWait(1800, 900, 900) &&
+                  !MixLibraryReadShouldWait(500, 900, 900),
+                  @"library read: after a failure the next try waits the retry time, and a clock set back does not hold it off");
             // The library kept on disk: what was read comes back, junk does not.
             NSArray *cacheIn = @[kindLib[0], kindLib[9], @{@"title": @"no id"}, @"junk",
                                  @{@"id": @"ODD", @"title": @7, @"plays": @"many", @"fav": @"yes", @"extra": NSNull.null}];

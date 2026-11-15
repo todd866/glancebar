@@ -5886,8 +5886,13 @@ static NSString *const kAppleMusicBundleID = @"com.apple.Music";
 static NSString *const kSpotifyBundleID = @"com.spotify.client";
 static NSString *const kPlayerOutputUIDKey = @"playerOutputUID";
 static NSString *const kPlayerOutputNameKey = @"playerOutputName";
+// Running means able to answer. A Music that has been stopped (SIGSTOP; found so on 15 Nov 2026,
+// by what is not known) is not running for us: every script to it waited out its whole time
+// limit, the library read was retried every 105 s, and the kind tiles had nothing to count.
 static BOOL AppleMusicIsRunning(void) {
-    return [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID].count > 0;
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:kAppleMusicBundleID])
+        if (!app.terminated && !ProcessIsStopped(app.processIdentifier)) return YES;
+    return NO;
 }
 static const int kVolumeScriptSec = 10;
 static int RunAppleScriptBlocking(NSString *source, int seconds, BOOL hardKill,
@@ -5944,7 +5949,13 @@ static void RunAppleScriptTimed(NSString *source, int seconds, void (^done)(NSSt
 #pragma mark - Seed mixes (Apple Music)
 
 // One bulk read of the library: per track, id, title, artist, album, genre, year, plays,
-// days since played (-1 never), favourite, dislike; unit/record separators between.
+// days since played (-1 never), favourite, dislike. It returns ten columns (ParseMixLibraryColumns).
+// The script must stay linear in the number of tracks. `item i of someList` on a plain list
+// walks the list, so the loop that used to build one line per track took 5 s for 4,000 tracks
+// and 34 s for 8,000 (measured 15 Nov 2026); with the library grown past that it never finished
+// inside the time limit and the kind tiles had nothing to count. The only loop left reads the
+// played dates through a script property, which is the form AppleScript indexes directly, and
+// the columns are joined by `as text`. (`idle` cannot be a property name: it is a handler.)
 static NSString *const kMixLibraryScript =
     @"tell application \"Music\"\n"
      "set lib to library playlist 1\n"
@@ -5959,29 +5970,24 @@ static NSString *const kMixLibraryScript =
      "set fs to favorited of every track of lib\n"
      "set ds to disliked of every track of lib\n"
      "end tell\n"
+     "script L\n"
+     "property playedDates : {}\n"
+     "property idleDays : {}\n"
+     "end script\n"
+     "set L's playedDates to pds\n"
      "set nowDate to current date\n"
-     "set us to character id 31\n"
-     "set out to {}\n"
      "repeat with i from 1 to count of ids\n"
-     "set pd to item i of pds\n"
-     "if pd is missing value then\nset daysIdle to -1\nelse\nset daysIdle to ((nowDate - pd) div 86400)\nend if\n"
-     "set end of out to (item i of ids) & us & (item i of ns) & us & (item i of ars) & us & (item i of als) & us & (item i of gs) & us & ((item i of ys) as text) & us & ((item i of pcs) as text) & us & (daysIdle as text) & us & ((item i of fs) as text) & us & ((item i of ds) as text)\n"
+     "set pd to item i of L's playedDates\n"
+     "if pd is missing value then\nset end of L's idleDays to -1\nelse\nset end of L's idleDays to ((nowDate - pd) div 86400)\nend if\n"
      "end repeat\n"
+     "set AppleScript's text item delimiters to (character id 31)\n"
+     "set cols to {ids as text, ns as text, ars as text, als as text, gs as text, ys as text, pcs as text, (L's idleDays) as text, fs as text, ds as text}\n"
      "set AppleScript's text item delimiters to (character id 30)\n"
-     "return out as text\n";
-
-static NSArray<NSDictionary *> *ParseMixLibrary(NSString *text) {
-    NSMutableArray *tracks = [NSMutableArray array];
-    NSString *us = [NSString stringWithFormat:@"%C", (unichar)31], *rs = [NSString stringWithFormat:@"%C", (unichar)30];
-    for (NSString *record in [[text stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsSeparatedByString:rs]) {
-        NSArray *f = [record componentsSeparatedByString:us];
-        if (f.count < 10 || ![f[0] length]) continue;
-        [tracks addObject:@{@"id": f[0], @"title": f[1], @"artist": f[2], @"album": f[3], @"genre": f[4],
-                            @"year": @([f[5] integerValue]), @"plays": @([f[6] integerValue]), @"idleDays": @([f[7] integerValue]),
-                            @"fav": @([f[8] isEqual:@"true"]), @"dislike": @([f[9] isEqual:@"true"])}];
-    }
-    return tracks;
-}
+     "return cols as text\n";
+static const int kMixLibraryScriptSec = 150;
+// After a read that failed or came back empty, the next try waits: each one keeps Music and a
+// script busy for as long as it runs, and an open popover asked again within seconds.
+static const double kMixLibraryRetrySec = 15 * 60;
 
 static NSString *MixDirectory(NSString *sub) {
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:
@@ -6148,6 +6154,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     NSArray<NSDictionary *> *_mixLibrary;      // one bulk read of Music's library
     CFAbsoluteTime _mixLibraryAt;
     BOOL _mixLibraryCacheTried;
+    CFAbsoluteTime _mixLibraryFailedAt;
     BOOL _mixLibraryLoading, _mixFrozen, _audioFrozen;   // frozen: tests set seeds / own the volume reading, no live reads
     NSArray<NSDictionary *> *_mixSeeds;        // the four tiles
     NSMutableDictionary<NSString *, NSArray *> *_mixPrepared;   // seed key → track ids, built ahead
@@ -6744,13 +6751,22 @@ static void PSChanged(void *ctx) { [(__bridge Controller *)ctx schedulePowerRefr
     if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;
     // Scripting Music launches it: read the library only while it is already open. On a Mac with an
     // empty library this retried and relaunched Music (1 Nov 2026).
-    BOOL stale = !_mixLibrary || CFAbsoluteTimeGetCurrent() - _mixLibraryAt > 6 * 3600;
-    if (stale && !_mixLibraryLoading) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL stale = !_mixLibrary || now - _mixLibraryAt > 6 * 3600;
+    if (stale && !_mixLibraryLoading && !MixLibraryReadShouldWait(now, _mixLibraryFailedAt, kMixLibraryRetrySec)) {
         _mixLibraryLoading = YES;
-        RunAppleScriptTimed(kMixLibraryScript, 90, ^(NSString *output, __unused NSString *errorText, int status) {
+        RunAppleScriptTimed(kMixLibraryScript, kMixLibraryScriptSec, ^(NSString *output, NSString *errorText, int status) {
             self->_mixLibraryLoading = NO;
-            NSArray *tracks = status == 0 ? ParseMixLibrary(output) : nil;
-            if (tracks.count < 20) return;   // Music closed, or permission not given yet
+            double took = CFAbsoluteTimeGetCurrent() - now;
+            NSArray *tracks = status == 0 ? ParseMixLibraryColumns(output) : nil;
+            if (tracks.count < 20) {   // Music closed, permission not given yet, or the read ran out of time
+                self->_mixLibraryFailedAt = CFAbsoluteTimeGetCurrent();
+                GBLog("music: library read failed after %.0f s (status %d, %lu tracks): %{public}@", took, status,
+                      (unsigned long)tracks.count, errorText.length > 200 ? [errorText substringToIndex:200] : errorText);
+                return;
+            }
+            self->_mixLibraryFailedAt = 0;
+            GBLog("music: library of %lu tracks read from Music in %.0f s", (unsigned long)tracks.count, took);
             self->_mixLibrary = [self markedMixLibrary:tracks];
             self->_mixLibraryAt = CFAbsoluteTimeGetCurrent();
             self->_kindTileAt = 0;

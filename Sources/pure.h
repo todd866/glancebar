@@ -866,6 +866,16 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
                                     uint64_t seed, NSArray<NSString *> *recentIDs);
 // Tracks of kind that are on this Mac (onDiskIDs non-empty ⇒ require membership; empty ⇒ count all matches).
 NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind);
+// The library as the bulk script returns it: ten columns (id, title, artist, album, genre, year,
+// plays, idle days, favourite, dislike) separated by RS (30), the values in a column by US (31).
+// Every column must hold the same number of values, or the read is refused whole: a row built
+// from columns of different lengths would pair one track's title with another's plays.
+NSArray<NSDictionary *> *ParseMixLibraryColumns(NSString *text);
+// YES when the process exists and is stopped (SIGSTOP, state T). Such an app answers no Apple
+// Event: a script sent to it waits out its whole time limit.
+BOOL ProcessIsStopped(pid_t pid);
+// YES while a read that failed `failedAt` (0 for none) is younger than `retrySec`.
+BOOL MixLibraryReadShouldWait(CFAbsoluteTime now, CFAbsoluteTime failedAt, double retrySec);
 // The music library as last read from Music, kept on disk so the kind tiles and play-by-kind
 // work while Music is closed and straight after a relaunch. Only the fields the app reads are
 // kept; a row without an id is dropped. `now` and `savedAt` are seconds since 1970. Reading
