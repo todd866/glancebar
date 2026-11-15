@@ -2004,8 +2004,11 @@ int main(int argc, const char **argv) {
             if (!ia || !ib || !ic || id_) return Fail(__LINE__);
             if (fabs(ia.size.width - ia.size.height) > 2 || fabs(ib.size.width - ib.size.height) > 2) return Fail(__LINE__);
             NSString *keyA = TrackCoverCacheKey(@"RA", pa);
+            NSString *keyB = TrackCoverCacheKey(@"RB", pb);
             NSString *artDir = [fixtureHome stringByAppendingPathComponent:@"Library/Application Support/Glancebar/mix/art"];
             if (![NSFileManager.defaultManager fileExistsAtPath:TrackCoverCacheJPEGPath(artDir, keyA)]) return Fail(__LINE__);
+            if (![NSFileManager.defaultManager fileExistsAtPath:TrackCoverProvisionalMarkerPath(TrackCoverCacheJPEGPath(artDir, keyB))])
+                return Fail(__LINE__);
             NSUInteger readsAfter = [c trackCoverEmbeddedReadCount];
             NSImage *ia2 = [c trackCoverImageForTrackID:@"RA" artist:@"Fix Artist A" title:@"Square" album:@"" path:pa];
             if (!ia2 || ![NSFileManager.defaultManager fileExistsAtPath:TrackCoverCacheJPEGPath(artDir, keyA)]) return Fail(__LINE__);
@@ -2020,21 +2023,220 @@ int main(int argc, const char **argv) {
             [c setValue:nil forKey:@"_kindTileSnapshot"];
             NSArray *mosaic = [c kindMosaicCoversForIDs:@[@"KD1", @"KD2", @"KA1", @"KR1"]];
             if (mosaic.count < 4) return Fail(__LINE__);
+
+            // Provisional upgrade: 16:9 provisional at once; fake catalogue replaces it.
+            [c setValue:@NO forKey:@"mixFrozen"];
+            [c setValue:@YES forKey:@"networkKnown"];
+            [c setValue:@YES forKey:@"networkOnline"];
+            NSString *widePath = [fixtureMusic stringByAppendingPathComponent:@"upgrade-wide.m4a"];
+            if (!WriteSilentM4A(widePath, @"Upgrade Artist", FixtureCoverWidePNG(0.55), 0.12)) return Fail(__LINE__);
+            NSString *keyU = TrackCoverCacheKey(@"RU", widePath);
+            NSString *jpgU = TrackCoverCacheJPEGPath(artDir, keyU);
+            NSString *markerU = TrackCoverProvisionalMarkerPath(jpgU);
+            [c setValue:@YES forKey:@"mixFrozen"];
+            NSImage *prov = [c trackCoverImageForTrackID:@"RU" artist:@"Upgrade Artist" title:@"Wide Song" album:@"" path:widePath];
+            if (!prov || ![NSFileManager.defaultManager fileExistsAtPath:markerU]) return Fail(__LINE__);
+            NSData *before = [NSData dataWithContentsOfFile:jpgU];
+            [c setValue:@NO forKey:@"mixFrozen"];
+            __block NSInteger catCalls = 0;
+            NSData *catJSON = [@"{\"results\":[{\"artistName\":\"Upgrade Artist\",\"artworkUrl100\":\"https://example.invalid/100x100bb.jpg\"}]}"
+                               dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *catJPEG = FixtureCoverPNG(0.71);
+            [c setCoverCatalogueFetch:^NSData *(NSString *artist, NSString *title) {
+                (void)artist; (void)title;
+                catCalls++;
+                return catJSON;
+            }];
+            [c setCoverImageFetch:^NSData *(NSURL *url) {
+                (void)url;
+                return catJPEG;
+            }];
+            [c setCoverClockOverride:5000];
+            (void)[c trackCoverImageForTrackID:@"RU" artist:@"Upgrade Artist" title:@"Wide Song" album:@"" path:widePath];
+            [c trackCoverKickNetworkWorker];
+            CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+            while (catCalls < 1 && CFAbsoluteTimeGetCurrent() < deadline) {
+                [c trackCoverKickNetworkWorker];
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            }
+            if (catCalls < 1) return Fail(__LINE__);
+            deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+            while ([NSFileManager.defaultManager fileExistsAtPath:markerU] && CFAbsoluteTimeGetCurrent() < deadline)
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            if ([NSFileManager.defaultManager fileExistsAtPath:markerU]) return Fail(__LINE__);
+            NSData *after = [NSData dataWithContentsOfFile:jpgU];
+            if (!after.length || [after isEqual:before]) return Fail(__LINE__);
+
+            // Pacing: five catalogue lookups, 3s apart on the fake clock; no false misses.
+            __block NSInteger paceCalls = 0;
+            __block CFAbsoluteTime harnessClock = 8000;
+            [c setCoverClockOverride:harnessClock];
+            [c setCoverCatalogueFetch:^NSData *(NSString *artist, NSString *title) {
+                paceCalls++;
+                // Match whatever artist the worker asked for so MixArtURLFromSearch scores a hit.
+                NSString *json = [NSString stringWithFormat:
+                    @"{\"results\":[{\"artistName\":\"%@\",\"artworkUrl100\":\"https://example.invalid/100x100bb.jpg\"}]}",
+                    artist ?: @"x"];
+                (void)title;
+                return [json dataUsingEncoding:NSUTF8StringEncoding];
+            }];
+            [c setCoverImageFetch:^NSData *(NSURL *url) { (void)url; return catJPEG; }];
+            NSMutableArray *paceIDs = [NSMutableArray array];
+            for (NSInteger i = 0; i < 5; i++) {
+                NSString *p = [fixtureMusic stringByAppendingPathComponent:[NSString stringWithFormat:@"pace-%ld.m4a", (long)i]];
+                if (!WriteSilentM4A(p, [NSString stringWithFormat:@"Pace %ld", (long)i], nil, 0.1)) return Fail(__LINE__);
+                NSString *tid = [NSString stringWithFormat:@"PACE%ld", (long)i];
+                [paceIDs addObject:@{@"tid": tid, @"path": p,
+                                     @"artist": [NSString stringWithFormat:@"Pace %ld", (long)i]}];
+                (void)[c trackCoverImageForTrackID:tid artist:paceIDs.lastObject[@"artist"]
+                                             title:@"Song" album:@"" path:p];
+            }
+            // Wait until local misses have enqueued network work, then drain on the fake clock.
+            deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+            while (CFAbsoluteTimeGetCurrent() < deadline) {
+                [c trackCoverKickNetworkWorker];
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                if (paceCalls > 0) break;
+            }
+            deadline = CFAbsoluteTimeGetCurrent() + 15.0;
+            harnessClock = 8000;
+            while (paceCalls < 5 && CFAbsoluteTimeGetCurrent() < deadline) {
+                NSInteger before = paceCalls;
+                [c setCoverClockOverride:harnessClock];
+                [c trackCoverKickNetworkWorker];
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                if (paceCalls == before) harnessClock += 3;
+                else harnessClock = 8000 + paceCalls * 3;
+            }
+            if (paceCalls != 5) return Fail(__LINE__);
+            (void)harnessClock;
+            NSString *missPath = TrackCoverMissesPath(artDir);
+            // A lookup that finds nothing is recorded and not retried inside the hour.
+            __block NSInteger missCalls = 0;
+            [c setCoverCatalogueFetch:^NSData *(NSString *a, NSString *t) {
+                (void)a; (void)t; missCalls++;
+                return [@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding];
+            }];
+            [c setCoverImageFetch:^NSData *(NSURL *u) { (void)u; return nil; }];
+            harnessClock = 9000;
+            [c setCoverClockOverride:harnessClock];
+            NSString *missTrack = [fixtureMusic stringByAppendingPathComponent:@"miss-track.m4a"];
+            if (!WriteSilentM4A(missTrack, @"Miss Artist", nil, 0.1)) return Fail(__LINE__);
+            // Empty track id so step 7 (Music.app) is not attempted if Music is running on this Mac.
+            NSString *missKey = TrackCoverCacheKey(@"", missTrack);
+            (void)[c trackCoverImageForTrackID:@"" artist:@"Miss Artist" title:@"Gone" album:@"" path:missTrack];
+            deadline = CFAbsoluteTimeGetCurrent() + 8.0;
+            while (missCalls < 1 && CFAbsoluteTimeGetCurrent() < deadline) {
+                // Step the fake clock so a Wait from the pace drain cannot stall forever.
+                harnessClock += 3;
+                [c setCoverClockOverride:harnessClock];
+                [c trackCoverKickNetworkWorker];
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            }
+            if (missCalls != 1) return Fail(__LINE__);
+            deadline = CFAbsoluteTimeGetCurrent() + 3.0;
+            while (![NSFileManager.defaultManager fileExistsAtPath:missPath] && CFAbsoluteTimeGetCurrent() < deadline)
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            if (![NSFileManager.defaultManager fileExistsAtPath:missPath]) return Fail(__LINE__);
+            NSInteger callsAfter = missCalls;
+            [c setCoverClockOverride:harnessClock + 100];
+            (void)[c trackCoverImageForTrackID:@"" artist:@"Miss Artist" title:@"Gone" album:@"" path:missTrack];
+            [c trackCoverKickNetworkWorker];
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+            if (missCalls != callsAfter) return Fail(__LINE__);
+            // Miss file survives a new resolver instance (reload from disk).
+            NSData *missData = [NSData dataWithContentsOfFile:missPath];
+            NSMutableDictionary *reloaded = MusicCoverMissesFromJSON(missData, harnessClock + 100);
+            if (!reloaded[[NSString stringWithFormat:@"cover:%@", missKey]])
+                return Fail(__LINE__);
+            [c setCoverCatalogueFetch:nil];
+            [c setCoverImageFetch:nil];
+            [c setCoverClockOverride:0];
+        } else if (musicState && strcmp(musicState, "art-stress") == 0) {
+            [c setValue:@NO forKey:@"mixFrozen"];
+            [c setValue:@YES forKey:@"networkKnown"];
+            [c setValue:@YES forKey:@"networkOnline"];
+            NSMutableArray *library = [NSMutableArray array];
+            NSMutableArray *manifestTracks = [NSMutableArray array];
+            NSMutableArray *ids = [NSMutableArray array];
+            for (NSUInteger i = 0; i < 40; i++) {
+                NSString *tid = [NSString stringWithFormat:@"ST%02lu", (unsigned long)i];
+                NSString *p = [fixtureMusic stringByAppendingPathComponent:[NSString stringWithFormat:@"stress-%@.m4a", tid]];
+                NSData *cover = (i % 3 == 0) ? FixtureCoverWidePNG(0.05 * (i % 10))
+                                             : FixtureCoverPNG(0.07 * (i % 12));
+                if (!WriteSilentM4A(p, [NSString stringWithFormat:@"Stress %@", tid], cover, 0.1)) return Fail(__LINE__);
+                [library addObject:@{@"id": tid, @"title": tid, @"artist": @"Stress", @"album": @"S",
+                                     @"genre": @"Dance", @"plays": @(40 - (NSInteger)i), @"fav": @(i % 7 == 0),
+                                     @"dislike": @NO, @"idleDays": @1}];
+                [manifestTracks addObject:@{@"id": tid, @"path": p, @"title": tid, @"artist": @"Stress", @"album": @"S"}];
+                [ids addObject:tid];
+            }
+            [c setValue:library forKey:@"mixLibrary"];
+            NSDictionary *live = [c valueForKey:@"offlineManifest"] ?: @{@"schemaVersion": @1, @"playlists": @[]};
+            NSMutableDictionary *manifest = [live mutableCopy];
+            NSMutableArray *playlists = [[manifest[@"playlists"] isKindOfClass:NSArray.class] ? manifest[@"playlists"] : @[] mutableCopy];
+            [playlists addObject:@{@"key": @"stress", @"tracks": manifestTracks, @"ready": @YES}];
+            manifest[@"playlists"] = playlists;
+            [c setValue:manifest forKey:@"offlineManifest"];
+            [c setValue:nil forKey:@"_onDiskLibraryIDs"];
+            [c setValue:nil forKey:@"_kindTileSnapshot"];
+            [c setCoverCatalogueFetch:^NSData *(NSString *a, NSString *t) {
+                (void)a; (void)t;
+                return [@"{\"results\":[]}" dataUsingEncoding:NSUTF8StringEncoding];
+            }];
+            [c setCoverImageFetch:^NSData *(NSURL *u) { (void)u; return nil; }];
+            [c scheduleCoverCacheWarm];
+            for (NSUInteger r = 0; r < 50; r++) {
+                [c rebuildContent];
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+            }
+            CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 30.0;
+            BOOL allCached = NO;
+            while (CFAbsoluteTimeGetCurrent() < deadline) {
+                allCached = YES;
+                for (NSString *tid in ids) {
+                    NSDictionary *rec = nil;
+                    for (NSDictionary *row in manifestTracks) if ([row[@"id"] isEqual:tid]) { rec = row; break; }
+                    if (![c trackCoverHasCachedImageForTrackID:tid path:rec[@"path"]]) { allCached = NO; break; }
+                }
+                if (allCached) break;
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            }
+            if (!allCached) return Fail(__LINE__);
+            [c setCoverCatalogueFetch:nil];
+            [c setCoverImageFetch:nil];
         } else if (musicState && strcmp(musicState, "art-tiles-render") == 0) {
+            // Frozen/synchronous resolve so every kind mosaic quarter has a picture before render.
+            [c setValue:@YES forKey:@"mixFrozen"];
             NSDictionary *kindPack = KindHarnessTracks(fixtureMusic, YES);
             if (!kindPack) return Fail(__LINE__);
             [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
             [c setValue:ManifestReplacingKindHarness([c valueForKey:@"offlineManifest"], kindPack[@"manifest"]) forKey:@"offlineManifest"];
             [c setValue:nil forKey:@"_onDiskLibraryIDs"];
             [c setValue:nil forKey:@"_kindTileSnapshot"];
+            for (NSDictionary *t in kindPack[@"library"]) {
+                NSDictionary *rec = nil;
+                for (id playlist in [c valueForKey:@"offlineManifest"][@"playlists"] ?: @[]) {
+                    if (![playlist isKindOfClass:NSDictionary.class]) continue;
+                    for (id row in playlist[@"tracks"] ?: @[])
+                        if ([row isKindOfClass:NSDictionary.class] && [row[@"id"] isEqual:t[@"id"]]) { rec = row; break; }
+                    if (rec) break;
+                }
+                NSString *path = [rec[@"path"] isKindOfClass:NSString.class] ? rec[@"path"] : @"";
+                (void)[c trackCoverImageForTrackID:t[@"id"] artist:t[@"artist"] title:t[@"title"]
+                                             album:t[@"album"] path:path];
+            }
             NSMutableArray *stationTracks = [NSMutableArray array];
             for (NSUInteger i = 0; i < 4; i++) {
                 NSString *p = [fixtureMusic stringByAppendingPathComponent:[NSString stringWithFormat:@"render-pick-%lu.m4a", (unsigned long)i]];
                 if (!WriteSilentM4A(p, @"Render Picks", FixtureCoverPNG(0.05 + 0.17 * i), 0.1)) return Fail(__LINE__);
                 [stationTracks addObject:@{@"id": [NSString stringWithFormat:@"RP%lu", (unsigned long)i], @"title": @"Pick",
                                           @"artist": @"Render", @"album": @"", @"local_path": p}];
+                (void)[c trackCoverImageForTrackID:[NSString stringWithFormat:@"RP%lu", (unsigned long)i]
+                                            artist:@"Render" title:@"Pick" album:@"" path:p];
             }
             [c setValue:stationTracks forKey:@"stationTracks"];
+            [c setValue:nil forKey:@"_kindTileSnapshot"];
             [c rebuildContent];
             root = p.contentViewController.view;
             if ([c stationMosaicCovers].count < 4) return Fail(__LINE__);

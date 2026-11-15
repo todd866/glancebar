@@ -26,6 +26,7 @@ TEST_FLAGS=(
     -Wall
     -Wextra
     -Werror
+    -DGLANCEBAR_ASSERT_MAIN
     -isysroot
     "$SDKROOT"
     -mmacosx-version-min=13.0
@@ -139,6 +140,10 @@ GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=kinds-five GLANCEBAR_MUSIC_ROW_PNG="
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=kinds-empty GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=kinds-render GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=art-resolver "$WORK_DIR/glancebar_popover_tests"
+# Cover warm-pass stress: a race does not show every time, so run it five times.
+for _art_stress in 1 2 3 4 5; do
+    GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=art-stress "$WORK_DIR/glancebar_popover_tests"
+done
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=art-tiles-render GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 if [[ -n "${GLANCEBAR_POPOVER_HARNESS_OUT:-}" ]]; then
     cp "$WORK_DIR/glancebar_popover_tests" "$GLANCEBAR_POPOVER_HARNESS_OUT"

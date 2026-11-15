@@ -892,7 +892,18 @@ typedef struct {
     CFAbsoluteTime lastThumb;
     NSMutableDictionary<NSString *, NSNumber *> *missUntil;
 } MusicCoverNetworkState;
+// Pacing vs hard block: Wait means try again at *outReadyAt (not a miss); Blocked is
+// offline/metered/remembered miss; Ready means the lookup may run now.
+typedef NS_ENUM(NSInteger, MusicCoverNetGate) {
+    MusicCoverNetBlocked = 0,
+    MusicCoverNetWait = 1,
+    MusicCoverNetReady = 2,
+};
 void MusicCoverNetworkStateInit(MusicCoverNetworkState *state);
+MusicCoverNetGate MusicCoverNetworkCatalogueGate(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online,
+                                                 BOOL metered, NSString *missKey, CFAbsoluteTime *outReadyAt);
+MusicCoverNetGate MusicCoverNetworkThumbGate(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online,
+                                             BOOL metered, NSString *missKey, CFAbsoluteTime *outReadyAt);
 BOOL MusicCoverNetworkAllowsCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
                                       NSString *missKey);
 BOOL MusicCoverNetworkAllowsThumb(MusicCoverNetworkState *state, CFAbsoluteTime now, BOOL online, BOOL metered,
@@ -900,6 +911,14 @@ BOOL MusicCoverNetworkAllowsThumb(MusicCoverNetworkState *state, CFAbsoluteTime 
 void MusicCoverNetworkNoteCatalogue(MusicCoverNetworkState *state, CFAbsoluteTime now);
 void MusicCoverNetworkNoteThumb(MusicCoverNetworkState *state, CFAbsoluteTime now);
 void MusicCoverNetworkNoteMiss(MusicCoverNetworkState *state, NSString *missKey, CFAbsoluteTime now);
+// Persistent miss list under the art directory (key → absolute time when a retry is allowed).
+NSString *TrackCoverMissesPath(NSString *artDir);
+// Load misses; drop entries whose retry time is already past `now`.
+NSMutableDictionary<NSString *, NSNumber *> *MusicCoverMissesFromJSON(NSData *data, CFAbsoluteTime now);
+// Serialize misses, pruning expired entries at `now`.
+NSData *MusicCoverMissesToJSON(NSDictionary<NSString *, NSNumber *> *missUntil, CFAbsoluteTime now);
+// Network queue order: higher plays first, then favourites, then cache key.
+NSComparisonResult MusicCoverNetRequestCompare(NSDictionary *a, NSDictionary *b);
 // One-shot CLI control flags. kind: 0 = not a control invocation, 1 = post command, 2 = usage error, 3 = print last kind.
 typedef struct {
     int kind;

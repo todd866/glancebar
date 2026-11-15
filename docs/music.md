@@ -264,11 +264,15 @@ catalogue (artist and title search); a non-square embedded picture centre-croppe
 artwork only when Music is already running; another cover by the same artist, then the same album.
 Fills from steps five upward are marked provisional so a later pass can replace them.
 
-Hits are stored as a square JPEG of at most 600 px, keyed by persistent id or by a hash of the
-path when there is no id. Network fetches are paced (one catalogue search every three seconds, one
-thumbnail per second, remembered misses for an hour) and do not run when
-`~/.local/state/METERED_LINK` exists or the Mac is offline. After the library or offline manifest
-loads, a background pass warms local steps for every on-disk track, then network steps for gaps.
+Hits are stored as a JPEG of at most 600 px on the long side (cropped square only when the step
+says to crop), keyed by persistent id or by a hash of the path when there is no id. Steps five to
+eight are provisional and may be replaced by a later catalogue hit. Network work is a single
+FIFO (most-played first) drained by one worker that waits for the pacing clocks (one catalogue
+search every three seconds, one thumbnail per second). A miss is written to `mix/art/misses.json`
+only after a lookup runs and finds nothing, and is not retried for an hour. Nothing is queued or
+fetched when `~/.local/state/METERED_LINK` exists or the Mac is offline (the queue is emptied).
+After the library or offline manifest loads, a background pass warms local steps for every on-disk
+track, then enqueues network steps for gaps; it yields for two seconds around a track change.
 
 ## Metadata and cover art are kept with every download (12 Nov 2026)
 
