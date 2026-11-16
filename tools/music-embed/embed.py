@@ -637,11 +637,11 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     name = job.name
     while True:
         job = client.batches.get(name=name)
-        state = str(job.state or "")
+        state = normalise_job_state(job.state)
         print(f"preflight job {state}")
-        if state in ("JOB_STATE_SUCCEEDED", "SUCCEEDED"):
+        if state == "SUCCEEDED":
             break
-        if state in ("JOB_STATE_FAILED", "FAILED", "JOB_STATE_CANCELLED", "CANCELLED", "JOB_STATE_EXPIRED", "EXPIRED"):
+        if state in ("FAILED", "CANCELLED", "EXPIRED"):
             print(f"preflight batch failed: {state}", file=sys.stderr)
             return 1
         time.sleep(2.0)
@@ -720,7 +720,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def normalise_job_state(state: Any) -> str:
-    s = str(state or "")
+    # The SDK's enum prints as "JobState.JOB_STATE_SUCCEEDED"; the REST API says "JOB_STATE_SUCCEEDED".
+    s = str(getattr(state, "value", None) or state or "").rsplit(".", 1)[-1]
     for prefix in ("JOB_STATE_",):
         if s.startswith(prefix):
             s = s[len(prefix) :]

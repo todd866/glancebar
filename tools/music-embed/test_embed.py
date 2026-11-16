@@ -16,6 +16,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import embed
 
 
+class JobStateTests(unittest.TestCase):
+    def test_sdk_enum_and_rest_strings(self):
+        import enum
+
+        class JobState(enum.Enum):
+            JOB_STATE_SUCCEEDED = "JOB_STATE_SUCCEEDED"
+
+        for raw in ("JobState.JOB_STATE_SUCCEEDED", "JOB_STATE_SUCCEEDED", "SUCCEEDED", JobState.JOB_STATE_SUCCEEDED):
+            self.assertEqual(embed.normalise_job_state(raw), "SUCCEEDED")
+
+
 class ClipWindowTests(unittest.TestCase):
     def test_short_track_one_clip(self):
         self.assertEqual(embed.clip_windows(30.0), [(0.0, 30.0)])
