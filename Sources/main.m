@@ -6116,6 +6116,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     BOOL _chargerRowShown;   // the popover has a Charger row (plugged in, still draining)
     BOOL _chargerShort;      // ChargerShortLatched: the row's state, with hysteresis
     double _chargerCalmSince;
+    int _chargerLatch;       // while the popover is open: 1 = Charger row held, 2 = held absent, 0 = closed
     NSString *_storageNotice;
     NSDictionary *_storageResult, *_storageUndo, *_storageProgress;
     NSMutableDictionary *_storageBlocked;
@@ -12270,6 +12271,12 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
     }
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    // Hold the rows that came up with the popover, not whatever the first rebuild after it decides.
+    {
+        NSView *shownRoot = _popover.contentViewController.view;
+        _chargerLatch = ViewWithAccessibilityIdentifier(shownRoot, @"popover.row.charger") ? 1 : 2;
+        _burnLatch = ViewWithAccessibilityIdentifier(shownRoot, @"popover.row.burn") ? 1 : 2;
+    }
     if (_mixPlayingKey.length) [self preparePlaylistFirstItem:_mixPlayingKey];
     else if (_mixSeeds.firstObject[@"key"]) [self preparePlaylistFirstItem:_mixSeeds.firstObject[@"key"]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,150*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
@@ -12312,7 +12319,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     if (!fresh.valid) { _bat = fresh; [self batteryForecast]; [self refreshVisibleSurfaces]; return; }
     BOOL shortNow = [self chargerShortFor:fresh];
     BOOL stateChanged = fresh.acConnected != _bat.acConnected || fresh.isCharging != _bat.isCharging ||
-                        fresh.percent != _bat.percent || shortNow != _chargerRowShown;
+                        fresh.percent != _bat.percent || (!popover && shortNow != _chargerRowShown);
     BOOL powerChanged = fresh.amperage_mA != _bat.amperage_mA || fresh.systemLoad_mW != _bat.systemLoad_mW ||
                         fresh.systemPowerIn_mW != _bat.systemPowerIn_mW;
     BOOL wasOnAC = _bat.acConnected;
@@ -12373,6 +12380,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     _fleetFocusPending = NO;
     _popoverPrepared = NO;
     _burnLatch = 0;
+    _chargerLatch = 0;
     [GBSeedTile closeLarge];
     (void)note;
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
@@ -13829,7 +13837,12 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     batteryRow.frame = NSMakeRect(0, y, kW, kRowH);
     [root addSubview:batteryRow];
     y += kRowH;
-    _chargerRowShown = [self chargerShortFor:_bat];
+    // The row set never changes under the pointer (Ian, 16 Nov 2026: it moved the like button
+    // as he reached for it). What the popover opened with holds until it closes; only
+    // unplugging, which he does himself, takes the row away.
+    BOOL chargerWant = [self chargerShortFor:_bat];
+    if (_popover.isShown && _chargerLatch) chargerWant = _chargerLatch == 1 && _bat.acConnected;
+    _chargerRowShown = chargerWant;
     if (_chargerRowShown) {
         NSView *charger = [self chargerInstrumentRow];
         charger.frame = NSMakeRect(0, y, kW, kRowH);

@@ -17,6 +17,10 @@ static void PrimeBatteryForecast(Controller *controller, BatteryState battery, B
     double now = NSDate.date.timeIntervalSince1970;
     for (int sec=60; sec>=0; sec-=15) [tracker update:battery limit80:limit80 at:now-sec];
     [controller setValue:tracker forKey:@"batteryForecastTracker"];
+    // The fixture has held this state for a minute, so the Charger row's hold has settled.
+    [controller setValue:@(ChargerFallsShort(battery)) forKey:@"chargerShort"];
+    [controller setValue:@0 forKey:@"chargerCalmSince"];
+    [controller setValue:@0 forKey:@"chargerLatch"];
 }
 static BOOL ForecastFits(BatteryForecastView *view) {
     if (![view isKindOfClass:BatteryForecastView.class]) return NO;
@@ -2797,6 +2801,8 @@ int main(int argc, const char **argv) {
                 shortCharger.systemPowerIn_mW = 6000; shortCharger.systemLoad_mW = 16000;
                 shortCharger.amperage_mA = -(long)lround(10.0e6 / shortCharger.voltage_mV);
                 [c setValue:[NSValue valueWithBytes:&shortCharger objCType:@encode(BatteryState)] forKey:@"bat"];
+                [c setValue:@YES forKey:@"chargerShort"];   // short for longer than the row's 20 s hold
+                [c setValue:@0 forKey:@"chargerLatch"];
                 for (NSNumber *appW in @[@9, @11]) {
                     [c setValue:@[@{@"name": @"IDrive", @"watts": appW, @"wh": @0, @"estimated": @YES}] forKey:@"burnRows"];
                     [c rebuildContent];

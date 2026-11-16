@@ -2555,18 +2555,29 @@ int main(void) {
                 int idle[] = {-19, 20, -45, -40, 10, -48, -30};
                 for (int i = 0; i < 7; i++) { cb.amperage_mA = idle[i]; on = ChargerShortLatched(on, cb, 100 + i * 5, &calm); flicker |= on; }
                 check(!flicker, @"charger row: a battery idling at its limit never shows it");
-                cb.amperage_mA = -700; on = ChargerShortLatched(on, cb, 200, &calm);
-                check(on, @"charger row: a clear shortfall shows it at once");
-                cb.amperage_mA = -20; BOOL held = YES;
-                for (int t = 205; t < 230; t += 5) held &= ChargerShortLatched(on, cb, t, &calm);
-                check(held && !ChargerShortLatched(YES, cb, 236, &calm), @"charger row: stays 30 s after the drain stops, then goes");
+                // A spiky load near the charger's rating: short for a few seconds, then charging.
+                calm = 0; on = NO; flicker = NO;
+                for (int t = 0; t < 600; t += 1) {
+                    cb.amperage_mA = (t % 30) < 8 ? -400 : 300;
+                    on = ChargerShortLatched(on, cb, 1000 + t, &calm); flicker |= on;
+                }
+                check(!flicker, @"charger row: brief load spikes never show it");
+                calm = 0; on = NO; cb.amperage_mA = -700;
+                for (int t = 2000; t < 2019; t++) on = ChargerShortLatched(on, cb, t, &calm);
+                check(!on, @"charger row: a shortfall waits 20 s");
+                on = ChargerShortLatched(on, cb, 2020, &calm);
+                check(on, @"charger row: a shortfall that lasts 20 s shows it");
+                BOOL held = YES;
+                for (int t = 2021; t < 2140; t++) { cb.amperage_mA = (t % 30) < 8 ? -400 : 300; held &= ChargerShortLatched(on, cb, t, &calm); }
+                check(held, @"charger row: a spiky load keeps it shown");
+                cb.amperage_mA = 300; calm = 0; held = YES;
+                for (int t = 3000; t < 3120; t++) held &= ChargerShortLatched(YES, cb, t, &calm);
+                check(held && !ChargerShortLatched(YES, cb, 3120, &calm), @"charger row: stays 120 s after the drain stops, then goes");
                 calm = 0; cb.amperage_mA = -110;   // 1.3 W: still short, a little
-                check(ChargerShortLatched(YES, cb, 300, &calm) && ChargerShortLatched(YES, cb, 400, &calm) && calm == 0,
+                check(ChargerShortLatched(YES, cb, 4000, &calm) && ChargerShortLatched(YES, cb, 4500, &calm) && calm == 0,
                       @"charger row: a small remaining shortfall keeps it");
-                cb.amperage_mA = 300;
-                check(!ChargerShortLatched(YES, cb, 402, &calm), @"charger row: a charging battery hides it at once");
                 cb.acConnected = NO;
-                check(!ChargerShortLatched(YES, cb, 401, &calm), @"charger row: unplugged hides it at once");
+                check(!ChargerShortLatched(YES, cb, 4501, &calm), @"charger row: unplugged hides it at once");
             }
             NSDictionary *idManifest = @{@"schemaVersion": @1, @"playlists": @[
                 @{@"key": @"a", @"tracks": @[@{@"id": @"LIB1", @"path": @"/m/Artist - Song [ytVideoId01].m4a"},

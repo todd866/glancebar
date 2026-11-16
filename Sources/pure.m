@@ -3169,18 +3169,20 @@ BOOL ChargerFallsShort(BatteryState b) {
         !isnan(w) && w < -0.5;
 }
 
-BOOL ChargerShortLatched(BOOL latched, BatteryState b, double now, double *calmSince) {
+BOOL ChargerShortLatched(BOOL latched, BatteryState b, double now, double *since) {
     double w = BatteryWatts(b);
     if (!b.valid || !b.acConnected || b.systemPowerIn_mW == LONG_MIN || b.systemPowerIn_mW < 0 || isnan(w)) {
-        if (calmSince) *calmSince = 0;
-        return NO;
+        if (since) *since = 0;
+        return NO;   // unplugged or unmeasured: gone at once
     }
-    if (w <= -2.0) { if (calmSince) *calmSince = 0; return YES; }
-    if (!latched || w >= 0.5) { if (calmSince) *calmSince = 0; return NO; }   // charging: not short, at once
-    if (w < -1.0) { if (calmSince) *calmSince = 0; return YES; }   // still short, a little
-    if (!calmSince) return NO;
-    if (*calmSince <= 0 || now < *calmSince) *calmSince = now;
-    return now - *calmSince < 30.0;
+    // The reading disagrees with what is shown: a drain of 1 W or more while hidden, or
+    // no drain left (under 0.5 W) while shown. Only a disagreement that lasts flips it.
+    BOOL disagrees = latched ? w >= -0.5 : w <= -1.0;
+    if (!disagrees || !since) { if (since) *since = 0; return latched; }
+    if (*since <= 0 || now < *since) *since = now;
+    if (now - *since < (latched ? 120.0 : 20.0)) return latched;
+    *since = 0;
+    return !latched;
 }
 
 double PowerFlowIntensity(BatteryState b) {

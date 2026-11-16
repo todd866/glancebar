@@ -42,11 +42,13 @@ double PowerFlowIntensity(BatteryState b);
 // Plugged in with a measured input, and the battery is still carrying part of the load
 // (a weak port, or a charger delivering nothing). The popover then names the charger.
 BOOL ChargerFallsShort(BatteryState b);
-// The Charger row's state, with hysteresis. It turns on at once when the battery is clearly
-// carrying load behind the charger (a net drain of 2 W or more), and off at once when the battery
-// charges (0.5 W or more), otherwise only after the net drain has stayed under 1 W for 30 s. At a charge limit the battery idles a few tenths of a
-// watt either side of zero; a single threshold at 0.5 W made the row (and the rows under it)
-// jump in and out every few seconds (15 Nov 2026). `calmSince` is kept by the caller (0 = not calm).
+// The Charger row's state, held in both directions so it never blinks. It appears only after
+// the battery has carried 1 W or more of the load behind the charger for 20 s, and goes only
+// after 120 s with no drain (under 0.5 W); unplugging hides it at once. A single threshold
+// made the row (and every row under it) jump in and out at a charge limit (15 Nov 2026), and
+// an at-once hide on any charging reading kept it blinking under a spiky load near the
+// charger's rating (16 Nov 2026). `since` is kept by the caller: when the reading started
+// disagreeing with the row (0 = it agrees).
 BOOL ChargerShortLatched(BOOL latched, BatteryState b, double now, double *calmSince);
 
 // Battery power in watts, signed: + charging, − discharging. NAN when not measurable.
