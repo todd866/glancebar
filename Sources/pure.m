@@ -3725,11 +3725,60 @@ NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *k
         [work removeObject:pick];
         strictSpacing = YES;
     }
-    for (NSDictionary *t in recents) {
+    // Heard songs come back oldest-heard first (recentIDs is in the order they played).
+    NSMutableSet *inKind = [NSMutableSet set];
+    for (NSDictionary *t in recents) [inKind addObject:t[@"id"]];
+    for (NSString *rid in [NSOrderedSet orderedSetWithArray:recentIDs ?: @[]]) {
         if (ordered.count >= count) break;
-        [ordered addObject:t[@"id"]];
+        if ([inKind containsObject:rid]) [ordered addObject:rid];
     }
     return ordered;
+}
+
+NSString *MusicKindNeighbour(NSString *kind) {
+    if ([kind isEqual:@"any"]) return nil;
+    return [kind isEqual:@"chill"] ? @"alt" : @"any";
+}
+
+NSArray<NSString *> *MusicKindRotation(NSArray<NSDictionary *> *tracks, NSString *kind, NSSet<NSString *> *onDiskIDs,
+                                       NSUInteger count, uint64_t seed, NSArray<NSString *> *recentIDs) {
+    if (!count || !tracks.count || !kind.length) return @[];
+    NSMutableArray<NSDictionary *> *playable = [NSMutableArray array];
+    for (NSDictionary *t in tracks)
+        if ([t isKindOfClass:NSDictionary.class] && (!onDiskIDs.count || [onDiskIDs containsObject:t[@"id"]])) [playable addObject:t];
+    NSSet *recent = [NSSet setWithArray:recentIDs ?: @[]];
+    NSArray<NSString *> *own = MusicKindQueue(playable, kind, count, seed, recentIDs);
+    NSMutableArray<NSString *> *fresh = [NSMutableArray array], *heard = [NSMutableArray array];
+    for (NSString *tid in own) [[recent containsObject:tid] ? heard : fresh addObject:tid];
+    // A kind with few songs on this Mac carries on with unheard songs of its nearest kind
+    // before it repeats one (16 Nov 2026: Chill had 9 and played "Reste un oiseau" 8 times in 4 days).
+    NSString *next = MusicKindNeighbour(kind);
+    if (next && fresh.count < count) {
+        NSMutableArray *skip = [NSMutableArray arrayWithArray:recentIDs ?: @[]];
+        [skip addObjectsFromArray:own];
+        NSSet *skipSet = [NSSet setWithArray:skip];
+        for (NSString *tid in MusicKindQueue(playable, next, count, seed ^ 0x9E3779B97F4A7C15ULL, skip)) {
+            if (fresh.count >= count) break;
+            if (![skipSet containsObject:tid]) [fresh addObject:tid];
+        }
+    }
+    for (NSString *tid in heard) { if (fresh.count >= count) break; [fresh addObject:tid]; }
+    return fresh;
+}
+
+NSArray<NSDictionary *> *MusicRecentPlaysPruned(NSArray *plays, double now, double horizon, NSUInteger cap) {
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    // Newest first while pruning, so a song heard twice keeps its latest time.
+    for (id p in [(([plays isKindOfClass:NSArray.class] ? plays : @[])) reverseObjectEnumerator]) {
+        if (![p isKindOfClass:NSDictionary.class]) continue;
+        NSString *tid = p[@"id"]; double at = [p[@"at"] doubleValue];
+        if (![tid isKindOfClass:NSString.class] || !tid.length || at <= 0 || now - at > horizon || [seen containsObject:tid]) continue;
+        [seen addObject:tid];
+        [out insertObject:@{@"id": tid, @"at": @(at)} atIndex:0];
+        if (out.count >= cap) break;
+    }
+    return out;
 }
 
 NSArray<NSDictionary *> *ParseMixLibraryColumns(NSString *text) {

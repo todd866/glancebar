@@ -236,8 +236,11 @@ Kinds: **dance**, **alt**, **rap**, **chill**, **any**. Genres map with chill ch
 (ambient, downtempo, chill, lo-fi, jazz, classical, acoustic, singer-songwriter, easy listening, …),
 then dance / rap / alt as the mix families (pop counts as alt); everything else is **other** and only
 plays under **any**. A kind queue is a weighted shuffle of library tracks that match, never disliked,
-with tracks you just heard pushed to the back; only files on this Mac play (the rest sync in the
-background like any other offline playlist).
+and only files on this Mac play. Songs heard in the last three days (any source, kept across clicks
+and relaunches in the `musicRecentPlays` default) go to the back, oldest-heard first. A kind that runs
+out of unheard songs carries on with unheard songs of its nearest kind (Chill → Alt, the rest → Any)
+before it repeats one: on 16 Nov 2026 Chill had 9 of its 34 songs on this Mac and looped them.
+Getting the other 25 onto the Mac is the hot set's job (`musiclib.py`), not the queue's.
 
 Command (posts to the running app, then exits):
 

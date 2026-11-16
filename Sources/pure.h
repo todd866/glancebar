@@ -872,6 +872,17 @@ NSString *MusicKindForGenre(NSString *genre);
 // recentIDs at the back; no dislikes; artist at most twice per sliding window of ten when possible.
 NSArray<NSString *> *MusicKindQueue(NSArray<NSDictionary *> *tracks, NSString *kind, NSUInteger count,
                                     uint64_t seed, NSArray<NSString *> *recentIDs);
+// The kind a small kind carries on with once its own unheard songs run out: chill → alt,
+// the rest → any; nil for any.
+NSString *MusicKindNeighbour(NSString *kind);
+// What a kind plays, from the files on this Mac (onDiskIDs empty ⇒ all): its unheard songs,
+// then unheard songs of MusicKindNeighbour, then its heard songs oldest-heard first.
+// recentIDs is in the order the songs played (oldest first).
+NSArray<NSString *> *MusicKindRotation(NSArray<NSDictionary *> *tracks, NSString *kind, NSSet<NSString *> *onDiskIDs,
+                                       NSUInteger count, uint64_t seed, NSArray<NSString *> *recentIDs);
+// Plays ({id, at}) oldest first: one per id at its latest time, none older than horizon
+// seconds, at most cap (the newest kept).
+NSArray<NSDictionary *> *MusicRecentPlaysPruned(NSArray *plays, double now, double horizon, NSUInteger cap);
 // Tracks of kind that are on this Mac (onDiskIDs non-empty ⇒ require membership; empty ⇒ count all matches).
 NSUInteger MusicKindOnMacCount(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind);
 // The library as the bulk script returns it: ten columns (id, title, artist, album, genre, year,

@@ -8532,6 +8532,22 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     _offlineManifest = manifest;
     [self invalidateOfflineCoverageCache];
 }
+// Songs heard on this Mac in the last three days, oldest first, kept across relaunches so a
+// new shuffle starts with something not heard lately.
+static NSString *const kMusicRecentPlaysKey = @"musicRecentPlays";
+static const double kMusicRecentHorizon = 3 * 86400.0;
+- (NSArray<NSString *> *)recentPlayIDs {
+    NSArray *plays = MusicRecentPlaysPruned([NSUserDefaults.standardUserDefaults arrayForKey:kMusicRecentPlaysKey],
+                                            NSDate.date.timeIntervalSince1970, kMusicRecentHorizon, 500);
+    return [plays valueForKey:@"id"] ?: @[];
+}
+- (void)noteRecentPlay:(NSString *)trackID {
+    if (!trackID.length) return;
+    NSMutableArray *plays = [[NSUserDefaults.standardUserDefaults arrayForKey:kMusicRecentPlaysKey] mutableCopy] ?: [NSMutableArray array];
+    double now = NSDate.date.timeIntervalSince1970;
+    [plays addObject:@{@"id": trackID, @"at": @(now)}];
+    [NSUserDefaults.standardUserDefaults setObject:MusicRecentPlaysPruned(plays, now, kMusicRecentHorizon, 500) forKey:kMusicRecentPlaysKey];
+}
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause {
     if (!_musicProbesEnabled || _musicOff || !GBValidMusicKind(kind)) return NO;
     if (!_mixLibrary.count) [self loadMixLibraryCacheIfNeeded];
@@ -8551,7 +8567,12 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     _kindPlaySeed = (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000) ^ (uint64_t)arc4random();
     _kindPlayingName = kind;
     [_kindPlayedIDs removeAllObjects];
-    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, playingID.length ? @[playingID] : @[]);
+    // What was heard in the last three days, across clicks and relaunches, goes to the back; the
+    // song playing now is the most recent of all.
+    NSMutableArray<NSString *> *heard = [[self recentPlayIDs] mutableCopy];
+    if (playingID.length) { [heard removeObject:playingID]; [heard addObject:playingID]; }
+    _onDiskLibraryIDs = nil;
+    NSArray<NSString *> *ids = MusicKindRotation(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed, heard);
     if (!ids.count) {
         GBLog("music: no %{public}@ tracks in library", kind);
         return NO;
@@ -8586,7 +8607,10 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSString *kind = [_mixPlayingKey substringFromIndex:5];
     if (!GBValidMusicKind(kind)) return NO;
     _kindPlaySeed = _kindPlaySeed * 6364136223846793005ULL + 1442695040888963407ULL;
-    NSArray<NSString *> *ids = MusicKindQueue(_mixLibrary, kind, 60, _kindPlaySeed, _kindPlayedIDs);
+    NSMutableArray<NSString *> *heard = [[self recentPlayIDs] mutableCopy];
+    for (NSString *tid in _kindPlayedIDs) { [heard removeObject:tid]; [heard addObject:tid]; }
+    _onDiskLibraryIDs = nil;
+    NSArray<NSString *> *ids = MusicKindRotation(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed, heard);
     if (!ids.count) return NO;
     NSDictionary *request = _offlineRequests[_mixPlayingKey];
     NSArray *existing = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
@@ -9272,7 +9296,9 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
         // What a kind has already played is kept by LIBRARY id, through the manifest. The id in
         // a file's name is not it (15 Nov 2026: 0 of 331 playable files; 80 carried a video id
         // and 251 none), so a list kept from names pushed nothing to the back of the next shuffle.
-        NSString *playedID = [_mixPlayingKey hasPrefix:@"kind:"] ? OfflineManifestTrackIDForPath(_offlineManifest, url.path) : nil;
+        NSString *playedID = OfflineManifestTrackIDForPath(_offlineManifest, url.path);
+        [self noteRecentPlay:playedID];
+        if (![_mixPlayingKey hasPrefix:@"kind:"]) playedID = nil;
         if (playedID.length && _kindPlayedIDs && ![_kindPlayedIDs containsObject:playedID]) [_kindPlayedIDs addObject:playedID];
     }
     _localHeartError = nil;

@@ -2465,6 +2465,30 @@ int main(void) {
             }
             check(playingNeverFirst, @"kind queue: the playing song goes last for every seed");
             check([MusicKindQueue(@[kindLib[0]], @"dance", 60, 5, @[@"D000"]) isEqual:@[@"D000"]], @"kind queue: the only song still plays");
+            {
+                NSArray *heardOrder = @[@"D005", @"D002", @"D007"];
+                NSArray *q = MusicKindQueue(kindLib, @"dance", 60, 3, heardOrder);
+                check([[q subarrayWithRange:NSMakeRange(q.count - 3, 3)] isEqual:heardOrder], @"kind queue: heard songs return oldest-heard first");
+                NSMutableArray *rot = [NSMutableArray array];
+                for (int i = 0; i < 3; i++)
+                    [rot addObject:T([NSString stringWithFormat:@"C%03d", i], [NSString stringWithFormat:@"Calm %d", i],
+                                     [NSString stringWithFormat:@"Quiet %d", i], @"", @"Jazz", 2019, 9, 20, NO, NO)];
+                [rot addObjectsFromArray:kindLib];
+                NSSet *disk = [NSSet setWithArray:@[@"C000", @"C001", @"C002", @"A000", @"A001", @"A002", @"D000"]];
+                NSArray *chillQ = MusicKindRotation(rot, @"chill", disk, 60, 11, @[@"C001", @"A001"]);
+                check(chillQ.count == 5 && [[NSSet setWithArray:[chillQ subarrayWithRange:NSMakeRange(0, 2)]] isEqual:[NSSet setWithArray:@[@"C000", @"C002"]]] &&
+                      [[NSSet setWithArray:[chillQ subarrayWithRange:NSMakeRange(2, 2)]] isEqual:[NSSet setWithArray:@[@"A000", @"A002"]]] &&
+                      [chillQ[4] isEqual:@"C001"],
+                      @"kind rotation: unheard chill, then unheard alt, then heard chill; never off the Mac");
+                check(![chillQ containsObject:@"D000"] && ![chillQ containsObject:@"A001"] && ![chillQ containsObject:@"A003"],
+                      @"kind rotation: chill tops up from alt only, never a heard alt song or a missing file");
+                NSArray *allHeard = MusicKindRotation(rot, @"chill", disk, 60, 11, @[@"A000", @"A002", @"C002", @"C000", @"C001", @"A001"]);
+                check([allHeard isEqual:(@[@"C002", @"C000", @"C001"])], @"kind rotation: all heard: the kind's own, oldest-heard first");
+                NSArray *pr = MusicRecentPlaysPruned(@[@{@"id": @"x", @"at": @100}, @{@"id": @"y", @"at": @5000}, @{@"id": @"x", @"at": @6000},
+                                                       @"junk", @{@"id": @"old", @"at": @1}, @{@"id": @"z", @"at": @7000}], 7000, 6950, 2);
+                check([[pr valueForKey:@"id"] isEqual:(@[@"x", @"z"])] && [pr[0][@"at"] doubleValue] == 6000,
+                      @"recent plays: latest time per song, horizon and cap, oldest first");
+            }
             // The library as the script returns it: ten columns, zipped into tracks.
             NSString *US = [NSString stringWithFormat:@"%C", (unichar)31], *RS = [NSString stringWithFormat:@"%C", (unichar)30];
             NSArray *libCols = @[@[@"A1", @"B2", @"C3"], @[@"One", @"", @"Three "], @[@"Ann", @"Bo", @"Cy"], @[@"LP", @"", @"EP"],
