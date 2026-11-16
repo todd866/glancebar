@@ -157,10 +157,12 @@ def embed_response_values(response: Any) -> list[float]:
     embs = response.get("embeddings")
     if isinstance(embs, list) and embs:
         first = embs[0]
-        if hasattr(first, "values"):
+        # A dict has a .values method too: check for one first.
+        if isinstance(first, dict):
+            if first.get("values"):
+                return [float(x) for x in first["values"]]
+        elif isinstance(getattr(first, "values", None), (list, tuple)):
             return [float(x) for x in first.values]
-        if isinstance(first, dict) and first.get("values"):
-            return [float(x) for x in first["values"]]
     single = response.get("embedding")
     vals = _values_from_mapping(single)
     if vals is not None:
