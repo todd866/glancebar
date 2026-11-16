@@ -12265,7 +12265,10 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     if (sender && CFAbsoluteTimeGetCurrent() - _popoverClosedAt < 0.20) return;
     // The prepared tree is refreshed while hidden. Nothing reads telemetry or
     // walks the filesystem between this click and the presentation request.
-    if (!_popoverPrepared) [self rebuildContent];
+    // The tree is held as it opens, so it must open right: a tree prepared before the Charger
+    // row's hold flipped (a replug, a charger that just fell short) is rebuilt first. No read:
+    // the latch is judged on the battery state already in hand.
+    if (!_popoverPrepared || [self chargerShortFor:_bat] != _chargerRowShown) [self rebuildContent];
     if (_popoverScroll) {
         [_popoverScroll.contentView scrollToPoint:NSZeroPoint];
         [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
