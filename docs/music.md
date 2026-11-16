@@ -322,3 +322,17 @@ lives on the M2's external drive with the masters.
 - **Beside the masters.** Every catalogue build writes the same document to
   `<masters>/_metadata/library-metadata.json` on the M2's drive, and prints how many masters
   have incomplete metadata.
+
+## Song embeddings (16 Nov 2026)
+
+Every song in the lossless library has a 3072-D `gemini-embedding-2` vector, the mean of up to
+three 80 s clips (20%, 50%, 80% of the song), made through the Gemini Batch API ($27.39 for
+1,451 songs / 4,299 clips; about 2¢ a new song). Tool: `tools/music-embed/embed.py`
+(plan, clips, build, preflight, cost, submit, poll, collect, neighbours). State and vectors on
+the M2 in `~/.local/state/glancebar-music-embed/` (`vectors/tracks.f32` + `tracks-index.jsonl`).
+The key is piped in from md3's `.env.local` at run time, never stored there. Tier 1 caps
+active batch work at 500k tokens: `drive.sh` submits the next shard only when no job is
+pending or running. Neighbour checks by ear looked right (genres and moods separate; Gang of
+Youths, Car Seat Headrest and The Middle East show up as hubs). Not yet used by Glancebar:
+next is kinds as regions of this space, then reception scores (Glancebar log, the Selector
+deck's plays, the YouTube Music Takeout requested 16 Nov) checked against neighbours.
