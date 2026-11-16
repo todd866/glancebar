@@ -18,6 +18,9 @@ cleanup() {
     rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
+# The harnesses drive real Controllers; their playback lines go here, never into the owner's
+# ~/Library/Logs/Glancebar/playback.jsonl (16 Nov 2026: "song:test" pauses in the real log).
+export GLANCEBAR_PLAYBACK_LOG="$WORK_DIR/playback.jsonl"
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

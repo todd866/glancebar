@@ -6064,6 +6064,65 @@ static NSString *const kMusicNextTip = @"Next track — tap blends, double-tap c
 
 static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
 
+// Player buttons take the click that also brings the popover forward; a plain NSButton
+// spends the first click on activation (16 Nov 2026: "thumbs-up doesn't work on first click").
+@interface GBFirstMouseButton : NSButton
+@end
+@implementation GBFirstMouseButton
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
+@end
+
+// Main-thread hang recorder (16 Nov 2026: the popover froze for about a minute as Bluetooth
+// headphones dropped, and nothing recorded where). A background timer checks a heartbeat the
+// main thread stamps twice a second; after 3 s without one it runs /usr/bin/sample on this
+// process once per hang, into ~/Library/Logs/Glancebar/hangs/, and logs the hang's length.
+static _Atomic double gGBMainBeat;
+static void GBHangWatchStart(void) {
+    static dispatch_source_t beat, watch;
+    if (watch) return;
+    gGBMainBeat = CFAbsoluteTimeGetCurrent();
+    beat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(beat, DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(beat, ^{ gGBMainBeat = CFAbsoluteTimeGetCurrent(); });
+    dispatch_resume(beat);
+    dispatch_queue_t q = dispatch_queue_create("glancebar.hangwatch", DISPATCH_QUEUE_SERIAL);
+    watch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(watch, DISPATCH_TIME_NOW, NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+    static double sampledFor = 0, hangStart = 0;
+    dispatch_source_set_event_handler(watch, ^{
+        double last = gGBMainBeat, now = CFAbsoluteTimeGetCurrent(), stalled = now - last;
+        if (stalled < 3.0) {
+            if (hangStart > 0) {
+                GBLog("hang: main thread blocked %.1f s", now - hangStart);
+                NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Glancebar/hangs"];
+                NSString *line = [NSString stringWithFormat:@"{\"at\":%.0f,\"seconds\":%.1f}\n",
+                                  hangStart + kCFAbsoluteTimeIntervalSince1970, now - hangStart];
+                NSString *path = [dir stringByAppendingPathComponent:@"hangs.jsonl"];
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                if (!fh) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+                else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+                hangStart = 0;
+            }
+            return;
+        }
+        if (hangStart <= 0) hangStart = last;
+        if (sampledFor == last) return;   // one sample per hang
+        sampledFor = last;
+        NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Glancebar/hangs"];
+        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSDateFormatter *f = [NSDateFormatter new];
+        f.dateFormat = @"yyyyMMdd-HHmmss";
+        NSString *out = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"hang-%@.txt", [f stringFromDate:NSDate.date]]];
+        NSTask *t = [NSTask new];
+        t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/sample"];
+        t.arguments = @[[NSString stringWithFormat:@"%d", getpid()], @"3", @"-file", out];
+        t.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        t.standardError = NSFileHandle.fileHandleWithNullDevice;
+        [t launchAndReturnError:nil];
+    });
+    dispatch_resume(watch);
+}
+
 @implementation Controller {
     MeteredMonitor *_meteredMonitor;
     NSDictionary *_metered;
@@ -6116,7 +6175,8 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
     BOOL _chargerRowShown;   // the popover has a Charger row (plugged in, still draining)
     BOOL _chargerShort;      // ChargerShortLatched: the row's state, with hysteresis
     double _chargerCalmSince;
-    int _chargerLatch;       // while the popover is open: 1 = Charger row held, 2 = held absent, 0 = closed
+    int _chargerLatch;
+    BOOL _rebuildAfterMouseUp;   // a rebuild is waiting for the mouse button to come up       // while the popover is open: 1 = Charger row held, 2 = held absent, 0 = closed
     NSString *_storageNotice;
     NSDictionary *_storageResult, *_storageUndo, *_storageProgress;
     NSMutableDictionary *_storageBlocked;
@@ -6360,6 +6420,7 @@ static _Atomic(NSUInteger) gOfflineHashLiveGeneration;
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     _appLaunched = YES;
+    GBHangWatchStart();
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
     dispatch_async(dispatch_get_main_queue(), ^{ GBFineVolumeStart(); });
@@ -10476,7 +10537,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightRegular];
     NSImage *image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
     if (!image) image = [NSImage imageWithSystemSymbolName:@"play.fill" accessibilityDescription:nil];
-    NSButton *button = [NSButton buttonWithImage:image target:self action:action];
+    NSButton *button = [GBFirstMouseButton buttonWithImage:image target:self action:action];
     button.title = @"";   // buttonWithImage: leaves the stock "Button" title
     button.bordered = NO;
     button.imagePosition = NSImageOnly;
@@ -13790,6 +13851,29 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 }
 
 - (void)rebuildContent {
+    // A rebuild between mouse-down and mouse-up replaces the button being pressed and the
+    // click goes nowhere. While the mouse is held in the open popover, wait for the release.
+    if (_popover.isShown && (NSEvent.pressedMouseButtons & 1)) {
+        if (!_rebuildAfterMouseUp) {
+            _rebuildAfterMouseUp = YES;
+            __weak Controller *weakSelf = self;
+            __block void (^retry)(void);
+            void (^attempt)(void) = ^{
+                Controller *me = weakSelf;
+                if (!me) return;
+                if (me->_popover.isShown && (NSEvent.pressedMouseButtons & 1)) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), retry);
+                    return;
+                }
+                me->_rebuildAfterMouseUp = NO;
+                retry = nil;
+                [me rebuildContent];
+            };
+            retry = attempt;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), retry);
+        }
+        return;
+    }
     CFAbsoluteTime rebuildStarted = CFAbsoluteTimeGetCurrent();
     _popoverPrepared=YES;
       // Playback scale harness: frozen mix, popover never shown, music off — skip full tree rebuild.
