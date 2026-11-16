@@ -220,6 +220,51 @@ class BuildResumeTests(unittest.TestCase):
             self.assertEqual((paths.batches / "shard-000.jsonl").read_bytes(), b"keep\n")
 
 
+class GenreKindTests(unittest.TestCase):
+    def test_genre_family_and_kind(self):
+        self.assertEqual(embed.genre_family("Electronic"), "dance")
+        self.assertEqual(embed.genre_family("Hip-Hop/Rap"), "rap")
+        self.assertEqual(embed.genre_family("Pop"), "pop")
+        self.assertEqual(embed.music_kind_for_genre("Electronic/Downtempo"), "chill")
+        self.assertEqual(embed.music_kind_for_genre("Electronic"), "dance")
+        self.assertEqual(embed.music_kind_for_genre("Pop"), "alt")
+        self.assertEqual(embed.music_kind_for_genre(""), "other")
+
+
+class MatchKeyTests(unittest.TestCase):
+    def test_feat_and_brackets(self):
+        a, t = embed.match_key("Fred again.., Bea", "Delilah (feat. Bea)")
+        self.assertEqual(a, "fred again")
+        self.assertEqual(t, "delilah")
+        self.assertEqual(embed.normalize_title("Song - Remastered 2020"), "song")
+
+
+class ExportSpaceTests(unittest.TestCase):
+    def test_toy_space(self):
+        index = [
+            {"id": "v1", "artist": "A", "title": "One", "album": "LP"},
+            {"id": "v2", "artist": "A", "title": "Two", "album": "LP"},
+            {"id": "v3", "artist": "B", "title": "Rap", "album": ""},
+        ]
+        vectors = [
+            [1.0, 0.0, 0.0],
+            [0.99, 0.1, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+        library = [
+            {"id": "L1", "artist": "A", "title": "One", "album": "LP", "genre": "House"},
+            {"id": "L2", "artist": "A", "title": "Two", "album": "LP", "genre": "House"},
+            {"id": "L3", "artist": "B", "title": "Rap", "album": "", "genre": "Hip-Hop/Rap"},
+        ]
+        payload = embed.build_music_space(vectors, index, library, progress=False)
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertEqual(payload["stats"]["matchedVectors"], 3)
+        self.assertEqual(payload["tracks"]["L1"]["kind"], "dance")
+        self.assertIn("L2", [p[0] for p in payload["tracks"]["L1"]["next"]])
+        self.assertNotIn("L1", [p[0] for p in payload["tracks"]["L1"]["next"]])
+        self.assertEqual(len(payload["tracks"]["L1"]["next"]), 2)
+
+
 class F32RoundTrip(unittest.TestCase):
     def test_write_read(self):
         with tempfile.TemporaryDirectory() as tmp:

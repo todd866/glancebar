@@ -2618,6 +2618,106 @@ int main(void) {
                   OfflineManifestTrackIDForPath(nil, @"/m/x.m4a") == nil &&
                   OfflineManifestTrackIDForPath((id)@"junk", @"/m/x.m4a") == nil,
                   @"manifest id for path: nothing for an unknown path or a bad manifest");
+            check(MusicSpaceParse(nil) == nil &&
+                  MusicSpaceParse([@"{" dataUsingEncoding:NSUTF8StringEncoding]) == nil &&
+                  MusicSpaceParse([@"[]" dataUsingEncoding:NSUTF8StringEncoding]) == nil &&
+                  MusicSpaceParse([@"{\"schemaVersion\":2}" dataUsingEncoding:NSUTF8StringEncoding]) == nil &&
+                  MusicSpaceParse([@"{\"schemaVersion\":1,\"tracks\":\"x\"}" dataUsingEncoding:NSUTF8StringEncoding]) == nil,
+                  @"music space: parse rejects garbage");
+            {
+                NSDictionary *space = @{
+                    @"schemaVersion": @1,
+                    @"kindNeighbours": @{@"chill": @[@"rap", @"dance", @"alt"]},
+                    @"tracks": @{
+                        @"C000": @{@"kind": @"chill", @"kindScore": @0.92, @"next": @[]},
+                        @"D000": @{@"kind": @"dance", @"kindScore": @0.88, @"next": @[]},
+                    },
+                };
+                NSDictionary *chillTr = @{@"id": @"C000", @"genre": @"House"};
+                NSDictionary *danceTr = @{@"id": @"D000", @"genre": @"Jazz"};
+                check(MusicKindMatchesWithSpace(@"chill", chillTr, space) &&
+                      !MusicKindMatchesWithSpace(@"dance", chillTr, space) &&
+                      MusicKindMatchesWithSpace(@"dance", danceTr, space) &&
+                      MusicKindMatchesWithSpace(@"dance", @{@"id": @"NOPE", @"genre": @"House"}, space),
+                      @"music space: membership via space and genre fallback");
+                check([MusicKindNeighbourWithSpace(@"chill", space) isEqual:@"rap"] &&
+                      [MusicKindNeighbourWithSpace(@"chill", nil) isEqual:@"alt"],
+                      @"music space: neighbour from embedding order");
+                BOOL rotSame = YES;
+                NSSet *diskAll = [NSSet set];
+                NSArray *dancePool = kindLib;
+                for (uint64_t rotSeed = 1; rotSeed <= 200 && rotSame; rotSeed++) {
+                    NSArray *legacy = MusicKindRotation(dancePool, @"dance", diskAll, 8, rotSeed, @[]);
+                    NSArray *withNil = MusicKindRotationInSpace(dancePool, @"dance", diskAll, 8, rotSeed, @[], nil);
+                    rotSame &= [legacy isEqual:withNil];
+                }
+                check(rotSame, @"music space: nil space matches legacy rotation");
+            }
+            {
+                NSMutableDictionary *tracks = [NSMutableDictionary dictionary];
+                NSMutableArray *flowLib = [NSMutableArray array];
+                for (int i = 0; i < 10; i++) {
+                    NSString *tid = [NSString stringWithFormat:@"F%03d", i];
+                    [flowLib addObject:T(tid, [NSString stringWithFormat:@"Track %d", i], [NSString stringWithFormat:@"A%d", i % 3],
+                                           @"", @"House", 2020, 5 + i, 20, NO, NO)];
+                    NSMutableArray *next = [NSMutableArray array];
+                    for (int j = 0; j < 10; j++) {
+                        if (j == i) continue;
+                        double sc = (j == (i + 1) % 10) ? 0.97 : 0.55;
+                        [next addObject:@[ [NSString stringWithFormat:@"F%03d", j], @(sc) ]];
+                    }
+                    tracks[tid] = @{@"kind": @"dance", @"kindScore": @0.9, @"next": next};
+                }
+                NSDictionary *flowSpace = @{@"schemaVersion": @1, @"kindNeighbours": @{@"dance": @[@"alt", @"rap", @"chill"]},
+                                          @"tracks": tracks};
+                double (^pairSim)(NSString *, NSString *, NSDictionary *) = ^double(NSString *from, NSString *to, NSDictionary *sp) {
+                    NSDictionary *entry = sp[@"tracks"][from];
+                    NSArray *next = [entry isKindOfClass:NSDictionary.class] ? entry[@"next"] : nil;
+                    if ([next isKindOfClass:NSArray.class])
+                        for (id pair in next)
+                            if ([pair isKindOfClass:NSArray.class] && [pair[0] isEqual:to]) return [pair[1] doubleValue];
+                    return 0.80;
+                };
+                double (^meanPairSim)(NSArray *, NSDictionary *) = ^double(NSArray *ids, NSDictionary *sp) {
+                    if (ids.count < 2) return 0;
+                    double sum = 0;
+                    for (NSUInteger k = 1; k < ids.count; k++) sum += pairSim(ids[k - 1], ids[k], sp);
+                    return sum / (double)(ids.count - 1);
+                };
+                double flowSim = 0, baseSim = 0;
+                for (uint64_t flowSeed = 1; flowSeed <= 200; flowSeed++) {
+                    NSArray *with = MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 8, flowSeed, @[], flowSpace);
+                    NSArray *without = MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 8, flowSeed, @[], nil);
+                    flowSim += meanPairSim(with, flowSpace);
+                    baseSim += meanPairSim(without, flowSpace);
+                }
+                check(flowSim / 200.0 > baseSim / 200.0 + 0.02, @"music space: flow raises mean consecutive similarity");
+                [flowLib addObject:T(@"DIS", @"Nope", @"X", @"", @"House", 2020, 1, 20, NO, YES)];
+                tracks[@"DIS"] = @{@"kind": @"dance", @"kindScore": @0.5, @"next": @[]};
+                NSDictionary *flowWithDislike = @{@"schemaVersion": @1, @"kindNeighbours": flowSpace[@"kindNeighbours"],
+                                                  @"tracks": tracks};
+                check(![MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 20, 42, @[], flowWithDislike) containsObject:@"DIS"],
+                      @"music space: dislikes never");
+                NSArray *heardOrder = @[@"F002", @"F005", @"F001"];
+                NSArray *heardRot = MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 20, 7, heardOrder, flowSpace);
+                check([[heardRot subarrayWithRange:NSMakeRange(heardRot.count - 3, 3)] isEqual:heardOrder],
+                      @"music space: heard songs still last oldest-first");
+                NSArray *detA = MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 8, 99, @[], flowSpace);
+                NSArray *detB = MusicKindRotationInSpace(flowLib, @"dance", [NSSet set], 8, 99, @[], flowSpace);
+                check([detA isEqual:detB], @"music space: deterministic for a seed");
+                BOOL artistOkFlow = YES;
+                NSMutableDictionary *byFlow = [NSMutableDictionary dictionary];
+                for (NSDictionary *t in flowLib) byFlow[t[@"id"]] = t;
+                for (NSUInteger w = 0; w + 10 <= detA.count; w++) {
+                    NSMutableDictionary *counts = [NSMutableDictionary dictionary];
+                    for (NSUInteger j = w; j < w + 10; j++) {
+                        NSString *a = [byFlow[detA[j]][@"artist"] lowercaseString];
+                        counts[a] = @([counts[a] integerValue] + 1);
+                        if ([counts[a] integerValue] > 2) artistOkFlow = NO;
+                    }
+                }
+                check(artistOkFlow, @"music space: artist at most twice per ten");
+            }
             NSArray *anyQ = MusicKindQueue(kindLib, @"any", 20, 7, @[]);
             check(anyQ.count == 12, @"kind queue: any is every track");
             NSMutableDictionary *kindByID = [NSMutableDictionary dictionary];

@@ -880,6 +880,19 @@ NSString *MusicKindNeighbour(NSString *kind);
 // recentIDs is in the order the songs played (oldest first).
 NSArray<NSString *> *MusicKindRotation(NSArray<NSDictionary *> *tracks, NSString *kind, NSSet<NSString *> *onDiskIDs,
                                        NSUInteger count, uint64_t seed, NSArray<NSString *> *recentIDs);
+// Parsed music-space.json (schemaVersion 1) or nil when JSON, version or types are wrong.
+NSDictionary *MusicSpaceParse(NSData *data);
+// Kind membership: space track entry when present, else MusicKindForGenre(genre).
+BOOL MusicKindMatchesWithSpace(NSString *kind, NSDictionary *track, NSDictionary *space);
+// Nearest kind from embedding centroids, else MusicKindNeighbour.
+NSString *MusicKindNeighbourWithSpace(NSString *kind, NSDictionary *space);
+// Like MusicKindRotation; when space is nil matches MusicKindRotation exactly. Unheard tiers
+// weight picks after the first by consecutive similarity from space.tracks[id].next.
+NSArray<NSString *> *MusicKindRotationInSpace(NSArray<NSDictionary *> *tracks, NSString *kind,
+                                              NSSet<NSString *> *onDiskIDs, NSUInteger count, uint64_t seed,
+                                              NSArray<NSString *> *recentIDs, NSDictionary *space);
+NSUInteger MusicKindOnMacCountInSpace(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind,
+                                    NSDictionary *space);
 // Plays ({id, at}) oldest first: one per id at its latest time, none older than horizon
 // seconds, at most cap (the newest kept).
 NSArray<NSDictionary *> *MusicRecentPlaysPruned(NSArray *plays, double now, double horizon, NSUInteger cap);

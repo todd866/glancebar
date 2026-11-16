@@ -3766,6 +3766,189 @@ NSArray<NSString *> *MusicKindRotation(NSArray<NSDictionary *> *tracks, NSString
     return fresh;
 }
 
+static BOOL MusicSpaceTrackEntryValid(id entry) {
+    if (![entry isKindOfClass:NSDictionary.class]) return NO;
+    NSDictionary *e = entry;
+    if (![e[@"kind"] isKindOfClass:NSString.class] || ![(NSString *)e[@"kind"] length]) return NO;
+    if (![e[@"kindScore"] isKindOfClass:NSNumber.class]) return NO;
+    id next = e[@"next"];
+    if (![next isKindOfClass:NSArray.class]) return NO;
+    for (id pair in next) {
+        if (![pair isKindOfClass:NSArray.class] || [(NSArray *)pair count] < 2) return NO;
+        if (![pair[0] isKindOfClass:NSString.class]) return NO;
+        if (![pair[1] isKindOfClass:NSNumber.class]) return NO;
+    }
+    return YES;
+}
+
+NSDictionary *MusicSpaceParse(NSData *data) {
+    if (![data isKindOfClass:NSData.class] || !data.length) return nil;
+    id root = nil;
+    @try {
+        root = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    } @catch (__unused NSException *ex) {
+        return nil;
+    }
+    if (![root isKindOfClass:NSDictionary.class]) return nil;
+    if (![root[@"schemaVersion"] isKindOfClass:NSNumber.class] || [root[@"schemaVersion"] integerValue] != 1) return nil;
+    id tracks = root[@"tracks"];
+    if (![tracks isKindOfClass:NSDictionary.class]) return nil;
+    for (id key in tracks) {
+        if (![key isKindOfClass:NSString.class] || !MusicSpaceTrackEntryValid(tracks[key])) return nil;
+    }
+    id kn = root[@"kindNeighbours"];
+    if (kn != nil && ![kn isKindOfClass:NSDictionary.class]) return nil;
+    if ([kn isKindOfClass:NSDictionary.class]) {
+        for (id key in kn) {
+            if (![key isKindOfClass:NSString.class]) return nil;
+            id arr = kn[key];
+            if (![arr isKindOfClass:NSArray.class]) return nil;
+            for (id el in arr)
+                if (![el isKindOfClass:NSString.class]) return nil;
+        }
+    }
+    return root;
+}
+
+BOOL MusicKindMatchesWithSpace(NSString *kind, NSDictionary *track, NSDictionary *space) {
+    if ([kind isEqual:@"any"]) return YES;
+    NSString *tid = track[@"id"];
+    if ([space isKindOfClass:NSDictionary.class] && [tid isKindOfClass:NSString.class] && tid.length) {
+        NSDictionary *tracks = space[@"tracks"];
+        NSDictionary *entry = [tracks isKindOfClass:NSDictionary.class] ? tracks[tid] : nil;
+        if ([entry isKindOfClass:NSDictionary.class] && [entry[@"kind"] isKindOfClass:NSString.class])
+            return [entry[@"kind"] isEqual:kind];
+    }
+    return [MusicKindForGenre(track[@"genre"]) isEqual:kind];
+}
+
+NSString *MusicKindNeighbourWithSpace(NSString *kind, NSDictionary *space) {
+    if ([kind isEqual:@"any"]) return nil;
+    if ([space isKindOfClass:NSDictionary.class]) {
+        NSDictionary *kn = space[@"kindNeighbours"];
+        NSArray *list = [kn isKindOfClass:NSDictionary.class] ? kn[kind] : nil;
+        if ([list isKindOfClass:NSArray.class] && list.count && [list[0] isKindOfClass:NSString.class])
+            return list[0];
+    }
+    return MusicKindNeighbour(kind);
+}
+
+static double MusicSpaceSimBetween(NSDictionary *space, NSString *fromID, NSString *toID) {
+    if (![space isKindOfClass:NSDictionary.class] || !fromID.length || !toID.length) return 0.80;
+    NSDictionary *tracks = space[@"tracks"];
+    NSDictionary *from = [tracks isKindOfClass:NSDictionary.class] ? tracks[fromID] : nil;
+    NSArray *next = [from isKindOfClass:NSDictionary.class] ? from[@"next"] : nil;
+    if (![next isKindOfClass:NSArray.class]) return 0.80;
+    for (id pair in next) {
+        if (![pair isKindOfClass:NSArray.class] || [(NSArray *)pair count] < 2) continue;
+        NSString *tid = pair[0];
+        if ([tid isKindOfClass:NSString.class] && [tid isEqual:toID]) return [pair[1] doubleValue];
+    }
+    return 0.80;
+}
+
+static double MusicSpaceFlowFactor(double sim) {
+    double x = exp((sim - 0.85) / 0.03);
+    if (x < 0.05) return 0.05;
+    if (x > 20.0) return 20.0;
+    return x;
+}
+
+static NSArray<NSString *> *MusicKindQueueInSpace(NSArray<NSDictionary *> *tracks, NSString *kind, NSUInteger count,
+                                                 uint64_t seed, NSArray<NSString *> *recentIDs, NSDictionary *space) {
+    if (!count || !tracks.count || !kind.length) return @[];
+    NSSet *recent = [NSSet setWithArray:recentIDs ?: @[]];
+    NSMutableDictionary<NSString *, NSDictionary *> *byId = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *pool = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *recents = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        byId[t[@"id"]] = t;
+        if (!MusicKindMatchesWithSpace(kind, t, space)) continue;
+        if ([recent containsObject:t[@"id"]]) [recents addObject:t];
+        else [pool addObject:t];
+    }
+    NSMutableArray<NSString *> *ordered = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *work = [pool mutableCopy];
+    NSUInteger mainTarget = count > recents.count ? count - recents.count : 0;
+    uint64_t state = seed ^ 0xA24BAED4963EE407ULL;
+    BOOL strictSpacing = YES;
+    while (ordered.count < mainTarget && work.count) {
+        NSString *prevID = (space && ordered.count) ? ordered.lastObject : nil;
+        double total = 0;
+        NSMutableArray<NSDictionary *> *eligible = [NSMutableArray array];
+        for (NSDictionary *t in work) {
+            NSString *artist = [t[@"artist"] lowercaseString];
+            NSUInteger maxPerWindow = strictSpacing ? 2 : NSUIntegerMax;
+            if (MusicKindArtistCount(ordered, byId, artist, 10, ordered.count) >= maxPerWindow) continue;
+            [eligible addObject:t];
+            double w = MixTrackWeight(t);
+            if (prevID.length) w *= MusicSpaceFlowFactor(MusicSpaceSimBetween(space, prevID, t[@"id"]));
+            total += w;
+        }
+        if (!eligible.count && strictSpacing) { strictSpacing = NO; continue; }
+        if (!eligible.count) break;
+        double r = (MixNext(&state) % 1000000) / 1000000.0 * total;
+        NSDictionary *pick = eligible.lastObject;
+        for (NSDictionary *t in eligible) {
+            double w = MixTrackWeight(t);
+            if (prevID.length) w *= MusicSpaceFlowFactor(MusicSpaceSimBetween(space, prevID, t[@"id"]));
+            r -= w;
+            if (r <= 0) { pick = t; break; }
+        }
+        [ordered addObject:pick[@"id"]];
+        [work removeObject:pick];
+        strictSpacing = YES;
+    }
+    NSMutableSet *inKind = [NSMutableSet set];
+    for (NSDictionary *t in recents) [inKind addObject:t[@"id"]];
+    for (NSString *rid in [NSOrderedSet orderedSetWithArray:recentIDs ?: @[]]) {
+        if (ordered.count >= count) break;
+        if ([inKind containsObject:rid]) [ordered addObject:rid];
+    }
+    return ordered;
+}
+
+NSArray<NSString *> *MusicKindRotationInSpace(NSArray<NSDictionary *> *tracks, NSString *kind, NSSet<NSString *> *onDiskIDs,
+                                              NSUInteger count, uint64_t seed, NSArray<NSString *> *recentIDs,
+                                              NSDictionary *space) {
+    if (!space) return MusicKindRotation(tracks, kind, onDiskIDs, count, seed, recentIDs);
+    if (!count || !tracks.count || !kind.length) return @[];
+    NSMutableArray<NSDictionary *> *playable = [NSMutableArray array];
+    for (NSDictionary *t in tracks)
+        if ([t isKindOfClass:NSDictionary.class] && (!onDiskIDs.count || [onDiskIDs containsObject:t[@"id"]]))
+            [playable addObject:t];
+    NSSet *recent = [NSSet setWithArray:recentIDs ?: @[]];
+    NSArray<NSString *> *own = MusicKindQueueInSpace(playable, kind, count, seed, recentIDs, space);
+    NSMutableArray<NSString *> *fresh = [NSMutableArray array], *heard = [NSMutableArray array];
+    for (NSString *tid in own) [[recent containsObject:tid] ? heard : fresh addObject:tid];
+    NSString *next = MusicKindNeighbourWithSpace(kind, space);
+    if (next && fresh.count < count) {
+        NSMutableArray *skip = [NSMutableArray arrayWithArray:recentIDs ?: @[]];
+        [skip addObjectsFromArray:own];
+        NSSet *skipSet = [NSSet setWithArray:skip];
+        for (NSString *tid in MusicKindQueueInSpace(playable, next, count, seed ^ 0x9E3779B97F4A7C15ULL, skip, space)) {
+            if (fresh.count >= count) break;
+            if (![skipSet containsObject:tid]) [fresh addObject:tid];
+        }
+    }
+    for (NSString *tid in heard) { if (fresh.count >= count) break; [fresh addObject:tid]; }
+    return fresh;
+}
+
+NSUInteger MusicKindOnMacCountInSpace(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs, NSString *kind,
+                                    NSDictionary *space) {
+    if (!kind.length || !tracks.count) return 0;
+    NSUInteger n = 0;
+    for (NSDictionary *t in tracks) {
+        if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
+        if (!MusicKindMatchesWithSpace(kind, t, space)) continue;
+        if (onDiskIDs.count && ![onDiskIDs containsObject:t[@"id"]]) continue;
+        n++;
+    }
+    return n;
+}
+
 NSArray<NSDictionary *> *MusicRecentPlaysPruned(NSArray *plays, double now, double horizon, NSUInteger cap) {
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];

@@ -6,6 +6,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -817,6 +818,298 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+_CHILL_GENRE_KEYS = (
+    "ambient",
+    "downtempo",
+    "chill",
+    "lo-fi",
+    "lofi",
+    "new age",
+    "classical",
+    "jazz",
+    "acoustic",
+    "singer",
+    "easy listening",
+)
+_DANCE_GENRE_KEYS = (
+    "electronic",
+    "dance",
+    "house",
+    "techno",
+    "trance",
+    "bass",
+    "drum",
+    "dubstep",
+    "garage",
+    "electronica",
+    "downtempo",
+    "ambient",
+)
+_RAP_GENRE_KEYS = ("hip-hop", "hip hop", "rap", "r&b", "soul", "funk", "grime", "trap")
+_ALT_GENRE_KEYS = ("alternative", "rock", "indie", "punk", "metal", "grunge", "emo", "folk", "singer")
+_BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+_REMASTERED_RE = re.compile(r"\s*-\s*remastered.*$", re.IGNORECASE)
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _strip_for_match(text: str) -> str:
+    text = text or ""
+    text = text.lower()
+    text = _REMASTERED_RE.sub("", text)
+    text = _BRACKET_RE.sub("", text)
+    text = _PUNCT_RE.sub(" ", text)
+    return _SPACE_RE.sub(" ", text).strip()
+
+
+def primary_artist(artist: str) -> str:
+    text = (artist or "").lower()
+    for needle in (",", "&", " feat.", " feat ", " ft.", " ft "):
+        idx = text.find(needle)
+        if idx >= 0:
+            text = text[:idx]
+    return _strip_for_match(text)
+
+
+def normalize_title(title: str) -> str:
+    return _strip_for_match(title)
+
+
+def match_key(artist: str, title: str) -> tuple[str, str]:
+    return primary_artist(artist), normalize_title(title)
+
+
+def genre_family(genre: str | None) -> str:
+    g = (genre or "").lower()
+    for k in _DANCE_GENRE_KEYS:
+        if k in g:
+            return "dance"
+    for k in _RAP_GENRE_KEYS:
+        if k in g:
+            return "rap"
+    for k in _ALT_GENRE_KEYS:
+        if k in g:
+            return "alt"
+    if "pop" in g:
+        return "pop"
+    return "other"
+
+
+def music_kind_for_genre(genre: str | None) -> str:
+    g = (genre or "").lower()
+    for k in _CHILL_GENRE_KEYS:
+        if k in g:
+            return "chill"
+    family = genre_family(genre)
+    if family == "pop":
+        return "alt"
+    if family in ("dance", "rap", "alt"):
+        return family
+    return "other"
+
+
+def load_mix_library(path: Path) -> list[dict[str, Any]]:
+    data = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        tracks = data.get("tracks")
+        if isinstance(tracks, list):
+            return tracks
+    raise ValueError("library must be a list or {\"tracks\": [...]}")
+
+
+def build_music_space(
+    track_vectors: Sequence[Sequence[float]],
+    track_index: Sequence[dict[str, Any]],
+    library: Sequence[dict[str, Any]],
+    *,
+    neighbour_k: int = 24,
+    progress: bool = True,
+) -> dict[str, Any]:
+    """Build music-space.json payload from vectors, index rows, and library tracks."""
+    kinds = ("dance", "alt", "rap", "chill")
+
+    lib_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    lib_all_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in library:
+        if not isinstance(row, dict):
+            continue
+        tid = row.get("id")
+        if not tid:
+            continue
+        ak, tk = match_key(str(row.get("artist", "")), str(row.get("title", "")))
+        lib_all_by_key.setdefault((ak, tk), []).append(row)
+        album = _strip_for_match(str(row.get("album", "")))
+        lib_by_key.setdefault((ak, tk, album), []).append(row)
+
+    vector_row_for_lib: dict[str, int] = {}
+    lib_ids_per_vector: dict[int, list[str]] = {}
+    matched_vectors = 0
+    unmatched = 0
+
+    for vi, meta in enumerate(track_index):
+        ak, tk = match_key(str(meta.get("artist", "")), str(meta.get("title", "")))
+        album = _strip_for_match(str(meta.get("album", "")))
+        matched_libs = lib_by_key.get((ak, tk, album)) or lib_all_by_key.get((ak, tk)) or []
+        if not matched_libs:
+            unmatched += 1
+            continue
+        matched_vectors += 1
+        ids = [str(t["id"]) for t in matched_libs if t.get("id")]
+        lib_ids_per_vector[vi] = ids
+        for lid in ids:
+            vector_row_for_lib[lid] = vi
+
+    seed_by_kind: dict[str, list[list[float]]] = {k: [] for k in kinds}
+    for vi, ids in lib_ids_per_vector.items():
+        if not ids:
+            continue
+        lib_row = next((t for t in library if str(t.get("id")) == ids[0]), None)
+        if not lib_row:
+            continue
+        seed = music_kind_for_genre(str(lib_row.get("genre", "")))
+        if seed in seed_by_kind:
+            seed_by_kind[seed].append(list(track_vectors[vi]))
+
+    centroids: dict[str, list[float]] = {}
+    for k in kinds:
+        vecs = seed_by_kind[k]
+        if vecs:
+            centroids[k] = l2_normalize(mean_vectors(vecs))
+
+    kind_neighbours: dict[str, list[str]] = {}
+    if len(centroids) >= 2:
+        for k in kinds:
+            if k not in centroids:
+                continue
+            scored = [
+                (cosine_similarity(centroids[k], centroids[o]), o)
+                for o in kinds
+                if o != k and o in centroids
+            ]
+            scored.sort(key=lambda t: t[0], reverse=True)
+            kind_neighbours[k] = [o for _, o in scored]
+
+    tracks_out: dict[str, dict[str, Any]] = {}
+    by_kind: dict[str, int] = {k: 0 for k in kinds}
+    by_kind["other"] = 0
+
+    assigned_kind: dict[int, str] = {}
+    assigned_score: dict[int, float] = {}
+
+    for vi, ids in lib_ids_per_vector.items():
+        vec = track_vectors[vi]
+        if centroids:
+            best_k = kinds[0]
+            best_s = -1.0
+            for k in kinds:
+                if k not in centroids:
+                    continue
+                s = cosine_similarity(vec, centroids[k])
+                if s > best_s:
+                    best_s = s
+                    best_k = k
+            assigned_kind[vi] = best_k
+            assigned_score[vi] = best_s
+        else:
+            lib_row = next((t for t in library if str(t.get("id")) == ids[0]), None)
+            sk = music_kind_for_genre(str((lib_row or {}).get("genre", "")))
+            assigned_kind[vi] = sk if sk in kinds else "other"
+            assigned_score[vi] = 0.0
+
+    for vi, ids in lib_ids_per_vector.items():
+        kind = assigned_kind[vi]
+        score = round(assigned_score[vi], 3)
+        for lid in ids:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            tracks_out[lid] = {"kind": kind, "kindScore": score, "next": []}
+
+    lib_ids = list(vector_row_for_lib.keys())
+    n_lib = len(lib_ids)
+    if progress and n_lib:
+        print(f"neighbours: {n_lib} library ids", flush=True)
+
+    # Similarities are per vector, not per library id (two ids can share a song): one row of
+    # cosines per used vector, through numpy when it is there (seconds instead of hours for
+    # 1.5k x 3072), else pure Python.
+    used = sorted(set(vector_row_for_lib.values()))
+    pos = {vi: n for n, vi in enumerate(used)}
+    try:
+        import numpy as _np  # optional fast path
+
+        mat = _np.asarray([track_vectors[vi] for vi in used], dtype=_np.float32)
+        sims = mat @ mat.T
+
+        def sim_row(vi):
+            return sims[pos[vi]].tolist()
+    except ImportError:
+        def sim_row(vi):
+            v = track_vectors[vi]
+            return [cosine_similarity(v, track_vectors[o]) for o in used]
+
+    lids_by_vector: dict[int, list[str]] = {}
+    for lid in lib_ids:
+        lids_by_vector.setdefault(vector_row_for_lib[lid], []).append(lid)
+    for i, vi in enumerate(used):
+        row = sim_row(vi)
+        order = sorted(range(len(used)), key=lambda n: row[n], reverse=True)
+        nxt: list[list[Any]] = []
+        for n in order:
+            if used[n] == vi:
+                continue
+            for other in lids_by_vector.get(used[n], []):
+                nxt.append([other, round(float(row[n]), 3)])
+            if len(nxt) >= neighbour_k:
+                break
+        for lid in lids_by_vector.get(vi, []):
+            if lid in tracks_out:
+                tracks_out[lid]["next"] = nxt[:neighbour_k]
+        if progress and ((i + 1) % 250 == 0 or i + 1 == len(used)):
+            print(f"  {i + 1}/{len(used)}", flush=True)
+
+    stats = {
+        "vectors": len(track_index),
+        "matchedVectors": matched_vectors,
+        "libraryIds": len(tracks_out),
+        "unmatchedVectors": unmatched,
+        "byKind": by_kind,
+    }
+    return {
+        "schemaVersion": 1,
+        "generatedAt": utc_now_iso(),
+        "model": DEFAULT_MODEL,
+        "kindNeighbours": kind_neighbours,
+        "tracks": tracks_out,
+        "stats": stats,
+    }
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    state = Path(args.state)
+    vectors_dir = Path(args.vectors).expanduser() if args.vectors else state.expanduser() / "vectors"
+    library_path = Path(args.library).expanduser()
+    out_path = Path(args.out).expanduser()
+
+    tracks_f32 = vectors_dir / "tracks.f32"
+    tracks_index = vectors_dir / "tracks-index.jsonl"
+    if not tracks_f32.is_file() or not tracks_index.is_file():
+        print("missing tracks.f32 or tracks-index.jsonl", file=sys.stderr)
+        return 1
+
+    library = load_mix_library(library_path)
+    index = load_tracks_jsonl(tracks_index)
+    vectors = read_f32_matrix(tracks_f32, dim=VECTOR_DIM)
+    if len(vectors) != len(index):
+        print("vector row count mismatch", file=sys.stderr)
+        return 1
+
+    payload = build_music_space(vectors, index, library)
+    write_json(out_path, payload)
+    print(json.dumps(payload["stats"], indent=2))
+    return 0
+
+
 def cmd_neighbours(args: argparse.Namespace) -> int:
     paths = Paths(Path(args.state))
     if not paths.tracks_f32.is_file() or not paths.tracks_index.is_file():
@@ -866,6 +1159,12 @@ def build_parser() -> argparse.ArgumentParser:
     nb.add_argument("query")
     nb.add_argument("-k", type=int, default=5)
     nb.set_defaults(func=cmd_neighbours)
+
+    ex = sub.add_parser("export", help="build music-space.json from track vectors and library")
+    ex.add_argument("--vectors", type=Path, default=None, help="directory with tracks.f32 + tracks-index.jsonl")
+    ex.add_argument("--library", type=Path, default=Path.home() / "Library/Application Support/Glancebar/mix/library.json")
+    ex.add_argument("--out", type=Path, default=Path.home() / "Library/Application Support/Glancebar/mix/music-space.json")
+    ex.set_defaults(func=cmd_export)
     return p
 
 

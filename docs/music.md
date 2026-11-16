@@ -333,6 +333,18 @@ the M2 in `~/.local/state/glancebar-music-embed/` (`vectors/tracks.f32` + `track
 The key is piped in from md3's `.env.local` at run time, never stored there. Tier 1 caps
 active batch work at 500k tokens: `drive.sh` submits the next shard only when no job is
 pending or running. Neighbour checks by ear looked right (genres and moods separate; Gang of
-Youths, Car Seat Headrest and The Middle East show up as hubs). Not yet used by Glancebar:
-next is kinds as regions of this space, then reception scores (Glancebar log, the Selector
-deck's plays, the YouTube Music Takeout requested 16 Nov) checked against neighbours.
+Youths, Car Seat Headrest and The Middle East show up as hubs).
+
+### Kinds from the embedding
+
+`embed.py export` reads `tracks.f32` and the mix `library.json`, matches rows by normalised
+artist and title, seeds kinds from genre (same rules as `MusicKindForGenre` in `pure.m`), then
+reassigns every matched library id to the nearest of the four kind centroids. It writes
+`~/Library/Application Support/Glancebar/mix/music-space.json` with per-track `kind`,
+`kindScore`, and up to 24 cosine neighbours (`next`). Glancebar reloads that file when its mtime
+changes (at most once a minute) and uses it for kind membership, the neighbour kind when a
+kind runs short, and embedding-weighted flow within unheard queues (`MusicKindRotationInSpace`).
+When the file is missing or stale, behaviour falls back to genre mapping.
+
+Reception scores (Glancebar log, the Selector deck's plays, the YouTube Music Takeout requested
+16 Nov) checked against neighbours are still to come.

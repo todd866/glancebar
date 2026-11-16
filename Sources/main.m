@@ -5658,7 +5658,8 @@ static NSString *PopoverRequestObject(void) {
 - (NSString *)mixLibraryCachePath;
 - (void)ensureKindTileSnapshot;
 - (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk
-                              cachedKeys:(NSSet<NSString *> *)cachedKeys;
+                              cachedKeys:(NSSet<NSString *> *)cachedKeys musicSpace:(NSDictionary *)space;
+- (NSDictionary *)musicSpaceForKindRotation;
 - (NSArray<NSImage *> *)kindMosaicCoversForIDs:(NSArray<NSString *> *)ids;
 - (NSUInteger)kindTileStamp;
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause;
@@ -6247,6 +6248,9 @@ static void GBHangWatchStart(void) {
     NSString *_kindPlayingName;
     uint64_t _kindPlaySeed;
     NSMutableArray<NSString *> *_kindPlayedIDs;
+    NSDictionary *_musicSpace;
+    CFAbsoluteTime _musicSpaceCheckedAt;
+    NSTimeInterval _musicSpaceMtime;
     NSMutableDictionary<NSString *, NSDictionary *> *_offlineRequests;
     NSDictionary *_offlineManifest;
     BOOL _offlineLoaded, _offlineCacheBusy, _offlineCacheAgain;
@@ -7794,14 +7798,36 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
         (NSUInteger)(_offlineManifest ? _offlineManifest.hash : 0);
 }
 
+- (NSDictionary *)musicSpaceForKindRotation {
+    GBAssertMain();
+    if (_mixFrozen) return _musicSpace;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (_musicSpace && now - _musicSpaceCheckedAt < 60.0) return _musicSpace;
+    _musicSpaceCheckedAt = now;
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"music-space.json"];
+    struct stat st;
+    if (stat(path.fileSystemRepresentation, &st)) {
+        _musicSpace = nil;
+        _musicSpaceMtime = 0;
+        return nil;
+    }
+    NSTimeInterval mtime = st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
+    if (_musicSpace && mtime == _musicSpaceMtime) return _musicSpace;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    NSDictionary *parsed = MusicSpaceParse(data);
+    _musicSpace = parsed;
+    _musicSpaceMtime = parsed ? mtime : 0;
+    return _musicSpace;
+}
+
 - (NSDictionary *)computeKindTileSnapshot:(NSArray<NSDictionary *> *)library onDisk:(NSSet<NSString *> *)onDisk
-                              cachedKeys:(NSSet<NSString *> *)cachedKeys {
+                              cachedKeys:(NSSet<NSString *> *)cachedKeys musicSpace:(NSDictionary *)space {
     // hasCover must not call the resolver: this runs on _mixQueue. cachedKeys was listed on
     // the main thread from the art directory (and memory) before the hop.
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (NSDictionary *def in GBKindTileOrder()) {
         NSString *kind = def[@"kind"];
-        NSUInteger count = MusicKindOnMacCount(library, onDisk, kind);
+        NSUInteger count = MusicKindOnMacCountInSpace(library, onDisk, kind, space);
         NSArray *ids = count ? MusicKindMosaicTrackIDsWithCovers(library, onDisk, kind, ^BOOL(NSString *trackID, NSDictionary *track) {
             (void)track;
             NSString *path = nil;
@@ -7862,8 +7888,10 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
         if (p.length) row[@"path"] = p;
         [libWithPaths addObject:row];
     }
+    NSDictionary *musicSpace = [self musicSpaceForKindRotation];
     if (_mixFrozen) {
-        _kindTileSnapshot = [self computeKindTileSnapshot:libWithPaths onDisk:onDisk cachedKeys:cachedKeys];
+        _kindTileSnapshot = [self computeKindTileSnapshot:libWithPaths onDisk:onDisk cachedKeys:cachedKeys
+                                               musicSpace:musicSpace];
         _kindTileStamp = stamp;
         _kindTileAt = now;
         return;
@@ -7872,17 +7900,20 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     NSArray *libCopy = [libWithPaths copy];
     NSSet *onDiskCopy = [onDisk copy];
     NSSet *keysCopy = [cachedKeys copy];
+    NSDictionary *spaceCopy = musicSpace;
     if (!_mixQueue) _mixQueue = dispatch_queue_create("glancebar.mix", DISPATCH_QUEUE_SERIAL);
     dispatch_queue_t mixQ = _mixQueue;
     if (!mixQ) {
         _kindTileBusy = NO;
-        _kindTileSnapshot = [self computeKindTileSnapshot:libCopy onDisk:onDiskCopy cachedKeys:keysCopy];
+        _kindTileSnapshot = [self computeKindTileSnapshot:libCopy onDisk:onDiskCopy cachedKeys:keysCopy
+                                                musicSpace:spaceCopy];
         _kindTileStamp = stamp;
         _kindTileAt = CFAbsoluteTimeGetCurrent();
         return;
     }
     dispatch_async(mixQ, ^{
-        NSDictionary *snap = [self computeKindTileSnapshot:libCopy onDisk:onDiskCopy cachedKeys:keysCopy];
+        NSDictionary *snap = [self computeKindTileSnapshot:libCopy onDisk:onDiskCopy cachedKeys:keysCopy
+                                                musicSpace:spaceCopy];
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_kindTileBusy = NO;
             if ([self kindTileStamp] != stamp) return;
@@ -8633,7 +8664,9 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
     NSMutableArray<NSString *> *heard = [[self recentPlayIDs] mutableCopy];
     if (playingID.length) { [heard removeObject:playingID]; [heard addObject:playingID]; }
     _onDiskLibraryIDs = nil;
-    NSArray<NSString *> *ids = MusicKindRotation(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed, heard);
+    NSDictionary *space = [self musicSpaceForKindRotation];
+    NSArray<NSString *> *ids = MusicKindRotationInSpace(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed,
+                                                        heard, space);
     if (!ids.count) {
         GBLog("music: no %{public}@ tracks in library", kind);
         return NO;
@@ -8671,7 +8704,9 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
     NSMutableArray<NSString *> *heard = [[self recentPlayIDs] mutableCopy];
     for (NSString *tid in _kindPlayedIDs) { [heard removeObject:tid]; [heard addObject:tid]; }
     _onDiskLibraryIDs = nil;
-    NSArray<NSString *> *ids = MusicKindRotation(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed, heard);
+    NSDictionary *space = [self musicSpaceForKindRotation];
+    NSArray<NSString *> *ids = MusicKindRotationInSpace(_mixLibrary, kind, [self onDiskLibraryTrackIDs], 60, _kindPlaySeed,
+                                                        heard, space);
     if (!ids.count) return NO;
     NSDictionary *request = _offlineRequests[_mixPlayingKey];
     NSArray *existing = [request[@"tracks"] isKindOfClass:NSArray.class] ? request[@"tracks"] : @[];
