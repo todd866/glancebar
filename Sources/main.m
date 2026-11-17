@@ -5263,6 +5263,7 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     existing.accessibilityLabel = fresh.accessibilityLabel;
     existing.accessibilityHelp = fresh.accessibilityHelp;
     existing.accessibilityRole = fresh.accessibilityRole;
+    if ([fresh.accessibilityIdentifier isEqual:@"popover.burn.symbol"]) existing.toolTip = fresh.toolTip;
 
     if ([existing isKindOfClass:NSTextField.class]) {
         NSTextField *old = (NSTextField *)existing, *new = (NSTextField *)fresh;
@@ -6288,6 +6289,8 @@ static void GBHangWatchStart(void) {
     NSUInteger _mixSeedsNextGen;
     CFAbsoluteTime _mixSeedsNextSince;
     BOOL _musicSilentQA;
+    BOOL _localResumePending;
+    NSUInteger _localTransportGeneration;
     NSString *_playbackCause, *_playbackRateState, *_playbackLoggedOutputUID;
     CFAbsoluteTime _playbackCauseAt;
     GBPlayerWatch *_localRateWatch;
@@ -8752,7 +8755,7 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
     if (!tokens.count) return;
     NSString *verb = tokens[0];
     if ([verb isEqual:@"pause"]) {
-        if (_localPlayer && _localPlayer.rate > 0) [self toggleLocalPlayback];
+        if (_localPlayer && (_localResumePending || _localPlayer.rate > 0)) [self toggleLocalPlayback];
         return;
     }
     if ([verb isEqual:@"next"]) {
@@ -8762,7 +8765,7 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
     if (![verb isEqual:@"play"]) return;
     if (tokens.count == 1) {
         if (_localPlayer) {
-            if (_localPlayer.rate == 0) [self toggleLocalPlayback];
+            if (!_localResumePending && _localPlayer.rate == 0) [self toggleLocalPlayback];
         } else if (_mixPlayingKey.length) {
             [self playbackCause:@"kind"];
             [self playOfflinePlaylist:_mixPlayingKey];
@@ -9712,6 +9715,8 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _seekCoalesceItem = nil;
 }
 - (void)tearDownLocalPlayer {
+    _localResumePending = NO;
+    ++_localTransportGeneration;
     [self saveShowPositionNow];
     [self stopShowPositionTimer];
     [self cancelCoalescedSeek];
@@ -9956,7 +9961,9 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     // Pause finishes the fade first, so the incoming track is the one that pauses
     // and the outgoing player is not left audible underneath.
     if (_localBlendTimer || _localOutgoing) [self finishLocalBlend];
-    if (_localPlayer.rate > 0) {
+    NSUInteger generation = ++_localTransportGeneration;
+    if (_localResumePending || _localPlayer.rate > 0) {
+        _localResumePending = NO;
         _playbackPlaying = NO;
         _playbackKnown = YES;
         [self updateMusicTransportInPlace];
@@ -9964,6 +9971,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     } else {
         // Sound and the button first; quieting Apple Music is a slower call and comes after
         // (and never from a silent test run, as in playLocalIndex:).
+        _localResumePending = YES;
         _playbackPlaying = YES;
         _playbackKnown = YES;
         [self updateMusicTransportInPlace];
@@ -9972,7 +9980,9 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         // is drawn first. A pause in between leaves it stopped.
         AVQueuePlayer *player = _localPlayer;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_localPlayer != player || !self->_playbackPlaying) return;
+            if (self->_localPlayer != player || self->_localTransportGeneration != generation ||
+                !self->_localResumePending) return;
+            self->_localResumePending = NO;
             [player play];
             if (!self->_musicSilentQA) [self pauseAppleMusicForLocalSource];
         });
@@ -10010,13 +10020,13 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         }
         return 0;
     }
-    if (_localPlayer.rate == 0) [self toggleLocalPlayback];
+    if (!_localResumePending && _localPlayer.rate == 0) [self toggleLocalPlayback];
     return 0;
 }
 - (NSInteger)remotePause:(id)event {
     [self noteRemote:@"pause"];
     ++_offlinePlayGeneration; _mixStartingKey = nil;
-    (void)event; if (_localPlayer.rate > 0) [self toggleLocalPlayback];
+    (void)event; if (_localResumePending || _localPlayer.rate > 0) [self toggleLocalPlayback];
     return 0;
 }
 - (NSInteger)remoteToggle:(id)event {
@@ -10654,7 +10664,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (_localMode && _localPlayer) {
         [self noteLocalPlaybackTime];
         _playbackKnown = YES;
-        _playbackPlaying = _localPlayer.rate > 0;
+        _playbackPlaying = _localResumePending || _localPlayer.rate > 0;
     }
     BOOL external = !_localMode && [_externalPlayback[@"valid"] boolValue];
     NSString *trackTitle = _localMode ? _localTitle : (external ? _externalPlayback[@"title"] : nil);
@@ -13480,14 +13490,14 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         double net = -BatteryWatts(_bat), fullWh = BatteryWattHours(_bat.rawMax_mAh, _bat.voltage_mV);
         int minutes = _bat.percent > 20 && fullWh > 0 && net > 0
             ? (int)lround((_bat.percent - 20) / 100.0 * fullWh / net * 60.0) : -1;
-        turnsToCharge = watts >= net && watts >= 1;
+        turnsToCharge = net > 0 && watts >= net && watts >= 1;
         gain = turnsToCharge ? 0 : BurnGainMinutes(minutes, net, watts);
     }
     BOOL want = draw > 0 && top && (gain >= 0 || turnsToCharge);
     // The gain hovers around its half-hour bar, and the row popping in and out moved everything under
     // the pointer (Ian, 1 Nov 2026): decide once when the popover opens, hold until it closes.
     if (_popover.isShown) {
-        if (_burnLatch) want = _burnLatch == 1 && draw > 0 && top;
+        if (_burnLatch) want = _burnLatch == 1;
         else _burnLatch = want ? 1 : 2;
     }
     if (!want) return y;
@@ -13497,26 +13507,28 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.accessibilityRole = NSAccessibilityButtonRole;
     row.accessibilityIdentifier = @"popover.row.burn";
     NSString *tip = [self burnTip:draw];
+    if ([top[@"name"] isEqual:@"rsync"]) tip = [@"rsync · file copy\n" stringByAppendingString:tip];
     row.accessibilityHelp = tip;
     row.accessibilityLabel = tip;
     NSImage *icon = BurnAppIcon(top);
     NSImageView *symbol = icon ? [self instrumentLogo:icon identifier:@"popover.burn.symbol" in:row]
         : [self instrumentSymbol:@"terminal" tint:NSColor.secondaryLabelColor identifier:@"popover.burn.symbol" in:row];
     symbol.accessibilityHelp = tip;
-    NSString *name = BurnShortName(top[@"name"]);
+    NSString *name = [top[@"name"] isEqual:@"rsync"] ? @"File copy" : (BurnShortName(top[@"name"]) ?: @"Apps");
     NSTextField *nameField = [self instrumentName:name identifier:@"popover.burn.name" in:row];
     nameField.lineBreakMode = NSLineBreakByTruncatingTail;
     nameField.accessibilityHelp = tip;
+    if ([top[@"name"] isEqual:@"rsync"]) symbol.toolTip = @"rsync";
     Gauge *bar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
-    bar.fraction = MIN(1, watts / draw);
+    bar.fraction = draw > 0 ? MIN(1, watts / draw) : 0;
     bar.color = NSColor.systemOrangeColor;
     bar.metricLabel = @"App share of battery draw";
     bar.accessibilityIdentifier = @"popover.burn.gauge";
     bar.accessibilityHelp = tip;
     [row addSubview:bar];
     // Root daemons' watts are estimated from CPU share: say so with "≈".
-    NSString *value = [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts];
-    [self instrumentValue:value color:watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
+    NSString *value = top && draw > 0 ? [NSString stringWithFormat:watts >= 10 ? @"%.0f W" : @"%.1f W", watts] : @"—";
+    [self instrumentValue:value color:draw > 0 && watts >= draw * 0.5 ? NSColor.systemRedColor : NSColor.labelColor
                identifier:@"popover.burn.value" in:row].accessibilityHelp = tip;
     [self instrumentDatum:turnsToCharge ? @"quit \u2192 charges" : gain >= 0 ? [@"quit +" stringByAppendingString:FmtDuration(gain)] : @""
                     color:turnsToCharge ? NSColor.systemGreenColor : NSColor.secondaryLabelColor
@@ -13986,10 +13998,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [root addSubview:batteryRow];
     y += kRowH;
     // The row set never changes under the pointer (Ian, 16 Nov 2026: it moved the like button
-    // as he reached for it). What the popover opened with holds until it closes; only
-    // unplugging, which he does himself, takes the row away.
+    // as he reached for it). What the popover opened with holds until it closes;
+    // power-source changes are reflected in values without moving the controls.
     BOOL chargerWant = [self chargerShortFor:_bat];
-    if (_popover.isShown && _chargerLatch) chargerWant = _chargerLatch == 1 && _bat.acConnected;
+    if (_popover.isShown && _chargerLatch) chargerWant = _chargerLatch == 1;
     _chargerRowShown = chargerWant;
     if (_chargerRowShown) {
         NSView *charger = [self chargerInstrumentRow];

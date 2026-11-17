@@ -9,6 +9,13 @@
 #undef main
 #pragma clang diagnostic pop
 #import "../Tests/offline_fixture.h"
+// Simulate an open panel without displaying a window or taking keyboard focus.
+@interface TestOpenPopover : NSPopover
+@property BOOL testShown;
+@end
+@implementation TestOpenPopover
+- (BOOL)isShown { return self.testShown; }
+@end
 static NSString *gOfflineFixtureHome;
 static void CleanupOfflineFixture(void) { if (gOfflineFixtureHome) [NSFileManager.defaultManager removeItemAtPath:gOfflineFixtureHome error:nil]; }
 
@@ -118,6 +125,7 @@ static BOOL MusicLoudnessSubtitleTip(NSView *view) {
     return tip.length && [tip isEqual:view.accessibilityHelp] && [tip containsString:@"level "];
 }
 static BOOL IntendedControlTip(NSView *view) {
+    if ([view.accessibilityIdentifier isEqual:@"popover.burn.symbol"] && [view.toolTip isEqual:@"rsync"]) return YES;
     if (![view.accessibilityIdentifier isEqual:@"popover.music.next"]) return NO;
     NSString *tip = view.toolTip ?: @"";
     if ([tip isEqual:kMusicNextTip]) return YES;
@@ -738,7 +746,7 @@ int main(int argc, const char **argv) {
         ] forKey:@"stationPicks"];
         [c setValue:@"limit80" forKey:@"chargeMode"];
         [c setValue:@YES forKey:@"chargeModeLoaded"];
-        NSPopover *p = [NSPopover new];
+        TestOpenPopover *p = [TestOpenPopover new];
         p.contentViewController = [NSViewController new];
         [c setValue:p forKey:@"popover"];
         Volume *v = [Volume new]; v.name = @"Macintosh HD"; v.path = @"/";
@@ -2827,6 +2835,28 @@ int main(int argc, const char **argv) {
                     }
                 }
             }
+            // Sampling can lose both draw and process rows while the panel is open.
+            // Neither it nor an unplug may move the transport under the pointer.
+            p.testShown = YES;
+            [c setValue:@1 forKey:@"burnLatch"];
+            [c setValue:@1 forKey:@"chargerLatch"];
+            [c rebuildContent];
+            CGFloat transportY = NSMinY(FindIdentifier(p.contentViewController.view, @"popover.sound.row").frame);
+            [c setValue:@[] forKey:@"burnRows"];
+            BatteryState missing = onBattery;
+            missing.amperage_mA = 0; missing.systemLoad_mW = 0;
+            [c setValue:[NSValue valueWithBytes:&missing objCType:@encode(BatteryState)] forKey:@"bat"];
+            [c setValue:[NSMutableArray array] forKey:@"ampHistory"];
+            [c rebuildContent];
+            if (!FindIdentifier(p.contentViewController.view, @"popover.row.burn") ||
+                !FindIdentifier(p.contentViewController.view, @"popover.row.charger") ||
+                NSMinY(FindIdentifier(p.contentViewController.view, @"popover.sound.row").frame) != transportY) return Fail(__LINE__);
+            [c setValue:@[@{@"name": @"rsync", @"watts": @2}] forKey:@"burnRows"];
+            [c rebuildContent];
+            if (![[(NSTextField *)FindIdentifier(p.contentViewController.view, @"popover.burn.name") stringValue] isEqual:@"File copy"]) return Fail(__LINE__);
+            p.testShown = NO;
+            [c setValue:@0 forKey:@"burnLatch"];
+            [c setValue:@0 forKey:@"chargerLatch"];
             // Keep an actionable sample on AC to prove power source alone hides it.
             [c setValue:@[@{@"name": @"node", @"watts": @14, @"wh": @2}] forKey:@"burnRows"];
             [c setValue:nil forKey:@"energyBaselineAt"];

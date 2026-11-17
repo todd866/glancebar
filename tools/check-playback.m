@@ -379,6 +379,27 @@ int main(void) {
         if (!PlayerAdvancing(c, 0.4, 3.0)) Fail(__LINE__);
         (void)moving; (void)pausedAt;
 
+        // An open panel rebuild used to overwrite the pending resume with rate == 0,
+        // cancelling Play before its deferred hardware start. Exercise the real row builder.
+        [c remotePause:nil];
+        [c remotePlay:nil];
+        [c addMusicControlsTo:[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 380, 200)] at:0];
+        if (![[c valueForKey:@"playbackPlaying"] boolValue]) Fail(__LINE__);
+        if (!WaitUntil(^BOOL { return player.rate > 0; }, 3)) Fail(__LINE__);
+        if (!PlayerAdvancing(c, 0.4, 3.0)) Fail(__LINE__);
+        // Pause and double-toggle must cancel a queued start, even before AVPlayer's rate changes.
+        [c remotePause:nil];
+        [c remotePlay:nil];
+        [c remotePause:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
+        if (player.rate > 0) Fail(__LINE__);
+        [c remoteToggle:nil];
+        [c remoteToggle:nil];
+        PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.2]);
+        if (player.rate > 0) Fail(__LINE__);
+        [c remotePlay:nil];
+        if (!WaitUntil(^BOOL { return player.rate > 0; }, 3)) Fail(__LINE__);
+
         // --- event log: every pause and resume is recorded with what caused it ---
         // (12 Nov 2026: the headphones sent Pause commands and nothing recorded why music stopped.)
         [c remotePause:nil];

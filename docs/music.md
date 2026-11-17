@@ -348,3 +348,18 @@ When the file is missing or stale, behaviour falls back to genre mapping.
 
 Reception scores (Glancebar log, the Selector deck's plays, the YouTube Music Takeout requested
 16 Nov) checked against neighbours are still to come.
+
+## Play ignored while the panel was open (17 Nov 2026)
+
+Play updates the button before starting the audio hardware on the next main-loop turn.
+The open panel's rebuild used to read the still-zero player rate and clear the same flag
+that authorised that start. The deferred start then cancelled itself. A separate pending
+resume and command generation now survive rendering; Pause, a second toggle, or replacing
+the player cancels them. The silent playback harness rebuilds the real transport row in
+that pending window and checks actual playback, plus cancellation before the start runs.
+
+The battery-use and charger rows retain their positions for the whole open-panel session,
+including missing process samples, zero draw and unplugging. Missing readings show a dash.
+The file-copy process `rsync` is labelled File copy, with its process name in the hover detail;
+the charge suggestion requires actual net battery drain. The offscreen popover harness
+checks the transport position through sample loss and recovery.
