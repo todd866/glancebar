@@ -148,11 +148,8 @@ static BOOL GBWindowRestoreScanOneWindow(AXUIElementRef window, NSInteger token,
         return YES;
     }
     BOOL standard = CFGetTypeID(subrole) == CFStringGetTypeID() && CFEqual(subrole, kAXStandardWindowSubrole);
+    DebugLog(@"window[%ld] subrole=%@", (long)token, (__bridge id)subrole);
     CFRelease(subrole);
-    if (!standard) {
-        DebugLog(@"window[%ld] skip auxiliary subrole", (long)token);
-        return YES;
-    }
 
     CFTypeRef mini = NULL;
     error = gCopyAttribute(window, kAXMinimizedAttribute, &mini);
@@ -166,8 +163,11 @@ static BOOL GBWindowRestoreScanOneWindow(AXUIElementRef window, NSInteger token,
         DebugLog(@"window[%ld] skip missing minimized err=%d", (long)token, error);
         return YES;
     }
-    *outRow = (GBWindowRestoreRow){.standard = YES,
-        .minimized = CFBooleanGetValue((CFBooleanRef)mini), .token = token};
+    BOOL minimized = CFBooleanGetValue((CFBooleanRef)mini);
+    // Finder may expose a minimized folder window with a non-standard subrole.
+    // A positive minimized state is sufficient; visible auxiliary windows stay ignored.
+    *outRow = (GBWindowRestoreRow){.standard = standard || minimized,
+        .minimized = minimized, .token = token};
     DebugLog(@"window[%ld] standard minimized=%d", (long)token, outRow->minimized);
     CFRelease(mini);
     return YES;
