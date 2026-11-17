@@ -331,6 +331,19 @@ Found with the system log before this existed: on 12 Nov 2026 the music "cut in 
 because the Bluetooth headphones were sending Pause and Play commands, and their link was
 dropping; the player had no stalls or errors.
 
+## New music retention policy (owner, 17 Nov 2026)
+
+Age alone is not a reason to remove an unheard recommendation. How long it stays
+should depend on how promising it is: strong prospects can stay beyond the normal
+freshness window until they get a fair listening opportunity; weaker prospects can
+make room for better candidates. Being offered in the tile is not evidence that it
+was heard. Explicit dislikes and established rejection still take precedence.
+This concerns playlist inclusion, not deleting the underlying music files.
+
+Implementation gap: `music-scout` currently applies a fixed `fresh_days` cutoff
+(default 14 days). Promise-sensitive retention and durable evidence of listening
+must replace that blanket cutoff; this policy is not yet implemented by the scout.
+
 ## Kind tiles (popover)
 
 The mix row under the player is **Dance · Alt · Rap · Chill**, an offered **radio-show** tile when one
