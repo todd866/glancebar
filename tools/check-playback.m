@@ -558,6 +558,7 @@ int main(void) {
         if (pc.loveLaunches || pc.unloveLaunches) Fail(__LINE__);
         if (HeartButtonFilled(c)) Fail(__LINE__);
         // A paused, seeked song must record the playhead, not time since Play.
+        if (!WaitUntil(^BOOL { return TrackDuration(LocalPlayer(c)) > 2; }, 5)) Fail(__LINE__);
         [c musicPlay:nil];
         if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 2)) Fail(__LINE__);
         [LocalPlayer(c) seekToTime:CMTimeMakeWithSeconds(2, 600)
@@ -591,7 +592,9 @@ int main(void) {
         NSDictionary *moment = heartEvent[@"playback"];
         if (![moment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
             fabs([moment[@"position_seconds"] doubleValue] - 2) > 0.05 ||
+            ![moment[@"duration_seconds"] isKindOfClass:NSNumber.class] ||
             [moment[@"duration_seconds"] doubleValue] <= 2 ||
+            ![moment[@"fraction"] isKindOfClass:NSNumber.class] ||
             [moment[@"fraction"] doubleValue] <= 0) Fail(__LINE__);
         [c musicThumbsUp:nil];
         NSString *feedbackText = [NSString stringWithContentsOfFile:[MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"]
