@@ -599,9 +599,10 @@ int main(void) {
         NSDictionary *thumbEvent = nil;
         for (NSString *line in [feedbackText componentsSeparatedByString:@"\n"])
             if (line.length) thumbEvent = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        NSDictionary *thumbMoment = thumbEvent[@"playback"];
         if (![thumbEvent[@"liked"] boolValue] ||
-            ![thumbEvent[@"playback"][@"position_seconds"] isKindOfClass:NSNumber.class] ||
-            fabs([thumbEvent[@"playback"][@"position_seconds"] doubleValue] - 2) > 0.05) Fail(__LINE__);
+            ![thumbMoment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
+            fabs([thumbMoment[@"position_seconds"] doubleValue] - 2) > 0.05) Fail(__LINE__);
         fprintf(stderr, "Like moment: heart and thumbs-up retain paused playhead and duration\n");
 
         // --- silent system default: player pins built-in, not the display ---
