@@ -987,6 +987,8 @@ extern NSString *const GBControlUsageLine;
 NSArray<NSDictionary *> *ChooseMixSeeds(NSArray<NSDictionary *> *tracks, NSArray<NSString *> *recentKeys,
                                         NSUInteger count, uint64_t salt);
 NSURL *MixArtSearchURL(NSString *artist, NSString *title);
+// Add the playback moment to a feedback record; unknown times are JSON null.
+NSString *MusicFeedbackWithPlayback(NSString *line, double position, double duration);
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at);
 NSSet<NSString *> *MixLikedIDs(NSString *jsonl);
 NSString *MixDislikeLine(NSString *trackID, NSString *trackKey, NSString *title, NSString *artist, BOOL disliked, NSDate *at);

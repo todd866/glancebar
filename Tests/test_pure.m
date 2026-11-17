@@ -2765,6 +2765,23 @@ int main(void) {
             for (NSDictionary *sd in ChooseMixSeeds(lib, @[], 12, 3)) [wide addObject:sd[@"trackID"]];
             check([wide containsObject:@"LORDE"] && ![wide containsObject:@"NEVER"] && wide.count == 7,
                   @"mix: favourites fill in after played songs run out; never-played non-favourites never");
+            NSString *base = MixFeedbackLine(@"moment", @"Song", @"Artist", YES, nil);
+            NSDictionary *(^moment)(double, double) = ^NSDictionary *(double position, double duration) {
+                NSString *line = MusicFeedbackWithPlayback(base, position, duration);
+                return [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            };
+            NSDictionary *record = moment(83.5, 200);
+            check([record[@"playback"][@"position_seconds"] doubleValue] == 83.5 &&
+                  [record[@"playback"][@"duration_seconds"] doubleValue] == 200 &&
+                  fabs([record[@"playback"][@"fraction"] doubleValue] - 0.4175) < 0.00001 &&
+                  [MixLikedIDs(MusicFeedbackWithPlayback(base, 83.5, 200)) containsObject:@"moment"],
+                  @"like moment preserves feedback identity and records elapsed time and fraction");
+            check([moment(0, 200)[@"playback"][@"position_seconds"] isEqual:@0] &&
+                  moment(NAN, 200)[@"playback"][@"position_seconds"] == NSNull.null &&
+                  moment(-1, INFINITY)[@"playback"][@"fraction"] == NSNull.null &&
+                  moment(10, 0)[@"playback"][@"duration_seconds"] == NSNull.null &&
+                  [moment(201, 200)[@"playback"][@"fraction"] isEqual:@1],
+                  @"like moment distinguishes start from unknown and handles unavailable durations");
             NSString *fb = [@[MixFeedbackLine(@"A", @"Song A", @"X", YES, [NSDate dateWithTimeIntervalSince1970:0]),
                               MixFeedbackLine(@"B", @"Song B", @"Y", YES, nil), @"not json", @"",
                               MixFeedbackLine(@"A", @"Song A", @"X", NO, nil)] componentsJoinedByString:@"\n"];

@@ -557,6 +557,12 @@ int main(void) {
         PlaybackController *pc = (PlaybackController *)c;
         if (pc.loveLaunches || pc.unloveLaunches) Fail(__LINE__);
         if (HeartButtonFilled(c)) Fail(__LINE__);
+        // A paused, seeked song must record the playhead, not time since Play.
+        [c musicPlay:nil];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate == 0; }, 2)) Fail(__LINE__);
+        [LocalPlayer(c) seekToTime:CMTimeMakeWithSeconds(2, 600)
+                  toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+        if (!WaitUntil(^BOOL { return fabs(PlayerSeconds(LocalPlayer(c)) - 2) < 0.05; }, 2)) Fail(__LINE__);
         [c musicFavorite:nil];
         PumpUntil([NSDate dateWithTimeIntervalSinceNow:0.5]);
         if (pc.loveLaunches != 1 || pc.unloveLaunches) Fail(__LINE__);
@@ -577,6 +583,26 @@ int main(void) {
         heartsJSON = [NSString stringWithContentsOfFile:heartsPath encoding:NSUTF8StringEncoding error:nil];
         if (HeartCacheKeys(heartsJSON).count != 1) Fail(__LINE__);
         if (HeartHistoryEventCount(gFixtureHome) != 3) Fail(__LINE__);
+        NSString *historyText = [NSString stringWithContentsOfFile:[c heartHistoryJSONL]
+                                                       encoding:NSUTF8StringEncoding error:nil];
+        NSString *firstHeart = [historyText componentsSeparatedByString:@"\n"].firstObject;
+        NSDictionary *heartEvent = [NSJSONSerialization JSONObjectWithData:[firstHeart dataUsingEncoding:NSUTF8StringEncoding]
+                                                                  options:0 error:nil];
+        NSDictionary *moment = heartEvent[@"playback"];
+        if (![moment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
+            fabs([moment[@"position_seconds"] doubleValue] - 2) > 0.05 ||
+            [moment[@"duration_seconds"] doubleValue] <= 2 ||
+            [moment[@"fraction"] doubleValue] <= 0) Fail(__LINE__);
+        [c musicThumbsUp:nil];
+        NSString *feedbackText = [NSString stringWithContentsOfFile:[MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"]
+                                                          encoding:NSUTF8StringEncoding error:nil];
+        NSDictionary *thumbEvent = nil;
+        for (NSString *line in [feedbackText componentsSeparatedByString:@"\n"])
+            if (line.length) thumbEvent = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        if (![thumbEvent[@"liked"] boolValue] ||
+            ![thumbEvent[@"playback"][@"position_seconds"] isKindOfClass:NSNumber.class] ||
+            fabs([thumbEvent[@"playback"][@"position_seconds"] doubleValue] - 2) > 0.05) Fail(__LINE__);
+        fprintf(stderr, "Like moment: heart and thumbs-up retain paused playhead and duration\n");
 
         // --- silent system default: player pins built-in, not the display ---
         [c tearDownLocalPlayer];

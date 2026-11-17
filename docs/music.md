@@ -71,6 +71,14 @@ a like.
 | Like pressed on the TV (music videos only) | the TV server's storage file, M2 |
 | "A master exists" / "the TV has a video" | the catalogue cache (M5) / the TV's music-video folder (M2) |
 
+New Glancebar heart and thumbs-up records include a `playback` object with
+`position_seconds`, `duration_seconds`, and `fraction` (0–1). These come from the
+current player's clock when the feedback is saved, including while paused, and
+are retained in `heart-history.jsonl` and `mix/feedback.jsonl`. Undo events carry
+their own moment too. Missing times are JSON `null`; older records have no
+`playback` object and are not backfilled. A pending track change records unknown
+rather than borrowing the previous song's position.
+
 What reads it:
 
 - **Scout** (`tools/music-scout`): a Shazam from the last 30 days, or a music video liked on

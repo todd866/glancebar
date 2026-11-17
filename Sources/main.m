@@ -10077,13 +10077,23 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
 - (NSString *)heartHistoryJSONL {
     return [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector/heart-history.jsonl"];
 }
+// Read the player clock, not the periodically refreshed progress label. A pending
+// track change must never attach the previous item's position to the new song.
+- (NSString *)feedbackLineWithPlayback:(NSString *)line {
+    AVPlayerItem *item = _localPlayer.currentItem;
+    NSURL *itemURL = [item.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)item.asset).URL : nil;
+    NSURL *trackURL = _localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count ? _localURLs[_localIndex] : nil;
+    BOOL matches = _localMode && item && itemURL && [itemURL isEqual:trackURL];
+    return MusicFeedbackWithPlayback(line, matches ? CMTimeGetSeconds(item.currentTime) : NAN,
+                                     matches ? CMTimeGetSeconds(item.duration) : NAN);
+}
 - (void)appendHeartHistory:(NSString *)action
                   trackKey:(NSString *)key
                     artist:(NSString *)artist
                      title:(NSString *)title
                       path:(NSString *)path {
     if (!_musicProbesEnabled) return;
-    NSString *line = HeartHistoryLine(action, key, artist, title, path, NSDate.date);
+    NSString *line = [self feedbackLineWithPlayback:HeartHistoryLine(action, key, artist, title, path, NSDate.date)];
     if (!line.length) return;
     NSString *dir = [GBHomeDirectory() stringByAppendingPathComponent:@".local/state/selector"];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -10359,7 +10369,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (liked) [_mixLiked addObject:thumbID]; else [_mixLiked removeObject:thumbID];
     NSString *title = ident[@"title"] ?: _localTitle;
     NSString *artist = ident[@"artist"] ?: _localArtist;
-    [self appendMixFeedbackLine:MixFeedbackLine(thumbID, title, artist, liked, NSDate.date)];
+    [self appendMixFeedbackLine:[self feedbackLineWithPlayback:MixFeedbackLine(thumbID, title, artist, liked, NSDate.date)]];
     for (NSUInteger i = 0; i < _mixLibrary.count; i++)
         if ([_mixLibrary[i][@"id"] isEqual:thumbID]) {
             NSMutableArray *lib = [_mixLibrary mutableCopy]; NSMutableDictionary *t = [lib[i] mutableCopy];

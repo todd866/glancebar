@@ -4603,6 +4603,22 @@ NSString *HeartHistoryTooltip(NSString *jsonl, NSString *trackKey, BOOL heartedN
     return @"";
 }
 
+NSString *MusicFeedbackWithPlayback(NSString *line, double position, double duration) {
+    if (!line.length) return line;
+    id parsed = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding]
+                                               options:NSJSONReadingMutableContainers error:nil];
+    if (![parsed isKindOfClass:NSMutableDictionary.class]) return line;
+    BOOL hasPosition = isfinite(position) && position >= 0;
+    BOOL hasDuration = isfinite(duration) && duration > 0;
+    parsed[@"playback"] = @{
+        @"position_seconds": hasPosition ? @(position) : NSNull.null,
+        @"duration_seconds": hasDuration ? @(duration) : NSNull.null,
+        @"fraction": hasPosition && hasDuration ? @(fmin(1, position / duration)) : NSNull.null
+    };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:parsed options:NSJSONWritingSortedKeys error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : line;
+}
+
 NSString *MixFeedbackLine(NSString *trackID, NSString *title, NSString *artist, BOOL liked, NSDate *at) {
     NSISO8601DateFormatter *f = [NSISO8601DateFormatter new];
     NSDictionary *o = @{@"at": [f stringFromDate:at ?: NSDate.date], @"trackID": trackID ?: @"", @"title": title ?: @"",
