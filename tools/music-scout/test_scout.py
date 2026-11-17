@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -203,7 +204,19 @@ class MediaShareTests(unittest.TestCase):
                 }
             },
         )
-        rows = scout.source_tv_likes(self.cfg, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"), set())
+        # The "why" shows the like's local day: 18:00Z on 12 Nov is 13 Nov in Perth. Pin the
+        # zone so a UTC host (CI) checks the same thing as the owner's Macs.
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Australia/Perth"
+        time.tzset()
+        try:
+            rows = scout.source_tv_likes(self.cfg, scout.Runners(clock=lambda: "2026-11-14T12:00:00Z"), set())
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["why"], "Liked on the TV 13 Nov")
         self.assertTrue(rows[0]["priority"])
