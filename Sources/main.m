@@ -9,6 +9,7 @@
 #import <DiskArbitration/DiskArbitration.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 #import "fine_volume.h"
+#import "window_restore.h"
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <notify.h>
@@ -6396,6 +6397,7 @@ static void GBHangWatchStart(void) {
     // the main thread for longer than the shared budget.
     _terminating = YES;
     [self saveShowPositionNow];
+    GBWindowRestoreStop();
     GBFineVolumeSetTargetProvider(nil);
     [self silenceMusicBlendsForQuit];
     [self cancelStorage];
@@ -6431,13 +6433,14 @@ static void GBHangWatchStart(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
     dispatch_async(dispatch_get_main_queue(), ^{ GBFineVolumeStart(); });
+    dispatch_async(dispatch_get_main_queue(), ^{ GBWindowRestoreStart(); });
     [ud registerDefaults:@{@"musicShowsRoot": [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Radio Shows"],
                            @"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
                            @"barShowSystem": @NO, @"starlinkCapGB": @100, @"starlinkResetDay": @13, @"telstraCapGB": @180, @"telstraResetDay": @7,
                            @"useClaudeAccount": @NO, @"useClaudeTranscripts": @NO,
                            @"useCursorAccount": @NO, @"switchToNewOutputs": @YES, @"lowData": @NO,
-                           @"speedAlways": @NO}];
+                           @"speedAlways": @NO, GBWindowRestorePreferenceKey: @NO}];
     _bat = ReadBattery();
     [self batteryForecast];
     [self noteEnergyBaseline:NO];
@@ -14252,6 +14255,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [self settingsItem:m title:@"Speed row always" symbol:@"gauge.with.dots.needle.67percent"
                     action:@selector(toggleSpeedAlways:)
                     on:[ud boolForKey:@"speedAlways"]].accessibilityHelp = @"Keep the Speed row (fast-core clock, chip and cell temperatures) up while the Mac is cool, instead of only under thermal pressure.";
+    [self settingsItem:m title:@"Restore minimized windows" symbol:@"macwindow"
+                    action:@selector(toggleRestoreMinimizedOnActivate:)
+                    on:[ud boolForKey:GBWindowRestorePreferenceKey]].accessibilityHelp =
+        @"When you switch to an app whose standard windows are all minimized, unminimize one. Other minimized windows stay put.";
 
     [self addSection:m title:@"Battery"];
     [self settingsItem:m title:@"Current draw" symbol:@"bolt" action:@selector(toggleWatts:) on:_showWatts].enabled = _bat.valid;
@@ -14410,6 +14417,14 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     [ud setBool:![ud boolForKey:@"heatGuard"] forKey:@"heatGuard"];
     [self runHeatGuard];
+}
+- (void)toggleRestoreMinimizedOnActivate:(id)sender {
+    (void)sender;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL enabling = ![ud boolForKey:GBWindowRestorePreferenceKey];
+    [ud setBool:enabling forKey:GBWindowRestorePreferenceKey];
+    if (enabling) GBWindowRestoreStart();
+    else GBWindowRestoreStop();
 }
 
 // Flips system Low Power Mode from the footer toggle. Like the lid toggle, the live system
