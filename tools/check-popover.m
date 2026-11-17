@@ -1330,7 +1330,7 @@ int main(int argc, const char **argv) {
             rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
             if (![rd.stringValue isEqual:@"away 10m"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
                 FindIdentifier(root, @"popover.remote.m2.volume.0")) return Fail(__LINE__);
-            {   // A worker behind this Mac keeps the same row: temperature, then one orange word.
+            {   // Fleet sync detail stays in the tooltip; the datum keeps temperature and the readiness limit only.
                 NSString *status = @"{\"state\":\"ok\",\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
                     "\"origin\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"behind\":3,"
                     "\"detail\":\"3 commits behind origin/main\"}";
@@ -1341,9 +1341,7 @@ int main(int argc, const char **argv) {
                 [c rebuildContent]; root = p.contentViewController.view;
                 rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
                 NSView *remoteRow = FindIdentifier(root, @"popover.row.remote.m2");
-                NSRange word = [rd.stringValue rangeOfString:@"3 behind"];
-                NSColor *wordColor = word.location == NSNotFound ? nil : [rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:word.location effectiveRange:NULL];
-                if (word.location == NSNotFound || ![wordColor isEqual:NSColor.systemOrangeColor] ||
+                if ([rd.stringValue rangeOfString:@"behind"].location != NSNotFound ||
                     ![rd.stringValue hasSuffix:@"CPU busy"] || FindIdentifier(root, @"popover.remote.m2.storage") ||
                     !HasTip(remoteRow, @"3 commits behind origin/main") || !FitsChildren(root) || !InstrumentRowsFit(root))
                     return Fail(__LINE__);
@@ -1355,12 +1353,25 @@ int main(int argc, const char **argv) {
                 [c rebuildContent]; root = p.contentViewController.view;
                 rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
                 remoteRow = FindIdentifier(root, @"popover.row.remote.m2");
-                word = [rd.stringValue rangeOfString:@"no release"];
-                wordColor = word.location == NSNotFound ? nil : [rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:word.location effectiveRange:NULL];
-                if (word.location == NSNotFound || ![wordColor isEqual:NSColor.systemOrangeColor] ||
+                if ([rd.stringValue rangeOfString:@"release"].location != NSNotFound ||
                     FindIdentifier(root, @"popover.remote.m2.storage") ||
                     !HasTip(remoteRow, @"matching signed release unavailable") || !InstrumentRowsFit(root))
                     return Fail(__LINE__);
+                status = @"{\"state\":\"ok\",\"behind\":0,\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                    "\"origin\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+                [c setValue:[@{@"m2": @{@"sample": sample, @"mode": @"full", @"free": @2, @"slots": @3,
+                                        @"at": @(CFAbsoluteTimeGetCurrent()), @"glancebar": status,
+                                        @"localSHA": @"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}} mutableCopy] forKey:@"remote"];
+                [c rebuildContent]; root = p.contentViewController.view;
+                rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
+                remoteRow = FindIdentifier(root, @"popover.row.remote.m2");
+                if (!HasTip(remoteRow, @"Different Glancebar build") || [rd.stringValue rangeOfString:@"build"].location != NSNotFound)
+                    return Fail(__LINE__);
+                if (argc > 1) {
+                    NSString *base = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-fleet-drift.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                    if (!RenderOffscreen(root, [base stringByAppendingString:@"-fleet-drift-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
+                }
             }
             [ud removeObjectForKey:@"remoteMachines"]; [ud removeObjectForKey:@"remoteOpen.m2"];
             [c rebuildContent]; root = p.contentViewController.view;

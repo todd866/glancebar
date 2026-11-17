@@ -3,6 +3,9 @@
 set -euo pipefail
 cd "${0:A:h}"
 
+/usr/bin/python3 tools/test-host-readiness/readiness.py
+
+/usr/bin/python3 -m unittest discover -s tools/test-host-readiness -v
 /usr/bin/python3 -m unittest discover -s tools/offline-cache -v
 /usr/bin/python3 -m unittest discover -s tools/music-library -v
 /usr/bin/python3 -m unittest discover -s tools/music-scout -v

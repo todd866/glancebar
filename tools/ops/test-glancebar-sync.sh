@@ -63,6 +63,28 @@ advance two; : > "$CASE/calls"; run
 [ "$(calls)" = "tests deploy" ] && [ "$(installed)" = "$(origin_head)" ] \
   && ok "origin moved: checkout fast-forwards and deploys" || not_ok "origin moved: checkout fast-forwards and deploys ('$(calls)')"
 
+setup defer
+printf '#!/bin/bash\necho tests >> "%s/calls"\nexit 75\n' "$CASE" > "$CASE/bin/tests"
+chmod +x "$CASE/bin/tests"
+: > "$CASE/calls"; run; rc=$?
+[ $rc = 0 ] && [ "$(calls)" = "tests" ] && [ -z "$(installed)" ] && [ ! -f "$CASE/state/failed" ] \
+  && ! grep -q '^mail ' "$CASE/calls" \
+  && ok "deferred tests: not deployed, no failure mark, not mailed" \
+  || not_ok "deferred tests: not deployed, no failure mark, not mailed (rc $rc, '$(calls)')"
+status_is deferred -1 && ok "deferred tests: status file says deferred" \
+  || not_ok "deferred tests: status file says deferred ($(cat "$CASE/update-state/status.json" 2>/dev/null))"
+: > "$CASE/calls"; run; rc=$?
+[ $rc = 0 ] && [ "$(calls)" = "tests" ] && [ -z "$(installed)" ] \
+  && ok "deferred: same SHA retried on the next run" \
+  || not_ok "deferred: same SHA retried on the next run (rc $rc, '$(calls)')"
+deferred_sha=$(origin_head)
+printf '#!/bin/bash\necho tests >> "%s/calls"\nexit 0\n' "$CASE" > "$CASE/bin/tests"
+chmod +x "$CASE/bin/tests"
+: > "$CASE/calls"; run
+[ "$(calls)" = "tests deploy" ] && [ "$(installed)" = "$deferred_sha" ] \
+  && ok "after green tests: deploy runs for the same SHA" \
+  || not_ok "after green tests: deploy runs for the same SHA ('$(calls)')"
+
 setup red
 touch "$CASE/tests-fail"; run; rc=$?
 [ $rc = 1 ] && [ "$(calls | cut -d' ' -f1-2)" = "tests mail" ] && [ -z "$(installed)" ] \

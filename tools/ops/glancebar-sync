@@ -9,7 +9,8 @@
 # Run by the LaunchAgent com.iantodd.glancebar-sync every 30 minutes on the M5. Each run:
 #   1. fast-forwards the checkout to origin/main (skips a checkout off main or with tracked edits)
 #   2. stops if the installed commit is already HEAD
-#   3. runs the test suite on a worker (remote-run -- ./tests.sh); a red suite is not deployed
+#   3. runs the test suite on a worker (remote-run -- ./tests.sh); exit 75 defers to the next run;
+#      a red suite is not deployed
 #   4. runs glancebar-deploy: signed release, install here, relaunch. The workers' own
 #      glancebar-update then fetches that release within 15 minutes.
 # A commit that fails its tests or its deploy is tried once, then left until main moves again;
@@ -127,8 +128,16 @@ fail() {
 }
 
 say "main is at ${head_sha:0:7}, installed is ${installed:0:7}: testing"
-if ! (cd "$repo" && $tests) > "$state/tests.log" 2>&1; then
-  fail "tests failed (see $state/tests.log)"
+(cd "$repo" && $tests) >"$state/tests.log" 2>&1
+test_rc=$?
+if [ "$test_rc" -eq 75 ]; then
+  detail=$(tail -n 1 "$state/tests.log" 2>/dev/null | sed 's/^/ /')
+  say "tests deferred (exit 75)${detail:-}: will retry on the next scheduled run"
+  write_status deferred "test suite deferred (host not ready; exit 75)"
+  exit 0
+fi
+if [ "$test_rc" -ne 0 ]; then
+  fail "tests failed with exit $test_rc (see $state/tests.log)"
 fi
 say "tests passed: deploying"
 # The suite has just passed for this commit: say so, and the release build does not run it again.

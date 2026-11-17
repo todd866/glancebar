@@ -3090,8 +3090,13 @@ int main(void) {
             NSDictionary *differs = FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":0,\"installed\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
                                                     "\"origin\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
                                                    @"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-            check([differs[@"word"] isEqual:@"differs"] && [differs[@"detail"] containsString:@"bbbbbbb"],
+            check([differs[@"word"] isEqual:@"different build"] &&
+                  [differs[@"detail"] containsString:@"Different Glancebar build"] &&
+                  [differs[@"detail"] containsString:@"bbbbbbb"],
                   @"fleet: same origin count, different commit from this Mac");
+            NSDictionary *currentButDifferent = FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":0,\"installed\":\"aaaaaaaa\",\"detail\":\"current\"}", @"bbbbbbbb");
+            check([currentButDifferent[@"detail"] containsString:@"Different Glancebar build"],
+                  @"fleet: current relative to origin still explains a different local build");
             check(FleetSyncDrift(@"{\"state\":\"ok\",\"behind\":-1,\"installed\":\"abcdefg\",\"origin\":\"abcdefg\"}", @"abcdefg") == nil,
                   @"fleet: an unknown count still matches when the commits do");
             check(FleetSyncDrift(@"{\"state\":\"weird\",\"behind\":0,\"installed\":\"abcdefg\",\"origin\":\"abcdefg\"}", @"abcdefg") == nil,

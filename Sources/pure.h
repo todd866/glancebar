@@ -1241,8 +1241,9 @@ NSInteger HeavySlotCounts(NSString *status, NSInteger *freeSlots);
 // look as it does without a status file: missing or unreadable JSON, state "ok"
 // with behind 0, and the same commit as this Mac when both shas are known
 // (a short sha matches a full one). Otherwise @{@"word", @"detail"}: the word is
-// the orange datum ("3 behind", "no release", "local edits", "not main",
-// "fetch failed", "install failed", "differs") and the detail is one tooltip line.
+// a short label for tests and fallbacks ("3 behind", "no release", "local edits",
+// "not main", "fetch failed", "install failed", "different build"); the detail is
+// the accessibility and tooltip line on the remote row.
 // A state other than ok wins over the behind count; the count is then kept in the detail.
 NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA);
 

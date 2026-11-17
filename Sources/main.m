@@ -10853,30 +10853,6 @@ static NSString *FleetLocalSHA(void) {
     return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
         stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
 }
-// Orange fleet word, after the chip temperature when the datum has one, otherwise in front of the limit.
-static void AppendFleetWord(NSTextField *datum, NSString *word) {
-    if (!word.length || !datum) return;
-    NSMutableAttributedString *base = [datum.attributedStringValue mutableCopy] ?: [NSMutableAttributedString new];
-    NSString *plain = base.string ?: @"";
-    NSDictionary *gap = @{NSFontAttributeName: datum.font};
-    NSDictionary *orange = @{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: NSColor.systemOrangeColor};
-    if ([plain isEqual:@"ready"]) {
-        datum.attributedStringValue = [[NSAttributedString alloc] initWithString:word attributes:orange];
-        datum.allowsDefaultTighteningForTruncation = YES;
-        return;
-    }
-    NSRange deg = [plain rangeOfString:@"°"];
-    NSUInteger insertAt = deg.location == NSNotFound ? 0 : NSMaxRange(deg);
-    NSMutableAttributedString *piece = [NSMutableAttributedString new];
-    if (insertAt > 0)
-        [piece appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:gap]];
-    [piece appendAttributedString:[[NSAttributedString alloc] initWithString:word attributes:orange]];
-    if (insertAt == 0 && plain.length)
-        [piece appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:gap]];
-    [base insertAttributedString:piece atIndex:insertAt];
-    datum.allowsDefaultTighteningForTruncation = YES;
-    datum.attributedStringValue = base;
-}
 // Background poll of the other Macs: every two minutes on mains, every ten on battery (owner,
 // 11 Nov 2026: "less often on battery"). A reading counts as current for a little longer than
 // the poll interval; an open popover renews it every 25 s whatever the power source.
@@ -10989,7 +10965,6 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         BOOL open = _fleetExpandedHosts ? [_fleetExpandedHosts containsObject:host] : [NSUserDefaults.standardUserDefaults boolForKey:[@"remoteOpen." stringByAppendingString:host]];
         NSString *glance = fresh && [reading[@"glancebar"] isKindOfClass:NSString.class] ? reading[@"glancebar"] : nil;
         NSDictionary *drift = glance.length ? FleetSyncDrift(glance, [reading[@"localSHA"] isKindOfClass:NSString.class] ? reading[@"localSHA"] : @"") : nil;
-        NSString *driftWord = [drift[@"word"] isKindOfClass:NSString.class] ? drift[@"word"] : nil;
         NSString *driftDetail = [drift[@"detail"] isKindOfClass:NSString.class] ? drift[@"detail"] : nil;
         NSString *tip = ready ? [NSString stringWithFormat:@"%@ · %@ ready · limited by %@ · click for details", name,
                                  [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)], ready[@"limit"]]
@@ -11035,7 +11010,6 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
                     attributes:@{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: color}]];
             if (text) datum.attributedStringValue = text;
         }
-        if (driftWord.length) AppendFleetWord(datum, driftWord);
         [root addSubview:row];
         y += kRowH;
         if (!open || !fresh) continue;

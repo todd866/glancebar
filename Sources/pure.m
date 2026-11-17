@@ -5308,11 +5308,12 @@ NSDictionary *FleetSyncDrift(NSString *statusJSON, NSString *localSHA) {
     if ([status[@"behind"] isKindOfClass:NSNumber.class]) behind = [status[@"behind"] integerValue];
     NSString *word = state.length && ![state isEqual:@"ok"] ? FleetStateWord(state) : nil;
     if (!word.length && behind > 0) word = [NSString stringWithFormat:@"%ld behind", (long)behind];
-    if (!word.length && installed.length && local.length && !FleetSHAEqual(installed, local)) word = @"differs";
+    if (!word.length && installed.length && local.length && !FleetSHAEqual(installed, local)) word = @"different build";
     if (!word.length) return nil;
-    if (!detail.length) {
-        if ([word isEqual:@"differs"])
-            detail = [NSString stringWithFormat:@"installed %@ · this Mac %@", FleetShortSHA(installed), FleetShortSHA(local)];
+    if (!detail.length || ([word isEqual:@"different build"] && [detail isEqual:@"current"])) {
+        if ([word isEqual:@"different build"])
+            detail = [NSString stringWithFormat:@"Different Glancebar build · %@ · this Mac %@",
+                      FleetShortSHA(installed), FleetShortSHA(local)];
         else detail = word;
     }
     if (behind > 0 && [detail rangeOfString:@"behind"].location == NSNotFound)

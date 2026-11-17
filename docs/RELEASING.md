@@ -72,3 +72,16 @@ Do not publish the OAuth token, notary credentials, Keychain exports, or signing
 certificate private keys. Signing Glancebar does not authorize its Claude integration:
 that opt-in path invokes Apple's `/usr/bin/security`, and Keychain evaluates that Apple
 tool rather than the app's signature.
+
+## Busy test hosts (17 Nov 2026)
+
+The full suite starts with `tools/test-host-readiness/readiness.py`. An active owner
+on a Mac with `focus-guard`, or a one-minute load above the logical CPU count,
+returns 75 before running the suite. Probe errors remain failures. There is no
+force/skip switch and the playback timing limits are unchanged.
+
+`glancebar-sync` records exit 75 as deferred and retries the same revision on its
+next existing scheduled run. It does not deploy, mail a test-failure report, or
+write the permanent failure marker for a deferral. Other test failures still
+block deployment until the revision changes. Only a completely green suite may
+supply `GLANCEBAR_TESTS_GREEN` for that exact commit.
