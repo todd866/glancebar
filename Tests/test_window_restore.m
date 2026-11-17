@@ -148,7 +148,7 @@ int main(void) {
         Check(gUnminimizedToken == 31, @"restore selects window with known minimized=yes");
 
         gMocks = @{};
-        RegisterMock(40, @{@"role": @"AXWindow", @"subrole": @"AXUnknown", @"minimized": @YES});
+        RegisterMock(40, @{@"role": @"AXWindow", @"subrole": @"AXDialog", @"minimized": @YES});
         RegisterMock(41, @{@"role": @"AXWindow", @"subrole": @"AXFloatingWindow", @"minimized": @NO});
         gUnminimizedToken = NSNotFound;
         Check(GBWindowRestoreTestRunRestorePass(WindowList(40, 41, 0), finder, own),
