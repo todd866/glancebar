@@ -147,6 +147,18 @@ int main(void) {
               @"missing minimized on one standard does not block restore");
         Check(gUnminimizedToken == 31, @"restore selects window with known minimized=yes");
 
+        gMocks = @{};
+        RegisterMock(40, @{@"role": @"AXWindow", @"subrole": @"AXUnknown", @"minimized": @YES});
+        RegisterMock(41, @{@"role": @"AXWindow", @"subrole": @"AXFloatingWindow", @"minimized": @NO});
+        gUnminimizedToken = NSNotFound;
+        Check(GBWindowRestoreTestRunRestorePass(WindowList(40, 41, 0), finder, own),
+              @"minimized nonstandard window restores despite visible auxiliary window");
+        Check(gUnminimizedToken == 40, @"only the genuinely minimized window is restored");
+        RegisterMock(42, @{@"role": @"AXWindow", @"subrole": @"AXStandardWindow", @"minimized": @NO});
+        gUnminimizedToken = NSNotFound;
+        Check(!GBWindowRestoreTestRunRestorePass(WindowList(40, 42, 0), finder, own),
+              @"visible standard still prevents restoring nonstandard minimized window");
+        Check(gUnminimizedToken == NSNotFound, @"visible standard prevents mutation");
         GBWindowRestoreTestResetAXHooks();
 
         printf("window_restore: %d checks passed\n", checks);
