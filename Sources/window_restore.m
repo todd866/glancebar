@@ -2,6 +2,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <stdatomic.h>
+#import <os/log.h>
 #import <string.h>
 
 NSString * const GBWindowRestorePreferenceKey = @"restoreMinimizedOnActivate";
@@ -42,7 +43,7 @@ static void DebugLog(NSString *format, ...) {
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    NSLog(@"%@ %@", kGBWindowRestoreLogPrefix, message);
+    os_log(OS_LOG_DEFAULT, "%{public}@ %{public}@", kGBWindowRestoreLogPrefix, message);
 }
 
 static AXError DefaultCopyAttribute(AXUIElementRef element, CFStringRef attribute, CFTypeRef *value) {
