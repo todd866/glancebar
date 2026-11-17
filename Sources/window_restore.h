@@ -2,8 +2,10 @@
 // raise one of them. Off by default (`restoreMinimizedOnActivate`). Needs Accessibility
 // (Glancebar already uses it for fine volume).
 #import <Foundation/Foundation.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 FOUNDATION_EXPORT NSString * const GBWindowRestorePreferenceKey;
+FOUNDATION_EXPORT NSString * const GBWindowRestoreDebugKey;
 
 typedef struct {
     BOOL standard;
@@ -23,3 +25,18 @@ BOOL GBWindowRestorePermitsMutation(pid_t expectedPID, pid_t frontmostPID, pid_t
 
 void GBWindowRestoreStart(void);
 void GBWindowRestoreStop(void);
+
+typedef AXError (*GBWindowRestoreCopyAttributeFn)(AXUIElementRef element, CFStringRef attribute,
+                                                  CFTypeRef *value);
+typedef AXError (*GBWindowRestoreSetAttributeFn)(AXUIElementRef element, CFStringRef attribute,
+                                                 CFTypeRef value);
+
+#ifdef GLANCEBAR_WINDOW_RESTORE_TEST
+void GBWindowRestoreTestSetAXHooks(GBWindowRestoreCopyAttributeFn copyFn,
+                                   GBWindowRestoreSetAttributeFn setFn);
+void GBWindowRestoreTestResetAXHooks(void);
+void GBWindowRestoreTestSetFrontmostPID(pid_t pid);
+
+// Production scan + policy + single unminimize; hooks must be installed first.
+BOOL GBWindowRestoreTestRunRestorePass(NSArray *windows, pid_t expectedPID, pid_t ownPID);
+#endif

@@ -75,7 +75,7 @@ fi
 "$CC" "${TEST_FLAGS[@]}" Sources/volume_step.m Tests/test_volume_step.m -framework Foundation -o "$WORK_DIR/glancebar_volume_step_tests"
 "$WORK_DIR/glancebar_volume_step_tests"
 
-"$CC" "${TEST_FLAGS[@]}" Sources/window_restore.m Tests/test_window_restore.m -framework Foundation -framework AppKit -o "$WORK_DIR/glancebar_window_restore_tests"
+"$CC" "${TEST_FLAGS[@]}" -DGLANCEBAR_WINDOW_RESTORE_TEST Sources/window_restore.m Tests/test_window_restore.m -framework Foundation -framework AppKit -o "$WORK_DIR/glancebar_window_restore_tests"
 "$WORK_DIR/glancebar_window_restore_tests"
 
 "$CC" "${TEST_FLAGS[@]}" Sources/pure.m Tests/test_player_output.m -framework Foundation -o "$WORK_DIR/glancebar_player_output_tests"
