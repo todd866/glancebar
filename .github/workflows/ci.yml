@@ -11,7 +11,8 @@ permissions:
 jobs:
   test-and-build:
     runs-on: macos-26
-    timeout-minutes: 15
+    # 15 for the suite plus up to 8 waiting for a freshly booted runner to settle.
+    timeout-minutes: 25
 
     steps:
       - name: Check out repository
@@ -24,6 +25,22 @@ jobs:
           zsh -n build.sh
           zsh -n tests.sh
           zsh -n Tests/make_fixture_home.sh
+
+      - name: Wait for the runner's boot load to settle
+        # tests.sh defers (exit 75) while the 1-minute load exceeds the CPU count. A new
+        # macos-26 runner reports a load above 100 for its first minutes, so wait on the
+        # same measure the gate uses instead of starting the suite into a deferral.
+        run: |
+          deadline=$(( $(date +%s) + 480 ))
+          while :; do
+            read -r load ncpu < <(/usr/bin/python3 -c 'import os; print(os.getloadavg()[0], os.cpu_count())')
+            echo "$(date -u +%H:%M:%SZ) 1-minute load $load, $ncpu CPUs"
+            if /usr/bin/python3 -c "import sys; sys.exit(0 if $load <= $ncpu else 1)"; then break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::runner load did not fall to $ncpu within 8 minutes"; exit 1
+            fi
+            sleep 10
+          done
 
       - name: Run tests with sanitizers
         env:
