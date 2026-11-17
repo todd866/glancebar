@@ -79,6 +79,14 @@ their own moment too. Missing times are JSON `null`; older records have no
 `playback` object and are not backfilled. A pending track change records unknown
 rather than borrowing the previous song's position.
 
+Dislike button presses (including undo) also carry the same `playback` fields, captured
+before the rejected song is dropped. Next/skip presses are kept separately in
+`mix/skip-history.jsonl`, with the outgoing track identity, timestamp, command,
+cause, and playback moment. This includes keyboard/headphone Next commands and
+each press in a double tap; the first press arms a blend, the second cuts.
+Automatic advances and dislike-induced track changes are not skip presses.
+Skipping never changes the stored like/dislike state.
+
 What reads it:
 
 - **Scout** (`tools/music-scout`): a Shazam from the last 30 days, or a music video liked on

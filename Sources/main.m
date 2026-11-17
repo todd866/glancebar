@@ -10297,8 +10297,11 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
 }
 - (void)appendMixFeedbackLine:(NSString *)line {
+    [self appendMixHistoryLine:line filename:@"feedback.jsonl"];
+}
+- (void)appendMixHistoryLine:(NSString *)line filename:(NSString *)filename {
     if (!line.length) return;
-    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:filename];
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     [fh seekToEndOfFile];
@@ -10415,7 +10418,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSString *artist = ident[@"artist"] ?: _localArtist;
     BOOL disliked = [self trackIsMixDisliked:thumbID trackKey:trackKey];
     NSString *line = MixDislikeLine(thumbID ?: @"", trackKey, title, artist, !disliked, NSDate.date);
-    [self appendMixFeedbackLine:line];
+    [self appendMixFeedbackLine:[self feedbackLineWithPlayback:line]];
     if (!disliked) {
         if (thumbID.length) [[self mixDisliked] addObject:thumbID];
         if (trackKey.length) [[self mixDisliked] addObject:trackKey];
@@ -10551,11 +10554,25 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (_localBlendTimer || _localOutgoing) { [self finishLocalBlend]; return; }
     [self beginLocalBlend];
 }
+- (void)recordMusicSkipPress {
+    if (!_localMode || _localIndex < 0 || _localIndex >= (NSInteger)_localURLs.count) return;
+    // Keep a file identity even before title/artist metadata becomes available.
+    NSMutableDictionary *record = [[self currentLocalIdentity] mutableCopy] ?: [NSMutableDictionary dictionary];
+    record[@"path"] = _localURLs[_localIndex].path ?: @"";
+    record[@"event"] = @"skip";
+    record[@"command"] = @"next";
+    record[@"cause"] = _playbackCause ?: @"click-next";
+    record[@"at"] = [[NSISO8601DateFormatter new] stringFromDate:NSDate.date];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:nil];
+    NSString *line = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+    [self appendMixHistoryLine:[self feedbackLineWithPlayback:line] filename:@"skip-history.jsonl"];
+}
 - (IBAction)musicNext:(id)sender {
     [self playbackUserCause:@"click-next"];
     ++_offlinePlayGeneration; _mixStartingKey = nil;
     (void)sender;
     if (!_musicProbesEnabled) return;
+    [self recordMusicSkipPress]; // Snapshot before the first tap can arm a blend or a second tap cuts.
     BOOL blending = [self musicBlendRunning];
     MusicNextTap tap = ClassifyMusicNext(&_musicNextArmedAt, CFAbsoluteTimeGetCurrent(),
                                         kMusicNextTapWindowSec, NO, blending);

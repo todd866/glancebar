@@ -207,6 +207,18 @@ static NSUInteger HeartHistoryEventCount(NSString *home) {
     return n;
 }
 
+static NSArray<NSDictionary *> *FeedbackRows(NSString *filename) {
+    NSString *text = [NSString stringWithContentsOfFile:[MixDirectory(nil) stringByAppendingPathComponent:filename]
+                                              encoding:NSUTF8StringEncoding error:nil];
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if (!line.length) continue;
+        id row = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        if ([row isKindOfClass:NSDictionary.class]) [rows addObject:row];
+    }
+    return rows;
+}
+
 static BOOL HeartButtonFilled(Controller *c) {
     NSDictionary *ident = [c currentLocalIdentity];
     NSString *key = ident[@"trackKey"];
@@ -607,6 +619,40 @@ int main(void) {
             ![thumbMoment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
             fabs([thumbMoment[@"position_seconds"] doubleValue] - 2) > 0.05) Fail(__LINE__);
         fprintf(stderr, "Like moment: heart and thumbs-up retain paused playhead and duration\n");
+        // Dislike records the outgoing song before dropping it, without making a skip event.
+        NSDictionary *rejectedIdentity = [c currentLocalIdentity];
+        NSArray<NSURL *> *rejectedURLs = [c valueForKey:@"localURLs"];
+        NSString *rejectedPath = rejectedURLs[[[c valueForKey:@"localIndex"] integerValue]].path;
+        NSUInteger skipCount = FeedbackRows(@"skip-history.jsonl").count;
+        [c musicThumbsDown:nil];
+        NSDictionary *rejection = FeedbackRows(@"feedback.jsonl").lastObject;
+        NSDictionary *rejectedMoment = rejection[@"playback"];
+        if (![rejection[@"event"] isEqual:@"dislike"] ||
+            ![rejection[@"track_key"] isEqual:rejectedIdentity[@"trackKey"]] ||
+            ![rejectedMoment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
+            fabs([rejectedMoment[@"position_seconds"] doubleValue] - 2) > 0.05 ||
+            FeedbackRows(@"skip-history.jsonl").count != skipCount) Fail(__LINE__);
+        [c clearMixDislikeForIdentity:rejectedIdentity];
+        [c playLocalPaths:@[rejectedPath]];
+        if (!WaitUntil(^BOOL { return LocalPlayer(c).rate > 0 && TrackDuration(LocalPlayer(c)) > 3; }, 5)) Fail(__LINE__);
+        [c musicPlay:nil];
+        [LocalPlayer(c) seekToTime:CMTimeMakeWithSeconds(3, 600)
+                  toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+        if (!WaitUntil(^BOOL { return fabs(PlayerSeconds(LocalPlayer(c)) - 3) < 0.05; }, 2)) Fail(__LINE__);
+        NSString *skipPath = rejectedPath;
+        NSUInteger feedbackCount = FeedbackRows(@"feedback.jsonl").count;
+        [c remoteNext:nil];
+        NSDictionary *skip = FeedbackRows(@"skip-history.jsonl").lastObject;
+        NSDictionary *skipMoment = skip[@"playback"];
+        if (![skip[@"event"] isEqual:@"skip"] || ![skip[@"cause"] isEqual:@"remote-next"] ||
+            ![skip[@"path"] isEqual:skipPath] ||
+            ![skipMoment[@"position_seconds"] isKindOfClass:NSNumber.class] ||
+            fabs([skipMoment[@"position_seconds"] doubleValue] - 3) > 0.05) Fail(__LINE__);
+        [c musicNext:nil]; // The second press cuts; both presses retain their own moment.
+        if (FeedbackRows(@"skip-history.jsonl").count != skipCount + 2 ||
+            FeedbackRows(@"feedback.jsonl").count != feedbackCount) Fail(__LINE__);
+        fprintf(stderr, "Dislike/skip moments: outgoing position saved, remote Next covered, likes unchanged by skips\n");
+
 
         // --- silent system default: player pins built-in, not the display ---
         [c tearDownLocalPlayer];
