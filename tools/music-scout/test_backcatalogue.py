@@ -155,8 +155,22 @@ class HelperTests(unittest.TestCase):
             {"trackId": 4, "trackName": "Song (Live)", "collectionName": "Live", "releaseDate": "1965-01-01"},
         ]
         self.assertEqual(bc.best_hit(hits)["trackId"], 2)
-        self.assertEqual(bc.earliest_year(hits), 1965)
+        self.assertEqual(bc.earliest_year(hits), 1969)  # the live one is excluded, the others reissues
         self.assertIsNone(bc.best_hit([hits[3]]))
+        # Found 18 Nov 2026: a soundtrack dated 1980-01-01 held a 1984 song. Only compilations and
+        # reissues on the catalogue: the year is unknown, and the station's or the model's is used.
+        cocteau = [{"trackId": 7, "collectionName": "Stars and Topsoil: A Collection (1982-1990)", "releaseDate": "2000-10-16"},
+                   {"trackId": 8, "collectionName": "The Perks of Being a Wallflower (Original Motion Picture Soundtrack)",
+                    "releaseDate": "1980-01-01"}]
+        self.assertIsNone(bc.earliest_year(cocteau))
+        self.assertTrue(bc.best_hit(cocteau))
+
+    def test_order_decade_takes_kinds_in_turn(self):
+        def row(key, score, canon=(), stations=None, llm=""):
+            return {"key": key, "score": score, "canon": list(canon), "stations": stations or {}, "llm": llm}
+        rows = [row("c1", 3.0, canon=["x"]), row("c2", 2.9, canon=["y"]), row("c3", 2.8, canon=["z"]),
+                row("r1", 1.0, stations={"wfmu": 1}), row("l1", 0.7, llm="near")]
+        self.assertEqual([r["key"] for r in bc.order_decade(rows)], ["c1", "r1", "l1", "c2", "c3"])
 
     def test_allocate_follows_deficits_and_gives_thin_decades_slots_away(self):
         decades = ["1960s", "1970s", "1980s"]
@@ -514,6 +528,12 @@ class AcquireAndStatusTests(unittest.TestCase):
         self.assertEqual(got["Can"]["canon"], ["x"])
         # A new row is dated from the catalogue release found for it.
         self.assertEqual((got["New Band"]["year"], got["New Band"]["era"]), (2026, "new"))
+
+    def test_old_radio_and_taste_picks_count_in_the_new_half(self):
+        rows = [{"artist": "Radio Act", "title": "Old One", "source": "radio:kexp", "year": 2015},
+                {"artist": "Back Act", "title": "Older", "source": "back:canon", "era": "back", "year": 1969}]
+        tagged = [scout.tag_era(dict(r), self.cfg["decades"]) for r in rows]
+        self.assertEqual([(r["era"], r["decade"]) for r in tagged], [("new", "2010s"), ("back", "1960s")])
 
     def test_status_document_counts_the_week_and_holds_no_paths(self):
         scout.cmd_acquire(self.cfg, self.paths, self.runners(), go=True)

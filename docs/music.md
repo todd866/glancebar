@@ -238,10 +238,16 @@ radio.py's Fetcher: generic User-Agent, 2 s between requests to a host, cached.
 Ranking: canon lists, stations and an LLM pick each add to a row's score, and agreement counts most
 (a radio play from a Mercury-shortlisted album carries the prize). Within a decade the best canon,
 radio and LLM rows are taken in turn. A list's own year is authoritative (an iTunes date is often a
-remaster); a radio play takes the earliest year it can find. The release acquired is the earliest
-non-compilation one. Excluded on the list row and again on the catalogue hit: children's music,
+remaster); a radio play takes the station's year or the earliest original release on iTunes.
+Compilations, soundtracks and remaster or anniversary editions do not date a record (a soundtrack
+on the catalogue dated 1980 holds Cocteau Twins' 1984 "Pearly-Dewdrops' Drops"); with only those,
+the station's or the model's year is used. The release acquired is the earliest original one. Excluded on the list row and again on the catalogue hit: children's music,
 karaoke, covers and tributes, live and re-recorded versions, and classical, opera, comedy and
 cast-recording genres. Owned, offered, hearted and rejected tracks are skipped.
+
+The halves are by source, not by year: radio, Shazams, new releases and taste picks are the
+new/radio half even when the record is from 2015 (owner: "50% new/radio"), and the decade spread
+is counted on the back half only. Every row still records its `year` and `decade`.
 
 Quota: a night offers at most `backcatalogue_max_candidates` (20), and never more than the back half
 of the week has room for, so a finite list is not burned as "offered" without being acquired. Slots

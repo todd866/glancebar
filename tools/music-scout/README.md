@@ -123,8 +123,9 @@ tracks skipped early via `click-next` on multiple days without ever finishing
    Radio plays radio.py already stored, dated by the station's year or the earliest iTunes release;
    critics' canon lists and prizes read from Wikipedia; and the taste LLM asked for older records near
    his artists. Every row has `year`, `decade`, `era: "back"`, `source` `back:canon|radio|llm`, and
-   `canon` / `stations` for its support. Every candidate with a known year is tagged `year`, `decade`
-   and `era`; `rank` keeps about `backcatalogue_share` of the week back catalogue, decades in turn.
+   `canon` / `stations` for its support. Every candidate gets `era` (the half of the week: `back` for
+   this source, `new` for all others, radio included whatever its year) and `year` / `decade` where
+   known; `rank` keeps about `backcatalogue_share` of the week back catalogue, decades in turn.
 
 ### Acquire guards
 

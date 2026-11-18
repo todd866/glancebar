@@ -498,20 +498,37 @@ class YearCache:
         tmp.replace(self.path)
 
 
+_COMPILATION = re.compile(r"soundtrack|motion picture|greatest hits|best of|\bhits\b|collection|anthology"
+                          r"|\bessential|compilation|retrospective|\bgold\b", re.IGNORECASE)
+_REISSUE = re.compile(r"remaster|deluxe|anniversary|expanded|reissue|legacy edition|bonus track", re.IGNORECASE)
+
+
+def is_compilation(hit: dict) -> bool:
+    return (str(hit.get("collectionArtistName") or "").lower() == "various artists"
+            or bool(_COMPILATION.search(str(hit.get("collectionName") or ""))))
+
+
+def is_original(hit: dict) -> bool:
+    """Not a compilation or soundtrack, not a remaster or anniversary edition: its date is the record's."""
+    return not is_compilation(hit) and not _REISSUE.search(f"{hit.get('collectionName') or ''} {hit.get('trackName') or ''}")
+
+
 def earliest_year(hits: list[dict]) -> int | None:
-    years = [year_of(h.get("releaseDate")) for h in hits]
+    """The record's year from the catalogue: the earliest ORIGINAL release. A compilation's or a
+    reissue's date says nothing about the record (a soundtrack dated 1980 holds a 1984 song), so
+    without an original the year is unknown."""
+    years = [year_of(h.get("releaseDate")) for h in hits if is_original(h) and not hit_excluded(h)]
     years = [y for y in years if y]
     return min(years) if years else None
 
 
 def best_hit(hits: list[dict]) -> dict | None:
-    """The release to acquire: not excluded, not a compilation, earliest first (the original)."""
+    """The release to acquire: not excluded; an original first, then a reissue, then a compilation;
+    the earliest of those."""
     ok = [h for h in hits if not hit_excluded(h)]
     if not ok:
         return None
-    originals = [h for h in ok if not str(h.get("collectionName") or "").lower().startswith(("greatest hits", "the best of", "best of"))
-                 and str(h.get("collectionArtistName") or "").lower() != "various artists"]
-    pool = originals or ok
+    pool = [h for h in ok if is_original(h)] or [h for h in ok if not is_compilation(h)] or ok
     return min(pool, key=lambda h: (year_of(h.get("releaseDate")) or 9999, str(h.get("trackId") or "")))
 
 

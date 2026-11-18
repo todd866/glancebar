@@ -1452,24 +1452,29 @@ def source_taste_expansion(
 # --- back catalogue (older records; backcatalogue.py) -----------------------------------------
 
 
-def era_of(year: Any, decades: list[str]) -> str:
-    """"back" for a year in one of the back-catalogue decades, else "new" (unknown counts as new)."""
-    return "back" if bc.decade_of(bc.year_of(year)) in decades else "new"
+def era_of(row: dict) -> str:
+    """Which half of the week a row belongs to: "back" for the back-catalogue source, "new" for
+    everything else. Radio, Shazams and taste picks are the new/radio half whatever their year
+    (owner: "50% new/radio"); their year and decade are still recorded."""
+    return "back" if str(row.get("era") or "") == "back" or str(row.get("source") or "").startswith("back:") else "new"
 
 
 def tag_era(row: dict, decades: list[str]) -> dict:
+    """Year and decade wherever the year is known; `era` (the half of the week) on every row."""
     year = bc.year_of(row.get("year"))
     if year:
         row["year"] = year
         row["decade"] = bc.decade_of(year)
-        row.setdefault("era", era_of(year, decades))
+    row["era"] = era_of(row)
     return row
 
 
 def weekly_era_stats(ledger: Path, now: datetime, decades: list[str]) -> dict[str, Any]:
-    """This week's acquisitions: back and new, and how many from each decade."""
+    """This week's acquisitions: back and new halves, how many from each decade (all of them, for
+    the status page) and how many from each decade in the back half (for the even spread)."""
     week_ago = now - timedelta(days=7)
     by_decade: Counter[str] = Counter()
+    back_by_decade: Counter[str] = Counter()
     back = new = 0
     for row in read_jsonl_rows(ledger):
         if row.get("action") != "acquired":
@@ -1480,11 +1485,13 @@ def weekly_era_stats(ledger: Path, now: datetime, decades: list[str]) -> dict[st
         decade = row.get("decade") or bc.decade_of(bc.year_of(row.get("year")))
         if decade:
             by_decade[decade] += 1
-        if (row.get("era") or era_of(row.get("year"), decades)) == "back":
+        if era_of(row) == "back":
             back += 1
+            if decade:
+                back_by_decade[decade] += 1
         else:
             new += 1
-    return {"back": back, "new": new, "by_decade": by_decade}
+    return {"back": back, "new": new, "by_decade": by_decade, "back_by_decade": back_by_decade}
 
 
 def era_room(cfg: dict[str, Any], ledger: Path, now: datetime) -> dict[str, Any]:
@@ -1502,7 +1509,7 @@ def era_room(cfg: dict[str, Any], ledger: Path, now: datetime) -> dict[str, Any]
         "new_target": tpw - back_target,
         "back_room": max(0, back_target - stats["back"]),
         "new_room": max(0, tpw - back_target - stats["new"]),
-        "deficits": {d: max(0, per_decade - stats["by_decade"].get(d, 0)) for d in decades},
+        "deficits": {d: max(0, per_decade - stats["back_by_decade"].get(d, 0)) for d in decades},
         "stats": stats,
     }
 
@@ -1552,9 +1559,8 @@ def back_llm_rows(
         best = bc.best_hit(hits or [])
         if not best:
             continue
-        found = bc.earliest_year(hits or [])
-        said = bc.year_of(item.get("year"))
-        year = min(y for y in (said, found) if y) if (said or found) else None
+        # The catalogue's earliest original release, else the year the model gave.
+        year = bc.earliest_year(hits or []) or bc.year_of(item.get("year"))
         out.append({"artist": best.get("artistName") or artist, "title": best.get("trackName") or title,
                     "album": best.get("collectionName") or "", "year": year,
                     "why": str(item.get("why") or "taste match"), "track_id": best.get("trackId")})
@@ -2103,10 +2109,10 @@ def apply_era_quota(
     room = era_room(cfg, paths.ledger, now)
     share = room["share"]
     head, tail = ranked[:n_priority], ranked[n_priority:]
-    back_room = max(0, room["back_room"] - sum(1 for r in head if r.get("era") == "back"))
-    new_room = max(0, room["new_room"] - sum(1 for r in head if r.get("era") != "back"))
-    back = interleave_decades([r for r in tail if r.get("era") == "back"], decades)
-    new = [r for r in tail if r.get("era") != "back"]
+    back_room = max(0, room["back_room"] - sum(1 for r in head if era_of(r) == "back"))
+    new_room = max(0, room["new_room"] - sum(1 for r in head if era_of(r) != "back"))
+    back = interleave_decades([r for r in tail if era_of(r) == "back"], decades)
+    new = [r for r in tail if era_of(r) != "back"]
     held = {"back": max(0, len(back) - back_room), "new": max(0, len(new) - new_room)}
     back, new = back[:back_room], new[:new_room]
     out: list[dict] = []
@@ -2228,8 +2234,7 @@ def cmd_acquire(
             continue
         url = song_url(song)
         year = bc.year_of(row.get("year")) or bc.year_of(song.get("releaseDate"))
-        era = {"year": year, "decade": bc.decade_of(year),
-               "era": row.get("era") or era_of(year, list(cfg["decades"]))} if year else {}
+        era = {"era": era_of(row), **({"year": year, "decade": bc.decade_of(year)} if year else {})}
         if not go:
             rec = {
                 "at": runners.clock(),
