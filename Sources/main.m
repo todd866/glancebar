@@ -5114,6 +5114,22 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
 @property (nonatomic, copy) NSString *outputUID;
 @end
 @implementation GBOutputVolumeSlider @end
+// A small slider built at its final frame. +sliderWithValue: makes a 100 × 16 slider, and on
+// macOS 26 AppKit's SwiftUI hosting view inside it keeps that size after the frame changes, so a
+// narrower slider drew past its own bounds (CI, 17 Nov 2026). Creating at the frame sizes it once.
+static id SmallSliderInFrame(Class cls, NSRect frame, double value, double minValue, double maxValue,
+                             id target, SEL action, BOOL continuous) {
+    NSSlider *slider = [[cls alloc] initWithFrame:frame];
+    slider.controlSize = NSControlSizeSmall;
+    slider.minValue = minValue;
+    slider.maxValue = maxValue;
+    slider.doubleValue = value;
+    slider.target = target;
+    slider.action = action;
+    slider.continuous = continuous;
+    [slider layoutSubtreeIfNeeded];
+    return slider;
+}
 @interface GBPickerChevron : NSImageView @end
 @implementation GBPickerChevron
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
@@ -11399,14 +11415,11 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     [line addSubview:speaker];
     sliderX += 22;
     sliderW -= 22;
-    GBOutputVolumeSlider *slider = [GBOutputVolumeSlider sliderWithValue:known ? _outputVolume : 0 minValue:0 maxValue:1
-        target:self action:@selector(setOutputVolumeFromSlider:)];
+    GBOutputVolumeSlider *slider = SmallSliderInFrame(GBOutputVolumeSlider.class, NSMakeRect(sliderX, 2, sliderW, 18),
+        known ? _outputVolume : 0, 0, 1, self, @selector(setOutputVolumeFromSlider:), YES);
     slider.outputUID = choice[@"effectiveUID"];
-    slider.controlSize = NSControlSizeSmall;
-    slider.continuous = YES;
     slider.enabled = known;
     slider.trackFillColor = OutputVolumeFill(known ? _outputVolume : -1, showMute);
-    slider.frame = NSMakeRect(sliderX, 2, sliderW, 18);
     slider.accessibilityIdentifier = @"popover.sound.volume";
     slider.accessibilityLabel = @"Player speaker volume";
     slider.accessibilityHelp = [NSString stringWithFormat:@"Hardware volume on %@", choice[@"name"]];
@@ -11442,12 +11455,9 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     length.accessibilityIdentifier = @"popover.music.duration";
     [line addSubview:length];
     if (timed) {
-        NSSlider *slider = [NSSlider sliderWithValue:MIN(MAX(elapsed, 0), _trackDuration) minValue:0
-                                            maxValue:_trackDuration target:self action:@selector(musicSeek:)];
-        slider.controlSize = NSControlSizeSmall;
-        slider.continuous = NO;
         CGFloat sx = NSMaxX(now.frame) + 4;
-        slider.frame = NSMakeRect(sx, 0, NSMinX(length.frame) - 4 - sx, h);
+        NSSlider *slider = SmallSliderInFrame(NSSlider.class, NSMakeRect(sx, 0, NSMinX(length.frame) - 4 - sx, h),
+            MIN(MAX(elapsed, 0), _trackDuration), 0, _trackDuration, self, @selector(musicSeek:), NO);
         slider.accessibilityIdentifier = @"popover.music.position";
         slider.accessibilityLabel = @"Position";
         [line addSubview:slider];
