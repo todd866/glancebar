@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Nightly map refresh: 20:45Z daily on the M5, which runs tools/music-embed/nightly.sh on the M2
+     over ssh (after the 19:40Z push), then copies the vectors and gap report back. UTC through
+     utc-daily on StartInterval; install with deploy-service.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.iantodd.glancebar-music-embed</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/iantodd/.local/bin/utc-daily</string>
+    <string>--label</string>
+    <string>com.iantodd.glancebar-music-embed</string>
+    <string>--at</string>
+    <string>20:45</string>
+    <string>--</string>
+    <string>/bin/zsh</string>
+    <string>/Users/iantodd/Projects/glancebar/tools/music-embed/nightly-kick.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/iantodd/.local/state/glancebar-music-embed/kick.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/iantodd/.local/state/glancebar-music-embed/kick.err.log</string>
+</dict>
+</plist>

@@ -69,6 +69,8 @@ DEFAULTS: Dict[str, Any] = {
     "music_library_state": str(HOME / ".local/state/glancebar-music-library"),
     "scout_state": str(HOME / ".local/state/glancebar-music-scout"),
     "selector_state": str(HOME / ".local/state/selector"),
+    # Nightly map refresh report (glancebar tools/music-embed): copied here from the M2.
+    "embed_gaps": str(HOME / ".local/state/glancebar-music-embed/gaps.json"),
     "tv_video_log": "",
     "rotations": [
         {"station": "triplej", "scores": str(HOME / ".local/state/selector/scores.json")},
@@ -93,6 +95,8 @@ DEFAULTS: Dict[str, Any] = {
         "offload_fail_h": 96,
         "upload_warn_h": 36,
         "upload_fail_h": 72,
+        "embed_warn_h": 36,
+        "embed_fail_h": 72,
         "scout_warn_h": 30,
         "scout_fail_h": 72,
         "hotset_warn_h": 30,
@@ -1221,6 +1225,41 @@ def make_row(
     }
 
 
+def embed_gaps_row(path: Path, chk: Dict[str, Any], host: str) -> CheckRow:
+    doc, err = read_json_file(path)
+    if doc is None:
+        return make_row("embeddings", "fail", err, host)
+    at = parse_iso(str(doc.get("at") or ""))
+    age_h = (utc_now() - at).total_seconds() / 3600.0 if at else float("inf")
+    todo = int(doc.get("inR2NotEmbedded") or 0)
+    orphans = int(doc.get("embeddedNotInR2") or 0)
+    down = doc.get("downloadedNotInR2")
+    spend = doc.get("embedSpendTodayUsd")
+    cap = doc.get("capUsd")
+    money = "$?" if spend is None else f"${float(spend):.2f}"
+    if cap is not None:
+        money += f"/${float(cap):.0f}"
+    fact = f"{todo} to embed, {orphans} not in R2, {'?' if down is None else down} downloaded not in R2, {money} today"
+    detail = fact
+    st = "pass"
+    last = doc.get("lastRun") if isinstance(doc.get("lastRun"), dict) else {}
+    if last and last.get("ok") is False:
+        st = "warn"
+        detail = f"{fact}; last run: {last.get('note') or 'failed'}"
+    if todo > 0 or (isinstance(down, int) and down > 0) or spend is None:
+        st = "warn"
+    if orphans:
+        names = ", ".join(f"{s.get('artist', '')} - {s.get('title', '')}" for s in (doc.get("embeddedNotInR2Songs") or [])[:5])
+        detail = f"{detail}; vectors with no song in R2: {names}"
+    if age_h > float(chk.get("embed_fail_h", 72)):
+        st = "fail"
+        fact = f"{fact}; {age_fact(age_h * 3600)} old" if at else f"{fact}; no time"
+    elif age_h > float(chk.get("embed_warn_h", 36)):
+        st = "warn"
+        fact = f"{fact}; {age_fact(age_h * 3600)} old"
+    return make_row("embeddings", st, fact, host, detail)
+
+
 def worst_status(rows: List[CheckRow]) -> str:
     if any(r["status"] == "fail" for r in rows):
         return "fail"
@@ -1454,6 +1493,12 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 elif age_h > float(chk.get("upload_warn_h", 36)):
                     st = "warn"
         rows.append(make_row("upload", st, fact, host))
+
+    # embeddings: every song in R2 has a vector (owner rule: the player offers only songs that
+    # are both). Warns while any wait, or a downloaded song is not in the bucket yet.
+    gaps_path = (cfg.get("embed_gaps") or "").strip()
+    if gaps_path and expand(gaps_path).is_file():
+        rows.append(embed_gaps_row(expand(gaps_path), chk, host))
 
     # scout
     last_run = expand(cfg["scout_state"]) / "last-run.json"

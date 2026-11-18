@@ -43,6 +43,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | `com.iantodd.glancebar-music-push` (03:40: masters → R2, then catalogue; `~/.local/bin/glancebar-music-push`, status in `push-status.json`) | M2 | installed 10 Nov 2026 |
 | hot-set sync (every few hours; the app also starts one on demand) | M5 | NOT YET INSTALLED |
 | `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | installed |
+| `com.iantodd.glancebar-music-embed` (20:45Z nightly map refresh: `tools/music-embed/nightly-kick.sh` runs `nightly.sh` on the M2 over ssh, which embeds songs in R2 with no vector within a $5/day cap and writes `radio/gaps.json`; then vectors and `gaps.json` come back to the M5 and `music-space.json` is rewritten; the morning check's `embeddings` row) | M5 → M2 | installed 18 Nov 2026 |
 
 ## Checks
 
@@ -397,10 +398,16 @@ three 80 s clips (20%, 50%, 80% of the song), made through the Gemini Batch API 
 1,451 songs / 4,299 clips; about 2¢ a new song). Tool: `tools/music-embed/embed.py`
 (plan, clips, build, preflight, cost, submit, poll, collect, neighbours). State and vectors on
 the M2 in `~/.local/state/glancebar-music-embed/` (`vectors/tracks.f32` + `tracks-index.jsonl`).
-The key is piped in from md3's `.env.local` at run time, never stored there. Tier 1 caps
+The first run piped the key in from md3's `.env.local`; the nightly reads the M2's copy (below). Tier 1 caps
 active batch work at 500k tokens: `drive.sh` submits the next shard only when no job is
 pending or running. Neighbour checks by ear looked right (genres and moods separate; Gang of
 Youths, Car Seat Headrest and The Middle East show up as hubs).
+
+Since 18 Nov 2026 new songs are added every night (`com.iantodd.glancebar-music-embed`, 20:45Z):
+songs in R2 with no vector are clipped, embedded through one Batch API job within a $5 UTC-day
+cap reserved before upload, and appended to `tracks.f32` / `tracks-index.jsonl` without
+touching existing rows. Details, the cap and the gap report: `tools/music-embed/README.md`.
+The M2's key copy is `~/.config/glancebar/gemini.env` (mode 600).
 
 ### Kinds from the embedding
 

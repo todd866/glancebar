@@ -526,6 +526,53 @@ class CheckRowsTest(MediaSyncTestBase):
         self.assertEqual(rc, 0)
 
 
+class EmbedGapsCheckTests(MediaSyncTestBase):
+    def gaps(self, **kw):
+        doc = {"at": ms.iso_now(), "inR2NotEmbedded": 0, "embeddedNotInR2": 0, "downloadedNotInR2": 0,
+               "embedSpendTodayUsd": 0.06, "capUsd": 5, "embeddedNotInR2Songs": []}
+        doc.update(kw)
+        path = self.root / "gaps.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        self.cfg["embed_gaps"] = str(path)
+
+    def row(self):
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        return [r for r in doc["rows"] if r["name"] == "embeddings"][0]
+
+    def test_all_embedded_passes_and_shows_spend(self):
+        self.gaps()
+        row = self.row()
+        self.assertEqual(row["status"], "pass")
+        self.assertIn("0 to embed", row["value"])
+        self.assertIn("$0.06/$5", row["value"])
+
+    def test_waiting_songs_or_unreadable_spend_warn(self):
+        self.gaps(inR2NotEmbedded=3)
+        self.assertEqual(self.row()["status"], "warn")
+        self.gaps(embedSpendTodayUsd=None)
+        self.assertEqual(self.row()["status"], "warn")
+        self.gaps(downloadedNotInR2=2)
+        self.assertEqual(self.row()["status"], "warn")
+
+    def test_orphan_vectors_are_named_not_warned(self):
+        self.gaps(embeddedNotInR2=1, embeddedNotInR2Songs=[{"artist": "Toro y Moi", "title": "The Difference"}])
+        row = self.row()
+        self.assertEqual(row["status"], "pass")
+        self.assertIn("Toro y Moi - The Difference", row["detail"])
+
+    def test_stale_report_fails(self):
+        old = datetime.fromtimestamp(self.t0 - 80 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.gaps(at=old)
+        self.assertEqual(self.row()["status"], "fail")
+
+    def test_no_report_no_row(self):
+        self.cfg["embed_gaps"] = str(self.root / "absent.json")
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        self.assertNotIn("embeddings", [r["name"] for r in doc["rows"]])
+
+
 class ListingTest(MediaSyncTestBase):
     # The score file must be buildable from a plain `ls -R` listing when the drive is busy.
     LISTING = (
