@@ -188,11 +188,15 @@ ends the range.
 Ranking: plays are matched across stations on primary artist and title (feat. and remaster
 suffixes ignored, remixes kept apart). A track heard on two or more stations comes first, scored
 by the number of stations, then repeat plays (at most 3 a station) and a liked artist. Each further
-pick from the same leading station costs a little, so no station fills the top. Up to
-`radio_max_single` (5) one-offs follow, one station at a time. One track per artist; a track only
+pick from the same leading station costs a little, so no station fills the top. One-offs (up to
+`radio_max_single`, one station at a time) only fill slots the multi-station tracks leave, which
+in a normal week (about 380 multi-station tracks) is none. One track per artist; a track only
 triple j played is left to the triple j source; owned, offered, hearted and rejected tracks are
-skipped. At most `radio_max_candidates` (15) a night, because `rank` records everything it queues
-as offered and never offers it again. The scout has no taste-space score for songs outside the
+skipped, judged on the loose key as well, since stations spell one track several ways. `rank`
+records everything it queues as offered and never offers it again, so radio offers at most
+`radio_max_candidates` (15) a night and never more than the week's free acquisition slots
+(`tracks_per_week` less this week's acquisitions); with the week full it still reads the
+stations but offers nothing (`held_back` in `candidates.json`). The scout has no taste-space score for songs outside the
 library (the embeddings cover library songs only), so taste comes in through the existing rank
 step: liked-artist affinity, the novelty tiers and the artist caps.
 

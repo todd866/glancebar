@@ -1174,20 +1174,26 @@ def source_radio(
         triplej_log=Path(cfg["triplej_plays"]).expanduser(),
     )
     fetcher.prune(float(cfg["radio_cache_days"]))
-    owned = owned_keys(cfg, paths)
-    hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+    skip = owned_keys(cfg, paths) | rejected | load_hearts(Path(cfg["hearts_path"]).expanduser())
+    # Stations spell one track several ways ("1tbsp feat. miki", "1tbsp, miki"), and the spelling
+    # shown can change from night to night, so "already offered" is judged on the loose key too.
+    skip_loose = {radio.match_key(*k.split("|", 1)) for k in skip if "|" in k}
 
     def exclude(artist: str, title: str) -> bool:
-        key = track_key(artist, title)
-        return key in owned or key in rejected or key in hearts
+        return track_key(artist, title) in skip or radio.match_key(artist, title) in skip_loose
 
+    # `rank` records every row it queues as offered, and an offered track is never offered again,
+    # so a row acquire cannot reach this week is lost. Radio offers no more than the week has room for.
+    acquired, _ = weekly_acquired_stats(paths.ledger, now)
+    room = max(0, int(cfg["tracks_per_week"]) - acquired)
+    limit = min(int(cfg["radio_max_candidates"]), room)
     liked = {oc.match_fold(oc.split_primary_artist(a)) for a in liked_artists(cfg)}
     agg = radio.aggregate(plays)
     rows = radio.select_candidates(
         agg,
         exclude=exclude,
         liked_artists=liked,
-        max_total=int(cfg["radio_max_candidates"]),
+        max_total=limit,
         max_single=int(cfg["radio_max_single"]),
     )
     multi = sum(1 for r in agg.values() if len(r["stations"]) >= 2)
@@ -1197,8 +1203,11 @@ def source_radio(
         "cache_hits": fetcher.cache_hits,
         "tracks": len(agg),
         "multi_station_tracks": multi,
+        "week_room": room,
         "stations": report,
     }
+    if not limit:
+        doc["held_back"] = "weekly track budget already used"
     return rows, doc
 
 
@@ -1415,7 +1424,9 @@ def cmd_candidates(
     radio_doc: dict[str, Any] | None = None
     if cfg.get("radio_enabled"):
         try:
-            by_source["radio"], radio_doc = source_radio(cfg, paths, runners, rejected)
+            radio_rows, radio_doc = source_radio(cfg, paths, runners, rejected)
+            if "held_back" not in radio_doc:  # a full week is not a quiet source
+                by_source["radio"] = radio_rows
         except Exception as exc:
             errors.append(f"radio: {exc}")
             print(f"candidates: radio failed: {exc}", file=sys.stderr)

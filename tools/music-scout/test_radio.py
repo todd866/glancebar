@@ -141,6 +141,7 @@ class FetcherTests(unittest.TestCase):
         ua = t.headers[0]["User-Agent"]
         self.assertNotIn("@", ua)
         self.assertNotIn("Ian", ua)
+        self.assertNotIn("glancebar", ua.lower())
 
     def test_cache_hit_sends_nothing(self):
         t = FakeTransport([("", (200, "hello"))])
@@ -338,6 +339,25 @@ class ScoutWiringTests(unittest.TestCase):
         ranked = scout.cmd_rank(self.cfg, self.paths, self.runners)
         row = next(r for r in ranked if r["artist"] == "Bonobo")
         self.assertEqual(row["heard"][0]["name"], "KEXP")
+
+    def test_offered_under_another_spelling_is_not_offered_again(self):
+        self.cfg.update(radio_enabled=True, radio_stations=["kexp", "triplej"], radio_days=2)
+        scout.append_jsonl(self.paths.ledger, {"at": "2026-11-10T00:00:00Z", "action": "offered",
+                                               "artist": "Bonobo feat. Someone", "title": "Vakata (Remastered)"})
+        merged, _, _ = scout.cmd_candidates(self.cfg, self.paths, self.runners)
+        self.assertFalse([c for c in merged if c["artist"] == "Bonobo"])
+
+    def test_no_radio_rows_when_the_week_is_full_and_no_dead_source_streak(self):
+        self.cfg.update(radio_enabled=True, radio_stations=["kexp"], radio_days=2, tracks_per_week=1)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        scout.append_jsonl(self.paths.ledger, {"at": now, "action": "acquired", "artist": "X", "title": "Y",
+                                               "size_bytes": 1})
+        merged, counts, _ = scout.cmd_candidates(self.cfg, self.paths, self.runners)
+        self.assertFalse([c for c in merged if c["source"].startswith("radio:")])
+        self.assertNotIn("radio", counts)
+        self.assertGreater(counts["radio:kexp"], 0)  # still read, so the store stays current
+        doc = json.loads(self.paths.candidates.read_text())
+        self.assertIn("held_back", doc["radio"])
 
     def test_one_failing_station_is_a_warning_not_a_failed_run(self):
         self.cfg.update(radio_enabled=True, radio_stations=["kexp", "wfmu"], radio_days=2)

@@ -43,7 +43,7 @@ if str(_OFFLINE_CACHE) not in sys.path:
     sys.path.insert(0, str(_OFFLINE_CACHE))
 import offline_cache as oc  # noqa: E402
 
-USER_AGENT = "glancebar-music-scout/1.0 (community radio playlist reader; one request per 2 s)"
+USER_AGENT = "community-radio-playlist-reader/1.0 (public playlists only; one request per 2 s per host)"
 
 # name: display name, kind: reader, tz: where the station's local times are
 STATIONS: dict[str, dict[str, Any]] = {
