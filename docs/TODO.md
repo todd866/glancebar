@@ -6,7 +6,7 @@ Open work, newest decisions first. Each item says what "done" means. Background 
 ## Music: web radio (Ian, 18 Nov 2026)
 
 Ian asked for "a music app ... run it as a website, password protected". It's the existing song map and R2 cold tier (`glancebar-music`) put behind a phone-first web player. Done when each item below works from his phone, away from home.
-- [ ] **Web player, password protected.** Works on a phone and plays from R2: signed URLs, ALAC, or an AAC transcode for mobile data. Anyone with the password can use it. Sharing outside the household is a licensing grey area for purchased/acquired music; keep access small.
+- [ ] **Web player, password protected.** Works on a phone and plays from R2: signed URLs, ALAC, or an AAC transcode for mobile data. Two listeners: Ian and one mate (Ian, 18 Nov). Keep it to those two accounts, not an open shared password, so each has his own profile.
 - [ ] **Mood-based play.** Moods come from the kinds in the song map, plus time-of-day rules (Ian: "don't play Slayer in the morning, play it in the afternoon"). Moods are steerable, not fixed playlists.
 - [ ] **Everything embedded.** Every song gets the 3072-dimension Gemini embedding the map already uses (see "Nightly map refresh" below). New acquisitions are embedded before they're offered.
 - [ ] **Radio scouting beyond triple j.** Scan the play lists of Australian community radio (RRR, RTR FM, PBS, FBi, 4ZZZ) and overseas stations (KEXP, NTS, BBC 6 Music, WFMU) into the scout's candidate pool. Rank candidates by nearness to liked regions of the map.
