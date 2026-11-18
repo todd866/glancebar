@@ -1244,3 +1244,15 @@ class GlancebarAppCheckTests(MediaSyncTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RadioThinRowTest(unittest.TestCase):
+    def test_thin_areas_and_raised_cap_are_listed(self):
+        lane = {"at": "2099-01-01T00:00:00Z", "today": 3, "week": 3, "byDecade": {}, "driveFreeGb": 290, "capToday": 50,
+                "thin": [{"name": "RTRFM", "songs": 16, "artists": 8}, {"name": "60s", "songs": 12, "artists": 9}]}
+        docs = {"radio/lane-status.json": lane, "radio/scout-status.json": {"acquiredThisWeek": 1, "budgetTracks": 200},
+                "radio/gaps.json": {"embedSpendTodayUsd": 1.5, "capUsd": 5, "embeddedNotInR2": 0}}
+        from unittest import mock
+        with mock.patch.object(ms, "_r2_reader", side_effect=lambda cfg, key: (docs.get(key), None)):
+            row = ms.radio_library_row({"radio_library_remote": "x"}, {}, "m5")
+        self.assertIn("thin: RTRFM 16/8, 60s 12/9", row["value"])
+        self.assertIn("cap raised to $50 today", row["value"])

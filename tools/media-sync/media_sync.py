@@ -1346,6 +1346,15 @@ def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> Ch
     free = lane.get("driveFreeGb") if lane else None
     if isinstance(free, (int, float)):
         parts.append(f"Stash {float(free):.0f} GB free")
+    # A dated cap override (e.g. one day at $50) shows while it is on.
+    cap_today = lane.get("capToday") if lane else None
+    if isinstance(cap_today, (int, float)) and gaps and gaps.get("capUsd") is not None and float(cap_today) > float(gaps["capUsd"]):
+        parts.append(f"cap raised to ${float(cap_today):.0f} today")
+    # Thin areas (under 150 songs / 40 artists) are listed only while they are thin; the lane builds them.
+    thin = [t for t in (lane.get("thin") or []) if isinstance(t, dict)] if lane else []
+    if thin:
+        parts.append("thin: " + ", ".join(f"{t.get('name')} {int(t.get('songs') or 0)}/{int(t.get('artists') or 0)}" for t in thin[:8])
+                     + (f" +{len(thin) - 8} more" if len(thin) > 8 else ""))
     if lane is None:
         warns.append(f"lane-status: {lane_err}")
     else:
