@@ -28,6 +28,7 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | Offline playlists (requests, manifest, verification) | `tools/offline-cache/`, `docs/offline-playlists.md` |
 | Hot set / cold tier (catalogue, push, plan, sync, status, touch) | `tools/music-library/` |
 | New-music scout (candidates, rank, acquire, publish, status) | `tools/music-scout/` |
+| Station playlist readers for the scout (KEXP, NTS, 6 Music, WFMU, RRR, PBS, 4ZZZ, RTR) | `tools/music-scout/radio.py` |
 | Shared likes/Shazam ledger and pipeline checks | `tools/media-sync/` |
 | Lossless acquisition (amdl; M5 only) | `tools/mixpool/` |
 | Silent real-playback check | `tools/check-playback.m` (runs in `tests.sh`) |
@@ -154,6 +155,52 @@ searches. The lead runs acquisitions; the worker only prints `would-acquire` lin
 prompts include `owned_artists_to_exclude`. Prefer `new-music.json` as the offline
 `station:triplej` source once it holds **≥12** verified tracks (paths + hashes), so the tile
 does not depend on selector queue paths under `~/Music/Glancebar Radio/`.
+
+## Heard on the radio: station playlists as candidates (18 Nov 2026)
+
+The scout reads the public playlists of the stations it trusts and offers what several of them
+are playing. `"radio_enabled": true` in `~/.config/glancebar/music-scout.json` turns it on (it is
+on on the M5); `false` turns it off without touching anything else.
+
+| Station | Read from |
+|---|---|
+| KEXP | `api.kexp.org/v2/plays` by UTC day (track plays only) |
+| NTS | `nts.live/api/v2/collections/recently-added`, then each episode's `/tracklist` |
+| BBC 6 Music | `rms.api.bbc.co.uk/v2/experience/inline/schedules/bbc_6music/<date>`, then `/play/<episode>` |
+| WFMU | `wfmu.org/playlistfeed.xml` (the last ~40 playlists, about a day), then each playlist page |
+| RRR | `rrr.org.au/explore/schedule?date=…`, then each episode page (Airnet lags RRR by a week) |
+| PBS, 4ZZZ | Airnet weekly grid (`airnet.org.au/rest/stations/<call>/guides/fm`), then each slot's `/playlists` |
+| RTR FM | Airnet program list and each program's `/episodes` (RTR has no grid on Airnet), then `/playlists` |
+| triple j | the selector's own `~/.local/state/selector/plays.jsonl`; nothing is fetched |
+| FBi | not read: its tracklists come only from the site's own `/payload-api` (disallowed in robots.txt) |
+
+Every request carries a generic User-Agent, waits 2 s after the previous request to the same host,
+and counts against a per-run budget (`radio_max_requests`, 700) and time limit
+(`radio_max_seconds`); a 429 or 5xx leaves that host alone until the next night. Responses are
+cached gzipped under `radio-cache/http/` (kept `radio_cache_days`, 14). Parsed plays live in
+`radio-cache/plays/<station>.json` by episode (or KEXP day); an episode is final a few hours after
+it ends (three days if it has no tracks yet), and a final episode is never fetched again, so a
+night reads only what is new. The window is `radio_days` (7). The first backfill on 18 Nov 2026 used the whole
+700-request budget in 8.5 min (RTR finished on the next run); a run straight after sent 60
+requests in 2 min. KEXP's API offers a next page past the end of a date range, so an empty page
+ends the range.
+
+Ranking: plays are matched across stations on primary artist and title (feat. and remaster
+suffixes ignored, remixes kept apart). A track heard on two or more stations comes first, scored
+by the number of stations, then repeat plays (at most 3 a station) and a liked artist. Each further
+pick from the same leading station costs a little, so no station fills the top. Up to
+`radio_max_single` (5) one-offs follow, one station at a time. One track per artist; a track only
+triple j played is left to the triple j source; owned, offered, hearted and rejected tracks are
+skipped. At most `radio_max_candidates` (15) a night, because `rank` records everything it queues
+as offered and never offers it again. The scout has no taste-space score for songs outside the
+library (the embeddings cover library songs only), so taste comes in through the existing rank
+step: liked-artist affinity, the novelty tiers and the artist caps.
+
+A candidate carries `source` `radio:<station>`, `why` ("Heard on KEXP and PBS, latest 16 Nov"),
+`stations`, `plays` and `heard` (per station: plays, last play, show). `heard` is copied onto the
+acquired ledger row and into `new-music.json`. `counts` in `candidates.json` has `radio:<station>`
+(plays read), so a station that goes quiet is flagged like any other source; one station failing
+is a warning in `candidates.json`, all of them failing is a run error.
 
 Supervised one-track trial on the M5 (mains, unmetered):
 

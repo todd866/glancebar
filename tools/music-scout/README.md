@@ -25,6 +25,15 @@ stage is idempotent and safe to rerun.
 | `storefront` | `au` | Apple Music URLs |
 | `playback_log` | `~/Library/Logs/Glancebar/playback.jsonl` | Skip/reject heuristics |
 | `reject_skips` | 2 | Early skip days before reject |
+| `radio_enabled` | false | Read station playlists (`radio.py`) as a candidate source |
+| `radio_stations` | all + `triplej` | Stations to read (`kexp nts bbc6 wfmu rrr pbs 4zzz rtr triplej`) |
+| `radio_days` | 7 | Look-back window |
+| `radio_max_candidates` | 15 | Radio candidates per night (multi-station first) |
+| `radio_max_single` | 5 | Of those, one-offs (one station each in turn) |
+| `radio_max_requests` | 700 | Request budget per run, all hosts |
+| `radio_min_gap_seconds` | 2 | Gap between requests to one host |
+| `radio_max_seconds` | 1500 | Time limit for the radio step |
+| `radio_cache_days` | 14 | Cached responses kept |
 
 ## State (`~/.local/state/glancebar-music-scout/`)
 
@@ -86,6 +95,13 @@ tracks skipped early via `click-next` on multiple days without ever finishing
    (exit **75** = skip tonight). Each suggestion is confirmed on the iTunes
    Search API before it counts.
 
+4. **radio** (when `radio_enabled`) — public playlists of KEXP, NTS, BBC 6 Music, WFMU,
+   RRR, PBS, 4ZZZ and RTR FM (`radio.py`; endpoints, politeness and ranking in
+   `docs/music.md`, "Heard on the radio"), plus triple j from the selector's `plays.jsonl`.
+   Tracks heard on two or more stations first; `source` is `radio:<station>`, with
+   `stations`, `plays`, `heard` and a `why` such as "Heard on KEXP and PBS, latest 16 Nov".
+   Cache and per-station plays: `radio-cache/` in the state folder.
+
 ### Acquire guards
 
 Exit **75** (defer) when not on Apple **M5**, when
@@ -120,7 +136,9 @@ days or the last `run` failed).
 python3 -m unittest discover -s tools/music-scout -v
 ```
 
-No network; mixpool, iTunes, `ai-pick`, and `amdl` are stubbed.
+No network; mixpool, iTunes, `ai-pick`, and `amdl` are stubbed. `test_radio.py` checks each
+station parser against the saved pages in `fixtures/radio/` and drives the readers through a
+fake transport.
 
 ## `new-music.json` track shape (for offline-cache)
 

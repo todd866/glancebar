@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/css" href="/rssstyle.css" ?>
+<!--most_recent_playlists_rss main template Created 9/8/06, Written 2006-2015 by Ken Garson. v9/1/15-->
+<rss version="2.0">
+<channel>
+<title>WFMU's recent playlists</title>
+<link>http://www.wfmu.org/</link>
+<description>WFMU's most recent playlists, updated every time a DJ publishes a new playlist! http://www.wfmu.org/</description>
+<language>en</language>
+<copyright>Copyright (C) 2026 WFMU</copyright>
+<pubDate>Tue, 17 Nov 2026 21:02:49 EST</pubDate>
+<lastBuildDate>Tue, 17 Nov 2026 21:02:49 EST</lastBuildDate>
+<item>
+<title>WFMU Playlist: The Wiggle Room from Nov 17, 2026</title>
+<link>http://www.wfmu.org/playlists/shows/170688</link>
+<description>&lt;a href="http://www.wfmu.org/playlists/shows/170688"&gt;Playlist&lt;/a&gt; from The Wiggle Room on WFMU, from Nov 17, 2026</description>
+<guid isPermaLink="true">http://www.wfmu.org/playlists/shows/170688</guid>
+<pubDate>Tue, 17 Nov 2026 21:02:49 -0500</pubDate>
+</item>
+<item>
+<title>WFMU Playlist: Five Miles To Midnight with The Knave from Nov 17, 2026</title>
+<link>http://www.wfmu.org/playlists/shows/170687</link>
+<description>&lt;a href="http://www.wfmu.org/playlists/shows/170687"&gt;Playlist&lt;/a&gt; from Five Miles To Midnight with The Knave on WFMU, from Nov 17, 2026</description>
+<guid isPermaLink="true">http://www.wfmu.org/playlists/shows/170687</guid>
+<pubDate>Tue, 17 Nov 2026 21:01:07 -0500</pubDate>
+</item>
+</channel>
+</rss>

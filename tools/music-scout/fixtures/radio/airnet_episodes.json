@@ -1,0 +1,39 @@
+[
+ {
+  "url": null,
+  "start": "2026-10-31 00:00:00",
+  "end": "2026-10-31 02:00:00",
+  "duration": 7200,
+  "multipleEpsOnDay": false,
+  "title": null,
+  "description": null,
+  "imageUrl": null,
+  "smallImageUrl": null,
+  "episodeRestUrl": "https://airnet.org.au/rest/stations/3pbs/programs/android-discotheque/episodes/2026-10-31+00%3A00%3A00"
+ },
+ {
+  "url": null,
+  "start": "2026-11-07 00:00:00",
+  "end": "2026-11-07 02:00:00",
+  "duration": 7200,
+  "multipleEpsOnDay": false,
+  "title": "A celebration of the Techno Music of Juan Atkins from Coogs and Tull",
+  "description": null,
+  "imageUrl": null,
+  "smallImageUrl": null,
+  "episodeRestUrl": "https://airnet.org.au/rest/stations/3pbs/programs/android-discotheque/episodes/2026-11-07+00%3A00%3A00"
+ },
+ {
+  "url": null,
+  "start": "2026-11-14 00:00:00",
+  "end": "2026-11-14 02:00:00",
+  "duration": 7200,
+  "multipleEpsOnDay": false,
+  "title": null,
+  "description": null,
+  "currentEpisode": true,
+  "imageUrl": null,
+  "smallImageUrl": null,
+  "episodeRestUrl": "https://airnet.org.au/rest/stations/3pbs/programs/android-discotheque/episodes/2026-11-14+00%3A00%3A00"
+ }
+]

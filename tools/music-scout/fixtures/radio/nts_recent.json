@@ -1,0 +1,78 @@
+{
+ "metadata": {
+  "resultset": {
+   "count": 91783,
+   "offset": 0,
+   "limit": 12
+  }
+ },
+ "results": [
+  {
+   "name": "The NTS Breakfast Show w/ Flo",
+   "broadcast": "2026-11-17T09:00:00+00:00",
+   "show_alias": "the-breakfast-show-flo",
+   "episode_alias": "the-breakfast-show-flo-17th-november-2026",
+   "genres": [
+    {
+     "id": "genres-other-pop",
+     "value": "Pop"
+    },
+    {
+     "id": "genres-soulrhythm-funk",
+     "value": "Funk"
+    },
+    {
+     "id": "genres-soulrhythm-soul",
+     "value": "Soul"
+    }
+   ]
+  },
+  {
+   "name": "The Early Bird Show w/ Maria Somerville",
+   "broadcast": "2026-11-17T07:00:00+00:00",
+   "show_alias": "early-bird-show-maria-somerville",
+   "episode_alias": "early-bird-show-maria-somerville-17th-november-2026",
+   "genres": [
+    {
+     "id": "genres-rock-folk",
+     "value": "Folk"
+    },
+    {
+     "id": "genres-ambientnewage-ambient",
+     "value": "Ambient"
+    },
+    {
+     "id": "genres-altrockpunk-dreampop",
+     "value": "Dream Pop"
+    }
+   ]
+  },
+  {
+   "name": "Sui Zhen",
+   "broadcast": "2026-11-17T02:00:00+00:00",
+   "show_alias": "sui-zhen",
+   "episode_alias": "sui-zhen-17th-november-2026",
+   "genres": [
+    {
+     "id": "genres-classicalopera-minimalism",
+     "value": "Minimalism"
+    },
+    {
+     "id": "genres-altrockpunk-postrock",
+     "value": "Post Rock"
+    },
+    {
+     "id": "genres-avantgarde-experimental",
+     "value": "Experimental"
+    }
+   ]
+  }
+ ],
+ "links": [
+  {
+   "rel": "self",
+   "href": "https://www.nts.live/api/v2/collections/recently-added?limit=12&offset=0",
+   "type": "application/vnd.episode-list+json;charset=utf-8"
+  }
+ ]
+}

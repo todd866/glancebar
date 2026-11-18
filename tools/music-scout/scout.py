@@ -2,7 +2,7 @@
 """music-scout — nightly pipeline to surface and acquire new lossless music.
 
 Stages (each a subcommand, idempotent):
-  candidates  gather tracks from triple j, new releases, taste LLM
+  candidates  gather tracks from triple j, new releases, taste LLM, community radio
   rank        dedupe, score, variety → queue.json
   acquire     top of queue via mixpool amdl (dry-run unless --go)
   publish     new-music.json for the Glancebar tile
@@ -45,6 +45,9 @@ if str(_OFFLINE_CACHE) not in sys.path:
     sys.path.insert(0, str(_OFFLINE_CACHE))
 import offline_cache as oc  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import radio  # noqa: E402
+
 DEFAULTS: dict[str, Any] = {
     "tracks_per_week": 20,
     "gb_per_week": 1.5,
@@ -81,6 +84,17 @@ DEFAULTS: dict[str, Any] = {
     "retry_days": 3,
     "retry_max": 3,
     "station_playlist": "station:triplej",
+    # Community / public radio playlists (radio.py). Off unless the config turns it on.
+    "radio_enabled": False,
+    "radio_stations": list(radio.DEFAULT_STATIONS) + ["triplej"],
+    "radio_days": 7,
+    "radio_max_candidates": 15,
+    "radio_max_single": 5,
+    "radio_max_requests": 700,
+    "radio_min_gap_seconds": 2.0,
+    "radio_max_seconds": 1500,
+    "radio_cache_days": 14,
+    "triplej_plays": str(HOME / ".local/state/selector/plays.jsonl"),
 }
 
 _SHORT_MONTHS = (
@@ -441,6 +455,8 @@ class Runners:
         sleep: Callable[[float], None] | None = None,
         media_collect: Callable[[], str | None] | None = None,
         media_check: Callable[[], str | None] | None = None,
+        radio_transport: Callable[..., tuple[int, str]] | None = None,
+        radio_sleep: Callable[[float], None] | None = None,
     ):
         self.itunes_search = itunes_search or _default_itunes_search
         self.itunes_lookup = itunes_lookup or _default_itunes_lookup
@@ -459,6 +475,9 @@ class Runners:
         # Rewrites the media check's result after a run, so what the morning digest reads is
         # about tonight's run and not last night's. Off unless the command line turns it on.
         self.media_check = media_check or (lambda: None)
+        # Station playlists: None means the real network (radio.urllib_transport) and time.sleep.
+        self.radio_transport = radio_transport
+        self.radio_sleep = radio_sleep or time.sleep
 
 
 MEDIA_SYNC = Path(__file__).resolve().parent.parent / "media-sync" / "media_sync.py"
@@ -1129,6 +1148,60 @@ def source_triplej(cfg: dict[str, Any]) -> list[dict]:
     return out
 
 
+def source_radio(
+    cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, rejected: set[str]
+) -> tuple[list[dict], dict[str, Any]]:
+    """Tracks from the public playlists of respected stations (radio.py), multi-station first.
+
+    Returns (candidates, report). The report has, per station, the plays read in the window,
+    the requests sent and any error; one station failing does not stop the others."""
+    now = parse_iso(runners.clock()) or utc_now()
+    cache = paths.state / "radio-cache"
+    fetcher = radio.Fetcher(
+        cache,
+        transport=runners.radio_transport,
+        sleep=runners.radio_sleep,
+        min_gap=float(cfg["radio_min_gap_seconds"]),
+        budget=int(cfg["radio_max_requests"]),
+        deadline_seconds=float(cfg["radio_max_seconds"]),
+    )
+    plays, report = radio.collect(
+        list(cfg["radio_stations"]),
+        cache,
+        fetcher,
+        now=now,
+        days=float(cfg["radio_days"]),
+        triplej_log=Path(cfg["triplej_plays"]).expanduser(),
+    )
+    fetcher.prune(float(cfg["radio_cache_days"]))
+    owned = owned_keys(cfg, paths)
+    hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+
+    def exclude(artist: str, title: str) -> bool:
+        key = track_key(artist, title)
+        return key in owned or key in rejected or key in hearts
+
+    liked = {oc.match_fold(oc.split_primary_artist(a)) for a in liked_artists(cfg)}
+    agg = radio.aggregate(plays)
+    rows = radio.select_candidates(
+        agg,
+        exclude=exclude,
+        liked_artists=liked,
+        max_total=int(cfg["radio_max_candidates"]),
+        max_single=int(cfg["radio_max_single"]),
+    )
+    multi = sum(1 for r in agg.values() if len(r["stations"]) >= 2)
+    doc = {
+        "window_days": float(cfg["radio_days"]),
+        "requests": fetcher.requests,
+        "cache_hits": fetcher.cache_hits,
+        "tracks": len(agg),
+        "multi_station_tracks": multi,
+        "stations": report,
+    }
+    return rows, doc
+
+
 def source_new_releases(
     cfg: dict[str, Any], runners: Runners, artists: list[str] | None = None
 ) -> list[dict]:
@@ -1339,6 +1412,14 @@ def cmd_candidates(
             errors.append(f"{name}: {exc}")
             print(f"candidates: {name} failed: {exc}", file=sys.stderr)
 
+    radio_doc: dict[str, Any] | None = None
+    if cfg.get("radio_enabled"):
+        try:
+            by_source["radio"], radio_doc = source_radio(cfg, paths, runners, rejected)
+        except Exception as exc:
+            errors.append(f"radio: {exc}")
+            print(f"candidates: radio failed: {exc}", file=sys.stderr)
+
     taste, taste_err = source_taste_expansion(cfg, runners, paths=paths)
     if taste_err:
         errors.append(f"taste-expansion: {taste_err}")
@@ -1354,6 +1435,17 @@ def cmd_candidates(
             if key in rejected:
                 continue
             merged.append(row)
+    warnings: list[str] = []
+    if radio_doc is not None:
+        # Plays read per station, so a station that goes quiet is flagged like any dead source.
+        fetched = {k: v for k, v in radio_doc["stations"].items() if k != "triplej"}
+        for code, rep in radio_doc["stations"].items():
+            counts[f"radio:{code}"] = int(rep.get("plays") or 0)
+            if rep.get("error"):
+                warnings.append(f"radio:{code}: {rep['error']}")
+        # One station failing is a warning (it is retried tomorrow); all of them failing is an error.
+        if fetched and all(v.get("error") for v in fetched.values()):
+            errors.append("radio: every station failed")
 
     doc = {
         "generated": runners.clock(),
@@ -1361,6 +1453,10 @@ def cmd_candidates(
         "counts": counts,
         "errors": errors,
     }
+    if warnings:
+        doc["warnings"] = warnings
+    if radio_doc is not None:
+        doc["radio"] = radio_doc
     paths.state.mkdir(parents=True, exist_ok=True)
     paths.candidates.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     update_source_stats(paths, counts, dead_nights=int(cfg["dead_source_nights"]), clock=runners.clock())
@@ -1668,6 +1764,7 @@ def cmd_acquire(
                 "why": row.get("why") or "",
                 "url": url,
                 "size_bytes": size_bytes,
+                **({"heard": row["heard"]} if row.get("heard") else {}),
                 "album": song.get("collectionName") or row.get("album") or "",
                 "duration_seconds": (float(song.get("trackTimeMillis") or 0) / 1000.0) or None,
                 "local_path": meta.get("local_path"),
@@ -1762,6 +1859,8 @@ def cmd_publish(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dic
             item["catalogue_relative_path"] = row["catalogue_relative_path"]
         if row.get("sha256"):
             item["sha256"] = row["sha256"]
+        if row.get("heard"):
+            item["heard"] = row["heard"]  # stations and dates, for "heard on KEXP"
         tracks.append(item)
     tracks.sort(key=lambda r: r.get("acquired_at") or "", reverse=True)
     doc = {

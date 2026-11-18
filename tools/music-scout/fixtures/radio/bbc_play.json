@@ -1,0 +1,73 @@
+{
+ "data": [
+  {
+   "id": "aod_play_area",
+   "data": []
+  },
+  {
+   "type": "inline_display_module",
+   "id": "aod_tracks",
+   "style": null,
+   "title": "Tracklist",
+   "description": null,
+   "state": "ok",
+   "uris": null,
+   "controls": null,
+   "total": null,
+   "data": [
+    {
+     "type": "segment_item",
+     "id": "p0pn5lkt",
+     "segment_type": "music",
+     "titles": {
+      "primary": "Fred Neil",
+      "secondary": "Faretheewell (Fred's Tune)",
+      "tertiary": null,
+      "entity_title": "Fred Neil"
+     },
+     "offset": {
+      "start": 34,
+      "end": 269,
+      "label": null,
+      "now_playing": false
+     }
+    },
+    {
+     "type": "segment_item",
+     "id": "p0pn5m58",
+     "segment_type": "music",
+     "titles": {
+      "primary": "Blue Lake",
+      "secondary": "The Animal (Antonina Nowacka Rewild)",
+      "tertiary": null,
+      "entity_title": "Blue Lake"
+     },
+     "offset": {
+      "start": 271,
+      "end": 493,
+      "label": null,
+      "now_playing": false
+     }
+    },
+    {
+     "type": "segment_item",
+     "id": "p0pn5mcb",
+     "segment_type": "music",
+     "titles": {
+      "primary": "June McDoom",
+      "secondary": "Human Angel",
+      "tertiary": null,
+      "entity_title": "June McDoom"
+     },
+     "offset": {
+      "start": 494,
+      "end": 670,
+      "label": null,
+      "now_playing": false
+     }
+    }
+   ],
+   "image_url": null
+  }
+ ]
+}

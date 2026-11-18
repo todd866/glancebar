@@ -1,0 +1,62 @@
+{
+ "metadata": {
+  "resultset": {
+   "count": 13,
+   "offset": 0,
+   "limit": 13
+  }
+ },
+ "results": [
+  {
+   "artist": "Al Wilson",
+   "title": "Be Concerned",
+   "uid": "aa2b4ff4-636a-4949-ab44-938bfb28efe5",
+   "offset": 10,
+   "duration": 140,
+   "offset_estimate": null,
+   "duration_estimate": null,
+   "acr_id": "b1e1c8091237a6cf7d723b2535a7de94",
+   "deezer_track_id": 128885136,
+   "isrc_id": "UKDNQ1510786",
+   "musicbrainz_track_id": null
+  },
+  {
+   "artist": "Cynthia Sheeler",
+   "title": "I'll Cry Over You",
+   "uid": "47e730cb-0c78-433c-82d3-6d5253ec772a",
+   "offset": 200,
+   "duration": 10,
+   "offset_estimate": null,
+   "duration_estimate": null,
+   "acr_id": "04a7d747943dcaf5774cbe83a716fe93",
+   "deezer_track_id": null,
+   "isrc_id": null,
+   "musicbrainz_track_id": null
+  },
+  {
+   "artist": "Wee",
+   "title": "You Can Fly On My Aeroplane",
+   "uid": "8bef7f2a-7e4f-4561-a1b2-db20330b22e5",
+   "offset": 331,
+   "duration": 157,
+   "offset_estimate": null,
+   "duration_estimate": null,
+   "acr_id": "0e847cfa5954e70ab36247879b7a09a1",
+   "deezer_track_id": 72201999,
+   "isrc_id": "USCW60890509",
+   "musicbrainz_track_id": "ff37ec78-1812-4a84-9941-1d6493435a9c"
+  }
+ ],
+ "links": [
+  {
+   "rel": "self",
+   "href": "https://www.nts.live/api/v2/shows/sun-cut/episodes/sun-cut-16th-november-2026/tracklist",
+   "type": "application/vnd.track-list+json;charset=utf-8"
+  },
+  {
+   "rel": "episode",
+   "href": "https://www.nts.live/api/v2/shows/sun-cut/episodes/sun-cut-16th-november-2026",
+   "type": "application/vnd.episode+json;charset=utf-8"
+  }
+ ]
+}

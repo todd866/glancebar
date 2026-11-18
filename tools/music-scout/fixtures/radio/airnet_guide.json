@@ -1,0 +1,57 @@
+[
+ {
+  "guideId": "fm",
+  "day": 1,
+  "start": "00:00:00",
+  "duration": 7200,
+  "name": "Dry Run",
+  "broadcasters": "Scarlett Cunningham",
+  "gridDescription": "Experiential ambience",
+  "slug": "dry-run",
+  "bannerImage": "https://amrap-pages-image.s3.amazonaws.com/banner/12074.jpg?cacbeb=12717909",
+  "bannerImageSmall": "https://amrap-pages-image.s3.amazonaws.com/banner-small/12074.jpg?cacbeb=33900043",
+  "profileImage": "https://amrap-pages-image.s3.amazonaws.com/profile/12074.jpg?cacbeb=55990698",
+  "profileImageSmall": "https://amrap-pages-image.s3.amazonaws.com/profile-small/12074.jpg?cacbeb=67442663",
+  "url": null,
+  "onairnow": false
+ },
+ {
+  "guideId": "fm",
+  "day": 1,
+  "start": "06:00:00",
+  "duration": 10800,
+  "name": "The Breakfast Spread",
+  "broadcasters": "Claire Dickson and Milo Eastwood",
+  "gridDescription": "Your musical alternative",
+  "slug": "the-breakfast-spread",
+  "bannerImage": "https://amrap-pages-image.s3.amazonaws.com/banner/7021.jpg?cacbeb=65631878",
+  "bannerImageSmall": "https://amrap-pages-image.s3.amazonaws.com/banner-small/7021.jpg?cacbeb=35316489",
+  "profileImage": "https://amrap-pages-image.s3.amazonaws.com/profile/7021.jpg?cacbeb=6104558",
+  "profileImageSmall": "https://amrap-pages-image.s3.amazonaws.com/profile-small/7021.jpg?cacbeb=6927394",
+  "url": null,
+  "onairnow": false
+ },
+ {
+  "guideId": "fm",
+  "day": 2,
+  "start": "06:00:00",
+  "duration": 10800,
+  "name": "The Breakfast Spread",
+  "broadcasters": "Claire Dickson and Milo Eastwood",
+  "gridDescription": "Your musical alternative",
+  "slug": "the-breakfast-spread",
+  "bannerImage": "https://amrap-pages-image.s3.amazonaws.com/banner/7021.jpg?cacbeb=10284224",
+  "bannerImageSmall": "https://amrap-pages-image.s3.amazonaws.com/banner-small/7021.jpg?cacbeb=13124192",
+  "profileImage": "https://amrap-pages-image.s3.amazonaws.com/profile/7021.jpg?cacbeb=15860541",
+  "profileImageSmall": "https://amrap-pages-image.s3.amazonaws.com/profile-small/7021.jpg?cacbeb=60840285",
+  "url": null,
+  "onairnow": false
+ },
+ {
+  "day": 2,
+  "start": "09:00:00",
+  "duration": 7200,
+  "name": "Mystic Brew",
+  "slug": "mystic-brew"
+ }
+]

@@ -1,0 +1,55 @@
+{
+ "$schema": "https://rms.api.bbc.co.uk/docs/swagger.json#/definitions/ExperienceResponse",
+ "data": [
+  {
+   "type": "inline_display_module",
+   "id": "schedule_items",
+   "style": null,
+   "title": "2026-11-16",
+   "description": null,
+   "state": "ok",
+   "uris": null,
+   "controls": null,
+   "total": null,
+   "data": [
+    {
+     "type": "broadcast_summary",
+     "id": "p0pj402c",
+     "urn": "urn:bbc:radio:episode:m0033zsm",
+     "start": "2026-11-15T22:00:00Z",
+     "end": "2026-11-16T00:00:00Z",
+     "titles": {
+      "primary": "Dream Time",
+      "secondary": "Up in the clouds with Zakia\u2026 ft. June McDoom",
+      "tertiary": ""
+     }
+    },
+    {
+     "type": "broadcast_summary",
+     "id": "p0pj402m",
+     "urn": "urn:bbc:radio:episode:m0033zs3",
+     "start": "2026-11-16T00:00:00Z",
+     "end": "2026-11-16T03:00:00Z",
+     "titles": {
+      "primary": "Guy Garvey's Finest Hour",
+      "secondary": "Bobby Friction sits in",
+      "tertiary": ""
+     }
+    },
+    {
+     "type": "broadcast_summary",
+     "id": "p0pj402t",
+     "urn": "urn:bbc:radio:episode:m0033zst",
+     "start": "2026-11-16T03:00:00Z",
+     "end": "2026-11-16T04:00:00Z",
+     "titles": {
+      "primary": "The 6 Music Playlist",
+      "secondary": "Heartworms, Sophia Stel, Queens of the Stone Age, and more!",
+      "tertiary": ""
+     }
+    }
+   ],
+   "image_url": null
+  }
+ ]
+}

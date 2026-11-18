@@ -1,0 +1,20 @@
+[
+ {
+  "slug": "blackandblue",
+  "name": "Black &amp; Blue",
+  "broadcasters": "",
+  "gridDescription": null,
+  "archived": false,
+  "programRestUrl": "https://airnet.org.au/rest/stations/6rtr/programs/blackandblue"
+ },
+ {
+  "slug": "oldshow",
+  "name": "Old",
+  "archived": true
+ },
+ {
+  "slug": null,
+  "name": "x",
+  "archived": false
+ }
+]

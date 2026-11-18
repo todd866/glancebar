@@ -1,0 +1,76 @@
+{
+ "next": "https://api.kexp.org/v2/plays/?airdate_after=2026-11-17T02%3A00%3A00Z&airdate_before=2026-11-17T03%3A00%3A00Z&limit=6&offset=6&ordering=airdate",
+ "previous": null,
+ "results": [
+  {
+   "id": 3732610,
+   "airdate": "2026-11-16T18:02:01-08:00",
+   "song": "Al borde del silencio",
+   "artist": "Guazuncho",
+   "album": "Forraje",
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2026-04-21"
+  },
+  {
+   "id": 3732611,
+   "airdate": "2026-11-16T18:07:12-08:00",
+   "song": "Vakata",
+   "artist": "Bonobo",
+   "album": "Memory Signal / Vakata",
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2026-11-12"
+  },
+  {
+   "id": 3732612,
+   "airdate": "2026-11-16T18:13:41-08:00",
+   "song": "Mlonje: Voices Joined (Goodmood remix)",
+   "artist": "Nubiyan Twist",
+   "album": "Chasing Shadows (Deluxe Edition)",
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2026-11-06"
+  },
+  {
+   "id": 3732613,
+   "airdate": "2026-11-16T18:16:11-08:00",
+   "song": "Like the Summer",
+   "artist": "Girls of the Internet feat. Zo\u00e9 Kypri",
+   "album": "Like the Summer",
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2026-11-13"
+  },
+  {
+   "id": 3732614,
+   "airdate": "2026-11-16T18:19:41-08:00",
+   "song": "Love Train (Lil' T Remix)",
+   "artist": "PillowTalk, Soul Clap Featuring Greg Paulus, Crew Love",
+   "album": "Love Train Remixes with Louie Vega, Soul Clap, Mak\u00e8z, Lil'T (PillowTalk)",
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2026-11-13"
+  },
+  {
+   "id": 3732615,
+   "airdate": "2026-11-16T18:24:38-08:00",
+   "song": "All My Life",
+   "artist": "The Sugarland Gang",
+   "album": null,
+   "play_type": "trackplay",
+   "show": 68338,
+   "release_date": "2003-02-18"
+  },
+  {
+   "id": 1,
+   "airdate": "2026-11-16T18:30:00-08:00",
+   "song": null,
+   "artist": null,
+   "album": null,
+   "play_type": "airbreak",
+   "show": 1,
+   "release_date": null
+  }
+ ]
+}
