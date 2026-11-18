@@ -3,6 +3,17 @@
 Open work, newest decisions first. Each item says what "done" means. Background is in
 `docs/music.md` ("Song embeddings", "Kinds from the embedding").
 
+## Music: web radio (Ian, 18 Nov 2026)
+
+Ian asked for "a music app ... run it as a website, password protected". It's the existing song map and R2 cold tier (`glancebar-music`) put behind a phone-first web player. Done when each item below works from his phone, away from home.
+- [ ] **Web player, password protected.** Works on a phone and plays from R2: signed URLs, ALAC, or an AAC transcode for mobile data. Anyone with the password can use it. Sharing outside the household is a licensing grey area for purchased/acquired music; keep access small.
+- [ ] **Mood-based play.** Moods come from the kinds in the song map, plus time-of-day rules (Ian: "don't play Slayer in the morning, play it in the afternoon"). Moods are steerable, not fixed playlists.
+- [ ] **Everything embedded.** Every song gets the 3072-dimension Gemini embedding the map already uses (see "Nightly map refresh" below). New acquisitions are embedded before they're offered.
+- [ ] **Radio scouting beyond triple j.** Scan the play lists of Australian community radio (RRR, RTR FM, PBS, FBi, 4ZZZ) and overseas stations (KEXP, NTS, BBC 6 Music, WFMU) into the scout's candidate pool. Rank candidates by nearness to liked regions of the map.
+- [ ] **Artist seeds.** Taken from Glancebar likes, heavy rotation and Shazams; the hub artists already show up (Gang of Youths, Car Seat Headrest, The Middle East). Ian can add names by voice or in a settings list.
+- [ ] **Voice mode.** "Not this, something heavier / something for the drive" steers the queue. It reuses md3's voice machinery (the same realtime/voice stack md3 is building), running in the browser.
+- [ ] **Per-listener profiles.** Each person with the password gets their own reception history and moods, like the user profiles md3 runs, and one listener's skips don't train another's map.
+
 ## Music: the song map (logged 16 Nov 2026)
 
 - [ ] **Nightly map refresh.** New songs reach the lossless library but not the map. A job on
