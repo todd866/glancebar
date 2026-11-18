@@ -6,13 +6,31 @@ Open work, newest decisions first. Each item says what "done" means. Background 
 ## Music: web radio (Ian, 18 Nov 2026)
 
 Ian asked for "a music app ... run it as a website, password protected". It's the existing song map and R2 cold tier (`glancebar-music`) put behind a phone-first web player. Done when each item below works from his phone, away from home.
-- [ ] **Web player, password protected.** Works on a phone and plays from R2: signed URLs, ALAC, or an AAC transcode for mobile data. Two listeners: Ian and one mate (Ian, 18 Nov). Keep it to those two accounts, not an open shared password, so each has his own profile.
-- [ ] **Mood-based play.** Moods come from the kinds in the song map, plus time-of-day rules (Ian: "don't play Slayer in the morning, play it in the afternoon"). Moods are steerable, not fixed playlists.
-- [ ] **Everything embedded.** Every song gets the 3072-dimension Gemini embedding the map already uses (see "Nightly map refresh" below). New acquisitions are embedded before they're offered.
-- [ ] **Radio scouting beyond triple j.** Scan the play lists of Australian community radio (RRR, RTR FM, PBS, FBi, 4ZZZ) and overseas stations (KEXP, NTS, BBC 6 Music, WFMU) into the scout's candidate pool. Rank candidates by nearness to liked regions of the map.
-- [ ] **Artist seeds.** Taken from Glancebar likes, heavy rotation and Shazams; the hub artists already show up (Gang of Youths, Car Seat Headrest, The Middle East). Ian can add names by voice or in a settings list.
-- [ ] **Voice mode.** "Not this, something heavier / something for the drive" steers the queue. It reuses md3's voice machinery (the same realtime/voice stack md3 is building), running in the browser.
-- [ ] **Per-listener profiles.** Each person with the password gets their own reception history and moods, like the user profiles md3 runs, and one listener's skips don't train another's map.
+Live (18 Nov): https://6ian-radio.vercel.app ("6IAN"), repo `~/Projects/music-radio` (private), Vercel project
+`music-radio` (syd1). Sign-ins in `~/.config/music-radio/accounts.txt`. Tests: `npm run ci` there (unit, headless smoke,
+fake-mic voice), run from a Mac with the `~/.config/music-radio` secrets; there is no hosted CI.
+- [ ] **Web player, password protected.** Two accounts (ian, mate), scrypt + signed session cookie; audio is
+  session-checked and streamed through `/api/audio` from short-lived signed R2 URLs. Works on iPhone WebKit (ALAC)
+  and Chrome (AAC). Not done until the AAC tier is complete: `radio/aac/` + covers are made on the M2 by
+  `~/.local/state/music-radio-media/bin/build_media.py run --from-r2` (heavy-slot; 26 of 1,435 so far), and Chrome
+  only offers AAC-ready songs. iPhone uses the 30-50 MB masters until then.
+- [x] **Mood-based play.** Tuner (Chill, Alt, Drive, Dance, Rap, Heavy, Wide) plus the map (tap a region). Queue
+  built server-side from embedding neighbours, steered by More / Less / likes / early skips, with an energy arc,
+  left turns, and a time-of-day rules table (`lib/rules.ts`, per-account timezone, default Australia/Perth, tested).
+- [ ] **Everything embedded.** Nightly incremental embed on the M2 in progress (another agent, 18 Nov). Gaps on
+  the radio's Profile page; 16 vectors have no R2 master.
+- [ ] **Radio scouting beyond triple j.** Fetchers for KEXP, NTS, 6 Music, WFMU, RRR, PBS, 4ZZZ, RTR are in
+  `tools/music-scout/radio.py`, switched on in `music-scout.json`, ranked by cross-station plays (commits
+  26cde4f, 1c79c16, not pushed). FBi skipped (robots.txt). Not yet ranked by nearness to liked map regions.
+- [ ] **Artist seeds.** Glancebar likes count as Ian's likes in the radio's queue. No settings list or voice add yet.
+- [ ] **Voice mode.** Works in the browser: mic button, one mic stream, Gemini 3.1 flash-lite intents (not this,
+  heavier, lighter, more new, something I know, who is this, go back, a mood, play X), ducking, barge-in, typed
+  fallback, fail-closed daily caps. Fake-mic suite passes 9/9 on production; music never paused. Own pipeline on
+  md3's Gemini key, not md3's realtime stack. Still to do: a command lands 3-4 s after you stop talking (target
+  ~2 s); track changes are hard cuts (no crossfade); real-phone check of lock screen and speaker routing.
+- [x] **Per-listener profiles.** Per-account play/skip/like log in R2 (`radio/profiles/`), AI-vs-random
+  scoreboard (1 in 10 picks is a hidden random control), new-vs-library share slider. Test runs use separate
+  `-qa` profiles.
 
 ## Music: the song map (logged 16 Nov 2026)
 
