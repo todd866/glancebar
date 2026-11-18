@@ -485,3 +485,22 @@ including missing process samples, zero draw and unplugging. Missing readings sh
 The file-copy process `rsync` is labelled File copy, with its process name in the hover detail;
 the charge suggestion requires actual net battery drain. The offscreen popover harness
 checks the transport position through sample loss and recovery.
+
+## Web radio (6IAN) and the M2 fetch worker (18 Nov 2026)
+
+The library is also a phone-first web radio, https://6ian.vercel.app (repo `~/Projects/music-radio`, private;
+Vercel project `6ian`). It streams from this bucket: AAC 256 under `radio/aac/`, covers under `radio/art/`
+(+ 300 px WebP under `radio/thumb/`), listener profiles under `radio/profiles/`.
+
+**Acquisition now also runs on the M2.** The scout's nightly batch stays on the M5 (amdl there), but the
+M2 has its own signed-in amdl guest and the radio's fetch worker uses it:
+
+| Piece | Where | What |
+|---|---|---|
+| `com.iantodd.music-radio-fetch` | M2, always on | Polls the radio's jobs every 5 s. "Play X" not in the library: iTunes lookup, amdl, AAC + cover, streamed through a Cloudflare quick tunnel before R2 has it (36-52 s to first audio), embedded at once under the shared $5/day ledger. With no listener waiting it works through a background lane (`~/.local/state/music-radio-fetch/lane.json`; the hip hop batch is the first), pausing when the masters drive falls under 10 GB free. |
+| `com.iantodd.music-radio-place` | M5, every 15 min | Over ssh (W17), puts the worker's masters onto `OTV Mirror` under disk-slot, then into R2, so the push's drive-vs-R2 count stays equal. |
+| `com.iantodd.music-radio-rebuild` | M5, 22:00Z | Rebuilds the radio's map bundle and station mixes from R2's catalogue and the M2 vectors, pushes, refreshes the worker. |
+
+**Storage limit:** `OTV Mirror` (master volume for "Music lossless masters") had 28 GB free on 18 Nov. At
+the owner's 100-songs-a-day target (~4.8 GB/day) it fills in about five days; moving the masters' home
+(e.g. to Stash, 281 GB free) is an owner decision in `placement.toml`, not yet made.

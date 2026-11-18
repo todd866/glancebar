@@ -6,8 +6,8 @@ Open work, newest decisions first. Each item says what "done" means. Background 
 ## Music: web radio (Ian, 18 Nov 2026)
 
 Ian asked for "a music app ... run it as a website, password protected". It's the existing song map and R2 cold tier (`glancebar-music`) put behind a phone-first web player. Done when each item below works from his phone, away from home.
-Live (18 Nov): https://6ian-radio.vercel.app ("6IAN"), repo `~/Projects/music-radio` (private), Vercel project
-`music-radio` (syd1). Sign-ins in `~/.config/music-radio/accounts.txt`. Tests: `npm run ci` there (unit, headless smoke,
+Live (18 Nov): https://6ian.vercel.app ("6IAN"), repo `~/Projects/music-radio` (private), Vercel project
+`6ian` (syd1). One shared site password, then a cookie account per device; email magic links to keep it. Tests: `npm run ci` there (unit, headless smoke,
 fake-mic voice), run from a Mac with the `~/.config/music-radio` secrets; there is no hosted CI.
 - [ ] **Web player, password protected.** Two accounts (ian, mate), scrypt + signed session cookie; audio is
   session-checked and streamed through `/api/audio` from short-lived signed R2 URLs. Works on iPhone WebKit (ALAC)
@@ -19,7 +19,7 @@ fake-mic voice), run from a Mac with the `~/.config/music-radio` secrets; there 
   left turns, and a time-of-day rules table (`lib/rules.ts`, per-account timezone, default Australia/Perth, tested).
 - [ ] **Everything embedded.** Nightly incremental embed on the M2 in progress (another agent, 18 Nov). Gaps on
   the radio's Profile page; 16 vectors have no R2 master.
-- [ ] **Radio scouting beyond triple j.** Fetchers for KEXP, NTS, 6 Music, WFMU, RRR, PBS, 4ZZZ, RTR are in
+- [x] **Radio scouting beyond triple j.** Fetchers for KEXP, NTS, 6 Music, WFMU, RRR, PBS, 4ZZZ, RTR are in
   `tools/music-scout/radio.py`, switched on in `music-scout.json`, ranked by cross-station plays (commits
   26cde4f, 1c79c16, not pushed). FBi skipped (robots.txt). Not yet ranked by nearness to liked map regions.
 - [ ] **Artist seeds.** Glancebar likes count as Ian's likes in the radio's queue. No settings list or voice add yet.
