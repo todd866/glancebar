@@ -1168,6 +1168,12 @@ class CapExceeded(RuntimeError):
         self.spent, self.want, self.cap = spent, want, cap
 
 
+def ledger_day(now: float | None = None) -> str:
+    """The spend ledger's day: the owner's day, Perth date (owner, 18 Nov 2026: one clock for the ledger and
+    for dated cap overrides). Australia/Perth has no daylight saving, so UTC+8 is exact."""
+    return datetime.fromtimestamp((time.time() if now is None else now) + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
 def utc_day(now: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if now is None else now, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -1227,7 +1233,7 @@ def reserve_spend(paths: Paths, usd: float, cap: float, *, note: str = "", now: 
 
     The check and the write happen under one lock, before anything is uploaded, so two runs
     cannot both pass the cap. Raises SpendError (ledger unreadable) or CapExceeded."""
-    day = utc_day(now)
+    day = ledger_day(now)
     with spend_locked(paths):
         doc = read_spend(paths.spend)
         spent = spend_today(doc, day)
@@ -1508,7 +1514,7 @@ def _prepared(paths: Paths) -> list[dict[str, Any]]:
 
 def _remaining_budget(paths: Paths, cap: float) -> float:
     doc = read_spend(paths.spend)
-    return cap - spend_today(doc, utc_day())
+    return cap - spend_today(doc, ledger_day())
 
 
 def cmd_inc_prepare(args: argparse.Namespace) -> int:
@@ -1762,7 +1768,7 @@ def cmd_spend(args: argparse.Namespace) -> int:
     except SpendError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    day = utc_day()
+    day = ledger_day()
     spent = spend_today(doc, day)
     print(json.dumps({"day": day, "spentUsd": round(spent, 4), "capUsd": args.cap_usd,
                       "remainingUsd": round(max(args.cap_usd - spent, 0.0), 4)}))
@@ -1792,7 +1798,7 @@ def cmd_gaps(args: argparse.Namespace) -> int:
             downloaded = [str(s) for s in local["songs"]]
     spend: float | None
     try:
-        spend = spend_today(read_spend(paths.spend), utc_day())
+        spend = spend_today(read_spend(paths.spend), ledger_day())
         spend_err = None
     except SpendError as exc:
         spend, spend_err = None, str(exc)

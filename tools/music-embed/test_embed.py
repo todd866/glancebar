@@ -494,7 +494,7 @@ class SubmitCollectTests(IncrementalBase):
         jobs = embed.load_jobs(self.paths.inc_jobs)
         self.assertEqual([j["ids"] for j in jobs], [["new1"]])  # $1.50 left covers one song
         self.assertEqual(jobs[0]["state"], "SUBMITTED")
-        self.assertAlmostEqual(embed.spend_today(embed.read_spend(self.paths.spend), embed.utc_day()), 4.5)
+        self.assertAlmostEqual(embed.spend_today(embed.read_spend(self.paths.spend), embed.ledger_day()), 4.5)
         self.assertEqual([p["id"] for p in embed._prepared(self.paths)], ["new2"])
         # The job is in flight: no second job.
         with mock.patch.object(embed, "get_genai_client") as gc:
@@ -572,3 +572,11 @@ class PrepareTests(IncrementalBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LedgerDayTest(unittest.TestCase):
+    def test_ledger_day_is_the_perth_date(self):
+        from datetime import datetime, timezone
+        ts = lambda iso: datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp()
+        self.assertEqual(embed.ledger_day(ts('2026-11-18T20:45:00')), '2026-11-19')  # tonight's batch: a new Perth day
+        self.assertEqual(embed.ledger_day(ts('2026-11-18T15:59:00')), '2026-11-18')
+        self.assertEqual(embed.ledger_day(ts('2026-11-17T16:00:00')), '2026-11-18')  # Perth midnight
