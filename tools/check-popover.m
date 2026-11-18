@@ -735,6 +735,9 @@ int main(int argc, const char **argv) {
         // Kind tiles from a fixture library: the harness never reads the real Music library.
         [c setValue:@YES forKey:@"mixFrozen"];
         [c setValue:@YES forKey:@"audioFrozen"];   // never read this Mac's live volume mid-check
+        // Lay out for a 1470 × 956 laptop display less its menu bar, never the host's screen: a CI
+        // runner's 1024 × 768 display with a Dock leaves 674 points, which made a fitting popover scroll.
+        [c setValue:@919 forKey:@"popoverScreenHeight"];
         [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
         [c setValue:@YES forKey:@"stationLoaded"];
         [c setValue:@YES forKey:@"stationAvailable"];

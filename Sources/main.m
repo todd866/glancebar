@@ -6175,6 +6175,9 @@ static void GBHangWatchStart(void) {
     NSString *_aiSignature;
     NSString *_aiCatchUpStatus;
     BOOL _aiTotalsIncomplete;
+    // Visible height the popover is laid out for; 0 reads the status item's screen. The layout
+    // harness pins it so a check's result does not depend on the host's display and Dock.
+    CGFloat _popoverScreenHeight;
     NSArray<NSDictionary *> *_hogs;
     // Battery burn by app, on battery only. The baseline is one energy snapshot taken when
     // the Mac is unplugged (or at launch on battery); live samples run only while a panel is open.
@@ -14142,8 +14145,9 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
 
     root.frame = NSMakeRect(0, 0, kW, MAX(y, 1));
     NSScreen *screen = _item.button.window.screen ?: NSScreen.mainScreen;
+    CGFloat visibleH = _popoverScreenHeight > 0 ? _popoverScreenHeight : (screen ? screen.visibleFrame.size.height : 0);
     CGFloat maxPopoverH = 720;
-    if (screen) maxPopoverH = MIN(maxPopoverH, MAX(360.0, screen.visibleFrame.size.height - 72.0));
+    if (visibleH > 0) maxPopoverH = MIN(maxPopoverH, MAX(360.0, visibleH - 72.0));
     NSView *freshView = nil;
     NSScrollView *freshScroll = nil;
     if (y + footerH > maxPopoverH) {
