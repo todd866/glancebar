@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sqlite3
@@ -71,6 +72,11 @@ DEFAULTS: Dict[str, Any] = {
     "selector_state": str(HOME / ".local/state/selector"),
     # Nightly map refresh report (glancebar tools/music-embed): copied here from the M2.
     "embed_gaps": str(HOME / ".local/state/glancebar-music-embed/gaps.json"),
+    # The web radio's library: radio/lane-status.json, scout-status.json and gaps.json read
+    # from R2 with rclone (credentials stay in rclone's config). Empty turns the row off; a Mac
+    # that should not answer for it leaves it out of `check.rows`.
+    "radio_library_remote": "glancebar-music:glancebar-music",
+    "rclone": "/opt/homebrew/bin/rclone",
     "tv_video_log": "",
     "rotations": [
         {"station": "triplej", "scores": str(HOME / ".local/state/selector/scores.json")},
@@ -97,6 +103,9 @@ DEFAULTS: Dict[str, Any] = {
         "upload_fail_h": 72,
         "embed_warn_h": 36,
         "embed_fail_h": 72,
+        "radio_lane_warn_h": 36,
+        # The lane keeps a 150 GB reserve on Stash; warn before it reaches it.
+        "radio_drive_warn_gb": 160,
         "scout_warn_h": 30,
         "scout_fail_h": 72,
         "hotset_warn_h": 30,
@@ -1260,6 +1269,112 @@ def embed_gaps_row(path: Path, chk: Dict[str, Any], host: str) -> CheckRow:
     return make_row("embeddings", st, fact, host, detail)
 
 
+def rclone_cat(cfg: Dict[str, Any], path: str) -> Tuple[Optional[Any], str]:
+    """One small JSON file from the radio's R2 bucket: (document, "") or (None, why)."""
+    exe = str(cfg.get("rclone") or "")
+    if not exe or not Path(exe).is_file():
+        exe = shutil.which("rclone") or ""
+    if not exe:
+        return None, "rclone not found"
+    remote = str(cfg.get("radio_library_remote") or "").rstrip("/")
+    try:
+        out = subprocess.run([exe, "cat", f"{remote}/{path}"], capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"rclone: {type(exc).__name__}"
+    if out.returncode != 0:
+        lines = [ln for ln in (out.stderr or "").strip().splitlines() if ln.strip()]
+        return None, f"rclone exit {out.returncode}: {lines[-1][-120:] if lines else 'no message'}"
+    try:
+        return json.loads(out.stdout), ""
+    except json.JSONDecodeError as exc:
+        return None, f"not JSON: {str(exc)[:80]}"
+
+
+# Replaced in tests so the check never reaches R2.
+_r2_reader: Callable[[Dict[str, Any], str], Tuple[Optional[Any], str]] = rclone_cat
+
+
+def set_r2_reader(fn: Callable[[Dict[str, Any], str], Tuple[Optional[Any], str]]) -> None:
+    global _r2_reader
+    _r2_reader = fn
+
+
+def _decades_short(by_decade: Any) -> str:
+    """{"1990s": 29, "1970s": 1} → "70s 1 90s 29" (chronological, empty decades left out)."""
+    if not isinstance(by_decade, dict):
+        return ""
+    rows = []
+    for name, n in by_decade.items():
+        m = re.match(r"^(\d{4})s$", str(name))
+        if m and isinstance(n, (int, float)) and n:
+            rows.append((int(m.group(1)), f"{m.group(1)[2:]}s {int(n)}"))
+    return " ".join(label for _, label in sorted(rows))
+
+
+def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> CheckRow:
+    """Songs the web radio's library gained (the lane plus the scout), by decade, today's embed
+    spend, and the faults that need a hand: a lane that stopped reporting, Stash near the lane's
+    reserve, or vectors for songs that are no longer in R2."""
+    lane, lane_err = _r2_reader(cfg, "radio/lane-status.json")
+    scout_doc, scout_err = _r2_reader(cfg, "radio/scout-status.json")
+    gaps, gaps_err = _r2_reader(cfg, "radio/gaps.json")
+    lane = lane if isinstance(lane, dict) else None
+    scout_doc = scout_doc if isinstance(scout_doc, dict) else None
+    gaps = gaps if isinstance(gaps, dict) else None
+    if lane is None and scout_doc is None and gaps is None:
+        # R2 not reachable from here is its own fault, not a stale lane.
+        return make_row("radio library", "warn", f"R2 unreadable: {lane_err or 'not an object'}", host)
+    warns: List[str] = []
+    parts: List[str] = []
+    today = int(lane.get("today") or 0) if lane else None
+    lane_week = int(lane.get("week") or 0) if lane else 0
+    scout_week = int(scout_doc.get("acquiredThisWeek") or 0) if scout_doc else 0
+    parts.append(f"{'?' if today is None else today} today")
+    week = f"{lane_week + scout_week} this week (lane {lane_week if lane else '?'}, scout {scout_week if scout_doc else '?'}"
+    if scout_doc and scout_doc.get("budgetTracks"):
+        week += f"/{int(scout_doc['budgetTracks'])}"
+    parts.append(week + ")")
+    decades = _decades_short(lane.get("byDecade") if lane else None)
+    if decades:
+        parts.append(decades)
+    if gaps:
+        spend, cap = gaps.get("embedSpendTodayUsd"), gaps.get("capUsd")
+        money = "$?" if spend is None else f"${float(spend):.2f}"
+        if cap is not None:
+            money += f"/${float(cap):.0f}"
+        parts.append(f"{money} today")
+    free = lane.get("driveFreeGb") if lane else None
+    if isinstance(free, (int, float)):
+        parts.append(f"Stash {float(free):.0f} GB free")
+    if lane is None:
+        warns.append(f"lane-status: {lane_err}")
+    else:
+        at = parse_iso(str(lane.get("at") or ""))
+        age_h = (utc_now() - at).total_seconds() / 3600.0 if at else float("inf")
+        if age_h > float(chk.get("radio_lane_warn_h", 36)):
+            warns.append(f"lane {age_fact(age_h * 3600)} old" if at else "lane-status has no time")
+        if isinstance(free, (int, float)) and float(free) < float(chk.get("radio_drive_warn_gb", 160)):
+            warns.append(f"Stash {float(free):.0f} GB free, near the lane's 150 GB reserve")
+    if scout_doc is None:
+        warns.append(f"scout-status: {scout_err}")
+    if gaps is None:
+        warns.append(f"gaps: {gaps_err}")
+    else:
+        orphans = int(gaps.get("embeddedNotInR2") or 0)
+        if orphans:
+            names = ", ".join(f"{s.get('artist', '')} - {s.get('title', '')}"
+                              for s in (gaps.get("embeddedNotInR2Songs") or [])[:5] if isinstance(s, dict))
+            warns.append(f"{orphans} embedded not in R2" + (f" ({names})" if names else ""))
+    fact = ", ".join(parts)
+    if warns:
+        fact = f"{fact}; " + "; ".join(warns)
+    detail = fact
+    if lane and isinstance(lane.get("byTag"), dict) and lane["byTag"]:
+        tags = " ".join(f"{k} {v}" for k, v in sorted(lane["byTag"].items(), key=lambda kv: -int(kv[1] or 0)))
+        detail = f"{fact}; lane by tag: {tags}; {int(lane.get('artistsQueued') or 0)} artists queued"
+    return make_row("radio library", "warn" if warns else "pass", fact, host, detail)
+
+
 def worst_status(rows: List[CheckRow]) -> str:
     if any(r["status"] == "fail" for r in rows):
         return "fail"
@@ -1499,6 +1614,11 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
     gaps_path = (cfg.get("embed_gaps") or "").strip()
     if gaps_path and expand(gaps_path).is_file():
         rows.append(embed_gaps_row(expand(gaps_path), chk, host))
+
+    # radio library: what the web radio gained (lane + scout), read from R2.
+    # Not read at all on a Mac whose `check.rows` leaves it out (three rclone calls).
+    if str(cfg.get("radio_library_remote") or "").strip() and "radio library" in (chk.get("rows") or ["radio library"]):
+        rows.append(radio_library_row(cfg, chk, host))
 
     # scout
     last_run = expand(cfg["scout_state"]) / "last-run.json"

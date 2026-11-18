@@ -54,6 +54,7 @@ Paths under `mixpool_state`, `apple_music_dir`, `music_library_state`, `scout_st
 | `offload` | no Apple Music download dir | files waiting to offload |
 | `upload` | no `push-status.json` | masters → R2 push |
 | `scout` | no scout `last-run.json` | nightly scout health |
+| `radio library` | `radio_library_remote` empty, or left out of `check.rows` | the web radio's library from R2 (`radio/lane-status.json`, `scout-status.json`, `gaps.json` via `rclone cat`): songs added today and this week (lane + scout), by decade, embed spend of cap. Warns when lane-status is over `radio_lane_warn_h` (36 h) old, Stash has under `radio_drive_warn_gb` (160 GB) free (the lane keeps 150 GB), a vector has no song in R2, or a file cannot be read |
 | `hot set` | no music-library `last-status.json` | hot-set sync |
 | `triple j` | no `station.json` | selector station refresh |
 | `tv videos` | `tv_video_log` empty | liked songs with a video file + log age |

@@ -573,6 +573,100 @@ class EmbedGapsCheckTests(MediaSyncTestBase):
         self.assertNotIn("embeddings", [r["name"] for r in doc["rows"]])
 
 
+class RadioLibraryCheckTests(MediaSyncTestBase):
+    def setUp(self):
+        super().setUp()
+        at = datetime.fromtimestamp(self.t0 - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.docs = {
+            "radio/lane-status.json": {"at": at, "total": 38, "today": 38, "week": 38, "byTag": {"hiphop": 38},
+                                       "byDecade": {"1990s": 29, "1970s": 1, "2000s": 6, "2010s": 2, "1980s": 0},
+                                       "artistsQueued": 131, "driveFreeGb": 300.4},
+            "radio/scout-status.json": {"acquiredThisWeek": 20, "budgetTracks": 200},
+            "radio/gaps.json": {"embedSpendTodayUsd": 0.0576, "capUsd": 5.0, "inR2NotEmbedded": 0,
+                                "embeddedNotInR2": 0, "embeddedNotInR2Songs": []},
+        }
+        self.asked: list = []
+
+        def reader(cfg, path):
+            self.asked.append((cfg.get("radio_library_remote"), path))
+            doc = self.docs.get(path)
+            return (doc, "") if doc is not None else (None, "rclone exit 1: object not found")
+
+        ms.set_r2_reader(reader)
+        self.cfg["radio_library_remote"] = "remote:bucket"
+
+    def tearDown(self):
+        ms.set_r2_reader(ms.rclone_cat)
+        super().tearDown()
+
+    def row(self):
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        return [r for r in doc["rows"] if r["name"] == "radio library"][0]
+
+    def test_healthy_library_passes_with_counts_decades_and_spend(self):
+        row = self.row()
+        self.assertEqual(row["status"], "pass")
+        self.assertEqual(row["value"],
+                         "38 today, 58 this week (lane 38, scout 20/200), 70s 1 90s 29 00s 6 10s 2, "
+                         "$0.06/$5 today, Stash 300 GB free")
+        self.assertEqual(row["datum"], "38")
+        self.assertIn("hiphop 38", row["detail"])
+        self.assertEqual({p for _, p in self.asked},
+                         {"radio/lane-status.json", "radio/scout-status.json", "radio/gaps.json"})
+        self.assertEqual({r for r, _ in self.asked}, {"remote:bucket"})
+
+    def test_stale_lane_warns(self):
+        self.docs["radio/lane-status.json"]["at"] = datetime.fromtimestamp(
+            self.t0 - 40 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = self.row()
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("lane 40 h old", row["value"])
+
+    def test_stash_near_the_reserve_warns(self):
+        self.docs["radio/lane-status.json"]["driveFreeGb"] = 155.2
+        row = self.row()
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("Stash 155 GB free, near", row["value"])
+        self.docs["radio/lane-status.json"]["driveFreeGb"] = 160.0
+        self.assertEqual(self.row()["status"], "pass")
+
+    def test_embedded_not_in_r2_warns_and_names_the_songs(self):
+        self.docs["radio/gaps.json"].update(embeddedNotInR2=1, embeddedNotInR2Songs=[
+            {"artist": "Flume", "title": "The Difference (feat. Toro y Moi)"}])
+        row = self.row()
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("1 embedded not in R2 (Flume - The Difference (feat. Toro y Moi))", row["value"])
+
+    def test_one_missing_file_warns_and_keeps_the_rest(self):
+        del self.docs["radio/scout-status.json"]
+        row = self.row()
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("38 today, 38 this week (lane 38, scout ?)", row["value"])
+        self.assertIn("scout-status: rclone exit 1", row["value"])
+
+    def test_r2_unreachable_is_its_own_warning(self):
+        self.docs.clear()
+        row = self.row()
+        self.assertEqual(row["status"], "warn")
+        self.assertTrue(row["value"].startswith("R2 unreadable"))
+        self.assertNotIn("old", row["value"])
+
+    def test_no_remote_no_row_and_no_r2_read(self):
+        self.cfg["radio_library_remote"] = ""
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        self.assertNotIn("radio library", [r["name"] for r in doc["rows"]])
+        self.assertEqual(self.asked, [])
+
+    def test_rows_filter_leaves_it_to_the_mac_that_answers_for_it(self):
+        self.cfg["check"]["rows"] = ["ledger"]
+        ms.cmd_check(self.cfg, argparse_namespace(json=False, strict=False))
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        self.assertNotIn("radio library", [r["name"] for r in doc["rows"]])
+        self.assertEqual(self.asked, [])
+
+
 class ListingTest(MediaSyncTestBase):
     # The score file must be buildable from a plain `ls -R` listing when the drive is busy.
     LISTING = (
