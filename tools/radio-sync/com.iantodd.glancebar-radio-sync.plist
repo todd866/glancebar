@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.iantodd.glancebar-radio-sync</string>
+  <!-- Every 10 min on the Mac that runs Glancebar: one taste profile with the 6IAN web radio
+       (docs/music.md, "Glancebar and 6IAN"). Small API calls only; no audio moves here. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/iantodd/Projects/glancebar/tools/radio-sync/radio_sync.py</string>
+    <string>sync</string>
+  </array>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/iantodd/.local/state/glancebar-radio/sync.log</string>
+  <key>StandardErrorPath</key><string>/Users/iantodd/.local/state/glancebar-radio/sync.log</string>
+</dict>
+</plist>

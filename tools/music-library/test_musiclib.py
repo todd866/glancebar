@@ -552,3 +552,29 @@ class MultiRootCatalogueTest(unittest.TestCase):
             doc = m.build_catalogue([a, b], Path(st))
             rels = sorted(e['relativePath'] for e in doc['entries'])
             self.assertEqual(rels, ['AM-Lossless/Artist/Album/one.m4a', 'AM-Lossless/Artist/Album/two.m4a'])
+
+
+class RadioRequestsTest(unittest.TestCase):
+    """The 6IAN radio's likes join the hot set's requests; the app's own requests win on a clash."""
+    def test_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            extra = Path(d) / 'hot.json'
+            extra.write_text(json.dumps({'schemaVersion': 1, 'playlists': [
+                {'key': 'radio:likes', 'title': '6IAN likes', 'tracks': [{'id': 'a|b', 'artist': 'A', 'title': 'B'}]},
+                {'key': 'station:triplej', 'title': 'clash', 'tracks': []}]}))
+            doc = {'schemaVersion': 1, 'playlists': [{'key': 'station:triplej', 'title': 'New music', 'tracks': []}]}
+            out = m.merge_extra_requests(doc, extra)
+            self.assertEqual([p['key'] for p in out['playlists']], ['station:triplej', 'radio:likes'])
+            self.assertEqual(out['playlists'][0]['title'], 'New music')
+            self.assertEqual(len(doc['playlists']), 1)  # the input is not changed
+
+    def test_missing_or_bad_file_adds_nothing(self):
+        doc = {'schemaVersion': 1, 'playlists': []}
+        self.assertIs(m.merge_extra_requests(doc, '/nonexistent/hot.json'), doc)
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / 'bad.json'; bad.write_text('{"schemaVersion": 2}')
+            self.assertIs(m.merge_extra_requests(doc, bad), doc)
+
+
+if __name__ == '__main__':
+    unittest.main()

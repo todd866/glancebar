@@ -11,6 +11,7 @@ cd "${0:A:h}"
 /usr/bin/python3 -m unittest discover -s tools/music-scout -v
 /usr/bin/python3 -m unittest discover -s tools/music-sync -v
 /usr/bin/python3 -m unittest discover -s tools/media-sync -v
+/usr/bin/python3 -m unittest discover -s tools/radio-sync -v
 
 CC="${CC:-$(xcrun --find clang)}"
 SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
@@ -143,6 +144,7 @@ fi
 GLANCEBAR_MUSIC_STATE=playing "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_MUSIC_STATE=idle "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=dislike "$WORK_DIR/glancebar_popover_tests"
+GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=radio-row GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-row GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=shows-playing GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"
 GLANCEBAR_SILENT_QA=1 GLANCEBAR_MUSIC_STATE=kinds-five GLANCEBAR_MUSIC_ROW_PNG="${GLANCEBAR_MUSIC_ROW_PNG:-$WORK_DIR/renders}" "$WORK_DIR/glancebar_popover_tests"

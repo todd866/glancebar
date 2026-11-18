@@ -32,6 +32,8 @@ HOME = Path.home()
 DEFAULT_CONFIG = HOME / '.config/glancebar/music-library.json'
 DEFAULT_STATE = HOME / '.local/state/glancebar-music-library'
 DEFAULT_REQUESTS = HOME / 'Library/Application Support/Glancebar/mix/offline-requests.json'
+# The 6IAN web radio's recent likes (tools/radio-sync writes it): kept in the hot set beside the app's requests.
+RADIO_REQUESTS = HOME / '.local/state/glancebar-radio/hot-requests.json'
 METERED_FLAG = HOME / '.local/state/METERED_LINK'
 TRASH = Path('/usr/bin/trash')
 AUDIO_SUFFIXES = {'.m4a', '.mp4', '.alac'}
@@ -521,6 +523,20 @@ def refresh_catalogue_cache(remote, state):
     dest = state_dir(state) / 'catalogue.json'
     fetch_remote_json(remote, 'catalogue.json', dest)
     return json.loads(dest.read_text())
+
+
+def merge_extra_requests(requests_doc, extra_path=None):
+    """Add the radio's playlists (schema 1) to the app's requests; a missing or bad file adds nothing,
+    and a key the app already requests is left to the app."""
+    path = Path(extra_path or RADIO_REQUESTS).expanduser()
+    try:
+        extra = load_requests(path)
+    except (OSError, ValueError):
+        return requests_doc
+    keys = {p.get('key') for p in requests_doc['playlists']}
+    merged = dict(requests_doc)
+    merged['playlists'] = list(requests_doc['playlists']) + [p for p in extra['playlists'] if p.get('key') not in keys]
+    return merged
 
 
 def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120):
@@ -1073,6 +1089,8 @@ def main(argv=None):
         state = args.state if hasattr(args, 'state') else None
         cap_bytes = cap_bytes_from_config(cfg)
         requests_doc = load_requests(args.requests)
+        if Path(args.requests).expanduser() == DEFAULT_REQUESTS:
+            requests_doc = merge_extra_requests(requests_doc)
         metered = metered_active()
         allow_metered = getattr(args, 'allow_metered', False)
         cached_catalogue_note = False

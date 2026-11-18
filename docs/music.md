@@ -512,3 +512,24 @@ M2 has its own signed-in amdl guest and the radio's fetch worker uses it:
 **Storage limit:** `OTV Mirror` (master volume for "Music lossless masters") had 28 GB free on 18 Nov. At
 the owner's 100-songs-a-day target (~4.8 GB/day) it fills in about five days; moving the masters' home
 (e.g. to Stash, 281 GB free) is an owner decision in `placement.toml`, not yet made.
+
+## Glancebar and 6IAN: one system, two front ends (18 Nov 2026)
+
+Owner, 18 Nov 2026: "glancebar should probably sync up with this project too." Glancebar and the 6IAN
+web radio share one taste profile, one library, the same moods and station mixes, and the same
+sourced song facts. `tools/radio-sync/radio_sync.py` is the only bridge; the app bundles it.
+
+| What | How |
+|---|---|
+| Taste, Glancebar → radio | Every 10 min (`com.iantodd.glancebar-radio-sync`, M5): new 👍/👎 lines in `mix/feedback.jsonl`, early skips (Next before 40%) from `mix/skip-history.jsonl`, and plays from `musicRecentPlays` go to the radio's `/api/device/signals` by artist and title. The radio matches exactly or not at all; unmatched songs are counted in `status.json`. |
+| Taste, radio → Glancebar | The radio's likes and dislikes (`/api/device/taste`) are appended to `mix/feedback.jsonl` as ordinary like/dislike lines tagged `"source": "6ian"`; the app re-reads the file when it changes (at most every 5 s). Glancebar's own marks are never written back; only lines the tool wrote are ever undone. A dislike on either side means never play it on either side. |
+| Library | The radio counts Glancebar's library as "Your library" (as before, from `library.json` in the nightly rebuild). The radio's recent likes become a hot-set request (`~/.local/state/glancebar-radio/hot-requests.json`, key `radio:likes`), which `musiclib.py` merges with the app's requests, so they are kept lossless on this Mac. |
+| Moods and stations | The **6IAN** line under the tiles: `6IAN ▾` lists the radio's moods and station mixes (`moods.json`, refreshed each sync). Picking one asks the radio's queue API (`radio_sync.py queue MOOD`), writes `station.json` in the New music file format, and plays it as `station:6ian` through the same lossless offline path as New music (songs on this Mac first; the hot set fetches the rest). `Glancebar --play radio:hiphop` or `radio:station:kexp` does the same from the command line. |
+| Song facts | The ⓘ on the 6IAN line shows the radio's sourced facts for the playing song: why it was picked, album, release year, credits, copyright line, and the artist's Wikipedia summary, each with its source (Apple, MusicBrainz, Wikipedia, 6IAN); picking a row opens the source. Nothing is written by a model. |
+| Auth | A device token for Ian's radio account, minted by the radio repo's `tools/device-token.mjs` into `~/.config/glancebar/radio.json` (0600, never in git). The radio accepts it only on the device API, the queue and song info, never as a browser session. No token on a Mac: no 6IAN line. |
+
+**Deliberate differences (parity note).** Glancebar plays lossless masters from its hot set and never
+streams the radio's AAC; a radio queue therefore waits for missing songs to be fetched (`fetching N of M`),
+where the website starts at once. The radio's voice DJ, map, lyrics and "this is wrong" flags stay on the
+website; Glancebar shows the facts read-only. Glancebar keeps its Dance/Alt/Rap/Chill kind tiles; the radio's
+moods sit beside them, not in place of them. QA stays silent on both sides (`musicSilentQA`; `?silent=1`).

@@ -65,6 +65,8 @@ static NSString *GBHomeDirectory(void) {
     return NSHomeDirectory();
 }
 
+static NSString *const kRadioStationKey = @"station:6ian";   // the 6IAN web radio queue (tools/radio-sync)
+
 #pragma mark - Metered links (Mac interface bytes only)
 
 static int MeteredResetDay(NSString *link) {
@@ -6320,6 +6322,11 @@ static void GBHangWatchStart(void) {
     CFAbsoluteTime _stationChecked;
     NSDate *_stationDate;
     NSArray *_stationFiles, *_stationPicks, *_stationTracks;
+    NSArray<NSDictionary *> *_radioMoods, *_radioStations;      // 6IAN mood dial + station mixes (glancebar-radio/moods.json)
+    NSString *_radioMood, *_radioMoodLabel, *_radioNote;           // the radio queue loaded as station:6ian
+    NSDate *_radioStationDate, *_radioMoodsDate;
+    BOOL _radioBusy;
+    NSDate *_mixFeedbackDate; CFAbsoluteTime _mixFeedbackChecked;   // feedback.jsonl also gets the radio's marks
     BOOL _showsLoaded, _showsScanBusy;
     CFAbsoluteTime _showsChecked;
     NSDate *_showsRootDate;
@@ -8003,7 +8010,7 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
 }
 - (BOOL)isMixPlaylistKey:(NSString *)key {
     if (!key.length) return NO;
-    if ([key isEqual:@"station:triplej"]) return YES;
+    if ([key isEqual:@"station:triplej"] || [key isEqual:kRadioStationKey]) return YES;
     for (NSDictionary *seed in _mixSeeds)
         if ([seed[@"key"] isEqual:key]) return YES;
     for (NSDictionary *seed in _mixSeedsNext)
@@ -8281,6 +8288,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSDictionary *primary = _offlineRequests[[self offlinePrimaryKey]];
     if (primary) [requests addObject:primary];
     if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
+    if (_offlineRequests[kRadioStationKey]) [requests addObject:_offlineRequests[kRadioStationKey]];
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
     if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
         _offlineRequestsGeneration++;
@@ -8450,7 +8458,7 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
 }
 - (BOOL)offlinePlaylistStillVisible:(NSString *)key {
     if (!key.length) return NO;
-    if ([key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"] || [key isEqual:@"show:episode"]) return YES;
+    if ([key isEqual:[self offlinePrimaryKey]] || [key isEqual:@"station:triplej"] || [key isEqual:kRadioStationKey] || [key isEqual:@"show:episode"]) return YES;
     if (_offlineRequests[key]) return YES;
     for (NSDictionary *seed in _mixSeeds) if ([seed[@"key"] isEqual:key]) return YES;
     return NO;
@@ -8802,6 +8810,11 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
         [self playStation:nil];
         return;
     }
+    if ([arg hasPrefix:@"radio:"] && arg.length > 6) {   // Glancebar --play radio:hiphop | radio:station:kexp
+        [self playbackCause:@"kind"];
+        [self playRadio:[arg substringFromIndex:6]];
+        return;
+    }
     if ([arg isEqual:@"show"]) {
         [self ensureShows];
         if (_showOffered) {
@@ -9151,6 +9164,252 @@ static NSString *const kShowMixKey = @"show:episode";
     }
     while (covers.count < 4 && covers.count) [covers addObject:covers.lastObject];
     return covers;
+}
+
+#pragma mark 6IAN web radio
+// Glancebar and the 6IAN web radio are one system with two front ends (docs/music.md, "Glancebar
+// and 6IAN"). The radio's engine picks the queue (moods, station mixes); Glancebar plays the
+// lossless masters from its own hot set through the same path as New music. The bridge is
+// tools/radio-sync/radio_sync.py (bundled); it holds the device token, never this app.
+- (NSString *)radioStatePath:(NSString *)name {
+    return [[GBHomeDirectory() stringByAppendingPathComponent:@".local/state/glancebar-radio"] stringByAppendingPathComponent:name];
+}
+- (void)ensureRadioMoods {
+    NSString *path = [self radioStatePath:@"moods.json"];
+    NSDate *d = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (!d || [d isEqual:_radioMoodsDate]) return;
+    _radioMoodsDate = d;
+    id raw = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:path] ?: NSData.data options:0 error:nil];
+    NSArray *(^rows)(id) = ^NSArray *(id list) {
+        NSMutableArray *out = [NSMutableArray array];
+        if (![list isKindOfClass:NSArray.class]) return out;
+        for (NSDictionary *r in list)
+            if ([r isKindOfClass:NSDictionary.class] && [r[@"id"] isKindOfClass:NSString.class] && [r[@"label"] isKindOfClass:NSString.class])
+                [out addObject:@{@"id": r[@"id"], @"label": r[@"label"]}];
+        return out;
+    };
+    _radioMoods = [raw isKindOfClass:NSDictionary.class] ? rows(raw[@"moods"]) : @[];
+    _radioStations = [raw isKindOfClass:NSDictionary.class] ? rows(raw[@"stations"]) : @[];
+}
+// station.json (written by `radio_sync.py queue MOOD`) -> the station:6ian offline request.
+- (BOOL)loadRadioStation {
+    NSString *path = [self radioStatePath:@"station.json"];
+    NSDate *d = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (!d) return NO;
+    if ([d isEqual:_radioStationDate] && _offlineRequests[kRadioStationKey]) return YES;
+    id raw = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:path] ?: NSData.data options:0 error:nil];
+    NSArray *rows = [raw isKindOfClass:NSDictionary.class] && [raw[@"tracks"] isKindOfClass:NSArray.class] ? raw[@"tracks"] : @[];
+    NSMutableArray *tracks = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSString *key = [row[@"track_key"] isKindOfClass:NSString.class] ? row[@"track_key"] : @"";
+        NSString *title = [row[@"title"] isKindOfClass:NSString.class] ? row[@"title"] : @"";
+        NSString *artist = [row[@"artist"] isKindOfClass:NSString.class] ? row[@"artist"] : @"";
+        if (!key.length || !title.length || [[self mixDisliked] containsObject:key]) continue;
+        NSMutableDictionary *t = [@{@"id": key, @"title": title, @"artist": artist,
+                                    @"album": [row[@"album"] isKindOfClass:NSString.class] ? row[@"album"] : @""} mutableCopy];
+        if ([row[@"duration"] isKindOfClass:NSNumber.class] && [row[@"duration"] doubleValue] > 0) t[@"duration"] = row[@"duration"];
+        for (NSString *f in @[@"catalogue_relative_path", @"sha256"])
+            if ([row[f] isKindOfClass:NSString.class] && [(NSString *)row[f] length]) t[f] = row[f];
+        [tracks addObject:t];
+    }
+    if (!tracks.count) return NO;
+    _radioStationDate = d;
+    NSString *mood = [raw[@"mood"] isKindOfClass:NSString.class] ? raw[@"mood"] : @"";
+    _radioMood = mood;
+    _radioMoodLabel = [self radioLabelFor:mood];
+    [self setOfflineRequest:kRadioStationKey title:[@"6IAN · " stringByAppendingString:_radioMoodLabel] tracks:tracks];
+    return YES;
+}
+- (NSString *)radioLabelFor:(NSString *)mood {
+    [self ensureRadioMoods];
+    for (NSDictionary *r in [_radioMoods arrayByAddingObjectsFromArray:_radioStations ?: @[]])
+        if ([r[@"id"] isEqual:mood]) return r[@"label"];
+    return mood.length ? mood : @"6IAN";
+}
+- (NSString *)radioHelper {
+    return [NSBundle.mainBundle pathForResource:@"radio_sync" ofType:@"py"];
+}
+// Ask the radio for a queue (in the background), then play it as station:6ian.
+- (void)playRadio:(NSString *)mood {
+    if (!_musicProbesEnabled || !mood.length || _radioBusy) return;
+    NSString *script = [self radioHelper];
+    if (!script.length) { _radioNote = @"radio helper missing"; return; }
+    _radioBusy = YES;
+    _radioMood = mood;
+    _radioMoodLabel = [self radioLabelFor:mood];
+    _radioNote = @"asking the radio…";
+    if (_popover.isShown) [self rebuildContent];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        task.arguments = @[script, @"queue", mood];
+        NSPipe *pipe = [NSPipe pipe];
+        task.standardOutput = pipe;
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        BOOL ok = NO;
+        if ([task launchAndReturnError:nil]) {
+            [pipe.fileHandleForReading readDataToEndOfFile];
+            [task waitUntilExit];
+            ok = task.terminationStatus == 0;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_radioBusy = NO;
+            if (ok && [self loadRadioStation]) {
+                self->_radioNote = nil;
+                [self saveOfflineRequests];
+                [self playOfflinePlaylist:kRadioStationKey];
+            } else self->_radioNote = @"radio unreachable";
+            if (self->_popover.isShown) [self rebuildContent];
+        });
+    });
+}
+- (IBAction)chooseRadioMood:(NSMenuItem *)item {
+    NSString *mood = [item.representedObject isKindOfClass:NSString.class] ? item.representedObject : nil;
+    if (!mood.length) return;
+    [self playbackCause:@"click"];
+    [self playRadio:mood];
+}
+- (NSMenu *)radioMenu {
+    [self ensureRadioMoods];
+    NSMenu *menu = [NSMenu new]; menu.autoenablesItems = NO;
+    void (^section)(NSString *, NSArray *) = ^(NSString *title, NSArray *rows) {
+        if (!rows.count) return;
+        if (menu.numberOfItems) [menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem *h = [menu addItemWithTitle:title action:nil keyEquivalent:@""]; h.enabled = NO;
+        for (NSDictionary *r in rows) {
+            NSMenuItem *it = [menu addItemWithTitle:r[@"label"] action:@selector(chooseRadioMood:) keyEquivalent:@""];
+            it.target = self; it.representedObject = r[@"id"];
+            it.state = [r[@"id"] isEqual:self->_radioMood] && [self->_mixPlayingKey isEqual:kRadioStationKey] ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+    };
+    section(@"Moods", _radioMoods);
+    section(@"Stations", _radioStations);
+    if (!menu.numberOfItems) {
+        NSMenuItem *none = [menu addItemWithTitle:@"No radio list yet (radio-sync has not run)" action:nil keyEquivalent:@""];
+        none.enabled = NO;
+    }
+    return menu;
+}
+- (IBAction)showRadioMenu:(NSButton *)sender {
+    [[self radioMenu] popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSHeight(sender.bounds) + 2) inView:sender];
+}
+// The now-playing song's sourced facts (the radio's About: Apple, MusicBrainz, Wikipedia, our
+// records), each with its source; nothing written by a model. Picking a row opens its source.
+- (IBAction)showRadioAbout:(NSButton *)sender {
+    NSDictionary *ident = [self currentLocalIdentity];
+    NSString *artist = ident[@"artist"] ?: _localArtist, *title = ident[@"title"] ?: _localTitle;
+    NSString *script = [self radioHelper];
+    if (!artist.length || !title.length || !script.length) return;
+    sender.enabled = NO;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+        task.arguments = @[script, @"about", artist, title];
+        NSPipe *pipe = [NSPipe pipe];
+        task.standardOutput = pipe;
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+        NSDictionary *doc = nil;
+        if ([task launchAndReturnError:nil]) {
+            NSData *out = [pipe.fileHandleForReading readDataToEndOfFile];
+            [task waitUntilExit];
+            id parsed = out.length ? [NSJSONSerialization JSONObjectWithData:out options:0 error:nil] : nil;
+            if ([parsed isKindOfClass:NSDictionary.class]) doc = parsed;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sender.enabled = YES;
+            [[self radioAboutMenu:doc] popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSHeight(sender.bounds) + 2) inView:sender];
+        });
+    });
+}
+- (NSMenu *)radioAboutMenu:(NSDictionary *)doc {
+    NSMenu *menu = [NSMenu new]; menu.autoenablesItems = NO;
+    if (![doc[@"ok"] boolValue]) {
+        NSMenuItem *it = [menu addItemWithTitle:doc ? @"Not in the radio's library" : @"Radio unreachable" action:nil keyEquivalent:@""];
+        it.enabled = NO;
+        return menu;
+    }
+    void (^row)(NSDictionary *) = ^(NSDictionary *f) {
+        if (![f isKindOfClass:NSDictionary.class] || ![f[@"label"] isKindOfClass:NSString.class] || ![f[@"value"] isKindOfClass:NSString.class]) return;
+        NSString *src = [f[@"src"] isKindOfClass:NSString.class] ? f[@"src"] : @"";
+        NSString *url = [f[@"url"] isKindOfClass:NSString.class] ? f[@"url"] : @"";
+        NSMenuItem *it = [menu addItemWithTitle:[NSString stringWithFormat:@"%@  %@", f[@"label"], f[@"value"]] action:url.length ? @selector(openRadioSource:) : nil keyEquivalent:@""];
+        it.target = self; it.representedObject = url; it.enabled = url.length > 0;
+        it.toolTip = src.length ? [@"Source: " stringByAppendingString:src] : nil;
+        NSMutableAttributedString *t = [[NSMutableAttributedString alloc] initWithString:f[@"label"]
+            attributes:@{NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSFontAttributeName: [NSFont menuFontOfSize:12]}];
+        [t appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:f[@"value"]]
+            attributes:@{NSForegroundColorAttributeName: NSColor.labelColor, NSFontAttributeName: [NSFont menuFontOfSize:12]}]];
+        if (src.length) [t appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:src]
+            attributes:@{NSForegroundColorAttributeName: NSColor.tertiaryLabelColor, NSFontAttributeName: [NSFont menuFontOfSize:10]}]];
+        it.attributedTitle = t;
+    };
+    NSArray *why = [doc[@"why"] isKindOfClass:NSArray.class] ? doc[@"why"] : @[];
+    for (NSDictionary *f in why) row(f);
+    NSArray *facts = [doc[@"facts"] isKindOfClass:NSArray.class] ? doc[@"facts"] : @[];
+    if (facts.count && why.count) [menu addItem:NSMenuItem.separatorItem];
+    for (NSDictionary *f in facts) row(f);
+    NSDictionary *bio = [doc[@"artist"] isKindOfClass:NSDictionary.class] ? doc[@"artist"] : nil;
+    if ([bio[@"summary"] isKindOfClass:NSString.class] && [bio[@"url"] isKindOfClass:NSString.class]) {
+        [menu addItem:NSMenuItem.separatorItem];
+        NSString *summary = bio[@"summary"];
+        NSRange end = [summary rangeOfString:@". "];
+        NSString *first = end.location != NSNotFound ? [summary substringToIndex:end.location + 1] : summary;
+        row(@{@"label": bio[@"title"] ?: @"Artist", @"value": first, @"src": @"Wikipedia", @"url": bio[@"url"]});
+        menu.itemArray.lastObject.toolTip = summary;   // the whole summary; the row shows its first sentence
+    }
+    return menu;
+}
+- (IBAction)openRadioSource:(NSMenuItem *)item {
+    NSString *url = [item.representedObject isKindOfClass:NSString.class] ? item.representedObject : nil;
+    if ([url hasPrefix:@"https://"]) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:url]];
+}
+// One compact row under the tiles: [6IAN ▾ mood] status ............ [ⓘ]
+- (BOOL)radioConfigured {
+    return [NSFileManager.defaultManager fileExistsAtPath:[GBHomeDirectory() stringByAppendingPathComponent:@".config/glancebar/radio.json"]];
+}
+- (CGFloat)addRadioLineTo:(NSView *)root at:(CGFloat)y {
+    if (![self radioConfigured]) return y;   // no device token on this Mac: no row
+    [self ensureRadioMoods];
+    [self loadRadioStation];
+    const CGFloat rowH = 22;
+    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
+    line.accessibilityIdentifier = @"popover.radio.line";
+    BOOL playing = [_mixPlayingKey isEqual:kRadioStationKey];
+    NSString *label = [NSString stringWithFormat:@"6IAN  %@ ▾", _radioMoodLabel.length ? _radioMoodLabel : @"moods & stations"];
+    NSButton *pick = [NSButton buttonWithTitle:label target:self action:@selector(showRadioMenu:)];
+    pick.bordered = NO;
+    pick.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    pick.contentTintColor = playing ? NSColor.controlAccentColor : NSColor.labelColor;
+    [pick sizeToFit];
+    pick.frame = NSMakeRect(kPad - 2, 1, MIN(NSWidth(pick.frame) + 4, kW / 2), rowH - 2);
+    pick.accessibilityHelp = @"6IAN web radio: play a mood or a station mix here, lossless from this Mac's library";
+    pick.accessibilityIdentifier = @"popover.radio.pick";
+    [line addSubview:pick];
+    NSString *status = _radioNote;
+    if (!status.length && _offlineRequests[kRadioStationKey]) status = [self offlineStatus:[self offlineCoverage:kRadioStationKey verifyHash:NO]];
+    CGFloat infoW = 22, sx = NSMaxX(pick.frame) + 6;
+    NSTextField *st = [GBRecoverableTextField labelWithString:status ?: @""];   // a clipped status keeps its full text on hover
+    st.font = [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightRegular];
+    st.textColor = NSColor.secondaryLabelColor;
+    st.maximumNumberOfLines = 1;
+    st.lineBreakMode = NSLineBreakByTruncatingTail;
+    st.frame = NSMakeRect(sx, 4, kW - kPad - infoW - 4 - sx, 14);
+    st.accessibilityHelp = status;
+    st.accessibilityIdentifier = @"popover.radio.status";
+    [line addSubview:st];
+    NSButton *info = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"info.circle" accessibilityDescription:@"About this song"]
+                                        target:self action:@selector(showRadioAbout:)];
+    info.bordered = NO;
+    info.frame = NSMakeRect(kW - kPad - infoW, 1, infoW, rowH - 2);
+    info.enabled = _localMode && _localTitle.length > 0;
+    info.accessibilityHelp = @"About this song: why it was picked, album, credits, artist (each with its source)";
+    info.accessibilityIdentifier = @"popover.radio.about";
+    [line addSubview:info];
+    [root addSubview:line];
+    return y + rowH;
 }
 
 - (void)ensureStation {
@@ -10326,7 +10585,19 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
 }
+// The radio sync (tools/radio-sync) appends the 6IAN web radio's likes and dislikes to
+// feedback.jsonl; re-read it when it changes (checked at most every 5 s).
+- (void)reloadMixFeedbackIfChanged {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - _mixFeedbackChecked < 5) return;
+    _mixFeedbackChecked = now;
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
+    NSDate *d = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (d && _mixFeedbackDate && ![d isEqual:_mixFeedbackDate]) { _mixLiked = nil; _mixDisliked = nil; }
+    _mixFeedbackDate = d;
+}
 - (NSMutableSet<NSString *> *)mixDisliked {
+    [self reloadMixFeedbackIfChanged];
     if (!_mixDisliked) {
         NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
         _mixDisliked = [MixDislikedKeys([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]) mutableCopy];
@@ -10372,6 +10643,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     _stationPicks = picks;
 }
 - (NSMutableSet<NSString *> *)mixLiked {
+    [self reloadMixFeedbackIfChanged];
     if (!_mixLiked) {
         NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"feedback.jsonl"];
         _mixLiked = [MixLikedIDs([NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]) mutableCopy];
@@ -10866,6 +11138,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (loaded && _trackDuration > 0) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
     y = [self addOutputLineTo:root at:y];
     if (!_musicOff) y = [self addSeedTilesTo:root at:y];
+    if (!_musicOff) y = [self addRadioLineTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
 }
 #pragma mark Other Macs

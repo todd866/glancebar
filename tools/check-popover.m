@@ -1615,6 +1615,52 @@ int main(int argc, const char **argv) {
                 if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"dislike-on-light.png"], NSAppearanceNameAqua))
                     return Fail(__LINE__);
             }
+        } else if (musicState && strcmp(musicState, "radio-row") == 0) {
+            // The 6IAN line: absent without a device config; with one, one compact row under the
+            // tiles (picker, status, About) that fits, keeps the popover within its budget, and
+            // carries no wordy hover text.
+            [c setValue:@YES forKey:@"localMode"];
+            [c setValue:@YES forKey:@"playbackKnown"];
+            [c setValue:@"Sure Shot" forKey:@"localTitle"];
+            [c setValue:@"Beastie Boys" forKey:@"localArtist"];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            if (FindIdentifier(root, @"popover.radio.line")) return Fail(__LINE__);
+            NSString *cfgDir = [fixtureHome stringByAppendingPathComponent:@".config/glancebar"];
+            NSString *stateDir = [fixtureHome stringByAppendingPathComponent:@".local/state/glancebar-radio"];
+            [NSFileManager.defaultManager createDirectoryAtPath:cfgDir withIntermediateDirectories:YES attributes:nil error:nil];
+            [NSFileManager.defaultManager createDirectoryAtPath:stateDir withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"{\"url\": \"https://radio.invalid\", \"token\": \"fixture\"}" writeToFile:[cfgDir stringByAppendingPathComponent:@"radio.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"{\"moods\": [{\"id\": \"hiphop\", \"label\": \"Hip hop\"}, {\"id\": \"chill\", \"label\": \"Chill\"}], \"stations\": [{\"id\": \"station:kexp\", \"label\": \"KEXP\"}]}"
+                writeToFile:[stateDir stringByAppendingPathComponent:@"moods.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"{\"mood\": \"hiphop\", \"tracks\": [{\"track_key\": \"beastie boys|sure shot\", \"title\": \"Sure Shot\", \"artist\": \"Beastie Boys\", \"album\": \"Ill Communication\"}]}"
+                writeToFile:[stateDir stringByAppendingPathComponent:@"station.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSView *radio = FindIdentifier(root, @"popover.radio.line");
+            NSButton *pick = (NSButton *)FindIdentifier(root, @"popover.radio.pick");
+            NSButton *about = (NSButton *)FindIdentifier(root, @"popover.radio.about");
+            if (!radio || !pick || !about || !FindIdentifier(root, @"popover.radio.status") || CountIdentifier(root, @"popover.radio.line") != 1)
+                return Fail(__LINE__);
+            if (![pick.title containsString:@"Hip hop"] || !about.enabled || radio.frame.size.height > 22.5) return Fail(__LINE__);
+            NSMenu *menu = [c performSelector:@selector(radioMenu)];
+            NSMutableArray *titles = [NSMutableArray array];
+            for (NSMenuItem *it in menu.itemArray) if (!it.separatorItem) [titles addObject:it.title];
+            if (![titles isEqual:(@[@"Moods", @"Hip hop", @"Chill", @"Stations", @"KEXP"])]) return Fail(__LINE__);
+            NSMenu *facts = [c performSelector:@selector(radioAboutMenu:) withObject:@{@"ok": @YES, @"why": @[],
+                @"facts": @[@{@"k": @"album", @"label": @"Album", @"value": @"Ill Communication", @"src": @"Apple", @"url": @"https://music.apple.com"},
+                            @{@"k": @"year", @"label": @"Released", @"value": @"1994", @"src": @"MusicBrainz"}]}];
+            if (facts.numberOfItems != 2 || ![facts.itemArray[0].toolTip isEqual:@"Source: Apple"] || !facts.itemArray[0].enabled ||
+                facts.itemArray[1].enabled) return Fail(__LINE__);
+            if (!FitsChildren(root) || !InstrumentRowsFit(root) || root.bounds.size.height > 490) return Fail(__LINE__);
+            const char *musicRowPNG = getenv("GLANCEBAR_MUSIC_ROW_PNG");
+            if (musicRowPNG && musicRowPNG[0]) {
+                NSString *dir = [NSString stringWithUTF8String:musicRowPNG];
+                [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                if (!RenderOffscreen(root, [dir stringByAppendingPathComponent:@"radio-light.png"], NSAppearanceNameAqua) ||
+                    !RenderOffscreen(root, [dir stringByAppendingPathComponent:@"radio-dark.png"], NSAppearanceNameDarkAqua))
+                    return Fail(__LINE__);
+            }
         } else if (musicState && strcmp(musicState, "idle") == 0) {
             [c setValue:@NO forKey:@"localMode"];
             [c setValue:@NO forKey:@"playbackKnown"];
@@ -2467,7 +2513,7 @@ int main(int argc, const char **argv) {
         [c rebuildContent];
         root = p.contentViewController.view;
         if (CountGauges(root) != 7 || FirstScrollView(root) || !FitsChildren(root) ||
-            root.bounds.size.height > 468 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row)
+            root.bounds.size.height > 490 || !InstrumentRowsFit(root)) return Fail(__LINE__);   // +22 output line, +90 seed tiles (title row + artist row), +22 6IAN radio line (only when the radio is configured)
         NSArray *compactDocs = @[root, [c overviewDetailsView].documentView, [c aiDetailsView].documentView];
         NSArray *compactStems = @[@"popover.ai.cursor", @"details.overview.ai.cursor", @"details.ai.cursor"];
         for (NSUInteger i = 0; i < compactDocs.count; i++) {

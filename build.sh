@@ -80,6 +80,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 tools/offline-cache/offline_cache.py "$APP/Contents/Resources/offline_cache.py"
 install -m 0644 tools/music-library/musiclib.py "$APP/Contents/Resources/musiclib.py"
+install -m 0644 tools/radio-sync/radio_sync.py "$APP/Contents/Resources/radio_sync.py"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 
 # Sign with a stable identity. Ad-hoc signing pins the designated requirement to the code
