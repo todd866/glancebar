@@ -172,8 +172,14 @@ on on the M5); `false` turns it off without touching anything else.
 | RRR | `rrr.org.au/explore/schedule?date=…`, then each episode page (Airnet lags RRR by a week) |
 | PBS, 4ZZZ | Airnet weekly grid (`airnet.org.au/rest/stations/<call>/guides/fm`), then each slot's `/playlists` |
 | RTR FM | Airnet program list and each program's `/episodes` (RTR has no grid on Airnet), then `/playlists` |
+| KCRW | `tracklist-api.kcrw.com/<channel>/date/Y/M/D?page_size=500` by Los Angeles day (Simulcast = 89.9's music shows, Music = Eclectic24; `[BREAK]` rows dropped) |
+| Radio Paradise | `api.radioparadise.com/api/nowplaying_list_v2022?chan=N`, then one `nowplaying_list_more_v2022` page, channels 0–3 (Main, Mellow, Rock, Global). It keeps only about 2 h of history, so each run adds to that channel's UTC day instead of replacing it: a nightly run sees about 2 h a channel |
+| Double J | `music.abcradio.net.au/api/v1/plays/search.json?station=doublej` by UTC day, 100 a page (the endpoint the selector reads triple j from); a page is about 1.6 MB, so a 7-day backfill is about 45 MB |
 | triple j | the selector's own `~/.local/state/selector/plays.jsonl`; nothing is fetched |
 | FBi | not read: its tracklists come only from the site's own `/payload-api` (disallowed in robots.txt) |
+| SomaFM | not read: robots.txt disallows `*/songhistory.html`, `*.json` and `*.xml` for every agent; `api.somafm.com` is `Disallow: /` |
+| Dublab | not read: its archive and tracklists come from `dublab.wpengine.com`, whose robots.txt is `Disallow: /` |
+| Worldwide FM | not read: no structured tracklists (episodes are Mixcloud uploads with free-text notes) |
 
 Every request carries a generic User-Agent, waits 2 s after the previous request to the same host,
 and counts against a per-run budget (`radio_max_requests`, 700) and time limit
@@ -184,7 +190,9 @@ it ends (three days if it has no tracks yet), and a final episode is never fetch
 night reads only what is new. The window is `radio_days` (7). The first backfill on 18 Nov 2026 used the whole
 700-request budget in 8.5 min (RTR finished on the next run); a run straight after sent 60
 requests in 2 min. KEXP's API offers a next page past the end of a date range, so an empty page
-ends the range.
+ends the range. KCRW, Radio Paradise and Double J were added on 18 Nov 2026; their first
+backfill took 52 requests (KCRW 3,298 plays, Double J 2,335, Radio Paradise 110), and with them
+247 of the week's 538 multi-station tracks reached two stations only because of a new one.
 
 Ranking: plays are matched across stations on primary artist and title (feat. and remaster
 suffixes ignored, remixes kept apart). A track heard on two or more stations comes first, scored

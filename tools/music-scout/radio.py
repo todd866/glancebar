@@ -13,9 +13,14 @@ dropped.
 few scout candidates, multi-station tracks first. Nothing here downloads audio: the
 scout's normal acquire step is the only way a candidate becomes a file.
 
-Station not covered: FBi (Sydney). Its tracklists are only served by the site's own
-GraphQL backend (/payload-api, disallowed in robots.txt) or embedded in each episode
-page's framework payload, with no public list of recent episodes.
+Stations not covered, and why:
+- FBi (Sydney): tracklists only come from the site's own GraphQL backend (/payload-api,
+  disallowed in robots.txt) or each episode page's framework payload.
+- SomaFM: robots.txt disallows */songhistory.html, *.json and *.xml for every agent, and
+  api.somafm.com is Disallow: /.
+- Dublab: its archive and tracklists come from dublab.wpengine.com, whose robots.txt is
+  Disallow: /.
+- Worldwide FM: no structured tracklists; episodes are Mixcloud uploads with free-text notes.
 """
 
 from __future__ import annotations
@@ -55,10 +60,13 @@ STATIONS: dict[str, dict[str, Any]] = {
     "pbs": {"name": "PBS", "kind": "airnet_guide", "call": "3pbs", "guide": "fm", "tz": "Australia/Melbourne"},
     "4zzz": {"name": "4ZZZ", "kind": "airnet_guide", "call": "4zzz", "guide": "fm", "tz": "Australia/Brisbane"},
     "rtr": {"name": "RTR FM", "kind": "airnet_programs", "call": "6rtr", "tz": "Australia/Perth"},
+    "kcrw": {"name": "KCRW", "kind": "kcrw", "channels": ["Simulcast", "Music"], "tz": "America/Los_Angeles"},
+    "rp": {"name": "Radio Paradise", "kind": "radioparadise", "channels": [0, 1, 2, 3]},
+    "doublej": {"name": "Double J", "kind": "abc", "station": "doublej"},
     # Read from the selector's own log (~/.local/state/selector/plays.jsonl); never fetched here.
     "triplej": {"name": "triple j", "kind": "local"},
 }
-DEFAULT_STATIONS = ["kexp", "nts", "bbc6", "wfmu", "rrr", "pbs", "4zzz", "rtr"]
+DEFAULT_STATIONS = ["kexp", "nts", "bbc6", "wfmu", "rrr", "pbs", "4zzz", "rtr", "kcrw", "rp", "doublej"]
 
 KEXP_API = "https://api.kexp.org/v2/plays/"
 NTS_RECENT = "https://www.nts.live/api/v2/collections/recently-added"
@@ -68,6 +76,12 @@ WFMU_FEED = "https://wfmu.org/playlistfeed.xml"
 WFMU_PLAYLIST = "https://wfmu.org/playlists/shows/{id}"
 RRR_BASE = "https://www.rrr.org.au"
 AIRNET = "https://airnet.org.au/rest/stations"
+KCRW_API = "https://tracklist-api.kcrw.com"
+RP_API = "https://api.radioparadise.com/api"
+ABC_PLAYS = "https://music.abcradio.net.au/api/v1/plays/search.json"
+KCRW_PAGE = 500  # the API's limit (400 above it); a busy Eclectic24 day is about 380 plays
+ABC_PAGE = 100
+RP_CHANNELS = {0: "Main Mix", 1: "Mellow Mix", 2: "Rock Mix", 3: "Global Mix"}
 
 HOUR = 3600.0
 DAY = 86400.0
@@ -446,6 +460,64 @@ def parse_airnet_playlist(text: str) -> list[dict]:
     return out
 
 
+def parse_kcrw_day(text: str) -> list[dict]:
+    """tracklist-api.kcrw.com/<channel>/date/Y/M/D → plays (breaks dropped), oldest first."""
+    doc = json.loads(text)
+    out = []
+    for row in doc if isinstance(doc, list) else []:
+        artist, title = row.get("artist") or "", row.get("title") or ""
+        if not artist or not title or artist.strip().upper() == "[BREAK]":
+            continue
+        out.append(play(artist, title, parse_time(row.get("datetime") or ""), album=row.get("album") or "",
+                        show=row.get("program_title") or "", year=row.get("year")))
+    return sorted(out, key=lambda p: p["at"])
+
+
+def parse_rp_list(text: str) -> tuple[list[dict], str | None]:
+    """Radio Paradise nowplaying_list(_more)_v2022 → (plays newest first, oldest event id for the
+    next page). Each play keeps the channel's own event id as `event`."""
+    doc = json.loads(text)
+    out = []
+    for s in doc.get("song") or []:
+        try:
+            at = datetime.fromtimestamp(float(s.get("play_time")) / 1000.0, tz=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        chan = s.get("chan", doc.get("chan"))
+        try:
+            show = (s.get("channel") or {}).get("title") or RP_CHANNELS.get(int(chan), "")
+        except (TypeError, ValueError):
+            show = ""
+        p = play(s.get("artist"), s.get("title"), at, album=s.get("album") or "", show=show, year=s.get("year"))
+        p["event"] = str(s.get("event") or "")
+        out.append(p)
+    events = [p["event"] for p in out if p["event"]]
+    return out, (min(events, key=lambda e: int(e) if e.isdigit() else 0) if events else None)
+
+
+def parse_abc_plays(text: str) -> tuple[list[dict], int]:
+    """music.abcradio.net.au plays/search page → (plays, rows on the page). The primary artist is
+    the recording's first artist of type primary, as the selector reads triple j."""
+    doc = json.loads(text)
+    items = doc.get("items") or []
+    out = []
+    for it in items:
+        rec = it.get("recording") or {}
+        summary = it.get("summary") or {}
+        artist = ""
+        for a in rec.get("artists") or []:
+            if (a.get("type") or "primary") == "primary" and a.get("name"):
+                artist = a["name"]
+                break
+        artist = artist or summary.get("artist") or ""
+        releases = rec.get("releases") or []
+        album = (releases[0].get("title") if releases else "") or ""
+        year = releases[0].get("release_year") if releases else None
+        out.append(play(artist, rec.get("title") or summary.get("title") or "", parse_time(it.get("played_time") or ""),
+                        album=album, year=year))
+    return out, len(items)
+
+
 def local_slot(local_start: str, tz: ZoneInfo) -> datetime | None:
     try:
         return datetime.strptime(local_start, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).astimezone(timezone.utc)
@@ -473,6 +545,15 @@ class Store:
 
     def put(self, unit: str, at: str, plays: list[dict], *, final: bool, end: str = "") -> None:
         self.units[unit] = {"at": at, "end": end or at, "final": final, "plays": plays}
+
+    def merge(self, unit: str, at: str, plays: list[dict], *, final: bool, end: str = "") -> None:
+        """Add plays to a unit without losing the ones already kept (for a source that only shows
+        the last few hours, read more than once a day)."""
+        old = (self.units.get(unit) or {}).get("plays") or []
+        seen = {(p.get("at"), p.get("artist"), p.get("title")) for p in old}
+        new = [p for p in plays if (p.get("at"), p.get("artist"), p.get("title")) not in seen]
+        merged = sorted(old + new, key=lambda p: p.get("at") or "")
+        self.put(unit, at, merged, final=final, end=end)
 
     def prune(self, since: datetime) -> None:
         """Forget units that ended before the window (a KEXP day half inside it stays)."""
@@ -642,7 +723,78 @@ def read_airnet_programs(f: Fetcher, store: Store, since: datetime, now: datetim
                             prog["name"])
 
 
+def read_kcrw(f: Fetcher, store: Store, since: datetime, now: datetime, st: dict) -> None:
+    """KCRW's tracklist API by channel and Los Angeles day (Simulcast = 89.9's music shows,
+    Music = Eclectic24)."""
+    tz = ZoneInfo(st["tz"])
+    day = since.astimezone(tz).date()
+    while day <= now.astimezone(tz).date():
+        start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        for ch in st.get("channels") or ["Music"]:
+            unit = f"{ch}/{day.isoformat()}"
+            if store.done(unit):
+                continue
+            body = f.get(f"{KCRW_API}/{ch}/date/{day.year}/{day.month:02d}/{day.day:02d}?page_size={KCRW_PAGE}",
+                         ttl=2 * HOUR)
+            if body is None:  # refused: try again next run rather than keep an empty day
+                continue
+            plays = [p for p in parse_kcrw_day(body) if p["at"] >= utc(since)]
+            store.put(unit, utc(start), plays, final=_final(end, now, len(plays), settle_hours=2), end=utc(end))
+        day += timedelta(days=1)
+
+
+def read_abc(f: Fetcher, store: Store, since: datetime, now: datetime, st: dict) -> None:
+    """ABC's public play history (the endpoint the selector reads triple j from), by UTC day."""
+    day = since.date()
+    while day <= now.date():
+        unit = day.isoformat()
+        start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        if not store.done(unit):
+            plays: list[dict] = []
+            for page in range(10):
+                q = urllib.parse.urlencode({"station": st["station"], "limit": ABC_PAGE, "order": "asc",
+                                            "offset": page * ABC_PAGE, "from": utc(start), "to": utc(min(end, now))})
+                body = f.get(f"{ABC_PLAYS}?{q}", ttl=2 * HOUR)
+                if body is None:
+                    break
+                rows, n = parse_abc_plays(body)
+                plays.extend(rows)
+                if n < ABC_PAGE:
+                    break
+            store.put(unit, utc(start), [p for p in plays if p["at"] >= utc(since)],
+                      final=_final(end, now, len(plays), settle_hours=2), end=utc(end))
+        day += timedelta(days=1)
+
+
+def read_radioparadise(f: Fetcher, store: Store, since: datetime, now: datetime, st: dict) -> None:
+    """Radio Paradise keeps only about two hours of history per channel (the list and one
+    'more' page), so each read adds to that channel's UTC day instead of replacing it."""
+    for chan in st.get("channels") or [0]:
+        body = f.get(f"{RP_API}/nowplaying_list_v2022?chan={chan}&mode=wip-channel", ttl=HOUR / 2)
+        plays, oldest = parse_rp_list(body) if body else ([], None)
+        if oldest:
+            more = f.get(f"{RP_API}/nowplaying_list_more_v2022?chan={chan}&list_offset={oldest}", ttl=HOUR / 2)
+            plays += parse_rp_list(more)[0] if more else []
+        by_day: dict[date, list[dict]] = defaultdict(list)
+        for p in plays:
+            at = parse_time(p["at"])
+            if at and at >= since:
+                by_day[at.date()].append({k: v for k, v in p.items() if k != "event"})
+        for day, rows in by_day.items():
+            unit = f"{chan}/{day.isoformat()}"
+            if store.done(unit):
+                continue
+            start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+            end = start + timedelta(days=1)
+            store.merge(unit, utc(start), rows, final=now - end >= timedelta(hours=2), end=utc(end))
+
+
 READERS: dict[str, Callable[..., None]] = {
+    "kcrw": read_kcrw,
+    "abc": read_abc,
+    "radioparadise": read_radioparadise,
     "kexp": read_kexp,
     "nts": read_nts,
     "bbc": read_bbc,

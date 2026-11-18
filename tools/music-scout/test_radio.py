@@ -113,6 +113,31 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([t["artist"] for t in tracks], ["Mr Jukes", "The J.B's", "Jill Scott"])  # comment dropped
         self.assertEqual(radio.parse_airnet_playlist('{"message":"No such episode"}'), [])
 
+    def test_kcrw_day_drops_breaks_and_keeps_show_and_utc(self):
+        plays = radio.parse_kcrw_day(fixture("kcrw_day.json"))
+        self.assertEqual(len(plays), 3)  # the [BREAK] row is gone
+        self.assertEqual(plays[-1]["artist"], "To Rococo Rot")  # oldest first
+        self.assertEqual(plays[-1]["at"], "2026-11-17T05:56:47Z")  # -08:00 converted to UTC
+        self.assertEqual(plays[-1]["show"], "Olive Kimoto")
+        self.assertEqual(plays[-1]["album"], "The Amateur View")
+
+    def test_radio_paradise_list(self):
+        plays, oldest = radio.parse_rp_list(fixture("rp_list.json"))
+        self.assertEqual([p["artist"] for p in plays], ["Crash Test Dummies", "Stereophonics", "BALTHVS"])
+        self.assertEqual(plays[0]["year"], 1993)
+        self.assertEqual(plays[0]["show"], "Main Mix")
+        self.assertTrue(plays[0]["at"].startswith("2026-11-18T"))
+        self.assertEqual(oldest, "2948559")
+        self.assertEqual(radio.parse_rp_list('{"song": []}'), ([], None))
+
+    def test_abc_plays_primary_artist_release_and_year(self):
+        plays, n = radio.parse_abc_plays(fixture("abc_plays.json"))
+        self.assertEqual(n, 3)
+        self.assertEqual(plays[1]["artist"], "Saint Etienne")
+        self.assertEqual(plays[1]["title"], "Only Love Can Break Your Heart")
+        self.assertEqual(plays[0]["at"], "2026-11-16T23:56:39Z")
+        self.assertIn("year", plays[0])
+
     def test_airnet_local_time_to_utc(self):
         tz = radio.ZoneInfo("Australia/Perth")
         self.assertEqual(radio.utc(radio.local_slot("2026-11-13 21:00:00", tz)), "2026-11-13T13:00:00Z")
@@ -206,6 +231,52 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(len(plays["pbs"]), 3)
         self.assertEqual(plays["pbs"][0]["at"], "2026-11-16T22:00:00Z")  # 09:00 Melbourne, UTC+11
         self.assertEqual(plays["pbs"][0]["show"], "Mystic Brew")
+
+    def test_kcrw_reads_each_channel_by_los_angeles_day(self):
+        t = FakeTransport([("tracklist-api.kcrw.com/Simulcast/date/2026/11/16", (200, fixture("kcrw_day.json"))),
+                           ("tracklist-api.kcrw.com", (200, "[]"))])
+        plays, report = self.run_collect(t, ["kcrw"])
+        self.assertIsNone(report["kcrw"]["error"])
+        days = sorted({c.split("/date/")[1].split("?")[0] for c in t.calls})
+        self.assertEqual(days, ["2026/11/16", "2026/11/17", "2026/11/18"])  # LA days covering the window
+        self.assertEqual({c.split(".com/")[1].split("/")[0] for c in t.calls}, {"Simulcast", "Music"})
+        self.assertEqual(len(plays["kcrw"]), 3)
+        self.assertTrue(all("page_size=500" in c for c in t.calls))
+
+    def test_kcrw_refused_day_is_not_kept_as_an_empty_final_day(self):
+        t = FakeTransport([("tracklist-api.kcrw.com", (400, '{"error":"page_size may not exceed 500"}'))])
+        self.run_collect(t, ["kcrw"], days=6.0)
+        store = radio.Store(self.cache / "plays" / "kcrw.json")
+        self.assertEqual(store.units, {})
+
+    def test_double_j_pages_a_utc_day_until_a_short_page(self):
+        full = json.loads(fixture("abc_plays.json"))
+        full["items"] = (full["items"] * 34)[:radio.ABC_PAGE]
+        t = FakeTransport([("offset=0&from=2026-11-17", (200, json.dumps(full))),
+                           ("music.abcradio.net.au", (200, fixture("abc_plays.json")))])
+        plays, report = self.run_collect(t, ["doublej"], days=1.0)
+        self.assertIsNone(report["doublej"]["error"])
+        self.assertTrue(all("station=doublej" in c for c in t.calls))
+        day17 = [c for c in t.calls if "from=2026-11-17" in c]
+        self.assertEqual(len(day17), 2)  # a full page, then a short one ends the day
+        self.assertIn("offset=100", day17[1])
+
+    def test_radio_paradise_adds_to_the_day_instead_of_replacing_it(self):
+        now = datetime(2026, 11, 18, 7, 0, tzinfo=timezone.utc)
+        first = FakeTransport([("nowplaying_list_v2022?chan=0", (200, fixture("rp_list.json"))),
+                               ("nowplaying_list", (200, '{"song": []}'))])
+        f = radio.Fetcher(self.cache, transport=first, sleep=self.clock.sleep, monotonic=self.clock.monotonic)
+        radio.collect(["rp"], self.cache, f, now=now, days=1.0)
+        self.assertIn("list_offset=2948559", first.calls[1])
+        later = json.loads(fixture("rp_list.json"))
+        later["song"] = [dict(later["song"][0], event="2948600", artist="Khruangbin", title="Maria Tambien",
+                              play_time=later["song"][0]["play_time"] + 600000)]
+        second = FakeTransport([("nowplaying_list_v2022?chan=0", (200, json.dumps(later))),
+                                ("nowplaying_list", (200, '{"song": []}'))])
+        # A new fetcher with a fresh cache dir; the play store is the same.
+        f = radio.Fetcher(self.cache / "fresh", transport=second, sleep=self.clock.sleep, monotonic=self.clock.monotonic)
+        plays, _ = radio.collect(["rp"], self.cache, f, now=now + radio.timedelta(hours=3), days=1.0)
+        self.assertEqual(len(plays["rp"]), 4)  # the first read's three are kept
 
     def test_one_station_failing_leaves_the_others(self):
         t = FakeTransport([("wfmu.org/playlistfeed", (503, "")), ("api.kexp.org", (200, kexp_last_page()))])

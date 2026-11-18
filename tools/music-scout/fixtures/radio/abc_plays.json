@@ -1,0 +1,79 @@
+{
+ "total": 3,
+ "offset": 0,
+ "limit": 100,
+ "items": [
+  {
+   "entity": "Play",
+   "arid": "mpnjl1561d",
+   "played_time": "2026-11-16T23:56:39+00:00",
+   "summary": {
+    "artist": "Candice Lorrae",
+    "title": "Paperbark And Lilies"
+   },
+   "recording": {
+    "title": "Paperbark And Lilies",
+    "artists": [
+     {
+      "name": "Candice Lorrae",
+      "type": "primary"
+     }
+    ],
+    "releases": [
+     {
+      "title": "Paperbark And Lilies",
+      "release_year": "2027"
+     }
+    ]
+   }
+  },
+  {
+   "entity": "Play",
+   "arid": "mprPjP28qL",
+   "played_time": "2026-11-16T23:52:06+00:00",
+   "summary": {
+    "artist": "Saint Etienne",
+    "title": "Only Love Can Break Your Heart"
+   },
+   "recording": {
+    "title": "Only Love Can Break Your Heart",
+    "artists": [
+     {
+      "name": "Saint Etienne",
+      "type": "primary"
+     }
+    ],
+    "releases": [
+     {
+      "title": "Foxbase Alpha",
+      "release_year": "1990"
+     }
+    ]
+   }
+  },
+  {
+   "entity": "Play",
+   "arid": "mpnYPVgO1r",
+   "played_time": "2026-11-16T23:46:48+00:00",
+   "summary": {
+    "artist": "Hot Chip",
+    "title": "Random Violence"
+   },
+   "recording": {
+    "title": "Random Violence",
+    "artists": [
+     {
+      "name": "Hot Chip",
+      "type": "primary"
+     }
+    ],
+    "releases": [
+     {
+      "title": "A Long Way From Kansas",
+      "release_year": "2027"
+     }
+    ]
+   }
+  }
+ ]
+}
