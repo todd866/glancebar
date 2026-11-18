@@ -5127,7 +5127,6 @@ static id SmallSliderInFrame(Class cls, NSRect frame, double value, double minVa
     slider.target = target;
     slider.action = action;
     slider.continuous = continuous;
-    [slider layoutSubtreeIfNeeded];
     return slider;
 }
 @interface GBPickerChevron : NSImageView @end
