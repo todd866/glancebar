@@ -535,3 +535,20 @@ class FakeTrash(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MultiRootCatalogueTest(unittest.TestCase):
+    """Drives are capacity pools: one catalogue over several masters roots (18 Nov 2026)."""
+
+    def test_two_roots_merge_with_same_key_layout(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, tempfile.TemporaryDirectory() as st:
+            for root, name in ((a, 'one.m4a'), (b, 'two.m4a')):
+                p = Path(root) / 'AM-Lossless' / 'Artist' / 'Album' / name
+                p.parent.mkdir(parents=True)
+                p.write_bytes(b'\0' * 64)
+            dup = Path(b) / 'AM-Lossless' / 'Artist' / 'Album' / 'one.m4a'
+            dup.write_bytes(b'\1' * 64)
+            doc = m.build_catalogue([a, b], Path(st))
+            rels = sorted(e['relativePath'] for e in doc['entries'])
+            self.assertEqual(rels, ['AM-Lossless/Artist/Album/one.m4a', 'AM-Lossless/Artist/Album/two.m4a'])

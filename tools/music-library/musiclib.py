@@ -252,13 +252,37 @@ def catalogue_entry_for_file(path, masters_root, cache):
     return entry, cache
 
 
+def _roots(masters_dir):
+    """One masters folder or several (drives are capacity pools: owner, 18 Nov 2026). Each root holds
+    the same AM-Lossless/... layout, so a file's path under its root is its R2 key either way."""
+    items = masters_dir if isinstance(masters_dir, (list, tuple)) else [masters_dir]
+    return [Path(m).expanduser().resolve() for m in items]
+
+
 def build_catalogue(masters_dir, state):
-    masters = Path(masters_dir).expanduser().resolve()
-    if not masters.is_dir():
-        raise ValueError(f'masters directory missing: {masters}')
+    roots = _roots(masters_dir)
+    for masters in roots:
+        if not masters.is_dir():
+            raise ValueError(f'masters directory missing: {masters}')
     cache = load_build_cache(state)
     entries = []
     skipped = []
+    seen = set()
+    for masters in roots:
+        cache = _catalogue_root(masters, cache, entries, skipped, seen)
+    if skipped:
+        print(f'catalogue: skipped {len(skipped)} file(s), first: {skipped[0]}', file=sys.stderr)
+    if not entries:
+        raise ValueError(f'no audio masters found under {", ".join(map(str, roots))}')
+    save_build_cache(state, cache)
+    return {
+        'schemaVersion': CATALOGUE_SCHEMA,
+        'generatedAt': int(time.time()),
+        'entries': entries,
+    }
+
+
+def _catalogue_root(masters, cache, entries, skipped, seen):
     def walk_error(exc):
         skipped.append(f'{getattr(exc, "filename", "?")}: {exc.strerror or exc}')
 
@@ -281,17 +305,12 @@ def build_catalogue(masters_dir, state):
             skipped.append(f'{path}: not a regular non-empty file')
             continue
         entry, cache = catalogue_entry_for_file(path, masters, cache)
+        if entry['relativePath'] in seen:  # same key in two pools: the first root wins
+            skipped.append(f'{path}: duplicate of {entry["relativePath"]} in an earlier root')
+            continue
+        seen.add(entry['relativePath'])
         entries.append(entry)
-    if skipped:
-        print(f'catalogue: skipped {len(skipped)} file(s), first: {skipped[0]}', file=sys.stderr)
-    if not entries:
-        raise ValueError(f'no audio masters found under {masters}')
-    save_build_cache(state, cache)
-    return {
-        'schemaVersion': CATALOGUE_SCHEMA,
-        'generatedAt': int(time.time()),
-        'entries': entries,
-    }
+    return cache
 
 
 def atomic_write_json(path, document):
@@ -320,20 +339,21 @@ def catalogue_command(masters_dir, remote, state, upload=True, archive=True):
     local_out = state / 'catalogue.json'
     atomic_write_json(local_out, doc)
     if archive:
-        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026).
-        try:
-            atomic_write_json(Path(masters_dir).expanduser().resolve() / ARCHIVE_DIR_NAME / 'library-metadata.json', doc)
-        except OSError as exc:
-            print(f'catalogue: could not write the metadata record beside the masters: {exc}', file=sys.stderr)
-            raise
+        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026): on every pool.
+        for root in _roots(masters_dir):
+            try:
+                atomic_write_json(root / ARCHIVE_DIR_NAME / 'library-metadata.json', doc)
+            except OSError as exc:
+                print(f'catalogue: could not write the metadata record beside the masters: {exc}', file=sys.stderr)
+                raise
     if upload:
         upload_local_json(local_out, remote, 'catalogue.json')
     return doc
 
 
 def push_command(masters_dir, remote):
-    masters = Path(masters_dir).expanduser().resolve()
-    rclone_run(['copy', str(masters), remote, '--checksum'])
+    for masters in _roots(masters_dir):
+        rclone_run(['copy', str(masters), remote, '--checksum'])
 
 
 def load_requests(path):
@@ -989,14 +1009,14 @@ def main(argv=None):
     sub = p.add_subparsers(dest='command', required=True)
 
     c_cat = sub.add_parser('catalogue', help='walk masters and publish catalogue.json')
-    c_cat.add_argument('--masters', type=Path, required=True)
+    c_cat.add_argument('--masters', type=Path, required=True, action='append', help='repeat for each masters pool')
     c_cat.add_argument('--config', type=Path)
     c_cat.add_argument('--state', type=Path)
     c_cat.add_argument('--no-upload', action='store_true')
     c_cat.add_argument('--no-archive', action='store_true', help='do not write _metadata/library-metadata.json beside the masters')
 
     c_push = sub.add_parser('push', help='rclone copy masters to remote (no deletes)')
-    c_push.add_argument('--masters', type=Path, required=True)
+    c_push.add_argument('--masters', type=Path, required=True, action='append', help='repeat for each masters pool')
     c_push.add_argument('--config', type=Path)
 
     c_plan = sub.add_parser('plan', help='compute hot-set plan JSON')
