@@ -34,6 +34,19 @@ stage is idempotent and safe to rerun.
 | `radio_min_gap_seconds` | 2 | Gap between requests to one host |
 | `radio_max_seconds` | 1500 | Time limit for the radio step |
 | `radio_cache_days` | 14 | Cached responses kept |
+| `backcatalogue_enabled` | false | Older records (`backcatalogue.py`) as a candidate source, with the weekly split below |
+| `backcatalogue_share` | 0.5 | Share of `tracks_per_week` kept for back catalogue; the rest is new (radio, Shazams, new releases, taste) |
+| `decades` | 1960s–2010s | Back-catalogue decades, filled roughly equally each week |
+| `backcatalogue_max_candidates` | 20 | Back-catalogue rows offered per night (never more than the back half of the week has room for) |
+| `backcatalogue_lookups` | 100 | iTunes lookups per night to date radio plays (remembered in `backcatalogue/years.json`) |
+| `backcatalogue_max_seconds` | 900 | Time limit for the back-catalogue step's lookups |
+| `backcatalogue_lists` | all | Canon lists read (`grammy-hof-*`, `pazz-jop`, `rolling-stone-500`, `mercury`, `polaris`, `amp`) |
+| `backcatalogue_refresh_days` | 30 | A canon list is fetched again after this |
+| `backcatalogue_llm` | true | Ask the taste LLM for older records near his artists |
+| `backcatalogue_llm_suggestions` | 24 | Tracks requested from that prompt |
+| `status_remote` | `glancebar-music:glancebar-music` | rclone remote for `scout-status.json` |
+| `status_remote_path` | `radio/scout-status.json` | Path in that remote |
+| `rclone` | `/opt/homebrew/bin/rclone` | rclone binary (launchd's PATH has no Homebrew) |
 
 ## State (`~/.local/state/glancebar-music-scout/`)
 
@@ -45,6 +58,8 @@ stage is idempotent and safe to rerun.
 | `new-music.json` | Playlist for the Glancebar **New music** tile |
 | `source-stats.json` | Per-source counts; flags sources empty ≥3 nights |
 | `last-run.json` | Last `run` summary for `status` |
+| `scout-status.json` | Public summary copied to R2 after each `run` (see below) |
+| `backcatalogue/` | Canon list copies (`lists/`), HTTP cache, `years.json` (release years and catalogue matches) |
 | `scout.lock` | Exclusive lock for state-changing commands |
 
 ## Commands
@@ -57,6 +72,7 @@ python3 tools/music-scout/scout.py acquire --go       # real amdl on M5
 python3 tools/music-scout/scout.py acquire --go --limit 1  # supervised single-track trial
 python3 tools/music-scout/scout.py publish
 python3 tools/music-scout/scout.py status           # exit 1 if unhealthy
+python3 tools/music-scout/scout.py publish-status   # write scout-status.json and copy it to R2
 python3 tools/music-scout/scout.py run [--go]
 ```
 
@@ -102,6 +118,14 @@ tracks skipped early via `click-next` on multiple days without ever finishing
    `stations`, `plays`, `heard` and a `why` such as "Heard on KEXP and PBS, latest 16 Nov".
    Cache and per-station plays: `radio-cache/` in the state folder.
 
+5. **backcatalogue** (when `backcatalogue_enabled`) — older records, 1960s to 2010s
+   (`backcatalogue.py`; sources, politeness and the weekly split in `docs/music.md`, "Back catalogue").
+   Radio plays radio.py already stored, dated by the station's year or the earliest iTunes release;
+   critics' canon lists and prizes read from Wikipedia; and the taste LLM asked for older records near
+   his artists. Every row has `year`, `decade`, `era: "back"`, `source` `back:canon|radio|llm`, and
+   `canon` / `stations` for its support. Every candidate with a known year is tagged `year`, `decade`
+   and `era`; `rank` keeps about `backcatalogue_share` of the week back catalogue, decades in turn.
+
 ### Acquire guards
 
 Exit **75** (defer) when not on Apple **M5**, when
@@ -138,7 +162,22 @@ python3 -m unittest discover -s tools/music-scout -v
 
 No network; mixpool, iTunes, `ai-pick`, and `amdl` are stubbed. `test_radio.py` checks each
 station parser against the saved pages in `fixtures/radio/` and drives the readers through a
-fake transport.
+fake transport. `test_backcatalogue.py` does the same for the canon lists (trimmed pages in
+`fixtures/canon/`), robots.txt, the decade split, the rank quota and the status document.
+
+## `scout-status.json` (R2 `radio/scout-status.json`, for the web radio's Profile page)
+
+```json
+{"schemaVersion": 1, "at": "…Z", "acquiredThisWeek": 31, "acquiredGbThisWeek": 1.2,
+ "budgetTracks": 200, "budgetGb": 10, "backcatalogueEnabled": true, "backcatalogueShare": 0.5,
+ "decades": ["1960s", "…"], "byDecadeThisWeek": {"1960s": 3, "…": 0, "2020s": 14},
+ "newVsBack": {"new": 18, "back": 13},
+ "lastRun": {"at": "…Z", "ok": true, "dryRun": false, "queue": 40, "acquired": 28, "failed": 1,
+             "noMatch": 0, "candidates": {"radio": 40, "backcatalogue": 20}, "errors": 0}}
+```
+
+Counts and flags only (no paths, no error text). Written after every `run`, also when it fails
+or defers; an upload failure is printed and never fails the run.
 
 ## `new-music.json` track shape (for offline-cache)
 

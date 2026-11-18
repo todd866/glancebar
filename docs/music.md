@@ -213,6 +213,48 @@ Supervised one-track trial on the M5 (mains, unmetered):
 python3 tools/music-scout/scout.py acquire --go --limit 1
 ```
 
+## Back catalogue: cool records from every era (18 Nov 2026)
+
+Owner, 18 Nov 2026: "lots of stuff in this app. Cool shit from every era." The scout keeps about
+half of each week's tracks (`backcatalogue_share`, 0.5) for records from the 1960s to the 2010s
+(`decades`), roughly the same number from each decade; the other half is new music (radio,
+Shazams, new releases, taste). `"backcatalogue_enabled": true` in the scout config turns it on.
+Code: `tools/music-scout/backcatalogue.py`; acquisition is the scout's usual amdl path, nothing else.
+
+| Source | What counts as support |
+|---|---|
+| Radio deep catalogue | Plays radio.py already stored (nothing extra fetched). Dated by the station's own year (KEXP release date, WFMU year column) or the earliest release of that song on the iTunes Search API, at most `backcatalogue_lookups` (100) a night, remembered in `backcatalogue/years.json` |
+| Critics' canon, from Wikipedia | Grammy Hall of Fame (four pages), Village Voice Pazz & Jop number-one albums and singles, Rolling Stone 500 top tens, Mercury Prize, Polaris Prize and Australian Music Prize winners and shortlists. Fetched again after 30 days |
+| Taste LLM, older | The taste step's engine (same `ai-pick` capacity guard) asked for older records near his artists, spread over the decades; each confirmed on iTunes |
+
+Not read, and why (checked 18 Nov 2026): Pitchfork, Rolling Stone, NME, the Guardian and Acclaimed
+Music name Claude/Anthropic agents in robots.txt, so this code does not read them even though its
+generic User-Agent would pass (Rolling Stone's top tens come from Wikipedia instead). AllMusic answers
+a plain request with a Cloudflare 403. The Rock Hall's "500 Songs" page on Wikipedia now redirects to
+the museum's article. The robots check is in the code: a list is fetched only when robots.txt allows
+it for `*`, our token and ClaudeBot, Claude-User and anthropic-ai alike. Requests go through
+radio.py's Fetcher: generic User-Agent, 2 s between requests to a host, cached.
+
+Ranking: canon lists, stations and an LLM pick each add to a row's score, and agreement counts most
+(a radio play from a Mercury-shortlisted album carries the prize). Within a decade the best canon,
+radio and LLM rows are taken in turn. A list's own year is authoritative (an iTunes date is often a
+remaster); a radio play takes the earliest year it can find. The release acquired is the earliest
+non-compilation one. Excluded on the list row and again on the catalogue hit: children's music,
+karaoke, covers and tributes, live and re-recorded versions, and classical, opera, comedy and
+cast-recording genres. Owned, offered, hearted and rejected tracks are skipped.
+
+Quota: a night offers at most `backcatalogue_max_candidates` (20), and never more than the back half
+of the week has room for, so a finite list is not burned as "offered" without being acquired. Slots
+go to the decades furthest below their weekly share; a decade with nothing left gives its slots to
+the others (`thin_decades` in `candidates.json`). In `rank`, after the priority rows, back and new
+rows alternate so the running share stays at the target and each side stops at its half of the
+week; rows left out are not recorded as offered and are there the next night. Acquired rows carry
+`year`, `decade` and `era`; a new row is dated from the release found for it.
+
+After every run the scout writes `scout-status.json` (week's acquisitions, budget, share, by decade,
+new against back, a brief of the last run; counts only) and copies it to R2 at
+`radio/scout-status.json` for the web radio's Profile page. `scout.py publish-status` does it by hand.
+
 ## Favourites bound to the wrong song (found 11 Nov 2026)
 
 Until 11 Nov 2026 `mixpool.py pull-liked` accepted any search result by the right artist, so

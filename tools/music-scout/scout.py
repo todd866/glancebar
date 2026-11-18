@@ -47,6 +47,7 @@ import offline_cache as oc  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import radio  # noqa: E402
+import backcatalogue as bc  # noqa: E402
 
 DEFAULTS: dict[str, Any] = {
     "tracks_per_week": 20,
@@ -95,6 +96,22 @@ DEFAULTS: dict[str, Any] = {
     "radio_max_seconds": 1500,
     "radio_cache_days": 14,
     "triplej_plays": str(HOME / ".local/state/selector/plays.jsonl"),
+    # Older records (backcatalogue.py): radio deep catalogue, critics' canon, LLM picks from older
+    # decades. Off unless the config turns it on. The share is of the weekly track budget.
+    "backcatalogue_enabled": False,
+    "backcatalogue_share": 0.5,
+    "decades": list(bc.DEFAULT_DECADES),
+    "backcatalogue_max_candidates": 20,
+    "backcatalogue_lookups": 100,
+    "backcatalogue_max_seconds": 900,
+    "backcatalogue_lists": list(bc.CANON_LISTS),
+    "backcatalogue_refresh_days": 30,
+    "backcatalogue_llm": True,
+    "backcatalogue_llm_suggestions": 24,
+    # Small status document for the web radio's Profile page, copied to R2 after each run.
+    "status_remote": "glancebar-music:glancebar-music",
+    "status_remote_path": "radio/scout-status.json",
+    "rclone": "/opt/homebrew/bin/rclone",
 }
 
 _SHORT_MONTHS = (
@@ -457,6 +474,12 @@ class Runners:
         media_check: Callable[[], str | None] | None = None,
         radio_transport: Callable[..., tuple[int, str]] | None = None,
         radio_sleep: Callable[[float], None] | None = None,
+        itunes_song_matches: Callable[..., list[dict] | None] | None = None,
+        itunes_album_songs: Callable[..., list[dict] | None] | None = None,
+        canon_transport: Callable[..., tuple[int, str]] | None = None,
+        canon_sleep: Callable[[float], None] | None = None,
+        publish_status: Callable[[Path], str | None] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ):
         self.itunes_search = itunes_search or _default_itunes_search
         self.itunes_lookup = itunes_lookup or _default_itunes_lookup
@@ -478,6 +501,16 @@ class Runners:
         # Station playlists: None means the real network (radio.urllib_transport) and time.sleep.
         self.radio_transport = radio_transport
         self.radio_sleep = radio_sleep or time.sleep
+        # Back catalogue: every same-song release on the catalogue (for the earliest year), an
+        # album's songs, and the list pages (None means the real network).
+        self.itunes_song_matches = itunes_song_matches or _default_itunes_song_matches
+        self.itunes_album_songs = itunes_album_songs or _default_itunes_album_songs
+        self.canon_transport = canon_transport
+        self.canon_sleep = canon_sleep or time.sleep
+        # Copies scout-status.json to R2. Off unless the command line turns it on, so a test never
+        # writes into the real bucket. Returns an error string or None.
+        self.publish_status = publish_status or (lambda path: None)
+        self.monotonic = monotonic or time.monotonic
 
 
 MEDIA_SYNC = Path(__file__).resolve().parent.parent / "media-sync" / "media_sync.py"
@@ -553,6 +586,55 @@ def _default_itunes_song_best(artist: str, title: str, album: str = "", *, sleep
 
     _itunes_rate_limit(sleep)
     return mixpool.itunes_song_best(artist, title, album)
+
+
+def _mixpool():
+    if str(MIXPOOL_DIR) not in sys.path:
+        sys.path.insert(0, str(MIXPOOL_DIR))
+    import mixpool  # noqa: E402
+
+    return mixpool
+
+
+def _default_itunes_song_matches(artist: str, title: str, *, sleep=time.sleep) -> list[dict] | None:
+    """Every release of this song by this artist (mixpool paces calls at about 20 a minute).
+    None means the catalogue could not be asked."""
+    mixpool = _mixpool()
+    raw = mixpool._itunes_search(artist, title)
+    if raw is None:
+        return None
+    return [r for r in raw if r.get("wrapperType") == "track" and mixpool._same_song(r, artist, title)]
+
+
+def _default_itunes_album_songs(artist: str, album: str, *, sleep=time.sleep) -> list[dict] | None:
+    """Songs from a search for "artist album", in the catalogue's own order (most played first)."""
+    mixpool = _mixpool()
+    raw = mixpool._itunes_get(ITUNES_API, {"term": f"{artist} {album}", "entity": "song", "country": "au", "limit": 25})
+    if raw is None:
+        return None
+    return [r for r in raw if r.get("wrapperType") == "track"]
+
+
+def rclone_publisher(cfg: dict[str, Any]) -> Callable[[Path], str | None]:
+    """Copies a file to `status_remote`/`status_remote_path` with rclone (credentials stay in
+    rclone's own config). launchd's PATH has no Homebrew, hence the absolute default."""
+
+    def push(path: Path) -> str | None:
+        exe = str(cfg.get("rclone") or "")
+        if not exe or not Path(exe).is_file():
+            exe = shutil.which("rclone", path=_tool_env()["PATH"]) or ""
+        if not exe:
+            return "rclone not found"
+        dest = f"{cfg['status_remote']}/{cfg['status_remote_path']}"
+        try:
+            proc = subprocess.run([exe, "copyto", str(path), dest], capture_output=True, text=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return f"rclone: {exc}"
+        if proc.returncode != 0:
+            return f"rclone exit {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-200:]}"
+        return None
+
+    return push
 
 
 ENGINE_COMMANDS = {
@@ -1262,6 +1344,7 @@ def source_new_releases(
                         "source": "new-release",
                         "why": f"New on {released}",
                         "score_hint": 0.78,
+                        "year": bc.year_of(released),
                     }
                 )
     return out
@@ -1358,11 +1441,329 @@ def source_taste_expansion(
                 "why": str(row.get("why") or "taste match"),
                 "score_hint": 0.65,
                 "track_id": hit.get("trackId"),
+                "year": bc.year_of(hit.get("releaseDate")),
             }
         )
     if dropped:
         print(f"taste-expansion: dropped {dropped} unconfirmed", file=sys.stderr)
     return out, None
+
+
+# --- back catalogue (older records; backcatalogue.py) -----------------------------------------
+
+
+def era_of(year: Any, decades: list[str]) -> str:
+    """"back" for a year in one of the back-catalogue decades, else "new" (unknown counts as new)."""
+    return "back" if bc.decade_of(bc.year_of(year)) in decades else "new"
+
+
+def tag_era(row: dict, decades: list[str]) -> dict:
+    year = bc.year_of(row.get("year"))
+    if year:
+        row["year"] = year
+        row["decade"] = bc.decade_of(year)
+        row.setdefault("era", era_of(year, decades))
+    return row
+
+
+def weekly_era_stats(ledger: Path, now: datetime, decades: list[str]) -> dict[str, Any]:
+    """This week's acquisitions: back and new, and how many from each decade."""
+    week_ago = now - timedelta(days=7)
+    by_decade: Counter[str] = Counter()
+    back = new = 0
+    for row in read_jsonl_rows(ledger):
+        if row.get("action") != "acquired":
+            continue
+        at = parse_iso(row.get("at") or "")
+        if not at or at < week_ago:
+            continue
+        decade = row.get("decade") or bc.decade_of(bc.year_of(row.get("year")))
+        if decade:
+            by_decade[decade] += 1
+        if (row.get("era") or era_of(row.get("year"), decades)) == "back":
+            back += 1
+        else:
+            new += 1
+    return {"back": back, "new": new, "by_decade": by_decade}
+
+
+def era_room(cfg: dict[str, Any], ledger: Path, now: datetime) -> dict[str, Any]:
+    """The week's track budget split into back catalogue and new, less what each already has,
+    and what each decade still needs for an even spread."""
+    decades = list(cfg["decades"])
+    tpw = int(cfg["tracks_per_week"])
+    share = min(1.0, max(0.0, float(cfg["backcatalogue_share"])))
+    back_target = int(round(tpw * share))
+    stats = weekly_era_stats(ledger, now, decades)
+    per_decade = -(-back_target // max(1, len(decades)))  # ceiling
+    return {
+        "share": share,
+        "back_target": back_target,
+        "new_target": tpw - back_target,
+        "back_room": max(0, back_target - stats["back"]),
+        "new_room": max(0, tpw - back_target - stats["new"]),
+        "deficits": {d: max(0, per_decade - stats["by_decade"].get(d, 0)) for d in decades},
+        "stats": stats,
+    }
+
+
+def _build_back_prompt(cfg: dict[str, Any], decades: list[str], n: int, exclude: list[str]) -> str:
+    payload = {
+        "task": "suggest_older_tracks",
+        "count": n,
+        "decades": decades,
+        "loved_artists": liked_artists(cfg)[:20],
+        "owned_artists_to_exclude": exclude[:1500],
+        "rules": [
+            "Return ONLY a JSON array",
+            "Each item: artist, title, year (the original release year), why (one short clause)",
+            "Spread the picks evenly over the decades listed",
+            "Older artists near the loved ones: their influences, precursors, contemporaries and the scenes they came from",
+            "Cool, respected records of the kind critics, crate-diggers and good community radio play",
+            "No novelty or chart filler, covers, tributes, live versions, karaoke or children's music",
+            "Primary artist must NOT appear in owned_artists_to_exclude or loved_artists",
+            "Real released tracks only",
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def back_llm_rows(
+    cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, decades: list[str], n: int
+) -> tuple[list[dict], str | None]:
+    """Older picks near his artists from the taste LLM (same ai-pick capacity guard), each confirmed
+    on the catalogue, which also gives the earliest release year."""
+    exclude = sorted(owned_artists(cfg, paths))
+    code, text = runners.ai_pick(_build_back_prompt(cfg, decades, n, exclude),
+                                 str(cfg.get("ai_pick_cmd") or DEFAULTS["ai_pick_cmd"]))
+    reason = " ".join(str(text or "").split())[:300]
+    if code == 75:
+        return [], "deferred" + (f": {reason}" if reason else "")
+    if code != 0:
+        return [], f"ai-pick exit {code}" + (f": {reason}" if reason else "")
+    loved = {normal(a) for a in liked_artists(cfg)}
+    skip_artists = {normal(a) for a in exclude}
+    out = []
+    for item in _parse_llm_json(text):
+        artist, title = str(item.get("artist") or "").strip(), str(item.get("title") or "").strip()
+        if not artist or not title or normal(artist) in loved or primary_artist_name(artist) in skip_artists:
+            continue
+        hits = runners.itunes_song_matches(artist, title, sleep=runners.sleep)
+        best = bc.best_hit(hits or [])
+        if not best:
+            continue
+        found = bc.earliest_year(hits or [])
+        said = bc.year_of(item.get("year"))
+        year = min(y for y in (said, found) if y) if (said or found) else None
+        out.append({"artist": best.get("artistName") or artist, "title": best.get("trackName") or title,
+                    "album": best.get("collectionName") or "", "year": year,
+                    "why": str(item.get("why") or "taste match"), "track_id": best.get("trackId")})
+    return out, None
+
+
+def _keep_hit(hit: dict | None, year: int | None) -> dict | None:
+    """The catalogue fields worth remembering, with the earliest release year as releaseDate."""
+    if not hit:
+        return None
+    keep = {k: hit.get(k) for k in ("trackId", "artistName", "trackName", "collectionName",
+                                     "primaryGenreName", "trackTimeMillis") if hit.get(k) is not None}
+    keep["releaseDate"] = str(year or "")
+    return keep
+
+
+def source_backcatalogue(
+    cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, rejected: set[str],
+    tonight: list[dict] | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
+    """Older records for the back-catalogue half of the week, spread over the decades.
+
+    Sources: station plays already stored by radio.py (dated by the station's year or the earliest
+    catalogue release), the critics' canon lists, and the LLM asked for older records near his
+    artists. Offers at most `backcatalogue_max_candidates` a night and never more than the back
+    half of the week has room for, so nothing finite is burned as "offered" unacquired."""
+    now = parse_iso(runners.clock()) or utc_now()
+    decades = list(cfg["decades"])
+    room = era_room(cfg, paths.ledger, now)
+    n = min(int(cfg["backcatalogue_max_candidates"]), room["back_room"])
+    doc: dict[str, Any] = {
+        "week_room": room["back_room"],
+        "back_target": room["back_target"],
+        "deficits": room["deficits"],
+        "not_read": dict(bc.NOT_READ),
+    }
+    if n <= 0:
+        doc["held_back"] = "back-catalogue share of the week already used"
+        return [], doc
+
+    state = paths.state / "backcatalogue"
+    started = runners.monotonic()
+    deadline = started + float(cfg["backcatalogue_max_seconds"])
+    lookups = {"date": 0, "resolve": 0}
+    lookup_budget = int(cfg["backcatalogue_lookups"])
+
+    # 1. Canon lists (cached for refresh_days; a refusal by robots.txt is reported, not fetched).
+    fetcher = radio.Fetcher(
+        state / "http",
+        transport=runners.canon_transport,
+        sleep=runners.canon_sleep,
+        min_gap=max(2.0, float(cfg["radio_min_gap_seconds"])),
+        budget=40,
+        deadline_seconds=300,
+        user_agent=bc.USER_AGENT,
+    )
+    canon, canon_report = bc.load_canon(fetcher, state, lists=list(cfg["backcatalogue_lists"]), now=now,
+                                        refresh_days=float(cfg["backcatalogue_refresh_days"]))
+    doc["canon"] = canon_report
+    doc["canon_requests"] = fetcher.requests
+
+    # 2. Radio deep catalogue: plays radio.py already stored this window (nothing is fetched).
+    skip = owned_keys(cfg, paths) | rejected | load_hearts(Path(cfg["hearts_path"]).expanduser())
+    skip_loose = {radio.match_key(*k.split("|", 1)) for k in skip if "|" in k}
+    # What the other sources already put forward tonight (a multi-station radio pick is often old).
+    skip_loose |= {radio.match_key(r.get("artist", ""), r.get("title", "")) for r in tonight or []}
+
+    def taken(artist: str, title: str) -> bool:
+        return track_key(artist, title) in skip or radio.match_key(artist, title) in skip_loose
+
+    stations = [c for c in cfg["radio_stations"] if c != "triplej"]
+    plays = bc.radio_plays(paths.state / "radio-cache", stations, now - timedelta(days=float(cfg["radio_days"])))
+    agg = {k: r for k, r in radio.aggregate(plays).items()
+           if not taken(r["artist"], r["title"]) and not bc.excluded(artist=r["artist"], title=r["title"], album=r.get("album") or "")}
+    given = bc.station_years(plays)
+    years = bc.YearCache(state / "years.json")
+    radio_years: dict[str, int] = {}
+    order = sorted(agg, key=lambda k: (-len(agg[k]["stations"]), -sum(s["plays"] for s in agg[k]["stations"].values()), k))
+    lookup_failed = 0
+    for key in order:
+        y = given.get(key)
+        cached = years.get(key, now)
+        if cached is not None:
+            y = min(v for v in (y, cached.get("year")) if v) if (y or cached.get("year")) else None
+        elif not (y and bc.decade_of(y) not in decades) and lookups["date"] < lookup_budget and runners.monotonic() < deadline:
+            # Undated, or dated old by the station (KEXP's date can be a reissue): ask the catalogue.
+            r = agg[key]
+            hits = runners.itunes_song_matches(r["artist"], r["title"], sleep=runners.sleep)
+            lookups["date"] += 1
+            if hits is None:
+                lookup_failed += 1
+                if lookup_failed >= 3:
+                    lookup_budget = lookups["date"]  # the catalogue is refusing: stop asking tonight
+                continue
+            found = bc.earliest_year(hits)
+            best = bc.best_hit(hits)
+            years.put(key, now, found, hit=_keep_hit(best, found),
+                      excluded=None if best or not hits else "only excluded releases")
+            y = min(v for v in (y, found) if v) if (y or found) else None
+        if y:
+            radio_years[key] = y
+    radio_back = {k: agg[k] for k, y in radio_years.items() if bc.decade_of(y) in decades}
+    doc["radio"] = {"tracks": len(agg), "dated": len(radio_years), "older": len(radio_back),
+                    "lookups": lookups["date"], "lookup_failures": lookup_failed}
+
+    # 3. Older picks near his artists from the taste LLM.
+    llm_rows: list[dict] = []
+    if cfg.get("backcatalogue_llm"):
+        llm_rows, llm_err = back_llm_rows(cfg, paths, runners, decades, int(cfg["backcatalogue_llm_suggestions"]))
+        doc["llm"] = {"rows": len(llm_rows), "error": llm_err}
+
+    liked = {bc.artist_fold(a) for a in liked_artists(cfg)}
+    pool = bc.build_pool(canon=canon, radio_rows=radio_back, radio_years=radio_years, llm_rows=llm_rows, liked=liked)
+    eligible: dict[str, list[dict]] = defaultdict(list)
+    for row in pool.values():
+        if row["decade"] not in decades:
+            continue
+        if row["kind"] == "song" and taken(row["artist"], row["title"]):
+            continue
+        if bc.excluded(artist=row["artist"], title=row["title"], album=row.get("album") or "", genre=row.get("genre") or ""):
+            continue
+        eligible[row["decade"]].append(row)
+    supply = {d: len(v) for d, v in eligible.items()}
+    doc["pool_by_decade"] = {d: supply.get(d, 0) for d in decades}
+
+    def resolve(row: dict) -> dict | None:
+        """The catalogue release for a pool row, through the resolution cache."""
+        ckey = ("album:" if row["kind"] == "album" else "song:") + row["key"]
+        cached = years.get(ckey, now)
+        if cached is not None:
+            return cached.get("hit")
+        dated = years.get(row["key"], now) if row["kind"] == "song" else None
+        if dated is not None and "hit" in dated:
+            return dated["hit"]
+        if row["kind"] == "song" and row.get("track_id") and row["llm"]:
+            return {"trackId": row["track_id"], "artistName": row["artist"], "trackName": row["title"],
+                    "collectionName": row.get("album") or ""}
+        if lookups["resolve"] >= 4 * n + 8 or runners.monotonic() >= deadline:
+            return None
+        lookups["resolve"] += 1
+        if row["kind"] == "album":
+            album = row.get("album") or ""
+            songs = runners.itunes_album_songs(row["artist"], album, sleep=runners.sleep)
+            if songs is None:
+                return None
+            want = bc.album_core(album)
+            mine = [s for s in songs if bc.artist_fold(str(s.get("artistName") or "")) == bc.artist_fold(row["artist"])
+                    and (bc.album_core(str(s.get("collectionName") or "")) == want
+                         or bc.album_core(str(s.get("collectionName") or "")).startswith(want))]
+            ok = [s for s in mine if not bc.hit_excluded(s)]
+            hit = dict(ok[0], releaseDate=f"{bc.earliest_year(mine) or ''}") if ok else None
+        else:
+            hits = runners.itunes_song_matches(row["artist"], row["title"], sleep=runners.sleep)
+            if hits is None:
+                return None
+            hit = bc.best_hit(hits)
+            if hit:
+                hit = dict(hit, releaseDate=f"{bc.earliest_year(hits) or ''}")
+        keep = _keep_hit(hit, bc.year_of((hit or {}).get("releaseDate")))
+        years.put(ckey, now, bc.year_of((keep or {}).get("releaseDate")), hit=keep)
+        return keep
+
+    slots = bc.allocate(n, decades, room["deficits"], supply)
+    chosen: dict[str, list[dict]] = defaultdict(list)
+    artists: set[str] = set()
+    tried: set[str] = set()
+    for _pass in range(2):  # the second pass hands slots a thin decade could not fill to the others
+        if _pass:
+            short = n - sum(len(v) for v in chosen.values())
+            if short <= 0:
+                break
+            left = {d: len([r for r in eligible.get(d, []) if r["key"] not in tried]) for d in decades}
+            slots = bc.allocate(short, decades, {d: room["deficits"][d] - len(chosen[d]) for d in decades}, left)
+            slots = {d: slots[d] + len(chosen[d]) for d in decades}
+        for d in decades:
+            attempts = 0
+            for row in bc.order_decade(eligible.get(d, [])):
+                if len(chosen[d]) >= slots.get(d, 0) or attempts >= 3 * slots.get(d, 0) + 3:
+                    break
+                if row["key"] in tried or bc.artist_fold(row["artist"]) in artists:
+                    continue
+                tried.add(row["key"])
+                attempts += 1
+                hit = resolve(row)
+                if not hit or bc.hit_excluded(hit):
+                    continue
+                cand = bc.to_candidate(row, hit, rank=sum(len(v) for v in chosen.values()))
+                if cand["decade"] not in decades or taken(cand["artist"], cand["title"]):
+                    continue
+                if bc.artist_fold(cand["artist"]) in artists:
+                    continue
+                chosen[cand["decade"]].append(cand)
+                artists.add(bc.artist_fold(cand["artist"]))
+    years.save()
+
+    # Decades taken in turn, so a budget cut-off in acquire still leaves an even spread.
+    rows: list[dict] = []
+    while any(chosen.values()):
+        for d in decades:
+            if chosen[d]:
+                rows.append(chosen[d].pop(0))
+    doc["offered_by_decade"] = dict(Counter(r["decade"] for r in rows))
+    doc["offered_by_source"] = dict(Counter(r["source"] for r in rows))
+    doc["lookups"] = dict(lookups)
+    doc["seconds"] = round(runners.monotonic() - started, 1)
+    thin = [d for d in decades if supply.get(d, 0) < room["deficits"].get(d, 0)]
+    if thin:
+        doc["thin_decades"] = thin
+    return rows, doc
 
 
 def update_source_stats(
@@ -1431,6 +1832,17 @@ def cmd_candidates(
             errors.append(f"radio: {exc}")
             print(f"candidates: radio failed: {exc}", file=sys.stderr)
 
+    back_doc: dict[str, Any] | None = None
+    if cfg.get("backcatalogue_enabled"):
+        try:
+            back_rows, back_doc = source_backcatalogue(cfg, paths, runners, rejected,
+                                                       tonight=[r for rows in by_source.values() for r in rows])
+            if "held_back" not in back_doc:
+                by_source["backcatalogue"] = back_rows
+        except Exception as exc:
+            errors.append(f"backcatalogue: {exc}")
+            print(f"candidates: backcatalogue failed: {exc}", file=sys.stderr)
+
     taste, taste_err = source_taste_expansion(cfg, runners, paths=paths)
     if taste_err:
         errors.append(f"taste-expansion: {taste_err}")
@@ -1439,13 +1851,20 @@ def cmd_candidates(
 
     merged: list[dict] = []
     counts: dict[str, int] = {}
+    decades = list(cfg["decades"])
+    year_cache = bc.YearCache(paths.state / "backcatalogue" / "years.json")
+    now_dt = parse_iso(runners.clock()) or utc_now()
     for name, rows in by_source.items():
         counts[name] = len(rows)
         for row in rows:
             key = track_key(row.get("artist", ""), row.get("title", ""))
             if key in rejected:
                 continue
-            merged.append(row)
+            if not row.get("year"):  # a radio pick the back catalogue has already dated
+                known = year_cache.get(radio.match_key(row.get("artist", ""), row.get("title", "")), now_dt)
+                if known and known.get("year"):
+                    row["year"] = known["year"]
+            merged.append(tag_era(row, decades))
     warnings: list[str] = []
     if radio_doc is not None:
         # Plays read per station, so a station that goes quiet is flagged like any dead source.
@@ -1468,6 +1887,13 @@ def cmd_candidates(
         doc["warnings"] = warnings
     if radio_doc is not None:
         doc["radio"] = radio_doc
+    if back_doc is not None:
+        doc["backcatalogue"] = back_doc
+        if (back_doc.get("llm") or {}).get("error"):
+            doc.setdefault("warnings", []).append(f"backcatalogue llm: {back_doc['llm']['error']}")
+        for lid, rep_ in (back_doc.get("canon") or {}).items():
+            if rep_.get("error"):
+                doc.setdefault("warnings", []).append(f"backcatalogue canon {lid}: {rep_['error']}")
     paths.state.mkdir(parents=True, exist_ok=True)
     paths.candidates.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     update_source_stats(paths, counts, dead_nights=int(cfg["dead_source_nights"]), clock=runners.clock())
@@ -1621,12 +2047,18 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
             owned_artist_set,
         )
 
+    era_doc = None
+    if cfg.get("backcatalogue_enabled"):
+        ranked, era_doc = apply_era_quota(ranked, len(priority_pool), cfg, paths, parse_iso(runners.clock()) or utc_now())
+
     queue = {
         "generated": runners.clock(),
         "tracks": ranked,
         "explore_share": explore_share,
         "explore_selected": sum(1 for r in ranked if r.get("source") == "taste-expansion"),
     }
+    if era_doc is not None:
+        queue["era"] = era_doc
     paths.queue.write_text(json.dumps(queue, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     now = runners.clock()
     for row in ranked:
@@ -1643,6 +2075,53 @@ def cmd_rank(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> list[d
             },
         )
     return ranked
+
+
+def interleave_decades(rows: list[dict], decades: list[str]) -> list[dict]:
+    """Back-catalogue rows with the decades taken in turn (each decade keeps its own order)."""
+    by: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by[r.get("decade") or ""].append(r)
+    keys = [d for d in decades if by.get(d)] + [d for d in by if d not in decades]
+    out: list[dict] = []
+    while any(by[k] for k in keys):
+        for k in keys:
+            if by[k]:
+                out.append(by[k].pop(0))
+    return out
+
+
+def apply_era_quota(
+    ranked: list[dict], n_priority: int, cfg: dict[str, Any], paths: ScoutPaths, now: datetime
+) -> tuple[list[dict], dict[str, Any]]:
+    """Hold the week near `backcatalogue_share` back catalogue. Priority rows (his own Shazams and
+    likes, retries) stay first and count toward their era. After them, back and new rows alternate
+    so the running share stays at the target, each side never more than its half of the week has
+    room for: a budget cut-off in acquire still leaves the split. Rows left out are not offered,
+    so they are still there tomorrow."""
+    decades = list(cfg["decades"])
+    room = era_room(cfg, paths.ledger, now)
+    share = room["share"]
+    head, tail = ranked[:n_priority], ranked[n_priority:]
+    back_room = max(0, room["back_room"] - sum(1 for r in head if r.get("era") == "back"))
+    new_room = max(0, room["new_room"] - sum(1 for r in head if r.get("era") != "back"))
+    back = interleave_decades([r for r in tail if r.get("era") == "back"], decades)
+    new = [r for r in tail if r.get("era") != "back"]
+    held = {"back": max(0, len(back) - back_room), "new": max(0, len(new) - new_room)}
+    back, new = back[:back_room], new[:new_room]
+    out: list[dict] = []
+    b = n = 0
+    while back or new:
+        # Whichever side is further behind its share of the next slot goes next (back on a tie).
+        want_back = share * (b + n + 1) - b >= (1 - share) * (b + n + 1) - n
+        if back and (want_back or not new):
+            out.append(back.pop(0))
+            b += 1
+        else:
+            out.append(new.pop(0))
+            n += 1
+    doc = {"share": share, "back_room": back_room, "new_room": new_room, "back": b, "new": n, "held": held}
+    return head + out, doc
 
 
 def estimate_track_bytes(song: dict, mb_per_minute: float) -> int:
@@ -1748,6 +2227,9 @@ def cmd_acquire(
             results.append(rec)
             continue
         url = song_url(song)
+        year = bc.year_of(row.get("year")) or bc.year_of(song.get("releaseDate"))
+        era = {"year": year, "decade": bc.decade_of(year),
+               "era": row.get("era") or era_of(year, list(cfg["decades"]))} if year else {}
         if not go:
             rec = {
                 "at": runners.clock(),
@@ -1755,8 +2237,10 @@ def cmd_acquire(
                 "artist": artist,
                 "title": title,
                 "track_key": key,
+                "source": row.get("source") or "",
                 "url": url,
                 "estimate_bytes": est_bytes,
+                **era,
             }
             results.append(rec)
             continue
@@ -1776,6 +2260,8 @@ def cmd_acquire(
                 "url": url,
                 "size_bytes": size_bytes,
                 **({"heard": row["heard"]} if row.get("heard") else {}),
+                **({"canon": row["canon"]} if row.get("canon") else {}),
+                **era,
                 "album": song.get("collectionName") or row.get("album") or "",
                 "duration_seconds": (float(song.get("trackTimeMillis") or 0) / 1000.0) or None,
                 "local_path": meta.get("local_path"),
@@ -1949,6 +2435,72 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
     return status, code
 
 
+def build_scout_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> dict[str, Any]:
+    """The small public summary the web radio's Profile page reads (`radio/scout-status.json`).
+    Counts and flags only: no file paths, no error text."""
+    now = parse_iso(runners.clock()) or utc_now()
+    decades = list(cfg["decades"])
+    count, nbytes = weekly_acquired_stats(paths.ledger, now)
+    stats = weekly_era_stats(paths.ledger, now, decades)
+    by_decade = {d: stats["by_decade"].get(d, 0) for d in decades}
+    for d in sorted(stats["by_decade"]):
+        by_decade.setdefault(d, stats["by_decade"][d])
+    last: dict[str, Any] = {}
+    if paths.last_run.is_file():
+        try:
+            last = json.loads(paths.last_run.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            last = {}
+    acq = last.get("acquire") or {}
+    results = acq.get("results") or []
+    counts = last.get("counts") or {}
+    brief = {
+        "at": last.get("at"),
+        "ok": last.get("ok"),
+        "dryRun": acq.get("dry_run"),
+        "queue": last.get("queue"),
+        "acquired": sum(1 for r in results if r.get("action") == "acquired"),
+        "failed": sum(1 for r in results if r.get("action") == "failed"),
+        "noMatch": sum(1 for r in results if r.get("action") == "no_match"),
+        "candidates": {k: v for k, v in counts.items() if not k.startswith("radio:")},
+        "errors": len(last.get("errors") or []),
+        **({"exit": last["exit"]} if "exit" in last else {}),
+    }
+    enabled = bool(cfg.get("backcatalogue_enabled"))
+    return {
+        "schemaVersion": 1,
+        "at": runners.clock(),
+        "acquiredThisWeek": count,
+        "acquiredGbThisWeek": round(nbytes / GIB, 2),
+        "budgetTracks": int(cfg["tracks_per_week"]),
+        "budgetGb": float(cfg["gb_per_week"]),
+        "backcatalogueEnabled": enabled,
+        "backcatalogueShare": float(cfg["backcatalogue_share"]) if enabled else 0.0,
+        "decades": decades,
+        "byDecadeThisWeek": by_decade,
+        "newVsBack": {"new": stats["new"], "back": stats["back"]},
+        "lastRun": brief,
+    }
+
+
+def publish_scout_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> str | None:
+    """Write scout-status.json in the state folder and hand it to the publisher (R2 from the
+    command line, nothing in tests). Returns the upload error, if any; never raises."""
+    try:
+        doc = build_scout_status(cfg, paths, runners)
+        paths.state.mkdir(parents=True, exist_ok=True)
+        out = paths.state / "scout-status.json"
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(out)
+        err = runners.publish_status(out)
+    except Exception as exc:  # the status page must never fail the run
+        err = f"{type(exc).__name__}: {exc}"
+    if err:
+        print(f"status: upload failed: {err}", file=sys.stderr)
+    return err
+
+
 def record_last_run(paths: ScoutPaths, *, ok: bool, stage: str, detail: dict, clock: str) -> None:
     doc = {"at": clock, "ok": ok, "stage": stage, **detail}
     paths.state.mkdir(parents=True, exist_ok=True)
@@ -1971,9 +2523,11 @@ def cmd_run(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: boo
                 clock=runners.clock(),
             )
             runners.media_check()
+            publish_scout_status(cfg, paths, runners)
             return 0
         except SystemExit as exc:
             record_last_run(paths, ok=False, stage="run", detail={"exit": exc.code}, clock=runners.clock())
+            publish_scout_status(cfg, paths, runners)
             raise
 
 
@@ -1995,6 +2549,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("publish")
     sub.add_parser("status")
+    sub.add_parser("publish-status", help="write scout-status.json and copy it to R2")
     p_run = sub.add_parser("run")
     p_run.add_argument("--go", action="store_true")
     return ap
@@ -2006,7 +2561,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     state = Path(args.state).expanduser() if args.state else DEFAULT_STATE
     paths = ScoutPaths(state)
-    runners = Runners(media_collect=_default_media_collect, media_check=_default_media_check)
+    publisher = rclone_publisher(cfg) if args.cmd in ("run", "publish-status") else None
+    runners = Runners(media_collect=_default_media_collect, media_check=_default_media_check,
+                      publish_status=publisher)
 
     if args.cmd == "candidates":
         with run_lock(paths.lock):
@@ -2026,6 +2583,10 @@ def main(argv: list[str] | None = None) -> None:
         doc, code = cmd_status(cfg, paths, runners)
         print(json.dumps(doc, indent=2))
         raise SystemExit(code)
+    elif args.cmd == "publish-status":
+        err = publish_scout_status(cfg, paths, runners)
+        print(json.dumps({"status": str(paths.state / "scout-status.json"), "upload_error": err}))
+        raise SystemExit(1 if err else 0)
     elif args.cmd == "run":
         cmd_run(cfg, paths, runners, go=args.go)
 

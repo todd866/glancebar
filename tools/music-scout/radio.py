@@ -128,8 +128,10 @@ class Fetcher:
         min_gap: float = 2.0,
         budget: int = 700,
         deadline_seconds: float | None = None,
+        user_agent: str = USER_AGENT,
     ):
         self.cache_dir = cache_dir
+        self.user_agent = user_agent
         self.transport = transport or urllib_transport
         self.sleep = sleep
         self.monotonic = monotonic
@@ -183,7 +185,7 @@ class Fetcher:
                 wait = self.min_gap - (self.monotonic() - last)
                 if wait > 0:
                     self.sleep(wait)
-            hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json, text/html, application/xml;q=0.9"}
+            hdrs = {"User-Agent": self.user_agent, "Accept": "application/json, text/html, application/xml;q=0.9"}
             hdrs.update(headers or {})
             try:
                 status, body = self.transport(url, data, hdrs)
@@ -234,9 +236,16 @@ def _clean(text: str | None) -> str:
     return " ".join(str(text or "").split()).strip(" |-–—/")
 
 
-def play(artist: str, title: str, at: datetime | str | None, *, album: str = "", show: str = "") -> dict:
+def play(artist: str, title: str, at: datetime | str | None, *, album: str = "", show: str = "",
+         year: Any = None) -> dict:
+    """One play. `year` is the release year when the station gives one (KEXP, WFMU): the back
+    catalogue dates older records by it."""
     when = at if isinstance(at, str) else (utc(at) if at else "")
-    return {"artist": _clean(artist), "title": _clean(title), "album": _clean(album), "at": when, "show": show or ""}
+    out = {"artist": _clean(artist), "title": _clean(title), "album": _clean(album), "at": when, "show": show or ""}
+    m = re.search(r"\b(19[0-9]{2}|20[0-9]{2})\b", str(year or ""))
+    if m:
+        out["year"] = int(m.group(1))
+    return out
 
 
 def parse_kexp_plays(text: str) -> tuple[list[dict], str | None]:
@@ -247,7 +256,8 @@ def parse_kexp_plays(text: str) -> tuple[list[dict], str | None]:
         if row.get("play_type") != "trackplay":
             continue
         at = parse_time(row.get("airdate") or "")
-        out.append(play(row.get("artist"), row.get("song"), at, album=row.get("album") or ""))
+        out.append(play(row.get("artist"), row.get("song"), at, album=row.get("album") or "",
+                        year=row.get("release_date")))
     # The API offers a next page even past the end of a filtered range: an empty page is the end.
     return out, (doc.get("next") if doc.get("results") else None)
 
@@ -346,7 +356,11 @@ def parse_wfmu_playlist(text: str) -> list[dict]:
         title = _wfmu_cell(row, "col_song_title")
         if artist.lower().startswith("music behind dj"):
             continue
-        out.append({"artist": artist, "title": title, "album": _wfmu_cell(row, "col_album_title")})
+        rec = {"artist": artist, "title": title, "album": _wfmu_cell(row, "col_album_title")}
+        year = re.search(r"\b(19[0-9]{2}|20[0-9]{2})\b", _wfmu_cell(row, "col_year"))
+        if year:
+            rec["year"] = int(year.group(1))
+        out.append(rec)
     return out
 
 
@@ -558,7 +572,8 @@ def read_wfmu(f: Fetcher, store: Store, since: datetime, now: datetime, st: dict
             continue
         page = f.get(WFMU_PLAYLIST.format(id=pl["id"]), ttl=6 * HOUR)
         tracks = parse_wfmu_playlist(page) if page else []
-        plays = [play(t["artist"], t["title"], pl["at"], album=t["album"], show=pl["show"]) for t in tracks]
+        plays = [play(t["artist"], t["title"], pl["at"], album=t["album"], show=pl["show"], year=t.get("year"))
+                 for t in tracks]
         # The feed time is when the DJ published; DJs keep editing for a while.
         store.put(pl["id"], pl["at"], plays, final=_final(parse_time(pl["at"]) or now, now, len(plays), settle_hours=24))
 
