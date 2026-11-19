@@ -276,6 +276,22 @@ int main(int argc, const char **argv) { @autoreleasepool {
             Check(f.attributedStringValue.size.width <= NSWidth(f.frame),
                   [NSString stringWithFormat:@"value '%@' fits its frame unclipped", text]);
         }
+        // House rule (owner, 19 Nov 2026): no "…" anywhere. Every single-line text field
+        // in a rendered surface must fit its text or clip without an ellipsis mode.
+        void (^audit)(NSView *) = nil;
+        audit = ^(NSView *v) {
+            for (NSView *child in v.subviews) {
+                if ([child isKindOfClass:NSTextField.class] && ((NSTextField *)child).maximumNumberOfLines <= 1) {
+                    NSLineBreakMode mode = ((NSTextField *)child).lineBreakMode;
+                    Check(mode != NSLineBreakByTruncatingTail && mode != NSLineBreakByTruncatingMiddle
+                          && mode != NSLineBreakByTruncatingHead,
+                          [NSString stringWithFormat:@"field '%@' never truncates with an ellipsis",
+                            ((NSTextField *)child).identifier ?: ((NSTextField *)child).stringValue]);
+                }
+                audit(child);
+            }
+        };
+        audit([ui activityDetailsView]);
     }
     [NSFileManager.defaultManager removeItemAtPath:home error:NULL];
     fprintf(stderr, "Activity UI and policy: %d checks passed\n", checks);

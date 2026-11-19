@@ -9563,7 +9563,7 @@ static NSString *const kShowMixKey = @"show:episode";
     st.font = [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightRegular];
     st.textColor = NSColor.secondaryLabelColor;
     st.maximumNumberOfLines = 1;
-    st.lineBreakMode = NSLineBreakByTruncatingTail;
+    st.lineBreakMode = NSLineBreakByClipping;   // no ellipsis: fit or clip, never dots
     st.frame = NSMakeRect(sx, 4, kW - kPad - infoW - 4 - sx, 14);
     st.accessibilityHelp = status;
     st.accessibilityIdentifier = @"popover.radio.status";
@@ -11679,7 +11679,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.textColor = playing ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
-            cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
             else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
@@ -11751,7 +11751,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             NSTextField *cap = [GBRecoverableTextField labelWithString:showCaps[l]];
             cap.textColor = showPlaying ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
-            cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, 10);
             else GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, namePt);
@@ -11815,7 +11815,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             cap.textColor = stationPlaying ? NSColor.controlAccentColor
                 : (l ? NSColor.secondaryLabelColor : (stationOn ? NSColor.labelColor : NSColor.tertiaryLabelColor));
             cap.alignment = NSTextAlignmentCenter;
-            cap.lineBreakMode = NSLineBreakByTruncatingTail;
+            cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
             else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
@@ -11926,7 +11926,7 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSFontAttributeName: [NSFont systemFontOfSize:12], NSForegroundColorAttributeName: NSColor.secondaryLabelColor}];
     ((NSButtonCell *)button.cell).wraps = NO;
     ((NSButtonCell *)button.cell).usesSingleLineMode = YES;
-    ((NSButtonCell *)button.cell).lineBreakMode = NSLineBreakByTruncatingTail;
+    ((NSButtonCell *)button.cell).lineBreakMode = NSLineBreakByClipping;   // no ellipsis
     button.accessibilityIdentifier = @"popover.sound";
     NSString *label = _playerOutputUID.length
         ? [NSString stringWithFormat:@"Player output, %@", choice[@"name"]]
@@ -13118,10 +13118,21 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
 }
 
 // --- layout helpers ---
+// House rule (owner, 19 Nov 2026): the UI never shows "…". A one-line label first
+// shrinks its type toward a floor to fit the frame; only if it still overflows does
+// it clip mid-glyph — no ellipsis, and the GBRecoverableTextField tooltip keeps the
+// full text on hover.
+static NSFont *GBFontFittedToWidth(NSFont *font, NSString *text, CGFloat width) {
+    if (width <= 0 || !text.length) return font;
+    while (font.pointSize > 9.0 &&
+           [text sizeWithAttributes:@{NSFontAttributeName: font}].width > width)
+        font = [NSFont fontWithDescriptor:font.fontDescriptor size:MAX(9.0, font.pointSize - 0.5)];
+    return font;
+}
 - (NSTextField *)text:(NSString *)s font:(NSFont *)f color:(NSColor *)c at:(NSRect)fr align:(NSTextAlignment)a {
     NSTextField *t = [GBRecoverableTextField labelWithString:s ?: @""];
-    t.font = f; if (c) t.textColor = c; t.alignment = a; t.frame = fr;
-    t.lineBreakMode = NSLineBreakByTruncatingTail;
+    t.font = GBFontFittedToWidth(f, s ?: @"", fr.size.width); if (c) t.textColor = c; t.alignment = a; t.frame = fr;
+    t.lineBreakMode = NSLineBreakByClipping;
     return t;
 }
 - (NSView *)sectionHeader:(NSString *)title at:(CGFloat)y {
@@ -13993,7 +14004,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     symbol.accessibilityHelp = tip;
     NSString *name = [top[@"name"] isEqual:@"rsync"] ? @"File copy" : (BurnShortName(top[@"name"]) ?: @"Apps");
     NSTextField *nameField = [self instrumentName:name identifier:@"popover.burn.name" in:row];
-    nameField.lineBreakMode = NSLineBreakByTruncatingTail;
+    nameField.lineBreakMode = NSLineBreakByClipping;   // no ellipsis
     nameField.accessibilityHelp = tip;
     if ([top[@"name"] isEqual:@"rsync"]) symbol.toolTip = @"rsync";
     Gauge *bar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
@@ -15742,7 +15753,7 @@ static NSColor *HealthColor(double fraction) {
                   identifier:(NSString *)identifier in:(NSView *)row {
     NSTextField *field = [self text:text ?: @"" font:font color:color at:frame align:align];
     field.maximumNumberOfLines = 1;
-    field.lineBreakMode = NSLineBreakByTruncatingTail;
+    field.lineBreakMode = NSLineBreakByClipping;   // no ellipsis: fit or clip, never dots
     field.cell.wraps = NO;
     if (identifier.length) field.accessibilityIdentifier = identifier;
     [row addSubview:field];
