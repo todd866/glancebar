@@ -2045,6 +2045,15 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
 static NSString *AIQuotaValueText(long long tokens, NSString *percentText) {
     return tokens > 0 ? FormatTokensCompact((double)tokens) : percentText;
 }
+// Owner, 19 Nov 2026: a pool row carries all three readings — reset in the datum column,
+// then percent AND token estimate in the value: "26%·76M" (no spaces; the compact token
+// figure keeps the value column narrow). Exact numbers stay in the tooltip.
+static NSString *AIQuotaBothText(double fraction, long long tokens, NSString *fallback) {
+    if (tokens > 0 && fraction >= 0)
+        return [NSString stringWithFormat:@"%.0f%%·%@",
+                fraction * 100, FormatTokensCompact((double)tokens)];
+    return AIQuotaValueText(tokens, fallback);
+}
 
 // The exact figures behind a compact value, one terse line: "27% left · 76,123,456 tokens
 // left · resets 19/11/2026, 3:04 pm". Parts that are unknown drop out.
@@ -5759,8 +5768,8 @@ static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the fo
 static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
 static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW + 4; "Claude" at 13pt plus the label inset
 static const CGFloat kGaugeX = 110, kGaugeW = 102, kGaugeH = 8; // kAINameX + kAINameW + 6
-static const CGFloat kValueX = 216, kValueW = 48;              // "100%" at 15pt
-static const CGFloat kDatumX = 272, kDatumW = 92;              // "resets 21:00"
+static const CGFloat kValueX = 206, kValueW = 72;              // "26%·76M" at 15pt ("100%" before, 19 Nov 2026)
+static const CGFloat kDatumX = 282, kDatumW = 82;              // "resets 3 Dec 10:24" at 12.5pt, fitted
 static const CGFloat kToggleH = 28, kToggleGap = 6;
 static const CGFloat kKeepW = 106, kLowW = 98, kChargeW = 96;  // 16pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
@@ -14088,7 +14097,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
             ? cursorPools[@"cursor"] : cursorPools[@"api"];
         valueTokens = PoolTokensLeft(primaryPool);
         valueFraction = primary;
-        pct = AIQuotaValueText(valueTokens, primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100]);
+        pct = AIQuotaBothText(primary, valueTokens, primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100]);
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
 
         plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
@@ -14100,7 +14109,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     } else if (hasGauge) {
         valueTokens = u.tokensLeft;
         valueFraction = u.remainingFraction;
-        pct = AIQuotaValueText(valueTokens, [self aiPercentText:u]);
+        pct = AIQuotaBothText(valueFraction, valueTokens, [self aiPercentText:u]);
         valueColor = [self aiStatusColor:u];
         plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         plainGauge.fraction = u.remainingFraction;
@@ -14175,7 +14184,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         apiBar.metricLabel = @"Cursor API remaining";
         apiBar.accessibilityIdentifier = @"popover.ai.cursor.api.gauge";
         [apiRow addSubview:apiBar];
-        NSTextField *apiValue = [self instrumentValue:AIQuotaValueText(apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100])
+        NSTextField *apiValue = [self instrumentValue:AIQuotaBothText(api, apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100])
                                                  color:ink identifier:@"popover.ai.cursor.api.value" in:apiRow];
         if (apiTokens > 0) apiValue.toolTip = AIQuotaValueTip(api, apiTokens, resetDate);
         apiRow.accessibilityHelp = apiTip;
@@ -14209,7 +14218,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
             fiveBar.metricLabel = @"Z.ai 5-hour window remaining";
             fiveBar.accessibilityIdentifier = @"popover.ai.z.ai.5h.gauge";
             [fiveRow addSubview:fiveBar];
-            NSTextField *fiveValue = [self instrumentValue:AIQuotaValueText(tokens, frac >= 0
+            NSTextField *fiveValue = [self instrumentValue:AIQuotaBothText(frac, tokens, frac >= 0
                 ? [NSString stringWithFormat:@"%.0f%%", frac * 100] : @"—")
                                                       color:ink identifier:@"popover.ai.z.ai.5h.value" in:fiveRow];
             if (tokens > 0) fiveValue.toolTip = fiveTip;
@@ -15937,12 +15946,12 @@ static NSColor *HealthColor(double fraction) {
         double primary = CursorPrimaryFraction(cursorPools);
         NSDictionary *primaryPool = CursorPoolFraction(cursorPools, @"cursor") >= 0
             ? cursorPools[@"cursor"] : cursorPools[@"api"];
-        pct = AIQuotaValueText(PoolTokensLeft(primaryPool),
+        pct = AIQuotaBothText(primary, PoolTokensLeft(primaryPool),
                                primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100]);
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
 
     } else if (hasGauge) {
-        pct = AIQuotaValueText(u.tokensLeft, [self aiPercentText:u]);
+        pct = AIQuotaBothText(u.remainingFraction, u.tokensLeft, [self aiPercentText:u]);
         valueColor = [self aiStatusColor:u];
     }
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
@@ -16024,7 +16033,7 @@ static NSColor *HealthColor(double fraction) {
               identifier:[stem stringByAppendingString:@".api.name"] in:apiRow].accessibilityHelp = apiTip;
         [self detailGauge:DetailGaugeRect(c) fraction:api color:ink label:@"Cursor API remaining"
                identifier:[stem stringByAppendingString:@".api.gauge"] tip:apiTip in:apiRow];
-        [self detailValue:AIQuotaValueText(apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100]) color:ink
+        [self detailValue:AIQuotaBothText(api, apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100]) color:ink
                identifier:[stem stringByAppendingString:@".api.value"] tip:apiTip in:apiRow cols:c];
         y += c.rowH;
     }
@@ -16052,7 +16061,8 @@ static NSColor *HealthColor(double fraction) {
             !CodexObservationFresh(observed ?: u.limitUpdatedAt,NSDate.date.timeIntervalSince1970);
         if (staleCodex) hasFrac=NO;
         double frac = hasFrac ? [w[@"remainingFraction"] doubleValue] : -1;
-        NSString *pct = hasFrac ? [NSString stringWithFormat:@"%d%%", (int)lround(frac * 100.0)] : @"—";
+        NSString *pct = AIQuotaBothText(frac, PoolTokensLeft(w),
+                                        hasFrac ? [NSString stringWithFormat:@"%d%%", (int)lround(frac * 100.0)] : @"—");
         NSDate *resetDate = [w[@"resetsAt"] isKindOfClass:NSNumber.class]
             ? [NSDate dateWithTimeIntervalSince1970:[w[@"resetsAt"] doubleValue]] : nil;
         NSString *clock = CompactResetClock(resetDate, NSDate.date);
