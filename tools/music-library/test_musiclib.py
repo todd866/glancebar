@@ -643,3 +643,11 @@ class RemoteCatalogueTest(unittest.TestCase):
             returncode, stdout, stderr = 1, '', 'network down'
         with self.assertRaises(RuntimeError):
             m.remote_listing('r:bucket', runner=lambda argv, check=False: P())
+
+    def test_command_publishes_catalogue_and_ids(self):
+        doc = m.catalogue_command([self.drive], str(self.remote), self.state, upload=True, archive=False,
+                                  from_remote=True)
+        self.assertEqual(doc['report']['entries'], 3)
+        ids = json.loads((self.remote / 'music/ids.json').read_text())
+        self.assertEqual(ids['key']['c|three'], [e['sha256'] for e in doc['entries'] if e['relativePath'].endswith('3.m4a')][0])
+        self.assertTrue((self.remote / 'catalogue.json').is_file())

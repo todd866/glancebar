@@ -510,8 +510,8 @@ ARCHIVE_DIR_NAME = '_metadata'
 
 
 def catalogue_command(masters_dir, remote, state, upload=True, archive=True, from_remote=False,
-                      fetch_max=200, allow_shrink=False, prefixes=DEFAULT_PREFIXES):
-    """Build and publish catalogue.json.
+                      fetch_max=200, allow_shrink=False, prefixes=DEFAULT_PREFIXES, aliases=None):
+    """Build and publish catalogue.json (and, from the bucket, the alias table music/ids.json).
 
     from_remote: the bucket's listing is the catalogue (the nightly push since 19 Nov 2026); the
     roots only supply hashes and tags. Otherwise the roots are walked (tests and one-off use)."""
@@ -536,9 +536,33 @@ def catalogue_command(masters_dir, remote, state, upload=True, archive=True, fro
                       file=sys.stderr)
     if upload:
         upload_local_json(local_out, remote, 'catalogue.json')
+    if from_remote:
+        ids_doc = publish_ids(doc, state, remote, upload=upload, aliases=aliases)
+        report['ids'] = ids_doc.get('counts')
     if report is not None:
         doc = dict(doc, report=report)
     return doc
+
+
+def publish_ids(doc, state, remote, upload=True, aliases=None):
+    """The alias table, built from this catalogue (the catalogue builder is its only writer)."""
+    store = _music_store()
+    prev = store.load_json(state / 'ids.json', {})
+    ids_doc = store.build_ids(doc['entries'], claims=store.read_claims(aliases or []), previous=prev)
+    out = state / 'ids.json'
+    atomic_write_json(out, ids_doc)
+    if upload:
+        rclone_run(['copyto', str(out), f'{remote}/{store.IDS_KEY}'])
+    return ids_doc
+
+
+def _music_store():
+    here = Path(__file__).resolve().parent
+    for cand in (here, here.parent / 'music-store'):
+        if (cand / 'musicstore.py').is_file() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+    import musicstore
+    return musicstore
 
 
 def push_command(masters_dir, remote):
@@ -1265,7 +1289,8 @@ def main(argv=None):
             doc = catalogue_command(roots, cfg['remote'], args.state, upload=not args.no_upload,
                                     archive=not args.no_archive, from_remote=args.from_remote,
                                     fetch_max=args.fetch_max if args.fetch_max is not None else cfg['catalogue_fetch_max'],
-                                    allow_shrink=args.allow_shrink, prefixes=cfg['catalogue_prefixes'])
+                                    allow_shrink=args.allow_shrink, prefixes=cfg['catalogue_prefixes'],
+                                    aliases=cfg['alias_inputs'])
             incomplete = []
             for entry in doc['entries']:
                 gaps = trackmeta.metadata_gaps({**(entry.get('meta') or {}), **(entry.get('tags') or {}),

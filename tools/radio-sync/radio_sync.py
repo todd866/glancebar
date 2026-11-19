@@ -34,6 +34,39 @@ SOURCE = '6ian'      # lines this tool writes into Glancebar's feedback carry th
 UA = 'glancebar-radio-sync/1.0'
 
 
+def music_store():
+    """tools/music-store (the alias table and the taste log), or None where it is not installed
+    (the app's bundled copy of this file runs without it)."""
+    here = Path(__file__).resolve().parent
+    for cand in (here, here.parent / 'music-store'):
+        if (cand / 'musicstore.py').is_file() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+    try:
+        import musicstore
+        return musicstore
+    except Exception:
+        return None
+
+
+def resolve_events(evs, store=None):
+    """Name each event's song by its sha through the one alias table (music/ids.json): the library
+    id first, then embed.match_key. Unresolved events keep only artist and title, so the radio's
+    own exact match is the fallback; the counts go into status.json."""
+    store = store if store is not None else music_store()
+    ids = store.Ids.load() if store else None
+    counts = {'ids': 0, 'fallback': 0}
+    for e in evs:
+        sha, how = (ids.resolve(persistent=e.get('pid'), artist=e['artist'], title=e['title'])
+                    if ids else (None, None))
+        if sha:
+            e['s'] = sha
+            e['how'] = how
+            counts['ids'] += 1
+        else:
+            counts['fallback'] += 1
+    return counts
+
+
 def now_iso():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
@@ -141,7 +174,8 @@ def glancebar_events(cur):
         at = p.get('at', 0)
         t = by_id.get(p.get('id'))
         if at > last and t and t.get('artist') and t.get('title'):
-            evs.append({'ev': 'play', 'artist': t['artist'], 'title': t.get('title'), 'at': int(at * 1000)})
+            evs.append({'ev': 'play', 'artist': t['artist'], 'title': t.get('title'), 'at': int(at * 1000),
+                        'pid': p.get('id')})
             newest = max(newest, at)
     cur['plays'] = newest
     return [e for e in evs if e['at'] is None or e['at'] > 0]
@@ -213,6 +247,7 @@ def cmd_sync():
     out = {'at': now_iso(), 'ok': False}
     try:
         evs = glancebar_events(cur)
+        out['resolved'] = resolve_events(evs)
         sent = unmatched = 0
         for i in range(0, len(evs), 400):
             r = api(c, 'POST', '/api/device/signals', {'events': evs[i:i + 400]})

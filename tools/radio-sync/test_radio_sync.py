@@ -91,3 +91,17 @@ class Pull(Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AliasLookup(unittest.TestCase):
+    """Events are named by sha through music/ids.json; unresolved ones fall back to artist+title."""
+    def test_resolve_by_library_id_then_key(self):
+        store = rs.music_store()
+        ids = store.Ids({'persistent': {'PID1': 'a' * 64}, 'key': {'zed|other': 'c' * 64}})
+        fake = mock.Mock(Ids=mock.Mock(load=lambda: ids))
+        evs = [{'ev': 'play', 'artist': 'X', 'title': 'Y', 'pid': 'PID1'},
+               {'ev': 'like', 'artist': 'Zed', 'title': 'Other (Remastered)'},
+               {'ev': 'skip', 'artist': 'No', 'title': 'Match'}]
+        self.assertEqual(rs.resolve_events(evs, fake), {'ids': 2, 'fallback': 1})
+        self.assertEqual([e.get('s') for e in evs], ['a' * 64, 'c' * 64, None])
+        self.assertEqual(evs[0]['how'], 'persistent')

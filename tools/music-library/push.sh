@@ -3,18 +3,21 @@
 # under bash a launchd run blocks for ever inside open() on an unanswered prompt (ledger W17).
 #
 # Nightly on the Mac that holds the masters: copy new lossless masters from every readable root to
-# the bucket, then rebuild catalogue.json from the bucket's own listing.
+# the bucket, then rebuild catalogue.json (and music/ids.json) from the bucket's own listing.
 # Idempotent; never deletes anything on either side. See docs/music.md and docs/music-unify.md.
 #
 # Roots come from `masters_roots` in ~/.config/glancebar/music-library.json; a Mac without them
 # exits 0. Since 19 Nov 2026 an unreadable root is a warning, not a failed push: the bucket is the
 # catalogue's truth, and the previous catalogue supplies what the drive cannot.
+# Alias inputs (Apple / persistent / YouTube ids) are written to alias-inputs/ before the build:
+# `youtube_dirs` in ~/.config/glancebar/music-store.json are scanned here; other Macs copy theirs in.
 set -u
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 here=${0:A:h}
 tool="$here/musiclib.py"
+store="$here/../music-store/musicstore.py"
 state="$HOME/.local/state/glancebar-music-library"
-mkdir -p "$state"
+mkdir -p "$state/alias-inputs"
 log="$state/push.log"
 hist="$state/push-history.jsonl"
 stamp() { date "+%Y-%m-%d %H:%M:%S"; }
@@ -60,6 +63,19 @@ done
 copied_after=$(grep -c "Copied (new)" "$log" 2>/dev/null || echo 0)
 uploaded=$((copied_after - copied_before))
 
+# Alias inputs this Mac can make itself (the TV's music videos), under disk-slot like any drive read.
+ytdirs=("${(@f)$(python3 -c 'import json,os
+p=os.path.expanduser("~/.config/glancebar/music-store.json")
+try: c=json.load(open(p))
+except Exception: c={}
+print("\n".join(c.get("youtube_dirs") or []))' 2>/dev/null)}")
+ytdirs=(${ytdirs:#})
+for d in $ytdirs; do
+  [ -d "$d" ] || { warnings+=("youtube dir not mounted: $d"); continue; }
+  disk-slot "$d" -- gtimeout 600 python3 "$store" claims --youtube-dir "$d" --out "$state/alias-inputs/youtube-$(basename "$d").jsonl" >> "$log" 2>&1 \
+    || warnings+=("youtube claims failed for $d")
+done
+
 out="$state/catalogue-last.json"
 if (( ${#readable} )); then
   margs=(); for r in $readable; do margs+=(--masters "$r"); done
@@ -76,7 +92,8 @@ out, status, hist, uploaded, remote_n, at, epoch, warn = sys.argv[1:9]
 rep = json.load(open(out)).get("report") or {}
 doc = {"ok": True, "at": at, "epoch": int(epoch), "masters": rep.get("entries"), "remote": int(remote_n),
        "uploaded": int(uploaded), "catalogue": rep.get("entries"), "fromDrive": rep.get("drive"),
-       "carried": rep.get("carried"), "fetched": rep.get("fetched"), "pending": rep.get("pending")}
+       "carried": rep.get("carried"), "fetched": rep.get("fetched"), "pending": rep.get("pending"),
+       "ids": rep.get("ids")}
 warnings = [w for w in warn.split("; ") if w] + [f"unreadable: {r}" for r in rep.get("unreadableRoots") or []]
 if rep.get("pending"):
     warnings.append(f"{rep['pending']} objects in the bucket not yet catalogued (fetch cap or metered)")
