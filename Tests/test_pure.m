@@ -3694,7 +3694,7 @@ int main(void) {
                 "\"zai\":{\"pools\":[{\"pool\":\"5h\",\"remainingPct\":99.9,\"resetAt\":\"2026-11-19T07:56:31.901Z\","
                 "\"estimate\":{\"tokensLeft\":269000000}},"
                 "{\"pool\":\"week\",\"remainingPct\":100,\"resetAt\":\"2026-11-26T02:53:52.984Z\","
-                "\"estimate\":{\"tokensLeft\":1347000000}]}}}";
+                "\"estimate\":{\"tokensLeft\":1347000000}}]}}}";
             NSDictionary *pools = ParseAICapacityDocument(doc);
             check(pools.count == 6, @"capacity: every service pool gets a row");
             check([pools[@"cursor.cursor"][@"fraction"] doubleValue] > 0.264 &&

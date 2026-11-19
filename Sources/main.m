@@ -1649,6 +1649,7 @@ static NSColor *CPUColor(double cpu) {
 
 @interface AIUsage : NSObject
 @property (copy) NSString *name, *source, *resetText, *statusText, *statusSource, *statusReason, *topModel;
+@property (copy) NSString *statusNotice;   // ai-status.json "notice": a flag ahead of the reset datum (e.g. "restricted")
 @property (copy) NSString *extraUsage;   // e.g. "9,122 of 10,000 AUD (91%)"
 @property (copy) NSString *limitRefreshError;
 @property (copy) NSString *billingNote;   // Codex: where requests bill when not the shown window's bucket
@@ -1995,6 +1996,12 @@ static void ApplyAIStatusFile(AIUsage *u, NSDictionary *root, NSString *source) 
         u.limitStale = NO;
         u.limitUpdatedAt = nil;
     }
+
+    // A "notice" states a condition, not a quota: it neither replaces the gauge nor
+    // clears the provider's own windows. It outranks the reset clock in the row's
+    // datum, the way "signed out" does, because it changes what the reading means.
+    NSString *notice = StatusStringForKeys(entry, @[@"notice"]);
+    if (notice.length) u.statusNotice = notice;
 
     NSString *reason = StatusStringForKeys(entry, @[@"status", @"detail", @"reason"]);
     u.statusSource = source;
@@ -2618,7 +2625,9 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         __weak AIReader *weakSelf = self;
         _cursorTokenReader = ^NSString *(NSString *home){ return CursorSessionToken(home, weakSelf.cursorRejectedToken); };
         _cursorUsageFetcher = ^NSDictionary *(NSString *token){ return FetchCursorUsageJSON(token); };
-        _capacityFetcher = ^NSString *{ return AICapacityJSONViaTool(_homeDirectory); };
+        // Capture the path, not self: the block is retained by self (retain cycle, -Werror).
+        NSString *capacityHome = _homeDirectory;
+        _capacityFetcher = ^NSString *{ return AICapacityJSONViaTool(capacityHome); };
         [self loadPersistentState];
     }
     return self;

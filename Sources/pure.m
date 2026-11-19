@@ -3238,7 +3238,7 @@ NSString *FormatTokensCompact(double tokens) {
             while (text.length > dot.location + 2 && [text characterAtIndex:text.length - 2] == '0')
                 [text deleteCharactersInRange:NSMakeRange(text.length - 2, 1)];
             if (text.length > dot.location + 1 && [text characterAtIndex:text.length - 2] == '.')
-                [text deleteCharactersInRange:NSMakeRange(text.length - 2, 2)];
+                [text deleteCharactersInRange:NSMakeRange(dot.location, 1)];
         }
         return text;
     }
