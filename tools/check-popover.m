@@ -563,9 +563,11 @@ static BOOL FitsChildren(NSView *view) {
             if (AppKitTruncatesLabel(field)) {
                 BOOL recoverable = [field.toolTip isEqual:field.stringValue] && field.lineBreakMode == NSLineBreakByTruncatingTail;
                 if (!recoverable) {
-                    fprintf(stderr, "truncated %s: \"%s\" in %.1fpt without recovery\n",
+                    fprintf(stderr, "truncated %s: \"%s\" in %.1fpt without recovery (font %s, attr %.1f, exp %s)\n",
                             field.accessibilityIdentifier.UTF8String, field.stringValue.UTF8String,
-                            field.bounds.size.width);
+                            field.bounds.size.width, field.font.description.UTF8String,
+                            field.attributedStringValue.size.width,
+                            NSStringFromRect([field.cell expansionFrameWithFrame:field.bounds inView:field]).UTF8String);
                     return NO;
                 }
             }
@@ -1049,7 +1051,7 @@ int main(int argc, const char **argv) {
             outputButton = (NSButton *)FindIdentifier(root, @"popover.sound");
             if (![outputButton.title containsString:@"Bose Flex SoundLink"] || fabs(volume.doubleValue - 0.55) > 0.001 ||
                 !volume.enabled || ![level.stringValue isEqual:@"55%"] || ![level.textColor isEqual:NSColor.secondaryLabelColor] ||
-                ((NSButtonCell *)outputButton.cell).lineBreakMode != NSLineBreakByTruncatingTail ||
+                ((NSButtonCell *)outputButton.cell).lineBreakMode != NSLineBreakByClipping ||   // no ellipsis (owner, 19 Nov 2026)
                 FindIdentifier(root, @"popover.sound.picker.chevron") || !FitsChildren(root)) return Fail(__LINE__);
             [c setValue:@0.85 forKey:@"outputVolume"]; [c rebuildContent]; root = p.contentViewController.view;
             level = (NSTextField *)FindIdentifier(root, @"popover.sound.level");
@@ -2583,8 +2585,8 @@ int main(int argc, const char **argv) {
             NSTextField *zaiFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.value");
             Gauge *zaiGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.gauge");
             Gauge *zaiFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.5h.gauge");
-            if (![cursorValue.stringValue isEqual:@"76M"] || ![apiTokenValue.stringValue isEqual:@"11M"] ||
-                ![zaiValue.stringValue isEqual:@"1.35B"] || ![zaiFiveValue.stringValue isEqual:@"269M"] ||
+            if (![cursorValue.stringValue isEqual:@"26%·76M"] || ![apiTokenValue.stringValue isEqual:@"46%·11M"] ||
+                ![zaiValue.stringValue isEqual:@"100%·1.35B"] || ![zaiFiveValue.stringValue isEqual:@"100%·269M"] ||
                 ![((NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.datum")).stringValue hasPrefix:@"resets "] ||
                 ![zaiGauge isKindOfClass:Gauge.class] || fabs(zaiGauge.fraction - 1.0) > 0.001 ||
                 ![zaiFiveGauge isKindOfClass:Gauge.class] || fabs(zaiFiveGauge.fraction - 0.999) > 0.001 ||

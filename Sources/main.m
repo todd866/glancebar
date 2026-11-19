@@ -5761,13 +5761,14 @@ static const CGFloat kW = 380, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
 // One instrument row. Every row has the same lead (symbol + name column), so the
 // gauge, value and datum share an x. Every row names itself (Storage, Battery, Claude…):
 // a blank name column read as wasted space, and the word identifies the row. The panel
-// grew by that column; the gauge stayed 102pt. kDatumX + kDatumW == kW - kPad.
+// grew by that column; the value column's 19 Nov widening took 10pt off the gauge
+// (RowGaugeW computes it; kGaugeW is only the fallback floor). kDatumX + kDatumW == kW - kPad.
 static const CGFloat kRowH = 30, kSoundH = 40;
 static const CGFloat kLeadSymbol = 22;
 static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the footer pill
 static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
 static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW + 4; "Claude" at 13pt plus the label inset
-static const CGFloat kGaugeX = 110, kGaugeW = 102, kGaugeH = 8; // kAINameX + kAINameW + 6
+static const CGFloat kGaugeX = 110, kGaugeW = 92, kGaugeH = 8;  // kAINameX + kAINameW + 6; width = kValueX - 4 - kGaugeX
 static const CGFloat kValueX = 206, kValueW = 72;              // "26%·76M" at 15pt ("100%" before, 19 Nov 2026)
 static const CGFloat kDatumX = 282, kDatumW = 82;              // "resets 3 Dec 10:24" at 12.5pt, fitted
 static const CGFloat kToggleH = 28, kToggleGap = 6;
@@ -11434,6 +11435,13 @@ static NSColor *ReadinessColor(double score) {
 }
 // One row per Mac: name and chevron, a readiness bar, the score and what limits it.
 static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor);
+// Same readout at a fitted point size: the popover's datum column narrowed on 19 Nov
+// (kDatumW 92 -> 82 for the wider value column) and the chip+cells pair no longer fit
+// at 12.5pt. House rule: fit the type, never truncate a reading. The chosen font comes
+// back through outFont so the field itself can carry it — AppKit's truncation probe
+// measures the field's font, not the attributed string's fonts.
+static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor,
+                                                  CGFloat width, NSFont **outFont);
 
 // Clicking opens that Mac's Storage, Battery, System and Speed rows beneath.
 - (CGFloat)addRemoteMachinesTo:(NSView *)root at:(CGFloat)y {
@@ -11499,11 +11507,23 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
             double chipC = chipN.doubleValue;
             NSColor *chipColor = (thermal && ![thermal isEqual:@"nominal"]) ? NSColor.systemOrangeColor
                 : chipC >= 95 ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
-            NSMutableAttributedString *text = [HeatTempsReadout(chipC, chipColor, 0, nil) mutableCopy];
-            if (text && ![ready[@"limit"] isEqual:@"ready"])
-                [text appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:ready[@"limit"]]
-                    attributes:@{NSFontAttributeName: datum.font, NSForegroundColorAttributeName: color}]];
-            if (text) datum.attributedStringValue = text;
+            // Fit the pair (chip reading + limit) to the datum column: the value column's
+            // 19 Nov widening left 82pt, and "76°  CPU busy" needs a smaller size to fit.
+            NSString *limit = [ready[@"limit"] isEqual:@"ready"] ? nil : ready[@"limit"];
+            NSFont *datumFont = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+            CGFloat reserve = 0;
+            if (limit.length)   // measured at the datum font: an upper bound on the fitted size
+                reserve = [[@" " stringByAppendingString:limit] sizeWithAttributes:@{NSFontAttributeName: datumFont}].width;
+            NSFont *fittedFont = nil;
+            NSMutableAttributedString *text = [HeatTempsReadoutFitted(chipC, chipColor, 0, nil,
+                                                                      MAX(0.0, NSWidth(datum.frame) - 5.0 - reserve), &fittedFont) mutableCopy];
+            if (text && limit.length)
+                [text appendAttributedString:[[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:limit]
+                    attributes:@{NSFontAttributeName: fittedFont ?: datumFont, NSForegroundColorAttributeName: color}]];
+            if (text) {
+                datum.attributedStringValue = text;
+                datum.font = fittedFont ?: datumFont;
+            }
         }
         [root addSubview:row];
         y += kRowH;
@@ -13720,13 +13740,14 @@ static NSFont *GBFontFittedToWidth(NSFont *font, NSString *text, CGFloat width) 
 }
 // The temperature readout: each reading carries its own symbol and colour, a chip
 // for the hottest core and a battery for the cells. Nil when neither is known.
-static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor) {
-    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
+static NSAttributedString *HeatTempsReadoutAtSize(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor,
+                                                  CGFloat fontSize) {
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:fontSize weight:NSFontWeightRegular];
     NSMutableAttributedString *temps = [NSMutableAttributedString new];
     void (^reading)(NSString *, double, NSColor *) = ^(NSString *symbol, double c, NSColor *color) {
         if (c <= 0) return;
         if (temps.length) [temps appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:@{NSFontAttributeName: font}]];
-        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:kDatumFont - 2.5 weight:NSFontWeightRegular]
+        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:fontSize - 2.5 weight:NSFontWeightRegular]
             configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[color]]];
         NSImage *glyph = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
         if (glyph) {
@@ -13741,6 +13762,28 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
     reading(@"cpu", chipC, chipColor);
     reading(@"battery.75", cellsC, cellColor);
     return temps.length ? temps : nil;
+}
+static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor) {
+    return HeatTempsReadoutAtSize(chipC, chipColor, cellsC, cellColor, kDatumFont);
+}
+// Half-point steps down to a floor; a temperature reading that still cannot fit keeps
+// the floor size and clips without an ellipsis, like every other single-line field.
+static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipColor, double cellsC, NSColor *cellColor,
+                                                  CGFloat width, NSFont **outFont) {
+    static const CGFloat kFloor = 10.0;
+    // The field cell's truncation probe measures ~5pt wider than the attributed string
+    // (cell inset), so fit against the cell's ruler, not the raw glyph width.
+    static const CGFloat kCellSlack = 5.0;
+    for (CGFloat size = kDatumFont; size >= kFloor; size -= 0.5) {
+        NSAttributedString *temps = HeatTempsReadoutAtSize(chipC, chipColor, cellsC, cellColor, size);
+        if (!temps) return nil;
+        if (temps.size.width + kCellSlack <= width) {
+            if (outFont) *outFont = [NSFont monospacedDigitSystemFontOfSize:size weight:NSFontWeightRegular];
+            return temps;
+        }
+    }
+    if (outFont) *outFont = [NSFont monospacedDigitSystemFontOfSize:kFloor weight:NSFontWeightRegular];
+    return HeatTempsReadoutAtSize(chipC, chipColor, cellsC, cellColor, kFloor);
 }
 - (void)addHeatInstrumentTo:(NSView *)row gauge:(NSRect)gaugeFrame value:(NSRect)valueFrame
                       datum:(NSRect)datumFrame stem:(NSString *)stem tip:(NSString *)tip {
@@ -13767,10 +13810,11 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         : level == ThermalNear ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
     NSColor *cellColor = cellHeat == BatteryHeatHot ? NSColor.systemRedColor
         : cellHeat == BatteryHeatWarm ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
-    NSAttributedString *temps = HeatTempsReadout(_sys.tempValid ? _sys.cpuTempC : 0, chipColor, _bat.valid ? _bat.tempC : 0, cellColor);
+    NSFont *fittedFont = nil;
+    NSAttributedString *temps = HeatTempsReadoutFitted(_sys.tempValid ? _sys.cpuTempC : 0, chipColor, _bat.valid ? _bat.tempC : 0, cellColor,
+                                                       NSWidth(datumFrame), &fittedFont);
     if (temps) {
-        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular];
-        NSTextField *datum = [self text:@"" font:font color:NSColor.secondaryLabelColor at:datumFrame align:NSTextAlignmentLeft];
+        NSTextField *datum = [self text:@"" font:fittedFont color:NSColor.secondaryLabelColor at:datumFrame align:NSTextAlignmentLeft];
         datum.attributedStringValue = temps;
         datum.accessibilityIdentifier = [stem stringByAppendingString:@".datum"];
         NSMutableArray *said = [NSMutableArray array];
@@ -13827,7 +13871,15 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 }
 
 - (NSTextField *)instrumentValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
-    NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
+    // Fit the type, never clip: "26%·76M" at 15pt semibold overruns the 72pt column by
+    // the cell's ruler, so step the size down before creating the field.
+    static const CGFloat kValueFloor = 10.5, kValueCellSlack = 5.0;   // "100%·1.35B" needs ~11pt
+    CGFloat valueSize = 15;
+    for (; valueSize > kValueFloor; valueSize -= 0.5) {
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:valueSize weight:NSFontWeightSemibold];
+        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + kValueCellSlack <= kValueW) break;
+    }
+    NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:valueSize weight:NSFontWeightSemibold]
                               color:color at:NSMakeRect(kValueX, (NSHeight(row.bounds) - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
     field.accessibilityIdentifier = identifier;
     [row addSubview:field];
@@ -13835,7 +13887,17 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
 }
 
 - (NSTextField *)instrumentDatum:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
-    NSTextField *field = [self text:text ?: @"" font:[NSFont monospacedDigitSystemFontOfSize:kDatumFont weight:NSFontWeightRegular]
+    NSString *string = text ?: @"";
+    // The datum column narrowed to 82pt on 19 Nov; "resets 16 Dec" no longer fits at
+    // 12.5pt by the cell's own ruler (~5pt of cell inset on top of the glyph width).
+    // House rule: fit the type, never truncate a reading.
+    static const CGFloat kDatumFloor = 10.5, kDatumCellSlack = 5.0;
+    CGFloat datumSize = kDatumFont;
+    for (; datumSize > kDatumFloor; datumSize -= 0.5) {
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:datumSize weight:NSFontWeightRegular];
+        if ([string sizeWithAttributes:@{NSFontAttributeName: font}].width + kDatumCellSlack <= kDatumW) break;
+    }
+    NSTextField *field = [self text:string font:[NSFont monospacedDigitSystemFontOfSize:datumSize weight:NSFontWeightRegular]
                               color:color ?: NSColor.secondaryLabelColor
                                  at:NSMakeRect(kDatumX, (NSHeight(row.bounds) - kDatumH) / 2.0, kDatumW, kDatumH) align:NSTextAlignmentLeft];
     field.accessibilityIdentifier = identifier;
