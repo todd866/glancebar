@@ -92,6 +92,11 @@ def log_taste(store=None, listener=None):
     cfg = load_json(store.CONFIG, {})
     listener = listener or cfg.get('glancebar_listener') or 'ian'
     ids = store.Ids.load()
+    if not ids and not store.METERED.exists():
+        store.pull()
+        ids = store.Ids.load()
+    if not ids:  # wait for the alias table, so the backlog is logged by sha, not by name
+        return {'skipped': 'no ids.json yet'}
     cur = load_json(STATE / 'taste-cursor.json', {})
     n = {'written': 0, 'unresolved': 0}
 
