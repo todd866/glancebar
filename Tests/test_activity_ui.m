@@ -263,6 +263,20 @@ int main(int argc, const char **argv) { @autoreleasepool {
     Check(![(NSButton *)Find(empty, @"details.activity.survey") isEnabled] &&
         [[(NSTextField *)Find(empty, @"details.activity.empty") stringValue] isEqual:@"Sampling…"], @"loading is explicit and resampling is disabled");
     [defaults setVolatileDomain:previous ?: @{} forName:NSArgumentDomain];
+    // A provider value is never clipped: "75.9M" rendered as "75…" in the fixed value
+    // column (owner, 19 Nov 2026). Fit the point size, then grow the frame — never cut.
+    {
+        Controller *valueCtl = [Controller new];
+        DetailColumns cols = DetailLayout(600);
+        NSView *valueRow = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 600, cols.rowH)];
+        for (NSString *text in @[@"100%", @"—", @"75.9M", @"1.23B", @"12,345,678 tokens left"])
+            {
+            NSTextField *f = [valueCtl detailValue:text color:NSColor.labelColor
+                                         identifier:@"test.value" tip:nil in:valueRow cols:cols];
+            Check(f.attributedStringValue.size.width <= NSWidth(f.frame),
+                  [NSString stringWithFormat:@"value '%@' fits its frame unclipped", text]);
+        }
+    }
     [NSFileManager.defaultManager removeItemAtPath:home error:NULL];
     fprintf(stderr, "Activity UI and policy: %d checks passed\n", checks);
 } return 0; }

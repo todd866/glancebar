@@ -15789,8 +15789,23 @@ static NSColor *HealthColor(double fraction) {
 
 - (NSTextField *)detailValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier
                           tip:(NSString *)tip in:(NSView *)row cols:(DetailColumns)c {
-    NSTextField *field = [self detailText:text font:[NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightSemibold]
-                                     color:color frame:DetailValueRect(c) align:NSTextAlignmentRight
+    // A value is never truncated ("75.9M" once became "75…" here). Fit the point size
+    // first (15 -> 12pt floor), then grow the frame leftward into gauge space: the
+    // same rule the history row has had since "20.8M" became "20…" in a 42pt field.
+    NSRect frame = DetailValueRect(c);
+    NSString *value = text ?: @"";
+    CGFloat pt = 15;
+    while (pt > 12 && [value sizeWithAttributes:@{NSFontAttributeName:
+            [NSFont monospacedDigitSystemFontOfSize:pt weight:NSFontWeightSemibold]}].width + 4 > frame.size.width)
+        pt -= 0.5;
+    NSFont *font = [NSFont monospacedDigitSystemFontOfSize:pt weight:NSFontWeightSemibold];
+    CGFloat need = ceil([value sizeWithAttributes:@{NSFontAttributeName: font}].width) + 4;
+    if (need > frame.size.width) {   // floor reached and still wide: take gauge space, never clip
+        frame.origin.x -= need - frame.size.width;
+        frame.size.width = need;
+    }
+    NSTextField *field = [self detailText:value font:font
+                                     color:color frame:frame align:NSTextAlignmentRight
                                 identifier:identifier in:row];
     if (tip.length) field.accessibilityHelp = tip;
     return field;
