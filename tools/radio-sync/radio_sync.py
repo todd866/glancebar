@@ -381,7 +381,21 @@ def cmd_queue(mood):
     return 0
 
 
+def store_facts(artist, title):
+    """The shared facts record (music/facts.json, pulled by sync) for a song, or None."""
+    store = music_store()
+    if not store:
+        return None
+    sha, _how = store.Ids.load().resolve(artist=artist, title=title)
+    songs = store.load_json(store.STATE / 'facts.json', {}).get('songs') or {}
+    return dict(songs[sha], sha=sha) if sha in songs else None
+
+
 def cmd_about(artist, title):
+    shared = store_facts(artist, title)
+    if shared and not CONFIG.exists():  # no radio on this Mac: the shared record alone
+        print(json.dumps({'ok': True, 's': shared['sha'], 'store': shared}, ensure_ascii=False))
+        return 0
     c = config()
     try:
         s = api(c, 'GET', '/api/device/lookup?' + urllib.parse.urlencode({'artist': artist, 'title': title}))['s']
@@ -392,7 +406,8 @@ def cmd_about(artist, title):
         raise
     about = api(c, 'GET', f'/api/info/{s}?kind=about')
     why = api(c, 'GET', f'/api/info/{s}?kind=why')
-    print(json.dumps({'ok': True, 's': s, 'facts': about.get('facts') or [], 'artist': about.get('artist'), 'why': why.get('rows') or []}, ensure_ascii=False))
+    print(json.dumps({'ok': True, 's': s, 'facts': about.get('facts') or [], 'artist': about.get('artist'), 'why': why.get('rows') or [],
+                      **({'store': shared} if shared else {})}, ensure_ascii=False))
     return 0
 
 
