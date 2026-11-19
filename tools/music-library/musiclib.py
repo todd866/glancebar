@@ -72,6 +72,14 @@ def load_config(path=None):
         'keep_days': int(raw['keep_days']),
         'min_free_gb': float(raw.get('min_free_gb', 20)),
         'max_playlist_tracks': int(raw.get('max_playlist_tracks', 120)),
+        # The Mac that holds masters lists every root here (drives are pools); the catalogue
+        # builder reads them for hashes and tags and builds from the bucket's listing.
+        'masters_roots': [Path(r).expanduser() for r in raw.get('masters_roots') or []],
+        'catalogue_prefixes': tuple(raw.get('catalogue_prefixes') or DEFAULT_PREFIXES),
+        # Alias claims (Apple ids, persistent ids, YouTube ids) other Macs hand the builder.
+        'alias_inputs': [str(Path(a).expanduser()) for a in
+                         raw.get('alias_inputs') or [str(DEFAULT_STATE / 'alias-inputs' / '*.jsonl')]],
+        'catalogue_fetch_max': int(raw.get('catalogue_fetch_max', 200)),
         'config_path': p,
     }
 
@@ -315,6 +323,172 @@ def _catalogue_root(masters, cache, entries, skipped, seen):
     return cache
 
 
+# --- The catalogue from the bucket (19 Nov 2026) --------------------------------------------------
+# The catalogue is the list of masters in R2, whichever drive or Mac put them there. Until this date
+# it was a walk of the drives, so a master placed straight into R2 (the 6IAN lane: 582 songs on
+# 19 Nov) never reached the catalogue or the nightly embed, and one unreadable drive failed the
+# whole build. Now the R2 listing is the truth; a readable masters root supplies hash and tags for
+# a new object, the previous catalogue supplies them for an unchanged one, and anything else is
+# fetched from R2 (bounded per run).
+
+DEFAULT_PREFIXES = ('AM-Lossless/', 'AM-MV/')
+SHRINK_GUARD = 0.9   # a build that would drop more than a tenth of the catalogue is refused
+
+
+def remote_listing(remote, prefixes=DEFAULT_PREFIXES, runner=None):
+    """{relativePath: {'size': int, 'time': str}} for audio objects under the prefixes.
+
+    One --fast-list request per prefix (no HEAD per object; --use-server-modtime). A failed
+    listing raises: a partial listing must never become a smaller catalogue."""
+    out = {}
+    for prefix in prefixes:
+        prefix = prefix.strip('/') + '/'
+        argv = ['lsf', '-R', '--files-only', '--fast-list', '--use-server-modtime',
+                '--format', 'pst', '--separator', '\t', f'{remote}/{prefix}']
+        proc = (runner or rclone_run)(argv, check=False)
+        if proc.returncode != 0:
+            msg = (proc.stderr or '').strip()
+            if 'directory not found' in msg.lower():
+                continue  # a prefix with nothing in it yet
+            raise RuntimeError(f'cannot list {remote}/{prefix}: {msg[-300:] or proc.returncode}')
+        for line in proc.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            rel = prefix + parts[0]
+            if Path(rel).suffix.lower() not in AUDIO_SUFFIXES:
+                continue
+            try:
+                out[rel] = {'size': int(parts[1]), 'time': parts[2] if len(parts) > 2 else ''}
+            except ValueError:
+                continue
+    return out
+
+
+def _time_ns(stamp):
+    """rclone's modtime text ('2026-11-18 03:54:00' or ISO) as nanoseconds since 1970, or 0."""
+    from datetime import datetime, timezone
+    text = (stamp or '').strip().replace('T', ' ').rstrip('Z')
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+        try:
+            dt = datetime.strptime(text[:26], fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp()) * 1_000_000_000
+        except ValueError:
+            continue
+    return 0
+
+
+def readable_roots(roots, retries=2):
+    """The roots this process can list now. An unreadable drive is left out with a warning (on
+    19 Nov 2026 `ls` on OTV Mirror failed with EINTR and failed the whole push)."""
+    ok, bad = [], []
+    for root in roots:
+        for attempt in range(retries + 1):
+            try:
+                if root.is_dir():
+                    with os.scandir(root) as it:
+                        next(it, None)
+                    ok.append(root)
+                else:
+                    bad.append(f'{root}: not mounted')
+                break
+            except OSError as exc:
+                if attempt == retries:
+                    bad.append(f'{root}: {exc}')
+                else:
+                    time.sleep(1)
+    return ok, bad
+
+
+def previous_entries(state, remote=None):
+    """The last catalogue's entries by path: the local copy, else the bucket's (fetched once)."""
+    doc = load_cached_catalogue(state)
+    if not doc and remote:
+        try:
+            doc = refresh_catalogue_cache(remote, state)
+        except (RuntimeError, OSError, ValueError):
+            doc = None
+    return {e['relativePath']: e for e in (doc or {}).get('entries') or []
+            if isinstance(e, dict) and e.get('relativePath') and e.get('sha256')}
+
+
+def build_catalogue_from_remote(remote, roots, state, *, listing=None, fetch_max=200,
+                                metered_flag=None, fetcher=None, allow_shrink=False,
+                                prefixes=DEFAULT_PREFIXES):
+    """One catalogue entry per audio object in the bucket. Returns (doc, report)."""
+    state = state_dir(state)
+    listing = remote_listing(remote, prefixes) if listing is None else listing
+    roots = _roots(roots or [])
+    usable, unreadable = readable_roots(roots)
+    prev = previous_entries(state, remote)
+    cache = load_build_cache(state)
+    metered = Path(metered_flag or METERED_FLAG).exists()
+    fetch = fetcher or (lambda rel, dest: remote_fetch_file(remote, rel, dest))
+    entries, pending, skipped = [], [], []
+    counts = {'drive': 0, 'carried': 0, 'fetched': 0}
+    tmp = None
+    try:
+        for rel in sorted(listing):
+            size = listing[rel]['size']
+            entry = None
+            for root in usable:
+                path = root / rel
+                try:
+                    st = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_size == size:
+                    try:
+                        entry, cache = catalogue_entry_for_file(path, root, cache)
+                        counts['drive'] += 1
+                    except OSError as exc:
+                        skipped.append(f'{path}: {exc}')
+                        entry = None
+                    break
+            if entry is None:
+                old = prev.get(rel)
+                if old and int(old.get('sizeBytes') or -1) == size:
+                    entry = old
+                    counts['carried'] += 1
+            if entry is None and not metered and counts['fetched'] < fetch_max:
+                if tmp is None:
+                    tmp = Path(tempfile.mkdtemp(prefix='catalogue-fetch-'))
+                dest = tmp / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    fetch(rel, dest)
+                    if dest.stat().st_size != size:
+                        raise OSError(f'fetched {dest.stat().st_size} bytes, bucket says {size}')
+                    entry, _ = catalogue_entry_for_file(dest, tmp, {})
+                    entry = dict(entry, mtimeNs=str(_time_ns(listing[rel].get('time')) or entry['mtimeNs']))
+                    counts['fetched'] += 1
+                except (OSError, RuntimeError) as exc:
+                    skipped.append(f'{rel}: fetch failed: {exc}')
+                    entry = None
+                finally:
+                    dest.unlink(missing_ok=True)  # inside this run's temp dir
+            if entry is None:
+                pending.append(rel)
+                continue
+            entries.append(entry)
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)  # the temp dir made above
+    save_build_cache(state, cache)
+    dropped = sorted(set(prev) - set(listing))
+    if not entries:
+        raise ValueError(f'no audio masters listed under {remote}')
+    if prev and not allow_shrink and len(entries) < SHRINK_GUARD * len(prev):
+        raise ValueError(f'refusing to publish {len(entries)} entries over the previous {len(prev)} '
+                         f'(more than {int((1 - SHRINK_GUARD) * 100)}% fewer); --allow-shrink if that is right')
+    doc = {'schemaVersion': CATALOGUE_SCHEMA, 'generatedAt': int(time.time()), 'source': 'remote', 'entries': entries}
+    report = {'listed': len(listing), 'entries': len(entries), **counts, 'pending': len(pending),
+              'firstPending': pending[:5], 'dropped': len(dropped), 'firstDropped': dropped[:5],
+              'unreadableRoots': unreadable, 'skipped': len(skipped), 'firstSkipped': skipped[:5],
+              'metered': metered}
+    return doc, report
+
+
 def atomic_write_json(path, document):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,21 +509,35 @@ def atomic_write_json(path, document):
 ARCHIVE_DIR_NAME = '_metadata'
 
 
-def catalogue_command(masters_dir, remote, state, upload=True, archive=True):
+def catalogue_command(masters_dir, remote, state, upload=True, archive=True, from_remote=False,
+                      fetch_max=200, allow_shrink=False, prefixes=DEFAULT_PREFIXES):
+    """Build and publish catalogue.json.
+
+    from_remote: the bucket's listing is the catalogue (the nightly push since 19 Nov 2026); the
+    roots only supply hashes and tags. Otherwise the roots are walked (tests and one-off use)."""
     state = state_dir(state)
-    doc = build_catalogue(masters_dir, state)
+    report = None
+    if from_remote:
+        doc, report = build_catalogue_from_remote(remote, masters_dir, state, fetch_max=fetch_max,
+                                                  allow_shrink=allow_shrink, prefixes=prefixes)
+    else:
+        doc = build_catalogue(masters_dir, state)
     local_out = state / 'catalogue.json'
     atomic_write_json(local_out, doc)
     if archive:
-        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026): on every pool.
-        for root in _roots(masters_dir):
+        # The record lives with the masters, on the same drive (owner rule, 12 Nov 2026): on every
+        # pool this run could read. A drive that cannot be written is a warning, not a failed build.
+        roots = readable_roots(_roots(masters_dir or []))[0]
+        for root in roots:
             try:
                 atomic_write_json(root / ARCHIVE_DIR_NAME / 'library-metadata.json', doc)
             except OSError as exc:
-                print(f'catalogue: could not write the metadata record beside the masters: {exc}', file=sys.stderr)
-                raise
+                print(f'catalogue: could not write the metadata record beside the masters ({root}): {exc}',
+                      file=sys.stderr)
     if upload:
         upload_local_json(local_out, remote, 'catalogue.json')
+    if report is not None:
+        doc = dict(doc, report=report)
     return doc
 
 
@@ -1024,15 +1212,23 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='command', required=True)
 
-    c_cat = sub.add_parser('catalogue', help='walk masters and publish catalogue.json')
-    c_cat.add_argument('--masters', type=Path, required=True, action='append', help='repeat for each masters pool')
+    c_cat = sub.add_parser('catalogue', help='build and publish catalogue.json (and ids.json with --from-remote)')
+    c_cat.add_argument('--masters', type=Path, action='append',
+                       help='repeat for each masters pool (default: masters_roots in the config)')
+    c_cat.add_argument('--from-remote', action='store_true',
+                       help="the bucket's listing is the catalogue; the roots only supply hashes and tags")
+    c_cat.add_argument('--fetch-max', type=int, help='at most this many new objects fetched from the bucket per run')
+    c_cat.add_argument('--allow-shrink', action='store_true')
     c_cat.add_argument('--config', type=Path)
     c_cat.add_argument('--state', type=Path)
     c_cat.add_argument('--no-upload', action='store_true')
     c_cat.add_argument('--no-archive', action='store_true', help='do not write _metadata/library-metadata.json beside the masters')
 
+    c_roots = sub.add_parser('roots', help='print the configured masters roots, one a line')
+    c_roots.add_argument('--config', type=Path)
+
     c_push = sub.add_parser('push', help='rclone copy masters to remote (no deletes)')
-    c_push.add_argument('--masters', type=Path, required=True, action='append', help='repeat for each masters pool')
+    c_push.add_argument('--masters', type=Path, action='append', help='repeat for each masters pool')
     c_push.add_argument('--config', type=Path)
 
     c_plan = sub.add_parser('plan', help='compute hot-set plan JSON')
@@ -1063,8 +1259,13 @@ def main(argv=None):
     try:
         if args.command == 'catalogue':
             cfg = load_config(args.config)
-            doc = catalogue_command(args.masters, cfg['remote'], args.state, upload=not args.no_upload,
-                                    archive=not args.no_archive)
+            roots = args.masters or cfg['masters_roots']
+            if not roots and not args.from_remote:
+                raise ValueError('no masters roots: pass --masters or set masters_roots in the config')
+            doc = catalogue_command(roots, cfg['remote'], args.state, upload=not args.no_upload,
+                                    archive=not args.no_archive, from_remote=args.from_remote,
+                                    fetch_max=args.fetch_max if args.fetch_max is not None else cfg['catalogue_fetch_max'],
+                                    allow_shrink=args.allow_shrink, prefixes=cfg['catalogue_prefixes'])
             incomplete = []
             for entry in doc['entries']:
                 gaps = trackmeta.metadata_gaps({**(entry.get('meta') or {}), **(entry.get('tags') or {}),
@@ -1073,12 +1274,17 @@ def main(argv=None):
                 if gaps:
                     incomplete.append({'relativePath': entry['relativePath'], 'missing': gaps})
             print(json.dumps({'entries': len(doc['entries']), 'remote': cfg['remote'],
-                              'metadataIncomplete': len(incomplete), 'firstIncomplete': incomplete[:5]},
+                              'metadataIncomplete': len(incomplete), 'firstIncomplete': incomplete[:5],
+                              **({'report': doc['report']} if doc.get('report') else {})},
                              indent=2, ensure_ascii=False))
+            return 0
+        if args.command == 'roots':
+            for root in load_config(args.config)['masters_roots']:
+                print(root)
             return 0
         if args.command == 'push':
             cfg = load_config(args.config)
-            push_command(args.masters, cfg['remote'])
+            push_command(args.masters or cfg['masters_roots'], cfg['remote'])
             return 0
         if args.command == 'touch':
             rel, ts = touch_played(args.path, args.state, config=args.config)

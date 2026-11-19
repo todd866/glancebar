@@ -578,3 +578,68 @@ class RadioRequestsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RemoteCatalogueTest(unittest.TestCase):
+    """The bucket's listing is the catalogue (19 Nov 2026): masters placed straight into R2 are
+    catalogued, an unreadable drive does not fail the build, and a short listing is refused."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.remote, self.drive, self.state = root / 'remote', root / 'drive', root / 'state'
+        for rel, title in (('AM-Lossless/A/X/1.m4a', 'One'), ('AM-Lossless/B/Y/2.m4a', 'Two')):
+            for base in (self.remote, self.drive):
+                p = base / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(audio_bytes(title, rel.split('/')[1], 'Alb'))
+        # A lane master that went straight to the bucket: on no readable drive.
+        lane = self.remote / 'AM-Lossless/C/Z/3.m4a'
+        lane.parent.mkdir(parents=True)
+        lane.write_bytes(audio_bytes('Three', 'C', 'Alb'))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_lane_master_in_bucket_only_is_catalogued(self):
+        doc, rep = m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state,
+                                                 metered_flag='/nonexistent')
+        rels = sorted(e['relativePath'] for e in doc['entries'])
+        self.assertEqual(rels, ['AM-Lossless/A/X/1.m4a', 'AM-Lossless/B/Y/2.m4a', 'AM-Lossless/C/Z/3.m4a'])
+        self.assertEqual((rep['drive'], rep['fetched'], rep['pending']), (2, 1, 0))
+        lane = [e for e in doc['entries'] if e['relativePath'].endswith('3.m4a')][0]
+        self.assertEqual(lane['tags']['title'], 'Three')
+        self.assertEqual(lane['sha256'], m.sha256_file(self.remote / 'AM-Lossless/C/Z/3.m4a'))
+
+    def test_unreadable_drive_carries_previous_entries(self):
+        doc, _ = m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state, metered_flag='/nonexistent')
+        m.atomic_write_json(self.state / 'catalogue.json', doc)
+        gone = Path(self.tmp.name) / 'unmounted'
+        doc2, rep = m.build_catalogue_from_remote(str(self.remote), [gone], self.state, metered_flag='/nonexistent',
+                                                  fetcher=lambda rel, dest: self.fail('nothing should be fetched'))
+        self.assertEqual(len(doc2['entries']), 3)
+        self.assertEqual(rep['carried'], 3)
+        self.assertTrue(rep['unreadableRoots'])
+
+    def test_metered_or_capped_leaves_new_objects_pending(self):
+        flag = Path(self.tmp.name) / 'METERED'
+        flag.write_text('')
+        _, rep = m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state, metered_flag=flag)
+        self.assertEqual((rep['entries'], rep['pending']), (2, 1))
+        _, rep = m.build_catalogue_from_remote(str(self.remote), [], self.state, metered_flag='/nonexistent', fetch_max=1)
+        self.assertEqual(rep['fetched'], 1)
+
+    def test_shrink_guard(self):
+        doc, _ = m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state, metered_flag='/nonexistent')
+        m.atomic_write_json(self.state / 'catalogue.json', doc)
+        short = {'AM-Lossless/A/X/1.m4a': {'size': (self.remote / 'AM-Lossless/A/X/1.m4a').stat().st_size, 'time': ''}}
+        with self.assertRaises(ValueError):
+            m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state, listing=short)
+        doc3, _ = m.build_catalogue_from_remote(str(self.remote), [self.drive], self.state, listing=short, allow_shrink=True)
+        self.assertEqual(len(doc3['entries']), 1)
+
+    def test_failed_listing_raises(self):
+        class P:
+            returncode, stdout, stderr = 1, '', 'network down'
+        with self.assertRaises(RuntimeError):
+            m.remote_listing('r:bucket', runner=lambda argv, check=False: P())

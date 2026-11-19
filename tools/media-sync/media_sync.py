@@ -1612,6 +1612,11 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 else:
                     age_h = (now - push_status.stat().st_mtime) / 3600.0
                 fact = f"ok, {age_fact(age_h * 3600)} ago"
+                if doc.get("warning"):
+                    # Since 19 Nov 2026 an unreadable drive or uncatalogued objects do not fail the
+                    # push (the bucket is the catalogue's truth); they warn.
+                    st = "warn"
+                    fact += f"; {str(doc['warning'])[:160]}"
                 if age_h > float(chk.get("upload_fail_h", 72)):
                     st = "fail"
                 elif age_h > float(chk.get("upload_warn_h", 36)):

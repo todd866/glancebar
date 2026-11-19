@@ -525,6 +525,17 @@ class CheckRowsTest(MediaSyncTestBase):
         rc = self.run_check(strict=False)
         self.assertEqual(rc, 0)
 
+    def test_push_warning_is_a_warn_row(self):
+        self.write_ledger(age_h=0)
+        push = self.root / "mlib/push-status.json"
+        push.parent.mkdir(parents=True, exist_ok=True)
+        push.write_text(json.dumps({"ok": True, "epoch": self.t0, "warning": "unreadable: masters root"}), encoding="utf-8")
+        self.run_check()
+        doc = json.loads((self.state / "check.json").read_text(encoding="utf-8"))
+        row = [r for r in doc["rows"] if r.get("name") == "upload"][0]
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("unreadable", row["value"])
+
 
 class EmbedGapsCheckTests(MediaSyncTestBase):
     def gaps(self, **kw):
