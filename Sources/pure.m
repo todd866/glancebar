@@ -3219,6 +3219,64 @@ double QuotaWindowSeconds(NSDictionary *window) {
     return 0;
 }
 
+NSString *FormatTokensCompact(double tokens) {
+    if (!isfinite(tokens) || tokens < 1) return nil;
+    const double scale[] = {1e12, 1e9, 1e6, 1e3};
+    const char *unit[] = {"T", "B", "M", "K"};
+    for (int i = 0; i < 4; i++) {
+        if (tokens < scale[i]) continue;
+        double value = tokens / scale[i];
+        // Three significant figures: a one-digit leading figure gets two decimals, two
+        // digits one, three digits none. Trailing zeros trim: 3 s.f. of 76,000,000 is "76M".
+        int decimals = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+        NSMutableString *text = [NSMutableString stringWithFormat:
+            [NSString stringWithFormat:@"%%.%df%s", decimals, unit[i]], value];
+        NSRange dot = [text rangeOfString:@"."];
+        if (dot.location != NSNotFound) {
+            // The unit letter is always last; trim zeros just before it, then a bare "."
+            // ("76.0M" -> "76.M" -> "76M", "1.50B" -> "1.5B").
+            while (text.length > dot.location + 2 && [text characterAtIndex:text.length - 2] == '0')
+                [text deleteCharactersInRange:NSMakeRange(text.length - 2, 1)];
+            if (text.length > dot.location + 1 && [text characterAtIndex:text.length - 2] == '.')
+                [text deleteCharactersInRange:NSMakeRange(text.length - 2, 2)];
+        }
+        return text;
+    }
+    return [NSString stringWithFormat:@"%.0f", tokens];
+}
+
+NSDictionary<NSString *, NSDictionary *> *ParseAICapacityDocument(NSString *json) {
+    if (![json isKindOfClass:NSString.class] || !json.length) return nil;
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSDictionary *root = [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+    NSDictionary *services = [root[@"services"] isKindOfClass:NSDictionary.class] ? root[@"services"] : nil;
+    if (!services.count) return nil;
+    NSMutableDictionary<NSString *, NSDictionary *> *pools = [NSMutableDictionary dictionary];
+    for (NSString *service in services.allKeys) {
+        if (![service isKindOfClass:NSString.class]) continue;
+        NSDictionary *svc = [services[service] isKindOfClass:NSDictionary.class] ? services[service] : nil;
+        NSArray *list = [svc[@"pools"] isKindOfClass:NSArray.class] ? svc[@"pools"] : nil;
+        for (id entry in list) {
+            NSDictionary *pool = [entry isKindOfClass:NSDictionary.class] ? entry : nil;
+            NSString *name = [pool[@"pool"] isKindOfClass:NSString.class] ? pool[@"pool"] : nil;
+            if (!name.length) continue;
+            double pct = [pool[@"remainingPct"] isKindOfClass:NSNumber.class] ? [pool[@"remainingPct"] doubleValue] : -100;
+            NSMutableDictionary *row = [NSMutableDictionary dictionary];
+            row[@"fraction"] = @(pct >= 0 && pct <= 100 ? pct / 100.0 : -1);
+            NSDictionary *estimate = [pool[@"estimate"] isKindOfClass:NSDictionary.class] ? pool[@"estimate"] : nil;
+            if ([estimate[@"tokensLeft"] isKindOfClass:NSNumber.class] && [estimate[@"tokensLeft"] doubleValue] > 0)
+                row[@"tokensLeft"] = @([estimate[@"tokensLeft"] longLongValue]);
+            NSString *resetAt = [pool[@"resetAt"] isKindOfClass:NSString.class] ? pool[@"resetAt"] : nil;
+            NSDate *reset = resetAt ? DateFromISO8601(resetAt) : nil;
+            row[@"resetAt"] = @(reset ? reset.timeIntervalSince1970 : 0);
+            pools[[NSString stringWithFormat:@"%@.%@", service, name]] = row;
+        }
+    }
+    return pools.count ? pools : nil;
+}
+
 static NSArray<NSDictionary *> *SortedBurnRows(NSArray<NSDictionary *> *rows);
 NSArray<NSDictionary *> *BurnRows(NSDictionary<NSNumber *, NSNumber *> *prev,
                                   NSDictionary<NSNumber *, NSNumber *> *cur,

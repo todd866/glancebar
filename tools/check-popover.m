@@ -142,9 +142,17 @@ static BOOL RecoveryTip(NSView *view) {
     NSTextField *field = (NSTextField *)view;
     return [view.toolTip isEqual:field.stringValue] && AppKitTruncatesLabel(field);
 }
+// The AI value column's hover figures for a token-sized pool: the exact percent, exact
+// token count and full reset time the row's compact number approximates. Terse by shape.
+static BOOL QuotaValueTip(NSView *view) {
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    if (![ident hasPrefix:@"popover.ai."] || ![ident hasSuffix:@".value"]) return NO;
+    NSString *tip = view.toolTip ?: @"";
+    return [tip containsString:@"% left · "] && [tip containsString:@" tokens left · resets "];
+}
 static NSView *WordyTip(NSView *view) {
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
-        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view))
+        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view) && !QuotaValueTip(view))
         return view;
     for (NSView *child in view.subviews) { NSView *w = WordyTip(child); if (w) return w; }
     return nil;
@@ -524,7 +532,7 @@ static BOOL SoundRow(NSView *root, NSString *title, NSString *subtitle, BOOL tra
 static BOOL FitsChildren(NSView *view) {
     if ([view isKindOfClass:GBRecoverableTextField.class] && !RecoverableLabelOK((NSTextField *)view)) return NO;
     if (view.toolTip.length && !RecoveryTip(view) && !IntendedControlTip(view) && !VolumeNamesTip(view) &&
-        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view)) {
+        !KindTileTip(view) && !ShowTileTip(view) && !MusicLoudnessSubtitleTip(view) && !QuotaValueTip(view)) {
         fprintf(stderr, "tooltip on %s: %s\n", view.accessibilityIdentifier.UTF8String, view.toolTip.UTF8String);
         return NO;
     }
@@ -2542,6 +2550,60 @@ int main(int argc, const char **argv) {
             NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
             if (!RenderOffscreen(root, [stem stringByAppendingString:@"-cursor.png"], look) ||
                 !RenderOffscreen([c aiDetailsView].documentView, [stem stringByAppendingString:@"-cursor-ai.png"], look)) return Fail(__LINE__);
+        }
+        // Z.ai GLM Coding Plan (owner, 19 Nov 2026): a weekly row with the plain bold Z in
+        // the logo box, the 5-hour window as its own plain row beneath (Cursor API shape),
+        // and the value column in tokens wherever a pool carries an estimate. Pools without
+        // one keep their percentage (Claude and Codex here).
+        {
+            double nowEpoch = NSDate.date.timeIntervalSince1970;
+            AIUsage *zai = [AIUsage new];
+            zai.name = @"Z.ai"; zai.available = YES; zai.limitStatusAvailable = YES;
+            zai.remainingFraction = 1.0; zai.tokensLeft = 1347000000;
+            zai.resetAt = [NSDate dateWithTimeIntervalSince1970:nowEpoch + 7 * 86400];
+            zai.limitWindows = @[
+                @{@"pool": @"week", @"window": @"weekly", @"remainingFraction": @1.0,
+                  @"resetsAt": @(nowEpoch + 7 * 86400), @"tokensLeft": @1347000000},
+                @{@"pool": @"5h", @"window": @"5-hour", @"remainingFraction": @0.999,
+                  @"resetsAt": @(nowEpoch + 4 * 3600), @"tokensLeft": @269000000}];
+            AIUsage *cursorSized = usage[2];
+            NSArray *cursorBeforeTokens = cursorSized.limitWindows;
+            cursorSized.limitWindows = @[
+                @{@"pool": @"cursor", @"window": @"Cursor models", @"remainingFraction": @0.265,
+                  @"resetsAt": @(nowEpoch + 14 * 86400), @"tokensLeft": @76000000},
+                @{@"pool": @"api", @"window": @"API models", @"remainingFraction": @0.456,
+                  @"resetsAt": @(nowEpoch + 14 * 86400), @"tokensLeft": @11000000}];
+            NSMutableArray *sizedUsage = [usage mutableCopy];
+            [sizedUsage addObject:zai];
+            [c setValue:sizedUsage forKey:@"aiUsage"];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *cursorValue = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.value");
+            NSTextField *apiTokenValue = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.api.value");
+            NSTextField *zaiValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.value");
+            NSTextField *zaiFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.value");
+            Gauge *zaiGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.gauge");
+            Gauge *zaiFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.5h.gauge");
+            if (![cursorValue.stringValue isEqual:@"76M"] || ![apiTokenValue.stringValue isEqual:@"11M"] ||
+                ![zaiValue.stringValue isEqual:@"1.35B"] || ![zaiFiveValue.stringValue isEqual:@"269M"] ||
+                ![((NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.datum")).stringValue hasPrefix:@"resets "] ||
+                ![zaiGauge isKindOfClass:Gauge.class] || fabs(zaiGauge.fraction - 1.0) > 0.001 ||
+                ![zaiFiveGauge isKindOfClass:Gauge.class] || fabs(zaiFiveGauge.fraction - 0.999) > 0.001 ||
+                !SameColumn(zaiGauge, FindIdentifier(root, @"popover.ai.cursor.gauge")) ||
+                !SameColumn(zaiFiveGauge, zaiGauge) || !SameColumn(zaiValue, cursorValue) ||
+                !SameColumn(zaiFiveValue, zaiValue) ||
+                !SameSize(FindIdentifier(root, @"popover.ai.z.ai.symbol"), FindIdentifier(root, @"popover.ai.cursor.symbol")) ||
+                !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+            if (![zaiValue.toolTip hasPrefix:@"100% left · 1,347,000,000 tokens left · resets "] ||
+                ![zaiFiveValue.toolTip containsString:@"269,000,000 tokens left"] ||
+                ![cursorValue.toolTip containsString:@"76,000,000 tokens left · resets "]) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+                if (!RenderOffscreen(root, [stem stringByAppendingString:@"-zai.png"], look)) return Fail(__LINE__);
+            }
+            cursorSized.limitWindows = cursorBeforeTokens;
+            [c setValue:usage forKey:@"aiUsage"];
+            [c rebuildContent]; root = p.contentViewController.view;
         }
         // Starlink adds exactly one aligned instrument, only while detected.
         if (FindIdentifier(root, @"popover.row.starlink")) return Fail(__LINE__);

@@ -250,6 +250,73 @@ int main(void) {
             [NSFileManager.defaultManager removeItemAtPath:fixture error:nil];
         }
 
+        // The ai-capacity document: token estimates join pools the provider itself reported
+        // (fractions and resets stay the provider's own), and the Z.ai GLM Coding Plan
+        // becomes its own provider row — weekly on the row, the 5-hour window as its
+        // second pool. Elapsed resets mean a stale document and show nothing.
+        {
+            NSString *fixture = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+            AIReader *reader = [[AIReader alloc] initWithHomeDirectory:fixture
+                                          applicationSupportDirectory:[fixture stringByAppendingPathComponent:@"support"]];
+            double now = NSDate.date.timeIntervalSince1970;
+            __block NSUInteger fetches = 0;
+            reader.capacityFetcher = ^NSString *{
+                fetches++;
+                return [NSString stringWithFormat:
+                    @"{\"services\":{\"cursor\":{\"pools\":["
+                    @"{\"pool\":\"api\",\"remainingPct\":45.6,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":11000000}},"
+                    @"{\"pool\":\"cursor\",\"remainingPct\":26.5,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":76234120}}]},"
+                    @"\"zai\":{\"pools\":["
+                    @"{\"pool\":\"5h\",\"remainingPct\":99.9,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":269000000}},"
+                    @"{\"pool\":\"week\",\"remainingPct\":100,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":1347000000}}]}}}",
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:14 * 86400]),
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:14 * 86400]),
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:4 * 3600]),
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:7 * 86400])];
+            };
+            AIUsage *cursorTokens = [AIUsage new];
+            cursorTokens.name = @"Cursor";
+            cursorTokens.limitStatusAvailable = YES;
+            cursorTokens.limitWindows = @[
+                @{@"pool": @"cursor", @"remainingFraction": @0.26, @"resetsAt": @(now + 86400)},
+                @{@"pool": @"api", @"remainingFraction": @0.45, @"resetsAt": @(now + 86400)}];
+            NSMutableArray *usage = [NSMutableArray arrayWithObject:cursorTokens];
+            [reader applyCapacityPoolsToUsage:usage];
+            NSDictionary *pools = CursorPoolQuotas(cursorTokens);
+            check(pools && [pools[@"cursor"][@"tokensLeft"] longLongValue] == 76234120 &&
+                  [pools[@"api"][@"tokensLeft"] longLongValue] == 11000000 &&
+                  fabs([pools[@"cursor"][@"remainingFraction"] doubleValue] - 0.26) < 0.001,
+                  @"capacity: token estimates join Cursor's own pool fractions");
+            AIUsage *zai = UsageNamed(usage, @"Z.ai");
+            check(zai && zai.limitStatusAvailable && fabs(zai.remainingFraction - 1.0) < 0.001 &&
+                  zai.tokensLeft == 1347000000 && zai.resetAt.timeIntervalSinceNow > 6 * 86400 &&
+                  zai.limitWindows.count == 2 && [zai.limitWindows[0][@"pool"] isEqual:@"week"] &&
+                  [zai.limitWindows[1][@"pool"] isEqual:@"5h"] &&
+                  [zai.limitWindows[1][@"tokensLeft"] longLongValue] == 269000000 &&
+                  [zai.limitWindows[1][@"resetsAt"] doubleValue] > now,
+                  @"capacity: Z.ai is a weekly provider row with the 5-hour second pool");
+            // The subprocess runs at most once per interval; the parsed document is reused.
+            [reader applyCapacityPoolsToUsage:usage];
+            check(fetches == 1, @"capacity: the document read is throttled, not per-pass");
+            // Without the tool (default on a Mac without the fleet setup) no row appears.
+            AIReader *bare = [[AIReader alloc] initWithHomeDirectory:fixture
+                                        applicationSupportDirectory:[fixture stringByAppendingPathComponent:@"support2"]];
+            NSArray *bareUsage = [bare read];
+            check(UsageNamed(bareUsage, @"Z.ai") == nil && bareUsage.count == 2,
+                  @"capacity: no tool, no Z.ai row and no extra providers");
+            // A document whose resets have elapsed is stale, not a quota to show.
+            AIReader *stale = [[AIReader alloc] initWithHomeDirectory:fixture
+                                          applicationSupportDirectory:[fixture stringByAppendingPathComponent:@"support3"]];
+            stale.capacityFetcher = ^NSString *{
+                return @"{\"services\":{\"zai\":{\"pools\":[{\"pool\":\"week\",\"remainingPct\":100,"
+                    @"\"resetAt\":\"2026-11-01T00:00:00Z\",\"estimate\":{\"tokensLeft\":1}}]}}}";
+            };
+            NSMutableArray *staleUsage = [NSMutableArray array];
+            [stale applyCapacityPoolsToUsage:staleUsage];
+            check(staleUsage.count == 0, @"capacity: elapsed resets show no row");
+            [NSFileManager.defaultManager removeItemAtPath:fixture error:nil];
+        }
+
         check(IsJSONBoolean(JSONBool(YES)) && IsJSONBoolean(JSONBool(NO)),
               @"JSONBool emits real JSON booleans");
         check(!IsJSONBoolean(@1) && !IsJSONBoolean(@0),

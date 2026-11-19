@@ -1218,6 +1218,35 @@ static NSString *RunTaskOutput(NSString *path, NSArray<NSString *> *args) {
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
+// `ai-capacity --json`: the fleet budget tool (~/.local/bin/ai-capacity, a wrapper that
+// execs Node on ~/.claude/bin/ai-budget.mjs). It reads only local cache files, never the
+// network, and sizes the pools the providers' own sources cannot (Cursor's token ledger,
+// the Z.ai GLM Coding Plan credits). Absent on a Mac without that setup: nil, no row.
+// RunTaskOutput scrubs the environment, but the wrapper finds node through PATH and the
+// budget script reads $HOME, so this task keeps both.
+static NSString *AICapacityJSONViaTool(NSString *homeDirectory) {
+    NSString *path = [(homeDirectory.length ? homeDirectory : NSHomeDirectory())
+        stringByAppendingPathComponent:@".local/bin/ai-capacity"];
+    if (![NSFileManager.defaultManager isExecutableFileAtPath:path]) return nil;
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
+    t.arguments = @[path, @"--json"];
+    t.environment = @{@"LC_ALL": @"C",
+                      @"HOME": homeDirectory.length ? homeDirectory : NSHomeDirectory(),
+                      @"PATH": @"/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"};
+    NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe;
+    t.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSError *launchError = nil;
+    if (![t launchAndReturnError:&launchError]) return nil;
+    GBWatchdog *watchdog = [[GBWatchdog alloc] initWithPid:t.processIdentifier seconds:8];
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [t waitUntilExit];
+    [watchdog disarm];
+    if (t.terminationReason != NSTaskTerminationReasonExit || t.terminationStatus != 0 ||
+        data.length == 0 || data.length > 32 * 1024 * 1024) return nil;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
 // Reads the live SleepDisabled system power setting (no admin needed — a plain IOKit read
 // surfaced by `pmset -g`). YES = Keep Awake is on (no idle or lid-close sleep).
 // nil when the setting could not be read — callers must not mistake that for "normal
@@ -1626,6 +1655,7 @@ static NSColor *CPUColor(double cpu) {
 @property (copy) NSString *diagnostics;   // --dump only: why the gauge is or isn't shown
 @property BOOL available, stale, limitStatusAvailable, limitStale, overageActive;
 @property double remainingFraction;
+@property long long tokensLeft;   // the row's primary pool in tokens (ai-capacity estimate); 0 = no estimate
 @property long long todayTokens, weekTokens, todayMessages, todaySessions, todayToolCalls, weekSessions;
 @property long long todayTokensAll, weekTokensAll;   // incl. cached context re-reads
 @property (strong) NSDate *lastActivity;
@@ -2001,6 +2031,27 @@ static NSDate *CursorPoolReset(NSDictionary *pools) {
         if (!reset || [date compare:reset] == NSOrderedAscending) reset = date;
     }
     return reset;
+}
+
+// The value column for a quota that has a token estimate: how big the pool is, in tokens.
+// Without one the percentage the row already had stays — the gauge still shows percentage.
+static NSString *AIQuotaValueText(long long tokens, NSString *percentText) {
+    return tokens > 0 ? FormatTokensCompact((double)tokens) : percentText;
+}
+
+// The exact figures behind a compact value, one terse line: "27% left · 76,123,456 tokens
+// left · resets 19/11/2026, 3:04 pm". Parts that are unknown drop out.
+static NSString *AIQuotaValueTip(double fraction, long long tokens, NSDate *reset) {
+    static NSNumberFormatter *grouped;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ grouped = [NSNumberFormatter new]; grouped.numberStyle = NSNumberFormatterDecimalStyle; });
+    NSMutableArray *parts = [NSMutableArray array];
+    if (fraction >= 0) [parts addObject:[NSString stringWithFormat:@"%.0f%% left", fraction * 100]];
+    if (tokens > 0) [parts addObject:[NSString stringWithFormat:@"%@ tokens left",
+                                     [grouped stringFromNumber:@(tokens)] ?: @(tokens).stringValue]];
+    if (reset && reset.timeIntervalSinceNow > 0)
+        [parts addObject:[@"resets " stringByAppendingString:ResetTextFromDate(reset)]];
+    return [parts componentsJoinedByString:@" · "];
 }
 
 static AIUsage *ReadClaudeUsage(NSString *homeDirectory) {
@@ -2430,6 +2481,10 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
 @property BOOL allowClaudeTranscripts;
 @property BOOL useCursorAccount;
 @property BOOL allowCursorAccountFetch;
+// `ai-capacity --json` output, for pools the providers' own sources cannot size in
+// tokens (Cursor's ledger estimates, the Z.ai GLM Coding Plan). Same seam shape as the
+// account fetchers: replace before the first read in tests; nil output = no document.
+@property (copy) NSString *(^capacityFetcher)(void);
 // A bounded pass intentionally leaves large histories unfinished. UI callers can
 // immediately schedule another pass while needsImmediateRescan is true; diagnostics
 // can drive catch-up without waiting for the normal 15-second refresh.
@@ -2532,6 +2587,9 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
     double _lastStateWrite;
     NSUInteger _stateWrites;   // diagnostic: how many times the state file was rewritten
     NSDate *_stateFileSeen;    // mtime of the state file as last read or written by us
+    NSDictionary *_capacityPools;   // parsed ai-capacity pools, "service.pool" -> row
+    double _capacityNextRead;       // the tool is a subprocess: re-read at most this often
+    double _capacityReadAt;         // when the last SUCCESSFUL read was parsed
 }
 
 - (instancetype)initWithHomeDirectory:(NSString *)homeDirectory {
@@ -2560,6 +2618,7 @@ static const NSUInteger kAIMaxLineBytes = 4 * 1024 * 1024;
         __weak AIReader *weakSelf = self;
         _cursorTokenReader = ^NSString *(NSString *home){ return CursorSessionToken(home, weakSelf.cursorRejectedToken); };
         _cursorUsageFetcher = ^NSDictionary *(NSString *token){ return FetchCursorUsageJSON(token); };
+        _capacityFetcher = ^NSString *{ return AICapacityJSONViaTool(_homeDirectory); };
         [self loadPersistentState];
     }
     return self;
@@ -4133,6 +4192,102 @@ typedef struct {
     return u;
 }
 
+// One pool row from the parsed capacity document, when it is current (a fraction is
+// reported and the reset is still ahead). The document is refreshed every few minutes by
+// its own job; a row whose window has elapsed means the doc went stale, not a quota to show.
+static NSDictionary *CurrentCapacityPool(NSDictionary *pools, NSString *key, double nowEpoch) {
+    NSDictionary *row = [pools[key] isKindOfClass:NSDictionary.class] ? pools[key] : nil;
+    if (!row || [row[@"fraction"] doubleValue] < 0) return nil;
+    return [row[@"resetAt"] doubleValue] > nowEpoch ? row : nil;
+}
+static long long PoolTokensLeft(NSDictionary *pool) {
+    return [pool isKindOfClass:NSDictionary.class] && [pool[@"tokensLeft"] isKindOfClass:NSNumber.class]
+        ? [pool[@"tokensLeft"] longLongValue] : 0;
+}
+
+// The capacity document is a subprocess read; at most one per hidden-refresh interval.
+// A failed read keeps the last good document for a while (it is a local cache read, not
+// a live account) and drops it once it is well past the poll interval.
+- (NSDictionary *)capacityPools {
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now >= _capacityNextRead) {
+        _capacityNextRead = now + kHiddenAIRefreshInterval;
+        NSDictionary *pools = ParseAICapacityDocument(self.capacityFetcher ? self.capacityFetcher() : nil);
+        if (pools) { _capacityPools = pools; _capacityReadAt = now; }
+        else if (_capacityPools && now - _capacityReadAt > kAccountPollInterval) _capacityPools = nil;
+    }
+    return _capacityPools;
+}
+
+// Token sizes for pools the providers' own sources cannot size, and the Z.ai provider
+// row, from one `ai-capacity --json` document. Fractions and resets stay the provider's
+// own truth; only the token estimate joins. The Z.ai row is weekly, with the 5-hour
+// window as its second pool (same shape as Cursor's API pool).
+- (void)applyCapacityPoolsToUsage:(NSMutableArray<AIUsage *> *)usage {
+    NSDictionary *pools = [self capacityPools];
+    if (!pools) return;
+    double now = NSDate.date.timeIntervalSince1970;
+    for (AIUsage *u in usage) {
+        if (![u.name isEqual:@"Cursor"] || !u.limitStatusAvailable) continue;
+        BOOL changed = NO;
+        NSMutableArray *windows = [NSMutableArray arrayWithCapacity:u.limitWindows.count];
+        for (NSDictionary *window in u.limitWindows) {
+            NSString *pool = [window[@"pool"] isKindOfClass:NSString.class] ? window[@"pool"] : nil;
+            long long tokens = pool ? PoolTokensLeft(CurrentCapacityPool(pools, [@"cursor." stringByAppendingString:pool], now)) : 0;
+            if (tokens > 0) {
+                NSMutableDictionary *sized = [window mutableCopy];
+                sized[@"tokensLeft"] = @(tokens);
+                [windows addObject:sized];
+                changed = YES;
+            } else [windows addObject:window];
+        }
+        if (changed) u.limitWindows = windows;
+    }
+    NSDictionary *week = CurrentCapacityPool(pools, @"zai.week", now);
+    NSDictionary *five = CurrentCapacityPool(pools, @"zai.5h", now);
+    if (!week && !five) return;
+    AIUsage *u = [AIUsage new];
+    u.name = @"Z.ai";
+    u.source = @"ai-capacity · Z.ai GLM Coding Plan credits";
+    u.available = YES;
+    u.remainingFraction = week ? [week[@"fraction"] doubleValue] : -1;
+    u.tokensLeft = PoolTokensLeft(week);
+    NSMutableArray *windows = [NSMutableArray array];
+    void (^addPool)(NSDictionary *, NSString *, NSString *) = ^(NSDictionary *row, NSString *pool, NSString *label) {
+        if (!row) return;
+        double reset = [row[@"resetAt"] doubleValue];
+        long long tokens = PoolTokensLeft(row);
+        NSMutableDictionary *window = [@{
+            @"pool": pool,
+            @"window": label,
+            @"remainingFraction": @([row[@"fraction"] doubleValue]),
+        } mutableCopy];
+        if (tokens > 0) window[@"tokensLeft"] = @(tokens);
+        if (reset > 0) window[@"resetsAt"] = @(reset);
+        [windows addObject:window];
+    };
+    addPool(week, @"week", @"weekly");
+    addPool(five, @"5h", @"5-hour");
+    u.limitWindows = windows;
+    if (week) {
+        double reset = [week[@"resetAt"] doubleValue];
+        if (reset > 0) {
+            u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
+            u.resetText = ResetTextFromDate(u.resetAt);
+        }
+    } else {   // only the 5-hour window reported: the row shows it, not a missing week
+        u.remainingFraction = [five[@"fraction"] doubleValue];
+        u.tokensLeft = PoolTokensLeft(five);
+        double reset = [five[@"resetAt"] doubleValue];
+        if (reset > 0) {
+            u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
+            u.resetText = ResetTextFromDate(u.resetAt);
+        }
+    }
+    u.limitStatusAvailable = u.remainingFraction >= 0;
+    [usage addObject:u];
+}
+
 - (NSArray<AIUsage *> *)read {
     // One budget covers Codex and the opt-in Claude transcript reader together. Codex
     // goes first so the tail snapshot makes the live limit gauge available even while
@@ -4164,6 +4319,10 @@ typedef struct {
             _lastStatusReasons[u.name] = u.statusReason;
         }
     }
+    // After the override file, so an explicit aggregate override of a provider still wins:
+    // token estimates only join pools the provider itself reported, and Z.ai is a row of
+    // its own rather than an override target.
+    [self applyCapacityPoolsToUsage:usage];
     // Mid-catch-up another pass follows immediately, so coalesce. The pass that lands the
     // backlog (and every steady-state pass) flushes.
     if (_needsImmediateRescan) [self savePersistentStateCoalesced];
@@ -12014,11 +12173,11 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSString *catchUpStatus = self->_aiReader.catchUpStatus;
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
+            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%lld|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
              u.name, u.available, u.limitStatusAvailable, u.limitStale,
              u.todayTokens, u.todayTokensAll, u.weekTokens, u.weekTokensAll,
              u.todaySessions, u.weekSessions, u.todayMessages, u.todayToolCalls,
-             u.remainingFraction, u.resetText, u.statusText, u.statusReason,
+             u.remainingFraction, u.tokensLeft, u.resetText, u.statusText, u.statusReason,
              u.statusSource, u.extraUsage, u.limitWindows, u.models, u.lastActivity,
              u.limitUpdatedAt, u.limitRefreshError, u.billingNote];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -13681,6 +13840,22 @@ static NSImage *AIProviderIcon(NSString *provider) {
     return nil;
 }
 static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
+    if ([provider isEqualToString:@"Z.ai"]) {
+        // The GLM Coding Plan has no app to borrow an icon from: a plain bold Z fills the
+        // same logo box every other provider's mark occupies, on every surface at once.
+        NSImage *z = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
+            NSFont *font = [NSFont systemFontOfSize:ceil(dst.size.width * 0.92) weight:NSFontWeightBold];
+            NSDictionary *attrs = @{NSFontAttributeName: font,
+                                    NSForegroundColorAttributeName: NSColor.labelColor};
+            NSSize size = [@"Z" sizeWithAttributes:attrs];
+            [@"Z" drawAtPoint:NSMakePoint(dst.origin.x + (dst.size.width - size.width) / 2.0,
+                                          dst.origin.y + (dst.size.height - size.height) / 2.0)
+                withAttributes:attrs];
+            return YES;
+        }];
+        z.template = NO;
+        return z;
+    }
     NSImage *icon = AIProviderIcon(provider);
     if (!icon) return nil;
     NSImage *sized = [icon copy];
@@ -13842,6 +14017,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSString *pct = @"—";
     NSColor *valueColor = NSColor.tertiaryLabelColor;
     NSString *tip = [self aiStatusSubtext:u] ?: @"";
+    // The value column's exact figures, when a token estimate sizes this pool (the
+    // tooltip behind the compact number). Zero tokens = no estimate, percentage stays.
+    long long valueTokens = 0;
+    double valueFraction = -1;
     // The logo (or the SF Symbol, if the app is not installed) plus the provider name.
     // popover.ai.<slug>.name stays on the text so focus restoration still finds it.
     NSString *symbolID = [NSString stringWithFormat:@"popover.ai.%@.symbol", slug];
@@ -13879,7 +14058,13 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [row addSubview:meter];
     } else if (cursorPools) {
         double primary = CursorPrimaryFraction(cursorPools);
-        pct = primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100];
+        // The pool behind the reading (Grok + Composer, falling back to API) carries the
+        // token estimate when the capacity document sizes it.
+        NSDictionary *primaryPool = CursorPoolFraction(cursorPools, @"cursor") >= 0
+            ? cursorPools[@"cursor"] : cursorPools[@"api"];
+        valueTokens = PoolTokensLeft(primaryPool);
+        valueFraction = primary;
+        pct = AIQuotaValueText(valueTokens, primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100]);
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
 
         plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
@@ -13889,7 +14074,9 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         plainGauge.accessibilityIdentifier = @"popover.ai.cursor.gauge";
         [row addSubview:plainGauge];
     } else if (hasGauge) {
-        pct = [self aiPercentText:u];
+        valueTokens = u.tokensLeft;
+        valueFraction = u.remainingFraction;
+        pct = AIQuotaValueText(valueTokens, [self aiPercentText:u]);
         valueColor = [self aiStatusColor:u];
         plainGauge = [[Gauge alloc] initWithFrame:RowGaugeRect()];
         plainGauge.fraction = u.remainingFraction;
@@ -13914,6 +14101,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         : [NSString stringWithFormat:@"popover.ai.%@.value", slug];
     NSTextField *value = [self instrumentValue:pct color:valueColor identifier:valueID in:row];
     value.accessibilityHelp = shortTip;
+    if (valueTokens > 0) {
+        value.toolTip = AIQuotaValueTip(valueFraction, valueTokens, resetDate);
+        value.accessibilityValue = value.toolTip;
+    }
     if (claudeMeter) value.accessibilityLabel = @"Percent of the week remaining, all models";
     NSString *problem = [self aiProblemText:u];
     NSColor *datumColor = NSColor.secondaryLabelColor;
@@ -13943,7 +14134,8 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         NSView *apiRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
         apiRow.accessibilityIdentifier = @"popover.row.ai.cursor.api";
         NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
-        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %.0f%% left", api * 100];
+        long long apiTokens = PoolTokensLeft(cursorPools[@"api"]);
+        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %@", AIQuotaValueTip(api, apiTokens, resetDate)];
         NSTextField *apiName = [self text:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
                                     color:NSColor.secondaryLabelColor
                                        at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
@@ -13954,12 +14146,52 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         apiBar.metricLabel = @"Cursor API remaining";
         apiBar.accessibilityIdentifier = @"popover.ai.cursor.api.gauge";
         [apiRow addSubview:apiBar];
-        [self instrumentValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
-                   identifier:@"popover.ai.cursor.api.value" in:apiRow];
+        NSTextField *apiValue = [self instrumentValue:AIQuotaValueText(apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100])
+                                                 color:ink identifier:@"popover.ai.cursor.api.value" in:apiRow];
+        if (apiTokens > 0) apiValue.toolTip = AIQuotaValueTip(api, apiTokens, resetDate);
         apiRow.accessibilityHelp = apiTip;
         for (NSView *sub in apiRow.subviews) sub.accessibilityHelp = apiTip;
         [root addSubview:apiRow];
         y += kRowH;
+    }
+    // Z.ai's 5-hour window is its own plain row under the weekly row, in that same shape.
+    // Like Cursor's API row it only rides under a live provider row, never a dead one.
+    if ([name isEqualToString:@"Z.ai"] && u.limitStatusAvailable) {
+        NSDictionary *five = nil;
+        for (NSDictionary *window in u.limitWindows)
+            if ([window[@"pool"] isEqual:@"5h"]) five = window;
+        if (five) {
+            double frac = [five[@"remainingFraction"] isKindOfClass:NSNumber.class]
+                ? [five[@"remainingFraction"] doubleValue] : -1;
+            long long tokens = PoolTokensLeft(five);
+            NSDate *fiveReset = [five[@"resetsAt"] isKindOfClass:NSNumber.class]
+                ? [NSDate dateWithTimeIntervalSince1970:[five[@"resetsAt"] doubleValue]] : nil;
+            NSView *fiveRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+            fiveRow.accessibilityIdentifier = @"popover.row.ai.z.ai.5h";
+            NSColor *ink = AIQuotaColor(MAX(frac, 0));
+            NSString *fiveTip = AIQuotaValueTip(frac, tokens, fiveReset);
+            NSTextField *fiveName = [self text:@"5h" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+                                        color:NSColor.secondaryLabelColor
+                                           at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
+            fiveName.accessibilityIdentifier = @"popover.ai.z.ai.5h.name";
+            [fiveRow addSubview:fiveName];
+            Gauge *fiveBar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
+            fiveBar.fraction = MAX(frac, 0); fiveBar.color = ink;
+            fiveBar.metricLabel = @"Z.ai 5-hour window remaining";
+            fiveBar.accessibilityIdentifier = @"popover.ai.z.ai.5h.gauge";
+            [fiveRow addSubview:fiveBar];
+            NSTextField *fiveValue = [self instrumentValue:AIQuotaValueText(tokens, frac >= 0
+                ? [NSString stringWithFormat:@"%.0f%%", frac * 100] : @"—")
+                                                      color:ink identifier:@"popover.ai.z.ai.5h.value" in:fiveRow];
+            if (tokens > 0) fiveValue.toolTip = fiveTip;
+            NSString *fiveClock = CompactResetClock(fiveReset, NSDate.date);
+            [self instrumentDatum:fiveClock.length ? [@"resets " stringByAppendingString:fiveClock] : @""
+                            color:NSColor.secondaryLabelColor identifier:@"popover.ai.z.ai.5h.datum" in:fiveRow];
+            fiveRow.accessibilityHelp = fiveTip;
+            for (NSView *sub in fiveRow.subviews) sub.accessibilityHelp = fiveTip;
+            [root addSubview:fiveRow];
+            y += kRowH;
+        }
     }
     return y;
 }
@@ -15084,6 +15316,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     if ([headingKey hasSuffix:@".claude"] || [title isEqualToString:@"Claude"]) provider = @"Claude";
     else if ([headingKey hasSuffix:@".codex"] || [title isEqualToString:@"Codex"]) provider = @"Codex";
     else if ([headingKey hasSuffix:@".cursor"] || [title isEqualToString:@"Cursor"]) provider = @"Cursor";
+    else if ([headingKey hasSuffix:@".z.ai"] || [title isEqualToString:@"Z.ai"]) provider = @"Z.ai";   // logo, not a symbol
     NSImage *providerLogo = provider ? AIProviderLogo(provider, 16) : nil;
     if (symbol.length || providerLogo) {
         NSImageView *mark = [NSImageView imageViewWithImage:(providerLogo ?: [self menuSymbol:symbol])];
@@ -15658,11 +15891,14 @@ static NSColor *HealthColor(double fraction) {
         tip = [parts componentsJoinedByString:@" · "];
     } else if (cursorPools) {
         double primary = CursorPrimaryFraction(cursorPools);
-        pct = primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100];
+        NSDictionary *primaryPool = CursorPoolFraction(cursorPools, @"cursor") >= 0
+            ? cursorPools[@"cursor"] : cursorPools[@"api"];
+        pct = AIQuotaValueText(PoolTokensLeft(primaryPool),
+                               primary < 0 ? @"—" : [NSString stringWithFormat:@"%.0f%%", primary * 100]);
         valueColor = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(MAX(primary, 0));
 
     } else if (hasGauge) {
-        pct = [self aiPercentText:u];
+        pct = AIQuotaValueText(u.tokensLeft, [self aiPercentText:u]);
         valueColor = [self aiStatusColor:u];
     }
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
@@ -15730,7 +15966,8 @@ static NSColor *HealthColor(double fraction) {
     y += c.rowH;
     double api = cursorPools ? CursorPoolFraction(cursorPools, @"api") : -1;
     if (overview && api >= 0 && CursorPoolFraction(cursorPools, @"cursor") >= 0) {
-        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %.0f%% left", api * 100];
+        long long apiTokens = PoolTokensLeft(cursorPools[@"api"]);
+        NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %@", AIQuotaValueTip(api, apiTokens, resetDate)];
         NSView *apiRow = [self detailRowAt:y cols:c identifier:[rowID stringByAppendingString:@".api"] tip:apiTip in:root];
         NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
         [self detailText:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium] color:NSColor.secondaryLabelColor
@@ -15738,7 +15975,7 @@ static NSColor *HealthColor(double fraction) {
               identifier:[stem stringByAppendingString:@".api.name"] in:apiRow].accessibilityHelp = apiTip;
         [self detailGauge:DetailGaugeRect(c) fraction:api color:ink label:@"Cursor API remaining"
                identifier:[stem stringByAppendingString:@".api.gauge"] tip:apiTip in:apiRow];
-        [self detailValue:[NSString stringWithFormat:@"%.0f%%", api * 100] color:ink
+        [self detailValue:AIQuotaValueText(apiTokens, [NSString stringWithFormat:@"%.0f%%", api * 100]) color:ink
                identifier:[stem stringByAppendingString:@".api.value"] tip:apiTip in:apiRow cols:c];
         y += c.rowH;
     }

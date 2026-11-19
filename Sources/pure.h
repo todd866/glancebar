@@ -250,6 +250,21 @@ NSArray<NSDictionary *> *CursorLimitWindows(NSDictionary *usage, double nowEpoch
 // billing cycle) or a "weekly"/"5-hour" label; 0 when unknown.
 double QuotaWindowSeconds(NSDictionary *window);
 
+// Tokens left, 3 significant figures with a K/M/B suffix: "269M", "1.35B", "11M", "940K".
+// Trailing zeros trim ("76.0M" -> "76M"); below 1 K it is a plain integer. nil when there
+// is no figure (non-finite or < 1).
+NSString *FormatTokensCompact(double tokens);
+
+// Parses one `ai-capacity --json` document (the fleet budget tool that reads
+// ~/.claude and ~/.local/state caches): {services: {<service>: {pools: [
+//   {pool, remainingPct, resetAt, estimate?: {tokensLeft, …}}]}}}. Returns
+// @"<service>.<pool>" -> @{@"fraction": 0..1 or @-1,
+//                          @"tokensLeft": long long (only when the pool has an estimate),
+//                          @"resetAt": epoch seconds (0 when absent)}. Pools without an
+// estimate simply have no tokensLeft key. nil when the document is not that shape.
+// Pure: no I/O, so the app and the unit tests parse the same sample.
+NSDictionary<NSString *, NSDictionary *> *ParseAICapacityDocument(NSString *json);
+
 // Who is burning the battery, by app. Snapshots map pid -> cumulative energy in nanojoules
 // (proc_pid_rusage ri_energy_nj). Live watts come from prev -> cur over dtSeconds (0 when
 // prev is nil); Wh come from baseline -> cur, where a pid missing from the baseline started

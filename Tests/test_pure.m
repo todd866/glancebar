@@ -3671,6 +3671,49 @@ int main(void) {
             check(c.year == 2026 && c.month == 3 && c.day == 14, @"broadcast date from filename");
         }
 
+        // --- Token-estimate value formatting and the ai-capacity document ---
+        check([FormatTokensCompact(269000000.0) isEqual:@"269M"], @"tokens: 3 s.f. in the M band");
+        check([FormatTokensCompact(1347000000.0) isEqual:@"1.35B"], @"tokens: B band keeps two decimals");
+        check([FormatTokensCompact(76000000.0) isEqual:@"76M"], @"tokens: trailing zero trims");
+        check([FormatTokensCompact(11000000.0) isEqual:@"11M"], @"tokens: two-digit M stays two digits");
+        check([FormatTokensCompact(940000.0) isEqual:@"940K"], @"tokens: K band has no decimals");
+        check([FormatTokensCompact(1500000.0) isEqual:@"1.5M"], @"tokens: 1.50M trims to 1.5M");
+        check([FormatTokensCompact(999999.0) isEqual:@"1000K"], @"tokens: below a million stays K");
+        check([FormatTokensCompact(712.0) isEqual:@"712"], @"tokens: below a K is a plain integer");
+        check(FormatTokensCompact(0) == nil && FormatTokensCompact(-5) == nil, @"tokens: no figure is nil");
+        {
+            // One sample `ai-capacity --json` document: the same shape the fleet budget
+            // tool prints (fractions, resets, and token estimates for the pools that have one).
+            NSString *doc = @"{\"services\":{"
+                "\"claude\":{\"pools\":[{\"pool\":\"5h\",\"remainingPct\":null,\"resetAt\":\"2026-11-19T07:00:00Z\"},"
+                "{\"pool\":\"7d\",\"remainingPct\":43,\"resetAt\":\"2026-11-24T13:00:00Z\"}]},"
+                "\"cursor\":{\"pools\":[{\"pool\":\"api\",\"remainingPct\":45.6,\"resetAt\":\"2026-12-03T12:24:31Z\","
+                "\"estimate\":{\"tokensLeft\":11234567,\"tokensPerPt\":200000}},"
+                "{\"pool\":\"cursor\",\"remainingPct\":26.5,\"resetAt\":\"2026-12-03T12:24:31Z\","
+                "\"estimate\":{\"tokensLeft\":76234120}}]},"
+                "\"zai\":{\"pools\":[{\"pool\":\"5h\",\"remainingPct\":99.9,\"resetAt\":\"2026-11-19T07:56:31.901Z\","
+                "\"estimate\":{\"tokensLeft\":269000000}},"
+                "{\"pool\":\"week\",\"remainingPct\":100,\"resetAt\":\"2026-11-26T02:53:52.984Z\","
+                "\"estimate\":{\"tokensLeft\":1347000000}]}}}";
+            NSDictionary *pools = ParseAICapacityDocument(doc);
+            check(pools.count == 6, @"capacity: every service pool gets a row");
+            check([pools[@"cursor.cursor"][@"fraction"] doubleValue] > 0.264 &&
+                  [pools[@"cursor.cursor"][@"fraction"] doubleValue] < 0.266, @"capacity: percent becomes a fraction");
+            check([pools[@"cursor.cursor"][@"tokensLeft"] longLongValue] == 76234120, @"capacity: estimate tokens are read");
+            check([pools[@"claude.7d"][@"fraction"] doubleValue] > 0.42, @"capacity: claude weekly fraction");
+            check(pools[@"claude.7d"][@"tokensLeft"] == nil, @"capacity: pools without an estimate have no tokens");
+            check([pools[@"claude.5h"][@"fraction"] doubleValue] < 0, @"capacity: missing percent is not zero");
+            NSISO8601DateFormatter *iso = [NSISO8601DateFormatter new];
+            iso.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+            check(fabs([pools[@"zai.week"][@"resetAt"] doubleValue] -
+                       [iso dateFromString:@"2026-11-26T02:53:52.984Z"].timeIntervalSince1970) < 1,
+                  @"capacity: fractional-second reset times parse");
+            check(ParseAICapacityDocument(@"{\"nope\":1}") == nil, @"capacity: wrong shape is rejected");
+            check(ParseAICapacityDocument(@"not json") == nil, @"capacity: non-JSON is rejected");
+            check(ParseAICapacityDocument(nil) == nil && ParseAICapacityDocument(@"") == nil,
+                  @"capacity: empty input is rejected");
+        }
+
         fprintf(stderr, "\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
                 failures, failures == 1 ? "" : "s");
     }
