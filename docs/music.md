@@ -8,8 +8,8 @@ R2 bucket and fetched as required. New music is found and acquired without being
 
 | What | Where | Notes |
 |---|---|---|
-| Lossless masters (Apple Music favourites + scout acquisitions, ALAC `.m4a`) | M2 `/Volumes/OTV Mirror/Music/Apple Music/` | Arrive from the M5 via `offload-am.sh` after each pull |
-| Cold tier (copy of every master) + `catalogue.json` | Cloudflare R2 bucket `glancebar-music` (private, Oceania, Standard) | rclone remote `glancebar-music:` in `~/.config/rclone/rclone.conf` on the M5 and M2; key scoped to this bucket only |
+| Lossless masters (Apple Music favourites + scout acquisitions + 6IAN lane, ALAC `.m4a`) | M2 pools listed in `masters_roots` (`~/.config/glancebar/music-library.json` there): `OTV Mirror/Music/Apple Music/` and `Stash/Music/radio-masters/` | Favourites arrive from the M5 via `offload-am.sh`; lane masters via `place_masters.py`. The bucket, not a drive, is the catalogue's truth (19 Nov 2026) |
+| Cold tier (copy of every master) + `catalogue.json` + the shared store `music/` (ids, taste, facts: `docs/music-unify.md`) | Cloudflare R2 bucket `glancebar-music` (private, Oceania, Standard) | rclone remote `glancebar-music:` in `~/.config/rclone/rclone.conf` on the M5 and M2; key scoped to this bucket only |
 | Lossless hot set | M5 `~/Music/Glancebar Lossless/` | Managed by `tools/music-library/musiclib.py`; capped (`cap_gb`), pinned to the M5 in the placement map |
 | YouTube likes (AAC, best source available) | M5 `~/Music/YouTube Liked/` | `~/Projects/liked-music/sync.sh`, launchd `com.iantodd.liked-music-sync` |
 | Daily new-music radio | M5 `~/Music/Glancebar Radio/` | `~/Projects/selector/tools/triplej`, launchd `com.iantodd.triplej-daily`; pinned to the M5 |
@@ -40,9 +40,10 @@ R2 bucket and fetched as required. New music is found and acquired without being
 | `com.iantodd.mixpool-liked` (pull favourites lossless, then offload to the M2) | M5 | installed |
 | `com.iantodd.liked-music-sync` | M5 | installed |
 | `com.iantodd.triplej-daily` | M5 | installed |
-| `com.iantodd.glancebar-music-push` (03:40: masters → R2, then catalogue; `~/.local/bin/glancebar-music-push`, status in `push-status.json`) | M2 | installed 10 Nov 2026 |
+| `com.iantodd.glancebar-music-push` (19:40Z: `tools/music-library/push-kick.sh` on the M5 copies its id claims over, then `push.sh` on the M2 (`~/.local/bin/glancebar-music-push` is a link to it): every readable root → R2, then `catalogue --from-remote` builds catalogue.json from the bucket's listing and publishes `music/ids.json`; an unreadable drive is a warning; status in `push-status.json`) | M5 → M2 | installed 10 Nov 2026; bucket-listing catalogue 19 Nov 2026 |
+| `com.iantodd.music-store-sync` (every 10 min: taste-log flush, 6IAN import, ids/facts pull) and `com.iantodd.music-facts` (22:30Z facts builder) | M2 | installed 19 Nov 2026 |
 | hot-set sync (every few hours; the app also starts one on demand) | M5 | NOT YET INSTALLED |
-| `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | installed |
+| `com.iantodd.glancebar-music-scout` (`scout.py run --go` at 03:10; since 19 Nov 2026 `acquire_via: lane` hands its picks to the 6IAN lane inbox on the M2 instead of acquiring; plist in `tools/music-scout/`, logs under `~/.local/state/glancebar-music-scout/`) | M5 | installed |
 | `com.iantodd.glancebar-music-embed` (20:45Z nightly map refresh: `tools/music-embed/nightly-kick.sh` runs `nightly.sh` on the M2 over ssh, which embeds songs in R2 with no vector within a $5/day cap and writes `radio/gaps.json`; then vectors and `gaps.json` come back to the M5 and `music-space.json` is rewritten; the morning check's `embeddings` row) | M5 → M2 | installed 18 Nov 2026 |
 
 ## Checks
@@ -122,7 +123,9 @@ Site config is `~/.config/glancebar/media-sync.json` on each Mac (`host`; on the
 
 ## Scout acquisition timeline (M5)
 
-1. **03:10** — `scout.py run --go` ranks the queue and acquires within the weekly budget via
+1. **03:10** — `scout.py run --go` ranks the queue. Since 19 Nov 2026 (`acquire_via: lane` on the M5) it
+   writes the queue to the 6IAN lane's inbox on the M2 (`lane_inbox`), which acquires under its one daily
+   budget; steps 2-3 below apply only with `acquire_via: amdl`. Before that it acquired within the weekly budget via
    `mixpool.run_amdl_detailed` (real file sizes and paths land in `ledger.jsonl`).
 2. **Same night** — after each successful pull, scout **copies** (never moves) new ALAC into
    `~/Music/Glancebar Lossless/` at the same relative path so Glancebar can play before
@@ -130,7 +133,8 @@ Site config is `~/.config/glancebar/media-sync.json` on each Mac (`host`; on the
    the Apple Music tree is later empty.
 3. **After pull** — `~/.local/state/glancebar-mix/offload-am.sh` rsyncs
    `~/Music/Apple Music` to the M2, verifies sizes, then moves the local tree to Trash.
-4. **03:40 (M5 → M2 over ssh)** — `glancebar-music-push` uploads masters to R2 and refreshes
+4. **03:40 (M5 → M2 over ssh)** — `glancebar-music-push` uploads masters from every readable root to R2 and rebuilds
+   `catalogue.json` from the bucket's listing (so lane masters placed straight into R2 are catalogued and embedded); it refreshes
    `catalogue.json`. Started on the M5 since 11 Nov 2026: as a LaunchAgent on the M2 the
    script could not read the external drive (workarounds ledger W17).
 5. **Later (M5)** — `musiclib.py sync` fetches wanted tracks into the hot set; the New music
