@@ -112,6 +112,11 @@ DEFAULTS: dict[str, Any] = {
     "status_remote": "glancebar-music:glancebar-music",
     "status_remote_path": "radio/scout-status.json",
     "rclone": "/opt/homebrew/bin/rclone",
+    # One acquisition queue (owner, 19 Nov 2026; docs/music-unify.md): "lane" hands the ranked
+    # picks to the 6IAN lane's inbox on the hub, which acquires them under its one daily budget;
+    # the scout then keeps no acquisition budget of its own. "amdl" is the old direct path.
+    "acquire_via": "amdl",
+    "lane_inbox": "",
 }
 
 _SHORT_MONTHS = (
@@ -479,6 +484,7 @@ class Runners:
         canon_transport: Callable[..., tuple[int, str]] | None = None,
         canon_sleep: Callable[[float], None] | None = None,
         publish_status: Callable[[Path], str | None] | None = None,
+        deliver_lane: Callable[[Path, str], str | None] | None = None,
         monotonic: Callable[[], float] | None = None,
     ):
         self.itunes_search = itunes_search or _default_itunes_search
@@ -511,6 +517,8 @@ class Runners:
         # writes into the real bucket. Returns an error string or None.
         self.publish_status = publish_status or (lambda path: None)
         self.monotonic = monotonic or time.monotonic
+        # Copies an inbox file to the lane (scp). Returns an error string or None.
+        self.deliver_lane = deliver_lane or _default_deliver_lane
 
 
 MEDIA_SYNC = Path(__file__).resolve().parent.parent / "media-sync" / "media_sync.py"
@@ -2167,6 +2175,73 @@ def _amdl_result(result: tuple) -> tuple[bool, bool, str, dict]:
     return ok, infra, error, {}
 
 
+def _default_deliver_lane(path: Path, dest: str) -> str | None:
+    if ":" in dest:
+        argv = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", str(path), dest.rstrip("/") + "/"]
+    else:
+        Path(dest).expanduser().mkdir(parents=True, exist_ok=True)
+        argv = ["cp", str(path), str(Path(dest).expanduser())]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    return None if proc.returncode == 0 else (proc.stderr or f"exit {proc.returncode}").strip()[-200:]
+
+
+def lane_item(row: dict, priority: int) -> dict:
+    """One queue row in the lane inbox's shape (music-radio README, "Interface"). Back-catalogue
+    rows carry no max_age: they are old on purpose."""
+    source = row.get("source") or "scout"
+    item = {"song": {"artist": row.get("artist") or "", "title": row.get("title") or ""},
+            "tag": source if ":" in source else f"scout:{source}",
+            "why": row.get("why") or f"Glancebar scout ({source})",
+            "priority": priority}
+    if row.get("album"):
+        item["song"]["album"] = row["album"]
+    if era_of(row) == "new" and source.startswith(("new-release", "new_release")):
+        item["max_age"] = 2
+    return item
+
+
+def cmd_hand_to_lane(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners, *, go: bool = False,
+                     limit: int | None = None) -> dict[str, Any]:
+    """The ranked queue goes to the lane's inbox; the lane acquires under its own daily budget.
+    Ledger rows are `lane` (handed over), so a pick is never handed over twice."""
+    queue = json.loads(paths.queue.read_text(encoding="utf-8")).get("tracks") or [] if paths.queue.is_file() else []
+    owned = ownership_sources(cfg, paths)
+    hearts = load_hearts(Path(cfg["hearts_path"]).expanduser())
+    handed = ledger_keys(paths.ledger, actions={"lane", "acquired"})
+    items, rows = [], []
+    for row in queue:
+        if limit is not None and len(rows) >= limit:
+            break
+        artist, title = row.get("artist") or "", row.get("title") or ""
+        key = row.get("track_key") or track_key(artist, title)
+        if not artist or not title or key in owned or key in handed or normal(key) in hearts:
+            continue
+        items.append(lane_item(row, 40 + len(items)))
+        rows.append({"at": runners.clock(), "action": "lane", "artist": artist, "title": title, "track_key": key,
+                     "source": row.get("source") or "", "why": row.get("why") or "", "era": era_of(row),
+                     **({"year": row["year"]} if row.get("year") else {})})
+    summary = {"at": runners.clock(), "dry_run": not go, "via": "lane", "handed": len(items), "results": rows}
+    if not go or not items:
+        return summary
+    dest = (cfg.get("lane_inbox") or "").strip()
+    if not dest:
+        raise SystemExit("acquire: acquire_via is lane but lane_inbox is not set")
+    out = paths.state / "lane-outbox" / f"scout-{runners.clock().replace(':', '')}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(items, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    err = runners.deliver_lane(out, dest)
+    if err:
+        summary["error"] = err
+        print(f"acquire: lane inbox not reached: {err}", file=sys.stderr)
+        raise SystemExit(1)
+    for rec in rows:
+        append_jsonl(paths.ledger, rec)
+    return summary
+
+
 def cmd_acquire(
     cfg: dict[str, Any],
     paths: ScoutPaths,
@@ -2175,6 +2250,8 @@ def cmd_acquire(
     go: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
+    if cfg.get("acquire_via") == "lane":
+        return cmd_hand_to_lane(cfg, paths, runners, go=go, limit=limit)
     reason = acquire_defer_reason(runners)
     if reason:
         print(f"acquire: defer ({reason})", file=sys.stderr)
@@ -2389,8 +2466,10 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
     _, torn = read_jsonl(paths.ledger)
     failures = sum(1 for r in read_jsonl_rows(paths.ledger) if r.get("action") == "failed")
     last_acquire: datetime | None = None
+    # In lane mode a hand-over to the lane is this tool's acquisition (the lane reports its own).
+    done_actions = {"acquired", "lane"} if cfg.get("acquire_via") == "lane" else {"acquired"}
     for row in read_jsonl_rows(paths.ledger):
-        if row.get("action") != "acquired":
+        if row.get("action") not in done_actions:
             continue
         at = parse_iso(row.get("at") or "")
         if at and (last_acquire is None or at > last_acquire):
@@ -2423,7 +2502,8 @@ def cmd_status(cfg: dict[str, Any], paths: ScoutPaths, runners: Runners) -> tupl
         "acquired_this_week": acquired_count,
         "acquired_bytes_this_week": acquired_bytes,
         "acquired_gb_this_week": round(acquired_bytes / GIB, 3),
-        "budget_tracks": int(cfg["tracks_per_week"]),
+        "acquire_via": cfg.get("acquire_via") or "amdl",
+        "budget_tracks": None if cfg.get("acquire_via") == "lane" else int(cfg["tracks_per_week"]),
         "budget_gb": float(cfg["gb_per_week"]),
         "failures_total": failures,
         "ledger_torn_line": torn,

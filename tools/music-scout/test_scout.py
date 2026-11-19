@@ -684,6 +684,35 @@ class ScoutLogicTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_lane_mode_hands_queue_to_inbox_once(self):
+        """acquire_via=lane (19 Nov 2026): picks go to the 6IAN lane's inbox, no amdl, no budget."""
+        cfg = dict(self.cfg, acquire_via="lane", lane_inbox=str(self.root / "inbox"), tracks_per_week=1)
+        rows = [{"artist": "New Band", "title": "Hit", "source": "radio:kexp", "why": "Heard on KEXP"},
+                {"artist": "Old Band", "title": "Classic", "source": "back:canon", "why": "Mercury 1994", "era": "back"},
+                {"artist": "Fresh", "title": "Single", "source": "new-release", "why": "out 12 Nov"}]
+        self.paths.queue.write_text(json.dumps({"tracks": rows}), encoding="utf-8")
+        sent = []
+        runners = scout.Runners(clock=lambda: "2026-11-19T01:00:00Z",
+                                run_amdl=lambda url: self.fail("no amdl in lane mode"),
+                                deliver_lane=lambda path, dest: sent.append(json.loads(path.read_text())) or None)
+        out = scout.cmd_acquire(cfg, self.paths, runners, go=True)
+        self.assertEqual(out["handed"], 3)  # tracks_per_week no longer limits it
+        items = sent[0]
+        self.assertEqual(items[0], {"song": {"artist": "New Band", "title": "Hit"}, "tag": "radio:kexp",
+                                    "why": "Heard on KEXP", "priority": 40})
+        self.assertNotIn("max_age", items[1])
+        self.assertEqual(items[2]["max_age"], 2)
+        again = scout.cmd_acquire(cfg, self.paths, runners, go=True)
+        self.assertEqual((again["handed"], len(sent)), (0, 1))
+
+    def test_lane_mode_failed_delivery_records_nothing(self):
+        cfg = dict(self.cfg, acquire_via="lane", lane_inbox="hub:inbox")
+        self.paths.queue.write_text(json.dumps({"tracks": [{"artist": "A", "title": "B", "source": "shazam"}]}), encoding="utf-8")
+        runners = scout.Runners(clock=lambda: "2026-11-19T01:00:00Z", deliver_lane=lambda p, d: "no route")
+        with self.assertRaises(SystemExit):
+            scout.cmd_acquire(cfg, self.paths, runners, go=True)
+        self.assertFalse(self.paths.ledger.exists() and "lane" in self.paths.ledger.read_text())
+
     def test_dedupe_owned_and_offered(self):
         owned_artist, owned_title = "Owned Band", "Owned Song"
         offered_artist, offered_title = "Queued Band", "Queued Song"
