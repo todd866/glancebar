@@ -91,6 +91,20 @@ static NSView *Find(NSView *root, NSString *identifier) {
     for (NSView *child in root.subviews) { NSView *hit = Find(child, identifier); if (hit) return hit; }
     return nil;
 }
+// House rule (owner, 19 Nov 2026): no "…" anywhere — every single-line text field must
+// fit its text or clip without an ellipsis line-break mode.
+static void AuditNoTruncatingFields(NSView *v) {
+    for (NSView *child in v.subviews) {
+        if ([child isKindOfClass:NSTextField.class] && ((NSTextField *)child).maximumNumberOfLines <= 1) {
+            NSLineBreakMode mode = ((NSTextField *)child).lineBreakMode;
+            Check(mode != NSLineBreakByTruncatingTail && mode != NSLineBreakByTruncatingMiddle
+                  && mode != NSLineBreakByTruncatingHead,
+                  [NSString stringWithFormat:@"field '%@' never truncates with an ellipsis",
+                    ((NSTextField *)child).identifier ?: ((NSTextField *)child).stringValue]);
+        }
+        AuditNoTruncatingFields(child);
+    }
+}
 static void CheckGeometry(NSView *root) {
     Check(!root.toolTip.length || ([root isKindOfClass:NSTextField.class] && [root.toolTip isEqual:((NSTextField *)root).stringValue]), @"Activity hover only recovers full text");
     for (NSView *view in root.subviews) {
@@ -278,20 +292,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
         }
         // House rule (owner, 19 Nov 2026): no "…" anywhere. Every single-line text field
         // in a rendered surface must fit its text or clip without an ellipsis mode.
-        void (^audit)(NSView *) = nil;
-        audit = ^(NSView *v) {
-            for (NSView *child in v.subviews) {
-                if ([child isKindOfClass:NSTextField.class] && ((NSTextField *)child).maximumNumberOfLines <= 1) {
-                    NSLineBreakMode mode = ((NSTextField *)child).lineBreakMode;
-                    Check(mode != NSLineBreakByTruncatingTail && mode != NSLineBreakByTruncatingMiddle
-                          && mode != NSLineBreakByTruncatingHead,
-                          [NSString stringWithFormat:@"field '%@' never truncates with an ellipsis",
-                            ((NSTextField *)child).identifier ?: ((NSTextField *)child).stringValue]);
-                }
-                audit(child);
-            }
-        };
-        audit([ui activityDetailsView]);
+        // A plain recursive function, not a block: a block recursing through its own
+        // local captured a stale stack copy and segfaulted on the first re-entry.
+        for (NSView *child in [ui activityDetailsView].subviews)
+            AuditNoTruncatingFields(child);
     }
     [NSFileManager.defaultManager removeItemAtPath:home error:NULL];
     fprintf(stderr, "Activity UI and policy: %d checks passed\n", checks);
