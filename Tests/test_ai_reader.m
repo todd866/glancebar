@@ -341,6 +341,18 @@ int main(void) {
         check(fabs(overrideUsage.remainingFraction - 0.02) < 0.001 && !overrideUsage.limitWindows.count &&
               !CursorPoolQuotas(overrideUsage), @"current override replaces pools with one explicit aggregate");
 
+        // A "notice" states a condition (e.g. an account restricted by its provider): it
+        // is carried without replacing the gauge, the pools or the reset.
+        AIUsage *noticeUsage = [AIUsage new];
+        noticeUsage.name = @"Claude";
+        noticeUsage.remainingFraction = 0.43;
+        noticeUsage.limitStatusAvailable = YES;
+        noticeUsage.limitWindows = @[@{@"pool": @"week", @"remainingFraction": @0.43}];
+        ApplyAIStatusFile(noticeUsage, @{@"Claude": @{@"notice": @"restricted"}}, @"override");
+        check([noticeUsage.statusNotice isEqualToString:@"restricted"] &&
+              fabs(noticeUsage.remainingFraction - 0.43) < 0.001 && noticeUsage.limitWindows.count == 1,
+              @"a notice flags the provider without overriding its quota snapshot");
+
         Controller *historyController = [Controller new];
         AIUsage *sessionHistory = [AIUsage new];
         sessionHistory.name = @"Codex";

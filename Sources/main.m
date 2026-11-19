@@ -12182,11 +12182,11 @@ static NSAttributedString *HeatTempsReadout(double chipC, NSColor *chipColor, do
         NSString *catchUpStatus = self->_aiReader.catchUpStatus;
         NSMutableString *sig = [NSMutableString string];
         for (AIUsage *u in usage)
-            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%lld|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
+            [sig appendFormat:@"%@|%d|%d|%d|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%.4f|%lld|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@;",
              u.name, u.available, u.limitStatusAvailable, u.limitStale,
              u.todayTokens, u.todayTokensAll, u.weekTokens, u.weekTokensAll,
              u.todaySessions, u.weekSessions, u.todayMessages, u.todayToolCalls,
-             u.remainingFraction, u.tokensLeft, u.resetText, u.statusText, u.statusReason,
+             u.remainingFraction, u.tokensLeft, u.resetText, u.statusText, u.statusReason, u.statusNotice,
              u.statusSource, u.extraUsage, u.limitWindows, u.models, u.lastActivity,
              u.limitUpdatedAt, u.limitRefreshError, u.billingNote];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -13276,6 +13276,10 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     // which would otherwise sit beside a figure frozen at the last good fetch.
     if ([u.limitRefreshError hasPrefix:@"Signed out"]) lead = u.limitRefreshError;
     if (!lead.length) lead = u.statusReason;
+    // A condition like "restricted" leads even when a reset exists: it says what the
+    // reading means, the clock only says when the window rolls.
+    if (u.statusNotice.length)
+        lead = lead.length ? [NSString stringWithFormat:@"%@ · %@", u.statusNotice, lead] : u.statusNotice;
     // Keep billing visible even when a carried-forward plan window has a reset.
     if ([u.billingNote containsString:@"credits"]) {
         NSString *billing = [u.billingNote containsString:@"none available"] ? @"No credits" : @"Using credits";
@@ -14122,6 +14126,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (u.statusNotice.length) {
+        // A provider-level condition (e.g. "restricted") outranks the reset clock: it
+        // changes what the reading means. Orange, not red: the pool still reads.
+        datum = u.statusNotice;
+        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
         NSDate *reset = resetDate;
         // A bare "21:00" beside a bar could mean anything; one word says what it is.
@@ -15966,6 +15975,11 @@ static NSColor *HealthColor(double fraction) {
         datum = problem;
         BOOL severe = [problem isEqualToString:@"signed out"] || [problem isEqualToString:@"rate limited"];
         datumColor = severe ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    } else if (u.statusNotice.length) {
+        // A provider-level condition (e.g. "restricted") outranks the reset clock: it
+        // changes what the reading means. Orange, not red: the pool still reads.
+        datum = u.statusNotice;
+        datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
         NSDate *reset = resetDate;
         NSString *clock = CompactResetClock(reset, NSDate.date);
