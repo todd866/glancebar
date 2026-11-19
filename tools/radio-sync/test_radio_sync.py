@@ -105,3 +105,33 @@ class AliasLookup(unittest.TestCase):
         self.assertEqual(rs.resolve_events(evs, fake), {'ids': 2, 'fallback': 1})
         self.assertEqual([e.get('s') for e in evs], ['a' * 64, 'c' * 64, None])
         self.assertEqual(evs[0]['how'], 'persistent')
+
+
+class TasteLog(Base):
+    """Glancebar's marks go into the one taste log once each; radio-sourced lines do not."""
+    def test_log_taste(self):
+        store = rs.music_store()
+        root = Path(self.tmp.name)
+        flag = root / 'METERED'; flag.write_text('')
+        hearts = root / 'hearts.jsonl'
+        hearts.write_text(json.dumps({'action': 'heart', 'artist': 'Zed', 'title': 'Other', 'at': '2026-11-17T09:00:00Z',
+                                      'playback': {'fraction': 0.3}}) + '\n')
+        ids = {'key': {'zed|other': 'c' * 64}, 'path': {'AM-Lossless/Z/Z/1.m4a': 'd' * 64}}
+        (root / 'store').mkdir()
+        (root / 'store/ids.json').write_text(json.dumps(ids))
+        self.write('feedback.jsonl', [{'artist': 'Zed', 'title': 'Other', 'liked': True, 'at': '2026-11-17T09:01:00Z'},
+                                      {'artist': 'Rad', 'title': 'Io', 'liked': True, 'source': '6ian', 'at': '2026-11-17T09:02:00Z'}])
+        self.write('skip-history.jsonl', [{'artist': 'Q', 'title': 'R', 'at': '2026-11-17T09:03:00Z',
+                                           'path': str(Path.home() / 'Music/Glancebar Lossless/AM-Lossless/Z/Z/1.m4a'),
+                                           'playback': {'fraction': 0.1}}])
+        with mock.patch.object(store, 'STATE', root / 'store'), mock.patch.object(store, 'METERED', flag), \
+                mock.patch.object(store, 'CONFIG', root / 'none.json'), mock.patch.object(rs, 'HEARTS', hearts), \
+                mock.patch.object(rs, 'LIB_CONFIG', root / 'none.json'):
+            out = rs.log_taste(store)
+            again = rs.log_taste(store)
+            evs = store.read_events(root / 'store/taste')
+        self.assertEqual(out['written'], 3)
+        self.assertEqual(again['written'], 0)
+        self.assertEqual(sorted((e['kind'], e.get('sha', '')[:1]) for e in evs),
+                         [('early-skip', 'd'), ('heart', 'c'), ('like', 'c')])
+        self.assertTrue(all(e['listener'] == 'ian' and e['app'] == 'glancebar' for e in evs))

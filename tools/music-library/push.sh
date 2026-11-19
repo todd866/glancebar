@@ -45,8 +45,10 @@ readable=() warnings=()
 for r in $roots; do
   if [ ! -d "$r" ]; then warnings+=("not mounted: $r"); continue; fi
   ok=0
-  for attempt in 1 2 3; do
-    err=$(disk-slot "$r" -- gtimeout 60 ls "$r" 2>&1 >/dev/null) && { ok=1; break; }
+  for attempt in 1 2; do
+    # Bounded wait for the disk: with the TV in use (disk-slot priority) or another job on it, the
+    # root is skipped tonight and the bucket plus the previous catalogue stand in for it.
+    err=$(disk-slot --wait 1200 "$r" -- gtimeout 60 ls "$r" 2>&1 >/dev/null) && { ok=1; break; }
     say "probe $attempt failed on $r: $(print -r -- "$err" | tail -1 | cut -c1-160)"
     command sleep 5
   done

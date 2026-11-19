@@ -29,6 +29,7 @@ CONFIG = HOME / '.config/glancebar/radio.json'
 STATE = Path(os.environ.get('GLANCEBAR_RADIO_STATE', HOME / '.local/state/glancebar-radio'))
 MIX = Path(os.environ.get('GLANCEBAR_MIX_DIR', HOME / 'Library/Application Support/Glancebar/mix'))
 LIB_CONFIG = HOME / '.config/glancebar/music-library.json'
+HEARTS = Path(os.environ.get('GLANCEBAR_HEARTS', HOME / '.local/state/selector/heart-history.jsonl'))
 EARLY = 0.4          # a Next before 40% of the song is an early skip (the scout's rule)
 SOURCE = '6ian'      # lines this tool writes into Glancebar's feedback carry this, so they never echo back
 UA = 'glancebar-radio-sync/1.0'
@@ -65,6 +66,78 @@ def resolve_events(evs, store=None):
         else:
             counts['fallback'] += 1
     return counts
+
+
+def _fraction(o):
+    f = (o.get('playback') or {}).get('fraction')
+    return float(f) if isinstance(f, (int, float)) else None
+
+
+def _rel_from_path(path):
+    """A hot-set file's catalogue path (the hot set mirrors the bucket's layout)."""
+    cfg = load_json(LIB_CONFIG, {})
+    hot = os.path.expanduser(cfg.get('hot_dir', '~/Music/Glancebar Lossless')).rstrip('/') + '/'
+    return path[len(hot):] if path and path.startswith(hot) else None
+
+
+def log_taste(store=None, listener=None):
+    """Glancebar's marks into the one taste log (tools/music-store; docs/music-unify.md): likes,
+    dislikes, hearts, every Next press (early-skip under 40%), and plays. Read from the files the
+    app writes (it does not call the log itself yet), with cursors of their own, so the radio
+    bridge above and this log never depend on each other. Lines this tool wrote from the radio
+    (source 6ian) are the radio's events, not Glancebar's, and are left out."""
+    store = store if store is not None else music_store()
+    if not store:
+        return {'skipped': 'music-store not installed'}
+    cfg = load_json(store.CONFIG, {})
+    listener = listener or cfg.get('glancebar_listener') or 'ian'
+    ids = store.Ids.load()
+    cur = load_json(STATE / 'taste-cursor.json', {})
+    n = {'written': 0, 'unresolved': 0}
+
+    def add(kind, o, *, pid=None, rel=None, fraction=None, at=None):
+        artist, title = o.get('artist'), o.get('title')
+        sha, _how = ids.resolve(persistent=pid, path=rel, artist=artist, title=title)
+        alias = None if sha else (f"key:{store.key_text(artist, title)}" if store.key_text(artist, title) else None)
+        if not sha and not alias:
+            return
+        if not sha:
+            n['unresolved'] += 1
+        ev = store.make_event(listener, 'glancebar', kind, sha=sha, alias=alias, fraction=fraction,
+                              at=at or o.get('at'))
+        n['written'] += store.append(ev)
+
+    fb, cur['feedback'] = read_lines(MIX / 'feedback.jsonl', cur.get('feedback', 0))
+    for o in fb:
+        if o.get('source') == SOURCE:
+            continue
+        ev = o.get('event')
+        if ev not in ('dislike', 'undislike'):
+            ev = 'like' if o.get('liked') is True else 'unlike' if o.get('liked') is False else None
+        if ev:
+            add(ev, o, fraction=_fraction(o))
+    sk, cur['skips'] = read_lines(MIX / 'skip-history.jsonl', cur.get('skips', 0))
+    for o in sk:
+        f = _fraction(o)
+        add('early-skip' if f is not None and f < EARLY else 'skip', o, rel=_rel_from_path(o.get('path')), fraction=f)
+    hh, cur['hearts'] = read_lines(HEARTS, cur.get('hearts', 0))
+    for o in hh:
+        if o.get('action') in ('heart', 'unheart'):
+            add(o['action'], o, fraction=_fraction(o))
+    lib = load_json(MIX / 'library.json', {}).get('tracks') or []
+    by_id = {t.get('id'): t for t in lib if isinstance(t, dict)}
+    last = newest = cur.get('plays', 0)
+    for p in recent_plays():
+        t = by_id.get(p.get('id'))
+        if p.get('at', 0) > last and t:
+            add('play', t, pid=p.get('id'), at=store.now_iso(p['at']))
+            newest = max(newest, p['at'])
+    cur['plays'] = newest
+    atomic_write(STATE / 'taste-cursor.json', cur)
+    if not store.METERED.exists():
+        n['flush'] = store.flush()
+        n['pull'] = store.pull()
+    return n
 
 
 def now_iso():
@@ -273,6 +346,10 @@ def cmd_sync():
         out.update(ok=True, sent=sent, unmatched=unmatched, pulled=written, likes=len(taste.get('likes') or []), dislikes=len(taste.get('dislikes') or []), hot=hot)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         out['error'] = str(exc)[:200]
+    try:  # the taste log does not depend on the radio being reachable
+        out['taste'] = log_taste()
+    except (OSError, ValueError) as exc:
+        out['taste'] = {'error': str(exc)[:200]}
     atomic_write(STATE / 'status.json', out)
     print(json.dumps(out))
     return 0 if out['ok'] else 1
