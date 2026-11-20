@@ -105,7 +105,7 @@ def build_snapshot(src, env):
             die(f'publish failed: build-remote exited {proc.returncode}')
         print('build-remote unavailable; building locally', file=sys.stderr)
         heavy = P.home() / '.local' / 'bin' / 'heavy-slot'
-        subprocess.run([str(heavy), '--', './build.sh'], cwd=src, env=env, check=True)
+        subprocess.run([str(heavy), '--', './build.sh'], cwd=src, env=env, stdout=sys.stderr, check=True)
 
 
 def main(argv=None):
