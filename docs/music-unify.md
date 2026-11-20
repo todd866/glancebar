@@ -38,9 +38,7 @@ one drive pool after the 26 Nov SanDisk, with the M2 drive lead. Ian's calls: da
 Jobs: `com.iantodd.glancebar-music-push` (M5, now runs `push-kick.sh`), `com.iantodd.music-store-sync` (M2,
 every 10 min), `com.iantodd.music-facts` (M2, 22:30Z). Config per Mac: `~/.config/glancebar/music-store.json`.
 
-**Interfaces for 6IAN (music-radio), not yet adopted:**
-1. `/api/device/signals`: take `x.s` when it is a known sha, else `shaFor(artist, title)`. Glancebar sends it now.
-2. Taste: append the radio's own events in the log's shape, using the same id rule (`sha1(listener|app|host|at|sha|alias|kind)[:20]`) and an object of its own (`music/taste/<listener>/<month>/6ian-<writer>.jsonl`). Then drop `radio_accounts` from the M2's `music-store.json` so `import-radio` stops. Until then `radio/profiles` is the source and the log is derived from it.
-3. Facts: read `music/facts.json` for year, cover, lyrics and bio instead of `tools/years.py` / `data/years.json`.
-4. IDs: resolve artist/title, YouTube ids (YT Music recs) and Apple ids through `music/ids.json`.
-5. `place_masters.py`: the `stash-not-in-r2` hold and the `def _roots` grep are no longer needed; the push no longer compares drive and bucket counts. `def _roots` stays in musiclib.
+**Landed 20 Nov 2026 (streamlining & 6IAN adoption):**
+1. **Shared backend extracted to `~/Projects/music-core`** (`store/`, `library/`, `embed/`, `discovery/`, `media_sync/`, `mixpool/`, `pipeline/`, `.fleet/check`). Glancebar, 6IAN, and Onto the TV are now thin front-ends reading the unified store; Glancebar keeps fallback copies in `tools/` only so standalone GitHub Actions CI stays green.
+2. **6IAN (`music-radio`) adopted all 5 unification interfaces**: `/api/device/signals` accepts `x.s` (sha), `lib/match.ts` resolves via `music/ids.json` (`embedMatchKey`), `lib/space.ts` + `/api/info/[sha]` read `music/facts.json` (retiring `tools/years.py` from nightly rebuild), `/api/event` appends real events directly to `music/taste/<listener>/<YYYY-MM>/6ian-vercel.jsonl` via ETag CAS (dropping `import_radio` on M2), and `media/place_masters.py` dropped the legacy `stash-not-in-r2` / `def _roots` hold.
+3. **Chained M2 nightly pipeline (`com.iantodd.music-core-nightly`, 19:40Z via `ssh localhost`)**: replaces the M5→M2 SSH-kick jobs (`glancebar-music-push`, `glancebar-music-embed`) and standalone `music-facts` with one sequenced hub run (`push → embed → mirror-vectors → facts → check`). `com.iantodd.music-core-place` (M2, every 15m) replaces M5→M2 `music-radio-place`. `com.iantodd.music-core-m5-sync` (M5, every 4h) handles alias claims, vector pull/export, and Glancebar's lossless hot-set sync.

@@ -79,7 +79,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     -o "$APP/Contents/MacOS/Glancebar"
 install -m 0644 Info.plist "$APP/Contents/Info.plist"
 install -m 0644 tools/offline-cache/offline_cache.py "$APP/Contents/Resources/offline_cache.py"
-install -m 0644 tools/music-library/musiclib.py "$APP/Contents/Resources/musiclib.py"
+if [ -f ../music-core/library/musiclib.py ]; then
+  install -m 0644 ../music-core/library/musiclib.py "$APP/Contents/Resources/musiclib.py"
+else
+  install -m 0644 tools/music-library/musiclib.py "$APP/Contents/Resources/musiclib.py"
+fi
 install -m 0644 tools/radio-sync/radio_sync.py "$APP/Contents/Resources/radio_sync.py"
 install -m 0644 Resources/Glancebar.icns "$APP/Contents/Resources/Glancebar.icns"
 

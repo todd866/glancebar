@@ -36,10 +36,10 @@ UA = 'glancebar-radio-sync/1.0'
 
 
 def music_store():
-    """tools/music-store (the alias table and the taste log), or None where it is not installed
+    """music-core/store (the alias table and the taste log), or None where it is not installed
     (the app's bundled copy of this file runs without it)."""
     here = Path(__file__).resolve().parent
-    for cand in (here, here.parent / 'music-store'):
+    for cand in (HOME / 'Projects/music-core/store', here, here.parent / 'music-store'):
         if (cand / 'musicstore.py').is_file() and str(cand) not in sys.path:
             sys.path.insert(0, str(cand))
     try:

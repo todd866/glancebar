@@ -518,7 +518,14 @@ PY
 }
 
 probe_media() {
-  local script="${MORNING_MEDIA_SYNC:-$MORNING_GLANCEBAR_REPO/tools/media-sync/media_sync.py}"
+  local script="${MORNING_MEDIA_SYNC:-}"
+  if [[ -z $script ]]; then
+    if [[ -f $MORNING_HOME/Projects/music-core/media_sync/media_sync.py ]]; then
+      script="$MORNING_HOME/Projects/music-core/media_sync/media_sync.py"
+    else
+      script="$MORNING_GLANCEBAR_REPO/tools/media-sync/media_sync.py"
+    fi
+  fi
   if [[ ! -f $script ]]; then
     record WARN "media" "media_sync.py missing"
     return

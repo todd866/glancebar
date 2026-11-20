@@ -558,7 +558,7 @@ def publish_ids(doc, state, remote, upload=True, aliases=None):
 
 def _music_store():
     here = Path(__file__).resolve().parent
-    for cand in (here, here.parent / 'music-store'):
+    for cand in (HOME / 'Projects/music-core/store', here, here.parent / 'music-store'):
         if (cand / 'musicstore.py').is_file() and str(cand) not in sys.path:
             sys.path.insert(0, str(cand))
     import musicstore
