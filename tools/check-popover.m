@@ -1650,12 +1650,21 @@ int main(int argc, const char **argv) {
                 writeToFile:[stateDir stringByAppendingPathComponent:@"station.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
             [c rebuildContent];
             root = p.contentViewController.view;
-            NSView *radio = FindIdentifier(root, @"popover.radio.line");
-            NSButton *pick = (NSButton *)FindIdentifier(root, @"popover.radio.pick");
-            NSButton *about = (NSButton *)FindIdentifier(root, @"popover.radio.about");
-            if (!radio || !pick || !about || !FindIdentifier(root, @"popover.radio.status") || CountIdentifier(root, @"popover.radio.line") != 1)
-                return Fail(__LINE__);
-            if (![pick.title containsString:@"Hip hop"] || !about.enabled || radio.frame.size.height > 22.5) return Fail(__LINE__);
+            // The old stapled-on radio row is gone; its entry point is now the 6IAN tile in the
+            // mix row, captioned with the current mood, and everything still fits.
+            if (FindIdentifier(root, @"popover.radio.pick") || FindIdentifier(root, @"popover.radio.about") ||
+                FindIdentifier(root, @"popover.radio.status")) return Fail(__LINE__);
+            if (CountIdentifier(root, @"popover.music.sixian") != 1) return Fail(__LINE__);
+            // station.json carries the mood the tile caption and the offline queue both use
+            // (normally loaded by a radio sync); load it directly, as the sync completion does.
+            [c performSelector:@selector(loadRadioStation)];
+            [c rebuildContent];
+            root = p.contentViewController.view;
+            NSTextField *sixMood = (NSTextField *)FindIdentifier(root, @"popover.music.sixian.mood");
+            if (![sixMood.stringValue isEqual:@"Hip hop"]) return Fail(__LINE__);
+            if (!KindMixRowLayoutOK(root, FindIdentifier(root, @"popover.music.show") ? 7u : 6u,
+                                    FindIdentifier(root, @"popover.music.show") ? 46 : 50) ||
+                !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
             NSMenu *menu = [c performSelector:@selector(radioMenu)];
             NSMutableArray *titles = [NSMutableArray array];
             for (NSMenuItem *it in menu.itemArray) if (!it.separatorItem) [titles addObject:it.title];
@@ -1872,8 +1881,8 @@ int main(int argc, const char **argv) {
             NSView *stMark = FindIdentifier(root, @"popover.mix.station.typemark");
             NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
             if (!show || !station || !showCap || !showSub || !nmCap || !prog ||
-                MixRowHasLegacySeedTiles(root) || !KindMixRowLayoutOK(root, 7, 46) ||
-                !KindMixRowOK(root, 6, 50, counts, nil) || !FitsChildren(root))
+                MixRowHasLegacySeedTiles(root) ||
+                !KindMixRowOK(root, 7, 46, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
             NSView *chill = KindTileButton(root, @"chill");
             if (NSMinX(show.frame) <= NSMaxX(chill.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)

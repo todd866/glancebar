@@ -5007,20 +5007,21 @@ static const CGFloat kTileCaptionBasePt = 11.5;
 static const CGFloat kTileCaptionFloorPt = 10.0;
 static const CGFloat kLabelPad = 8;   // what an NSTextField label needs beyond its text's width
 
-static CGFloat TileCaptionFitPointSize(NSString *text, CGFloat width, CGFloat basePt) {
+static CGFloat TileCaptionFitPointSizeFloor(NSString *text, CGFloat width, CGFloat basePt, CGFloat floorPt) {
     CGFloat pt = basePt > 0 ? basePt : kTileCaptionBasePt;
-    while (pt >= kTileCaptionFloorPt) {
+    while (pt >= floorPt) {
         NSFont *font = [NSFont systemFontOfSize:pt];
         // A label needs kLabelPad more than its text or AppKit truncates it (measured with the
         // cell's expansion frame: 58.9 pt of text is cut in a 65.2 pt label and whole in 70).
         if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + kLabelPad <= width) return pt;
         pt -= 0.5;
     }
-    return kTileCaptionFloorPt;
+    return floorPt;
 }
 
-static void GBApplyTileCaption(NSTextField *cap, NSString *text, CGFloat capW, CGFloat basePt) {
-    CGFloat pt = TileCaptionFitPointSize(text, capW, basePt);
+static void GBApplyTileCaptionFloor(NSTextField *cap, NSString *text, CGFloat capW, CGFloat basePt, CGFloat floorPt) {
+    // A base below the floor (the 7-tile mix row) IS the floor: never size back up.
+    CGFloat pt = TileCaptionFitPointSizeFloor(text, capW, basePt, MIN(floorPt, basePt > 0 ? basePt : kTileCaptionBasePt));
     cap.font = [NSFont systemFontOfSize:pt];
     cap.stringValue = text;
     if ([cap respondsToSelector:@selector(updateClippedTextHelp)])
@@ -5029,7 +5030,6 @@ static void GBApplyTileCaption(NSTextField *cap, NSString *text, CGFloat capW, C
         [cap performSelector:@selector(updateClippedTextHelp)];
 #pragma clang diagnostic pop
 }
-
 
 static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
     NSString *words = [showName isKindOfClass:NSString.class] ? showName : @"";
@@ -11744,12 +11744,13 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     // one, "House Party" came out smaller than "Chill" beside it, and two names that each
     // filled their tile's width ran together as "House PartyNew music".
     CGFloat namePt = kTileCaptionBasePt;
+    const CGFloat rowFloorPt = tileCount >= 7 ? 8 : kTileCaptionFloorPt;
     {
         NSMutableArray<NSString *> *rowNames = [NSMutableArray arrayWithObject:@"New music"];
         for (NSDictionary *def in GBKindTileOrder()) if ([def[@"name"] length]) [rowNames addObject:def[@"name"]];
         if (showTile && [_showOffered[@"show"] length]) [rowNames addObject:_showOffered[@"show"]];
         for (NSString *rowName in rowNames)
-            namePt = MIN(namePt, TileCaptionFitPointSize(rowName, side + gap + kLabelPad, kTileCaptionBasePt));
+            namePt = MIN(namePt, TileCaptionFitPointSizeFloor(rowName, side + gap + kLabelPad, kTileCaptionBasePt, rowFloorPt));
     }
     CGFloat x = kPad;
     NSDictionary *snap = _kindTileSnapshot ?: @{};
@@ -11801,7 +11802,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
+            else GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? [NSString stringWithFormat:@"popover.music.kind.%@.songs", kind]
                                              : [NSString stringWithFormat:@"popover.music.kind.%@.caption", kind];
             [line addSubview:cap];
@@ -11872,8 +11873,8 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
-            if (l) GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, 10);
-            else GBApplyTileCaption(cap, showCaps[l], capW + kLabelPad, namePt);
+            if (l) GBApplyTileCaptionFloor(cap, showCaps[l], capW + kLabelPad, 10, rowFloorPt);
+            else GBApplyTileCaptionFloor(cap, showCaps[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? @"popover.music.show.artist" : @"popover.music.show.caption";
             [line addSubview:cap];
         }
@@ -11937,7 +11938,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
             if (l) cap.font = capFont;
-            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
+            else GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? @"popover.mix.artist.4" : @"popover.mix.caption.4";
             [line addSubview:cap];
         }
@@ -11983,8 +11984,8 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
-            if (l) GBApplyTileCaption(cap, captions[l], capW + kLabelPad, 10);
-            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
+            if (l) GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, 10, rowFloorPt);
+            else GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? @"popover.music.sixian.mood" : @"popover.music.sixian.caption";
             [line addSubview:cap];
         }
