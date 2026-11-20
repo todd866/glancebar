@@ -416,20 +416,23 @@ static NSView *KindTileButton(NSView *root, NSString *kind) {
 }
 static BOOL KindMixRowLayoutOK(NSView *root, NSUInteger tileCount, CGFloat expectedSide) {
     if (MixRowHasLegacySeedTiles(root)) return NO;
-    if (tileCount != 5 && tileCount != 6) return NO;
+    if (tileCount != 6 && tileCount != 7) return NO;
     NSMutableArray<NSView *> *tiles = [NSMutableArray array];
     for (NSString *kind in KindTileIDs()) {
         NSView *t = KindTileButton(root, kind);
         if (!t) return NO;
         [tiles addObject:t];
     }
-    if (tileCount == 6) {
+    if (tileCount == 7) {
         if (!FindIdentifier(root, @"popover.music.show")) return NO;
         [tiles addObject:FindIdentifier(root, @"popover.music.show")];
     } else if (FindIdentifier(root, @"popover.music.show")) return NO;
     NSView *station = FindIdentifier(root, @"popover.mix.station");
     if (!station) return NO;
     [tiles addObject:station];
+    NSView *sixian = FindIdentifier(root, @"popover.music.sixian");
+    if (!sixian) return NO;
+    [tiles addObject:sixian];
     CGFloat gap = -1;
     for (NSView *t in tiles) {
         if (fabs(NSWidth(t.frame) - expectedSide) > 0.6 || fabs(NSHeight(t.frame) - expectedSide) > 0.6) return NO;
@@ -1083,12 +1086,12 @@ int main(int argc, const char **argv) {
         [c setValue:kindPack[@"library"] forKey:@"mixLibrary"];
         [c ensureOfflinePlaylists];
         [c rebuildContent]; root = p.contentViewController.view;
-        {   // Dance, Alt, Rap, Chill kind tiles and the New music station; five 54pt covers in one row.
+        {   // Dance, Alt, Rap, Chill tiles, New music and the 6IAN tile; six 50pt covers in one row.
             NSView *mix = FindIdentifier(root, @"popover.mix");
             NSView *line = FindIdentifier(root, @"popover.sound.line");
             NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
             if (!mix || !line || NSMinY(mix.frame) < NSMaxY(line.frame) - 0.5 ||
-                !KindMixRowOK(root, 5, 54, counts, nil) || !FitsChildren(root))
+                !KindMixRowOK(root, 6, 50, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
             NSView *badge = FindIdentifier(root, @"popover.mix.station.badge");
             NSButton *station = (NSButton *)FindIdentifier(root, @"popover.mix.station");
@@ -1097,7 +1100,7 @@ int main(int argc, const char **argv) {
             [c setValue:@"kind:dance" forKey:@"mixPlayingKey"];
             [c setValue:@YES forKey:@"localMode"];
             [c rebuildContent]; root = p.contentViewController.view;
-            if (!KindMixRowOK(root, 5, 54, counts, @"dance")) return Fail(__LINE__);
+            if (!KindMixRowOK(root, 6, 50, counts, @"dance")) return Fail(__LINE__);
             [c setValue:@NO forKey:@"localMode"]; [c setValue:nil forKey:@"mixPlayingKey"];
             [c rebuildContent]; root = p.contentViewController.view;
             // Kind tiles stay visible whenever music is enabled; network state no longer hides them.
@@ -1869,7 +1872,7 @@ int main(int argc, const char **argv) {
             NSView *stMark = FindIdentifier(root, @"popover.mix.station.typemark");
             NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
             if (!show || !station || !showCap || !showSub || !nmCap || !prog ||
-                MixRowHasLegacySeedTiles(root) || !KindMixRowLayoutOK(root, 6, 50) ||
+                MixRowHasLegacySeedTiles(root) || !KindMixRowLayoutOK(root, 7, 46) ||
                 !KindMixRowOK(root, 6, 50, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
             NSView *chill = KindTileButton(root, @"chill");
@@ -2038,8 +2041,8 @@ int main(int argc, const char **argv) {
             root = p.contentViewController.view;
             NSDictionary *counts = chillEmpty ? @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @0}
                                               : @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
-            NSUInteger tiles = withShow ? 6u : 5u;
-            CGFloat side = withShow ? 50 : 54;
+            NSUInteger tiles = withShow ? 7u : 6u;   // kinds + New music + 6IAN (+ show)
+            CGFloat side = withShow ? 46 : 50;
             NSString *playing = withShow ? @"dance" : nil;
             if (!KindMixRowOK(root, tiles, side, counts, playing) || !FitsChildren(root)) return Fail(__LINE__);
             if (withShow) {
@@ -2364,22 +2367,22 @@ int main(int argc, const char **argv) {
             NSDictionary *all = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
             // No copy on disk, then a broken one: nothing to play, and no crash.
             root = relaunched();
-            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 5, 54, none, nil)) return Fail(__LINE__);
+            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 6, 50, none, nil)) return Fail(__LINE__);
             [@"{not json" writeToFile:cachePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
             root = relaunched();
-            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 5, 54, none, nil)) return Fail(__LINE__);
+            if ([[c valueForKey:@"mixLibrary"] count] || !KindMixRowOK(root, 6, 50, none, nil)) return Fail(__LINE__);
             // A copy saved an hour ago: the same tiles as with the library in memory.
             NSData *saved = MixLibraryCacheData(fixtureLibrary, NSDate.date.timeIntervalSince1970 - 3600);
             if (![saved writeToFile:cachePath atomically:YES]) return Fail(__LINE__);
             root = relaunched();
-            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 5, 54, all, nil) ||
+            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 6, 50, all, nil) ||
                 !FitsChildren(root))
                 return Fail(__LINE__);
             // It is read once, not at every rebuild.
             [@"{not json" writeToFile:cachePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
             [c rebuildContent];
             root = p.contentViewController.view;
-            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 5, 54, all, nil))
+            if ([[c valueForKey:@"mixLibrary"] count] != fixtureLibrary.count || !KindMixRowOK(root, 6, 50, all, nil))
                 return Fail(__LINE__);
             if (![saved writeToFile:cachePath atomically:YES]) return Fail(__LINE__);
             // A dislike given on this Mac is in its own record, not in the copy of the library:
@@ -2394,7 +2397,7 @@ int main(int argc, const char **argv) {
             if (!line.length || ![[line stringByAppendingString:@"\n"] writeToFile:fbPath atomically:YES encoding:NSUTF8StringEncoding error:nil])
                 return Fail(__LINE__);
             root = relaunched();
-            if (!KindMixRowOK(root, 5, 54, @{@"dance": @1, @"alt": @2, @"rap": @2, @"chill": @1}, nil)) return Fail(__LINE__);
+            if (!KindMixRowOK(root, 6, 50, @{@"dance": @1, @"alt": @2, @"rap": @2, @"chill": @1}, nil)) return Fail(__LINE__);
             for (NSDictionary *t in [c valueForKey:@"mixLibrary"])
                 if ([t[@"id"] isEqual:dance[@"id"]] && ![t[@"dislike"] boolValue]) return Fail(__LINE__);
             // Play by kind needs no popover and no Music either: it loads the copy itself.

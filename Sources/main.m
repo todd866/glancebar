@@ -6508,6 +6508,8 @@ static void GBHangWatchStart(void) {
     NSString *_radioMood, *_radioMoodLabel, *_radioNote;           // the radio queue loaded as station:6ian
     NSDate *_radioStationDate, *_radioMoodsDate;
     BOOL _radioBusy;
+    NSArray *_radioNowDocs; NSDate *_radioNowFileDate;      // every surface's now-playing heartbeats (glancebar-radio/now.json)
+    NSURLSessionDataTask *_radioNowTask; NSTimer *_radioNowTimer;
     NSDate *_mixFeedbackDate; CFAbsoluteTime _mixFeedbackChecked;   // feedback.jsonl also gets the radio's marks
     BOOL _showsLoaded, _showsScanBusy;
     CFAbsoluteTime _showsChecked;
@@ -9552,48 +9554,102 @@ static NSString *const kShowMixKey = @"show:episode";
 - (BOOL)radioConfigured {
     return [NSFileManager.defaultManager fileExistsAtPath:[GBHomeDirectory() stringByAppendingPathComponent:@".config/glancebar/radio.json"]];
 }
-- (CGFloat)addRadioLineTo:(NSView *)root at:(CGFloat)y {
-    if (![self radioConfigured]) return y;   // no device token on this Mac: no row
-    [self ensureRadioMoods];
-    [self loadRadioStation];
-    const CGFloat rowH = 22;
-    NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, rowH)];
-    line.accessibilityIdentifier = @"popover.radio.line";
-    BOOL playing = [_mixPlayingKey isEqual:kRadioStationKey];
-    NSString *label = [NSString stringWithFormat:@"6IAN  %@ ▾", _radioMoodLabel.length ? _radioMoodLabel : @"moods & stations"];
-    NSButton *pick = [NSButton buttonWithTitle:label target:self action:@selector(showRadioMenu:)];
-    pick.bordered = NO;
-    pick.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    pick.contentTintColor = playing ? NSColor.controlAccentColor : NSColor.labelColor;
-    [pick sizeToFit];
-    pick.frame = NSMakeRect(kPad - 2, 1, MIN(NSWidth(pick.frame) + 4, kW / 2), rowH - 2);
-    pick.accessibilityHelp = @"6IAN web radio: play a mood or a station mix here, lossless from this Mac's library";
-    pick.accessibilityIdentifier = @"popover.radio.pick";
-    [line addSubview:pick];
-    NSString *status = _radioNote;
-    if (!status.length && _offlineRequests[kRadioStationKey]) status = [self offlineStatus:[self offlineCoverage:kRadioStationKey verifyHash:NO]];
-    CGFloat infoW = 22, sx = NSMaxX(pick.frame) + 6;
-    NSTextField *st = [GBRecoverableTextField labelWithString:status ?: @""];   // a clipped status keeps its full text on hover
-    st.font = [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightRegular];
-    st.textColor = NSColor.secondaryLabelColor;
-    st.maximumNumberOfLines = 1;
-    st.lineBreakMode = NSLineBreakByClipping;   // no ellipsis: fit or clip, never dots
-    st.frame = NSMakeRect(sx, 4, kW - kPad - infoW - 4 - sx, 14);
-    st.accessibilityHelp = status;
-    st.accessibilityIdentifier = @"popover.radio.status";
-    [line addSubview:st];
-    NSButton *info = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"info.circle" accessibilityDescription:@"About this song"]
-                                        target:self action:@selector(showRadioAbout:)];
-    info.bordered = NO;
-    info.frame = NSMakeRect(kW - kPad - infoW, 1, infoW, rowH - 2);
-    info.enabled = _localMode && _localTitle.length > 0;
-    info.accessibilityHelp = @"About this song: why it was picked, album, credits, artist (each with its source)";
-    info.accessibilityIdentifier = @"popover.radio.about";
-    [line addSubview:info];
-    [root addSubview:line];
-    return y + rowH;
-}
 
+// The device credentials this Mac's radio-sync installed. The app reads them directly (owner
+// approved 20 Nov 2026) so the popover can ask the backend itself instead of waiting for sync.
+- (NSDictionary *)radioCredentials {
+    NSString *path = [GBHomeDirectory() stringByAppendingPathComponent:@".config/glancebar/radio.json"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    id raw = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSDictionary *d = [raw isKindOfClass:NSDictionary.class] ? raw : nil;
+    if (![d[@"url"] isKindOfClass:NSString.class] || ![d[@"token"] isKindOfClass:NSString.class]) return nil;
+    return d;
+}
+// now.json: the cache of GET /api/device/now, same watch pattern as moods.json.
+- (void)loadRadioNow {
+    NSString *path = [self radioStatePath:@"now.json"];
+    NSDate *d = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+    if (!d || [d isEqual:_radioNowFileDate]) return;
+    _radioNowFileDate = d;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    id raw = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSArray *all = [raw isKindOfClass:NSDictionary.class] && [raw[@"all"] isKindOfClass:NSArray.class] ? raw[@"all"] : nil;
+    _radioNowDocs = all;
+}
+- (NSDictionary *)radioNowPlaying {
+    [self loadRadioNow];
+    return RadioNowPick(_radioNowDocs, NSDate.date);
+}
+// Ask the backend directly (background session, never the UI thread). Any failure is silent:
+// no now-playing row appears, no error row.
+- (void)fetchRadioNow {
+    if (_radioNowTask) return;
+    NSDictionary *cred = [self radioCredentials];
+    if (!cred) return;
+    NSURL *url = [NSURL URLWithString:@"api/device/now" relativeToURL:[NSURL URLWithString:cred[@"url"]]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:10];
+    req.HTTPMethod = @"GET";
+    [req setValue:[NSString stringWithFormat:@"Bearer %@", cred[@"token"]] forHTTPHeaderField:@"Authorization"];
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, __unused NSError *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_radioNowTask = nil;
+                if ([resp isKindOfClass:NSHTTPURLResponse.class] && ((NSHTTPURLResponse *)resp).statusCode == 200 && data.length) {
+                    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    NSArray *all = [parsed isKindOfClass:NSDictionary.class] && [parsed[@"all"] isKindOfClass:NSArray.class] ? parsed[@"all"] : nil;
+                    if (all) {
+                        NSError *werr = nil;
+                        NSFileManager *fm = NSFileManager.defaultManager;
+                        NSString *dir = [self radioStatePath:@"now.json"].stringByDeletingLastPathComponent;
+                        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                        [[NSJSONSerialization dataWithJSONObject:@{@"all": all} options:0 error:&werr] writeToFile:[self radioStatePath:@"now.json"] options:NSDataWritingAtomic error:nil];
+                        [self loadRadioNow];
+                        if (self->_popover.isShown) [self rebuildContent];
+                    }
+                }
+            });
+        }];
+    _radioNowTask = task;
+    [task resume];
+}
+// While the popover is open: fetch at once, then every 30 s. Stopped on close.
+- (void)startRadioNowWatch {
+    [self fetchRadioNow];
+    [_radioNowTimer invalidate];
+    _radioNowTimer = [NSTimer scheduledTimerWithTimeInterval:30 target:self selector:@selector(fetchRadioNow) userInfo:nil repeats:YES];
+}
+- (void)stopRadioNowWatch {
+    [_radioNowTimer invalidate];
+    _radioNowTimer = nil;
+    [_radioNowTask cancel];
+    _radioNowTask = nil;
+}
+// The heart beside a now-playing row posts the like straight to the backend (taste event).
+- (IBAction)radioNowLike:(NSButton *)sender {
+    NSDictionary *doc = [self radioNowPlaying];
+    NSDictionary *cred = [self radioCredentials];
+    if (!doc || !cred) return;
+    NSMutableDictionary *ev = [NSMutableDictionary dictionaryWithObject:@"like" forKey:@"ev"];
+    for (NSString *f in @[@"sha", @"artist", @"title"]) if ([doc[f] isKindOfClass:NSString.class]) ev[f] = doc[f];
+    NSURL *url = [NSURL URLWithString:@"api/device/signals" relativeToURL:[NSURL URLWithString:cred[@"url"]]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:10];
+    req.HTTPMethod = @"POST";
+    [req setValue:[NSString stringWithFormat:@"Bearer %@", cred[@"token"]] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"content-type"];
+    NSError *jerr = nil;
+    NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"events": @[ev]} options:0 error:&jerr];
+    if (body) req.HTTPBody = body;
+    if (body) [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}] resume];
+    sender.contentTintColor = NSColor.systemPinkColor;
+}
+// The surface glyph for a now-playing document: where the music is coming from.
++ (NSImage *)radioNowSymbol:(NSString *)surface {
+    NSString *name = [surface isEqual:@"tv"] ? @"tv" : ([surface isEqual:@"mac"] ? @"desktopcomputer" : @"safari.fill");
+    NSImage *img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:surface];
+    if (!img) img = [NSImage imageWithSystemSymbolName:@"dot.radiowaves.left.and.right" accessibilityDescription:surface];
+    return img;
+}
 - (void)ensureStation {
     if (_mixFrozen || !_musicProbesEnabled) return;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -11169,8 +11225,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         _playbackPlaying = _localResumePending || _localPlayer.rate > 0;
     }
     BOOL external = !_localMode && [_externalPlayback[@"valid"] boolValue];
-    NSString *trackTitle = _localMode ? _localTitle : (external ? _externalPlayback[@"title"] : nil);
-    NSString *trackArtist = _localMode ? _localArtist : (external ? _externalPlayback[@"artist"] : nil);
+    NSDictionary *radioNow = (!loaded && !external) ? [self radioNowPlaying] : nil;   // 6IAN in a browser tab or on the TV
+    NSString *trackTitle = _localMode ? _localTitle : (external ? _externalPlayback[@"title"] : (radioNow ? radioNow[@"title"] : nil));
+    NSString *trackArtist = _localMode ? _localArtist : (external ? _externalPlayback[@"artist"] : (radioNow ? radioNow[@"artist"] : nil));
     NSString *symbol = @"play.fill", *playLabel = @"Play";
     if (loaded) {
         if (!_playbackKnown) { symbol = @"playpause"; playLabel = @"Play or pause"; }
@@ -11223,6 +11280,34 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         source.accessibilityHelp = playingIn;
         [row addSubview:source];
         textRight = NSMinX(source.frame) - 6;
+    } else if (radioNow) {
+        NSImage *sym = [Controller radioNowSymbol:radioNow[@"surface"]];
+        NSImageView *source = [NSImageView imageViewWithImage:sym];
+        source.imageScaling = NSImageScaleProportionallyDown;
+        source.frame = NSMakeRect(textRight - 22, (kSoundH - 20) / 2.0, 20, 20);
+        NSString *where = [radioNow[@"surface"] isEqual:@"tv"] ? @"Playing on the TV (6IAN)"
+            : ([radioNow[@"surface"] isEqual:@"mac"] ? @"Playing on a Mac (6IAN)" : @"Playing in the browser (6IAN)");
+        source.accessibilityIdentifier = @"popover.music.radionow.surface";
+        source.accessibilityLabel = where;
+        source.accessibilityHelp = where;
+        [row addSubview:source];
+        textRight = NSMinX(source.frame) - 6;
+        NSButton *heart = [self transportButton:@"heart" pointSize:15 side:22
+                                         action:@selector(radioNowLike:) identifier:@"popover.music.radionow.like"
+                                          label:@"Like this song (the radio learns from it)"];
+        heart.frame = NSOffsetRect(heart.frame, textRight - 22, 0);
+        heart.contentTintColor = NSColor.secondaryLabelColor;
+        [row addSubview:heart];
+        textRight = NSMinX(heart.frame) - 6;
+    } else if (loaded && _localMode && _localTitle.length > 0 && [_mixPlayingKey isEqual:kRadioStationKey]) {
+        // 6IAN playing here: the About button that used to sit on the deleted radio row.
+        NSButton *info = [self transportButton:@"info.circle" pointSize:14 side:22
+                                        action:@selector(showRadioAbout:) identifier:@"popover.music.radionow.about"
+                                         label:@"About this song: why it was picked, album, credits, artist (each with its source)"];
+        info.frame = NSOffsetRect(info.frame, textRight - 22, 0);
+        info.contentTintColor = NSColor.secondaryLabelColor;
+        [row addSubview:info];
+        textRight = NSMinX(info.frame) - 6;
     } else if (loaded && [self playingShowEpisode]) {
         NSDictionary *ident = [self currentLocalIdentity];
         NSString *key = ident[@"trackKey"];
@@ -11294,6 +11379,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSString *subtitleText;
     if (external) {
         subtitleText = trackArtist.length ? trackArtist : @"";
+    } else if (radioNow) {
+        subtitleText = trackArtist.length ? trackArtist : @"";
     } else if (!loaded) {
         NSDictionary *coverage = [self offlineCoverage:[self offlinePrimaryKey] verifyHash:NO];
         subtitleText = [self offlineStatus:coverage];
@@ -11320,7 +11407,6 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (loaded && _trackDuration > 0) y = [self addAppleMusicScrubberTo:root at:y elapsed:shownElapsed];
     y = [self addOutputLineTo:root at:y];
     if (!_musicOff) y = [self addSeedTilesTo:root at:y];
-    if (!_musicOff) y = [self addRadioLineTo:root at:y];
     return [self addMusicNoteTo:root at:y + 2];
 }
 #pragma mark Other Macs
@@ -11646,8 +11732,8 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     [self ensureKindTileSnapshot];
     const CGFloat capH = 30, top = 6, rowH = 14;
     BOOL showTile = _showOffered != nil;
-    NSUInteger tileCount = 5 + (showTile ? 1u : 0u);
-    const CGFloat side = tileCount >= 6 ? 50 : 54;
+    NSUInteger tileCount = 6 + (showTile ? 1u : 0u);   // four kinds + New music + 6IAN (+ show)
+    const CGFloat side = tileCount >= 7 ? 46 : (tileCount >= 6 ? 50 : 54);
     CGFloat contentW = kW - 2 * kPad;
     CGFloat gap = tileCount > 1 ? (contentW - tileCount * side) / (CGFloat)(tileCount - 1) : 0;
     if (gap < 0) gap = 0;
@@ -11861,6 +11947,47 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         hover.preloadKey = @"station:triplej";
         hover.accessibilityIdentifier = @"popover.mix.hover.station";
         [line addSubview:hover];
+    }
+    x += side + gap;
+    // 6IAN: the unified radio. Click for the moods/stations menu; when something is playing
+    // on any surface (browser tab, another Mac, the TV) the transport row above shows it.
+    {
+        NSButton *six = [NSButton buttonWithTitle:@"" target:self action:@selector(showRadioMenu:)];
+        six.image = KindTilePlaceholderImage(@"sixian", @"6IAN", side);   // flat "6" tile, same family as the kind tiles
+        six.imagePosition = NSImageOnly;
+        six.imageScaling = NSImageScaleNone;
+        six.bordered = NO;
+        six.wantsLayer = YES;
+        six.layer.cornerRadius = 4;
+        six.layer.masksToBounds = YES;
+        six.frame = NSMakeRect(x, capH, side, side);
+        six.accessibilityIdentifier = @"popover.music.sixian";
+        [self ensureRadioMoods];
+        NSString *moodLabel = nil;
+        for (NSDictionary *r in [_radioMoods arrayByAddingObjectsFromArray:_radioStations])
+            if ([r[@"id"] isEqual:_radioMood]) { moodLabel = r[@"label"]; break; }
+        NSString *tip = moodLabel.length
+            ? [NSString stringWithFormat:@"6IAN personal radio - %@", moodLabel]
+            : @"6IAN personal radio";
+        six.accessibilityLabel = tip;
+        if ([_mixPlayingKey isEqual:kRadioStationKey]) {
+            six.layer.borderWidth = 2;
+            six.layer.borderColor = NSColor.controlAccentColor.CGColor;
+        }
+        [line addSubview:six];
+        CGFloat capW = side + gap, capX = x - gap / 2.0;
+        NSArray *captions = @[ @"6IAN", moodLabel.length ? moodLabel : @"moods" ];
+        for (NSUInteger l = 0; l < captions.count; l++) {
+            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
+            cap.textColor = l ? NSColor.secondaryLabelColor : NSColor.labelColor;
+            cap.alignment = NSTextAlignmentCenter;
+            cap.lineBreakMode = NSLineBreakByClipping;
+            cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
+            if (l) GBApplyTileCaption(cap, captions[l], capW + kLabelPad, 10);
+            else GBApplyTileCaption(cap, captions[l], capW + kLabelPad, namePt);
+            cap.accessibilityIdentifier = l ? @"popover.music.sixian.mood" : @"popover.music.sixian.caption";
+            [line addSubview:cap];
+        }
     }
     [root addSubview:line];
     return y + top + side + capH;
@@ -12896,6 +13023,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
         [_popoverScroll reflectScrolledClipView:_popoverScroll.contentView];
     }
     [_popover showRelativeToRect:_item.button.bounds ofView:_item.button preferredEdge:NSMaxYEdge];
+    if (!_musicOff) [self startRadioNowWatch];   // live now-playing while the panel is open
     // Hold the rows that came up with the popover, not whatever the first rebuild after it decides.
     {
         NSView *shownRoot = _popover.contentViewController.view;
@@ -13009,6 +13137,7 @@ static OSStatus GBPopoverHotKeyPressed(EventHandlerCallRef next, EventRef event,
     [GBSeedTile closeLarge];
     (void)note;
     _popoverClosedAt = CFAbsoluteTimeGetCurrent();
+    [self stopRadioNowWatch];
     [self stopTrackTick];
     if (!_detailsWindow.isVisible) [self stopPowerTick];
 }

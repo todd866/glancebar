@@ -5939,3 +5939,35 @@ void GBLoudnessProcess(float *left, float *right, UInt32 stride, UInt32 frames, 
     if (lim) lim->env = env;
 }
 
+
+// --- unified now-playing (music/now/<listener>/<surface>-<host>.json) ----------------------------
+// Every playing surface heartbeats one small document ~10 s; readers take the freshest live
+// one. Live means at most 60 s old and not stamped absurdly far ahead (a broken clock is not
+// "playing now"). The most recent `at` wins regardless of surface.
+
+NSDate *RadioNowDate(NSString *iso) {
+    if (![iso isKindOfClass:NSString.class] || !iso.length) return nil;
+    static NSISO8601DateFormatter *frac = nil, *plain = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        frac = [NSISO8601DateFormatter new];
+        frac.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+        plain = [NSISO8601DateFormatter new];
+    });
+    return [frac dateFromString:iso] ?: [plain dateFromString:iso];
+}
+
+NSDictionary *RadioNowPick(NSArray *docs, NSDate *now) {
+    if (![docs isKindOfClass:NSArray.class] || !docs.count || !now) return nil;
+    NSDictionary *best = nil;
+    NSDate *bestAt = nil;
+    for (id row in docs) {
+        if (![row isKindOfClass:NSDictionary.class]) continue;
+        NSDate *at = RadioNowDate(row[@"at"]);
+        if (!at) continue;
+        NSTimeInterval age = [now timeIntervalSinceDate:at];
+        if (age < -60 || age > 60) continue;   // far-future or stale: not live
+        if (!bestAt || [at compare:bestAt] == NSOrderedDescending) { best = row; bestAt = at; }
+    }
+    return best;
+}

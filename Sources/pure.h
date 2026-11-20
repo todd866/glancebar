@@ -1354,3 +1354,8 @@ void GBLoudnessProcess(float *left, float *right, UInt32 stride, UInt32 frames, 
                        float targetGainLinear, double rampSeconds, double sampleRate,
                        GBLoudnessLimiter *lim);
 
+
+// Unified now-playing: parse a heartbeat's ISO stamp (with or without fractional seconds).
+NSDate *RadioNowDate(NSString *iso);
+// The freshest live document (≤60 s old, no far-future stamps), most recent `at` wins. nil = nothing playing.
+NSDictionary *RadioNowPick(NSArray *docs, NSDate *now);
