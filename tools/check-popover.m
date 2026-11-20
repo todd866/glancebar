@@ -2575,8 +2575,18 @@ int main(int argc, const char **argv) {
                   @"resetsAt": @(nowEpoch + 14 * 86400), @"tokensLeft": @76000000},
                 @{@"pool": @"api", @"window": @"API models", @"remainingFraction": @0.456,
                   @"resetsAt": @(nowEpoch + 14 * 86400), @"tokensLeft": @11000000}];
+            AIUsage *gemini = [AIUsage new];
+            gemini.name = @"Gemini"; gemini.available = YES; gemini.limitStatusAvailable = YES;
+            gemini.remainingFraction = 0.94; gemini.tokensLeft = 195000000;
+            gemini.resetAt = [NSDate dateWithTimeIntervalSince1970:nowEpoch + 6 * 86400];
+            gemini.limitWindows = @[
+                @{@"pool": @"week", @"window": @"weekly", @"remainingFraction": @0.94,
+                  @"resetsAt": @(nowEpoch + 6 * 86400), @"tokensLeft": @195000000},
+                @{@"pool": @"5h", @"window": @"5-hour", @"remainingFraction": @0.80,
+                  @"resetsAt": @(nowEpoch + 4 * 3600), @"tokensLeft": @50000000}];
             NSMutableArray *sizedUsage = [usage mutableCopy];
             [sizedUsage addObject:zai];
+            [sizedUsage addObject:gemini];
             [c setValue:sizedUsage forKey:@"aiUsage"];
             [c rebuildContent]; root = p.contentViewController.view;
             NSTextField *cursorValue = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.value");
@@ -2585,18 +2595,31 @@ int main(int argc, const char **argv) {
             NSTextField *zaiFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.value");
             Gauge *zaiGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.gauge");
             Gauge *zaiFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.5h.gauge");
+            NSTextField *gemValue = (NSTextField *)FindIdentifier(root, @"popover.ai.gemini.value");
+            NSTextField *gemFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.gemini.5h.value");
+            Gauge *gemGauge = (Gauge *)FindIdentifier(root, @"popover.ai.gemini.gauge");
+            Gauge *gemFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.gemini.5h.gauge");
             if (![cursorValue.stringValue isEqual:@"26%·76M"] || ![apiTokenValue.stringValue isEqual:@"46%·11M"] ||
                 ![zaiValue.stringValue isEqual:@"100%·1.35B"] || ![zaiFiveValue.stringValue isEqual:@"100%·269M"] ||
+                ![gemValue.stringValue isEqual:@"94%·195M"] || ![gemFiveValue.stringValue isEqual:@"80%·50M"] ||
                 ![((NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.datum")).stringValue hasPrefix:@"resets "] ||
+                ![((NSTextField *)FindIdentifier(root, @"popover.ai.gemini.5h.datum")).stringValue hasPrefix:@"resets "] ||
                 ![zaiGauge isKindOfClass:Gauge.class] || fabs(zaiGauge.fraction - 1.0) > 0.001 ||
                 ![zaiFiveGauge isKindOfClass:Gauge.class] || fabs(zaiFiveGauge.fraction - 0.999) > 0.001 ||
+                ![gemGauge isKindOfClass:Gauge.class] || fabs(gemGauge.fraction - 0.94) > 0.001 ||
+                ![gemFiveGauge isKindOfClass:Gauge.class] || fabs(gemFiveGauge.fraction - 0.80) > 0.001 ||
                 !SameColumn(zaiGauge, FindIdentifier(root, @"popover.ai.cursor.gauge")) ||
                 !SameColumn(zaiFiveGauge, zaiGauge) || !SameColumn(zaiValue, cursorValue) ||
                 !SameColumn(zaiFiveValue, zaiValue) ||
+                !SameColumn(gemGauge, zaiGauge) || !SameColumn(gemFiveGauge, gemGauge) ||
+                !SameColumn(gemValue, zaiValue) || !SameColumn(gemFiveValue, gemValue) ||
                 !SameSize(FindIdentifier(root, @"popover.ai.z.ai.symbol"), FindIdentifier(root, @"popover.ai.cursor.symbol")) ||
+                !SameSize(FindIdentifier(root, @"popover.ai.gemini.symbol"), FindIdentifier(root, @"popover.ai.cursor.symbol")) ||
                 !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
             if (![zaiValue.toolTip hasPrefix:@"100% left · 1,347,000,000 tokens left · resets "] ||
                 ![zaiFiveValue.toolTip containsString:@"269,000,000 tokens left"] ||
+                ![gemValue.toolTip hasPrefix:@"94% left · 195,000,000 tokens left · resets "] ||
+                ![gemFiveValue.toolTip containsString:@"50,000,000 tokens left"] ||
                 ![cursorValue.toolTip containsString:@"76,000,000 tokens left · resets "]) return Fail(__LINE__);
             if (argc > 1) {
                 NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];

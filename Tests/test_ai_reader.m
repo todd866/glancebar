@@ -268,11 +268,16 @@ int main(void) {
                     @"{\"pool\":\"cursor\",\"remainingPct\":26.5,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":76234120}}]},"
                     @"\"zai\":{\"pools\":["
                     @"{\"pool\":\"5h\",\"remainingPct\":99.9,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":269000000}},"
-                    @"{\"pool\":\"week\",\"remainingPct\":100,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":1347000000}}]}}}",
+                    @"{\"pool\":\"week\",\"remainingPct\":100,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":1347000000}}]},"
+                    @"\"gemini\":{\"pools\":["
+                    @"{\"pool\":\"week\",\"remainingPct\":94,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":195000000}},"
+                    @"{\"pool\":\"5h\",\"remainingPct\":80,\"resetAt\":\"%@\",\"estimate\":{\"tokensLeft\":50000000}}]}}}",
                     ISODateString([NSDate dateWithTimeIntervalSinceNow:14 * 86400]),
                     ISODateString([NSDate dateWithTimeIntervalSinceNow:14 * 86400]),
                     ISODateString([NSDate dateWithTimeIntervalSinceNow:4 * 3600]),
-                    ISODateString([NSDate dateWithTimeIntervalSinceNow:7 * 86400])];
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:7 * 86400]),
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:6 * 86400]),
+                    ISODateString([NSDate dateWithTimeIntervalSinceNow:3 * 3600])];
             };
             AIUsage *cursorTokens = [AIUsage new];
             cursorTokens.name = @"Cursor";
@@ -295,6 +300,14 @@ int main(void) {
                   [zai.limitWindows[1][@"tokensLeft"] longLongValue] == 269000000 &&
                   [zai.limitWindows[1][@"resetsAt"] doubleValue] > now,
                   @"capacity: Z.ai is a weekly provider row with the 5-hour second pool");
+            AIUsage *gemini = UsageNamed(usage, @"Gemini");
+            check(gemini && gemini.limitStatusAvailable && fabs(gemini.remainingFraction - 0.94) < 0.001 &&
+                  gemini.tokensLeft == 195000000 && gemini.resetAt.timeIntervalSinceNow > 5 * 86400 &&
+                  gemini.limitWindows.count == 2 && [gemini.limitWindows[0][@"pool"] isEqual:@"week"] &&
+                  [gemini.limitWindows[1][@"pool"] isEqual:@"5h"] &&
+                  [gemini.limitWindows[1][@"tokensLeft"] longLongValue] == 50000000 &&
+                  [gemini.limitWindows[1][@"resetsAt"] doubleValue] > now,
+                  @"capacity: Gemini is a weekly provider row with the 5-hour second pool");
             // The subprocess runs at most once per interval; the parsed document is reused.
             [reader applyCapacityPoolsToUsage:usage];
             check(fetches == 1, @"capacity: the document read is throttled, not per-pass");

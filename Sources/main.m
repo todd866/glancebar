@@ -4261,49 +4261,53 @@ static long long PoolTokensLeft(NSDictionary *pool) {
         }
         if (changed) u.limitWindows = windows;
     }
-    NSDictionary *week = CurrentCapacityPool(pools, @"zai.week", now);
-    NSDictionary *five = CurrentCapacityPool(pools, @"zai.5h", now);
-    if (!week && !five) return;
-    AIUsage *u = [AIUsage new];
-    u.name = @"Z.ai";
-    u.source = @"ai-capacity · Z.ai GLM Coding Plan credits";
-    u.available = YES;
-    u.remainingFraction = week ? [week[@"fraction"] doubleValue] : -1;
-    u.tokensLeft = PoolTokensLeft(week);
-    NSMutableArray *windows = [NSMutableArray array];
-    void (^addPool)(NSDictionary *, NSString *, NSString *) = ^(NSDictionary *row, NSString *pool, NSString *label) {
-        if (!row) return;
-        double reset = [row[@"resetAt"] doubleValue];
-        long long tokens = PoolTokensLeft(row);
-        NSMutableDictionary *window = [@{
-            @"pool": pool,
-            @"window": label,
-            @"remainingFraction": @([row[@"fraction"] doubleValue]),
-        } mutableCopy];
-        if (tokens > 0) window[@"tokensLeft"] = @(tokens);
-        if (reset > 0) window[@"resetsAt"] = @(reset);
-        [windows addObject:window];
+    void (^addCapacityProvider)(NSString *, NSString *, NSString *) = ^(NSString *svc, NSString *displayName, NSString *source) {
+        NSDictionary *week = CurrentCapacityPool(pools, [svc stringByAppendingString:@".week"], now);
+        NSDictionary *five = CurrentCapacityPool(pools, [svc stringByAppendingString:@".5h"], now);
+        if (!week && !five) return;
+        AIUsage *u = [AIUsage new];
+        u.name = displayName;
+        u.source = source;
+        u.available = YES;
+        u.remainingFraction = week ? [week[@"fraction"] doubleValue] : -1;
+        u.tokensLeft = PoolTokensLeft(week);
+        NSMutableArray *windows = [NSMutableArray array];
+        void (^addPool)(NSDictionary *, NSString *, NSString *) = ^(NSDictionary *row, NSString *pool, NSString *label) {
+            if (!row) return;
+            double reset = [row[@"resetAt"] doubleValue];
+            long long tokens = PoolTokensLeft(row);
+            NSMutableDictionary *window = [@{
+                @"pool": pool,
+                @"window": label,
+                @"remainingFraction": @([row[@"fraction"] doubleValue]),
+            } mutableCopy];
+            if (tokens > 0) window[@"tokensLeft"] = @(tokens);
+            if (reset > 0) window[@"resetsAt"] = @(reset);
+            [windows addObject:window];
+        };
+        addPool(week, @"week", @"weekly");
+        addPool(five, @"5h", @"5-hour");
+        u.limitWindows = windows;
+        if (week) {
+            double reset = [week[@"resetAt"] doubleValue];
+            if (reset > 0) {
+                u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
+                u.resetText = ResetTextFromDate(u.resetAt);
+            }
+        } else {   // only the 5-hour window reported: the row shows it, not a missing week
+            u.remainingFraction = [five[@"fraction"] doubleValue];
+            u.tokensLeft = PoolTokensLeft(five);
+            double reset = [five[@"resetAt"] doubleValue];
+            if (reset > 0) {
+                u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
+                u.resetText = ResetTextFromDate(u.resetAt);
+            }
+        }
+        u.limitStatusAvailable = u.remainingFraction >= 0;
+        [usage addObject:u];
     };
-    addPool(week, @"week", @"weekly");
-    addPool(five, @"5h", @"5-hour");
-    u.limitWindows = windows;
-    if (week) {
-        double reset = [week[@"resetAt"] doubleValue];
-        if (reset > 0) {
-            u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
-            u.resetText = ResetTextFromDate(u.resetAt);
-        }
-    } else {   // only the 5-hour window reported: the row shows it, not a missing week
-        u.remainingFraction = [five[@"fraction"] doubleValue];
-        u.tokensLeft = PoolTokensLeft(five);
-        double reset = [five[@"resetAt"] doubleValue];
-        if (reset > 0) {
-            u.resetAt = [NSDate dateWithTimeIntervalSince1970:reset];
-            u.resetText = ResetTextFromDate(u.resetAt);
-        }
-    }
-    u.limitStatusAvailable = u.remainingFraction >= 0;
-    [usage addObject:u];
+    addCapacityProvider(@"zai", @"Z.ai", @"ai-capacity · Z.ai GLM Coding Plan credits");
+    addCapacityProvider(@"gemini", @"Gemini", @"ai-capacity · Gemini / Antigravity quota");
 }
 
 - (NSArray<AIUsage *> *)read {
@@ -13951,6 +13955,36 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         z.template = NO;
         return z;
     }
+    if ([provider isEqualToString:@"Gemini"]) {
+        // Gemini four-point sparkle mark in the same logo box, tinted with labelColor so
+        // light and dark appearances stay crisp without adding chrome.
+        NSImage *gem = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
+            CGFloat w = dst.size.width, h = dst.size.height;
+            CGFloat cx = dst.origin.x + w / 2.0, cy = dst.origin.y + h / 2.0;
+            CGFloat r = MIN(w, h) * 0.46;
+            CGFloat q = r * 0.14;
+            NSBezierPath *star = [NSBezierPath bezierPath];
+            [star moveToPoint:NSMakePoint(cx, cy + r)];
+            [star curveToPoint:NSMakePoint(cx + r, cy)
+                 controlPoint1:NSMakePoint(cx + q, cy + q)
+                 controlPoint2:NSMakePoint(cx + q, cy + q)];
+            [star curveToPoint:NSMakePoint(cx, cy - r)
+                 controlPoint1:NSMakePoint(cx + q, cy - q)
+                 controlPoint2:NSMakePoint(cx + q, cy - q)];
+            [star curveToPoint:NSMakePoint(cx - r, cy)
+                 controlPoint1:NSMakePoint(cx - q, cy - q)
+                 controlPoint2:NSMakePoint(cx - q, cy - q)];
+            [star curveToPoint:NSMakePoint(cx, cy + r)
+                 controlPoint1:NSMakePoint(cx - q, cy + q)
+                 controlPoint2:NSMakePoint(cx - q, cy + q)];
+            [star closePath];
+            [NSColor.labelColor setFill];
+            [star fill];
+            return YES;
+        }];
+        gem.template = NO;
+        return gem;
+    }
     NSImage *icon = AIProviderIcon(provider);
     if (!icon) return nil;
     NSImage *sized = [icon copy];
@@ -13966,6 +14000,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     if ([provider isEqualToString:@"Claude"]) symbol = @"sparkle";
     else if ([provider isEqualToString:@"Codex"]) symbol = @"chevron.left.forwardslash.chevron.right";
     else if ([provider isEqualToString:@"Cursor"]) symbol = @"cursorarrow.rays";
+    else if ([provider isEqualToString:@"Gemini"]) symbol = @"sparkles";
     if (![NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil]) symbol = @"circle.dashed";
     return symbol;
 }
@@ -14254,9 +14289,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:apiRow];
         y += kRowH;
     }
-    // Z.ai's 5-hour window is its own plain row under the weekly row, in that same shape.
-    // Like Cursor's API row it only rides under a live provider row, never a dead one.
-    if ([name isEqualToString:@"Z.ai"] && u.limitStatusAvailable) {
+    // Z.ai and Gemini 5-hour windows are their own plain rows under the weekly row, in that same shape.
+    // Like Cursor's API row they only ride under a live provider row, never a dead one.
+    if (([name isEqualToString:@"Z.ai"] || [name isEqualToString:@"Gemini"]) && u.limitStatusAvailable) {
+        NSString *slug = name.lowercaseString;
         NSDictionary *five = nil;
         for (NSDictionary *window in u.limitWindows)
             if ([window[@"pool"] isEqual:@"5h"]) five = window;
@@ -14267,26 +14303,26 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
             NSDate *fiveReset = [five[@"resetsAt"] isKindOfClass:NSNumber.class]
                 ? [NSDate dateWithTimeIntervalSince1970:[five[@"resetsAt"] doubleValue]] : nil;
             NSView *fiveRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
-            fiveRow.accessibilityIdentifier = @"popover.row.ai.z.ai.5h";
+            fiveRow.accessibilityIdentifier = [NSString stringWithFormat:@"popover.row.ai.%@.5h", slug];
             NSColor *ink = AIQuotaColor(MAX(frac, 0));
             NSString *fiveTip = AIQuotaValueTip(frac, tokens, fiveReset);
             NSTextField *fiveName = [self text:@"5h" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
                                         color:NSColor.secondaryLabelColor
                                            at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
-            fiveName.accessibilityIdentifier = @"popover.ai.z.ai.5h.name";
+            fiveName.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.name", slug];
             [fiveRow addSubview:fiveName];
             Gauge *fiveBar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
             fiveBar.fraction = MAX(frac, 0); fiveBar.color = ink;
-            fiveBar.metricLabel = @"Z.ai 5-hour window remaining";
-            fiveBar.accessibilityIdentifier = @"popover.ai.z.ai.5h.gauge";
+            fiveBar.metricLabel = [NSString stringWithFormat:@"%@ 5-hour window remaining", name];
+            fiveBar.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.gauge", slug];
             [fiveRow addSubview:fiveBar];
             NSTextField *fiveValue = [self instrumentValue:AIQuotaBothText(frac, tokens, frac >= 0
                 ? [NSString stringWithFormat:@"%.0f%%", frac * 100] : @"—")
-                                                      color:ink identifier:@"popover.ai.z.ai.5h.value" in:fiveRow];
+                                                      color:ink identifier:[NSString stringWithFormat:@"popover.ai.%@.5h.value", slug] in:fiveRow];
             if (tokens > 0) fiveValue.toolTip = fiveTip;
             NSString *fiveClock = CompactResetClock(fiveReset, NSDate.date);
             [self instrumentDatum:fiveClock.length ? [@"resets " stringByAppendingString:fiveClock] : @""
-                            color:NSColor.secondaryLabelColor identifier:@"popover.ai.z.ai.5h.datum" in:fiveRow];
+                            color:NSColor.secondaryLabelColor identifier:[NSString stringWithFormat:@"popover.ai.%@.5h.datum", slug] in:fiveRow];
             fiveRow.accessibilityHelp = fiveTip;
             for (NSView *sub in fiveRow.subviews) sub.accessibilityHelp = fiveTip;
             [root addSubview:fiveRow];
@@ -15417,6 +15453,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     else if ([headingKey hasSuffix:@".codex"] || [title isEqualToString:@"Codex"]) provider = @"Codex";
     else if ([headingKey hasSuffix:@".cursor"] || [title isEqualToString:@"Cursor"]) provider = @"Cursor";
     else if ([headingKey hasSuffix:@".z.ai"] || [title isEqualToString:@"Z.ai"]) provider = @"Z.ai";   // logo, not a symbol
+    else if ([headingKey hasSuffix:@".gemini"] || [title isEqualToString:@"Gemini"]) provider = @"Gemini";
     NSImage *providerLogo = provider ? AIProviderLogo(provider, 16) : nil;
     if (symbol.length || providerLogo) {
         NSImageView *mark = [NSImageView imageViewWithImage:(providerLogo ?: [self menuSymbol:symbol])];
