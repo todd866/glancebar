@@ -366,11 +366,101 @@ def local_rel_exists(rel):
     return bool(rel) and (hot / rel).is_file()
 
 
-def cmd_queue(mood):
-    """A queue from the radio's engine, written in the New music station's file format. Songs
-    already on this Mac go first so it starts at once; the rest the hot set fetches."""
-    c = config()
-    r = api(c, 'POST', '/api/queue', {'mood': mood, 'n': 40, 'lossless': True})
+def _find_node():
+    import shutil
+    nvm = sorted((HOME / '.nvm/versions/node').glob('v*/bin/node'))
+    if nvm:
+        return str(nvm[-1])
+    return shutil.which('node') or '/opt/homebrew/bin/node'
+
+
+def _local_playable_shas():
+    """Shas of tracks currently present on disk in the local lossless hot set."""
+    cfg = load_json(LIB_CONFIG, {})
+    hot = Path(os.path.expanduser(cfg.get('hot_dir', '~/Music/Glancebar Lossless')))
+    cat = load_json(HOME / '.local/state/glancebar-music-library/catalogue.json', {})
+    shas = []
+    for entry in (cat.get('tracks') or cat.get('entries') or []):
+        rel = entry.get('relativePath') or entry.get('path') or ''
+        sha = entry.get('sha256') or ''
+        if sha and rel and (hot / rel).is_file():
+            shas.append(sha)
+    return shas
+
+
+def local_queue(mood, *, n=40, space_dir=None, store_dir=None, listener=None, cli_path=None):
+    """Run the shared music-core/engine/cli.mjs locally (works 100% offline on a plane)."""
+    import subprocess
+    import tempfile
+    cli = Path(cli_path) if cli_path else (HOME / 'Projects/music-core/engine/cli.mjs')
+    sdir = Path(space_dir) if space_dir else (HOME / 'Projects/music-radio/data')
+    stdir = Path(store_dir) if store_dir else (HOME / '.local/state/music-store')
+    if not cli.is_file() or not (sdir / 'space.json').is_file():
+        return None
+    node = _find_node()
+    if not node or not Path(node).is_file():
+        return None
+    l_name = listener or load_json(HOME / '.config/glancebar/music-store.json', {}).get('glancebar_listener') or 'ian'
+    snap = stdir / 'taste-all' / l_name / 'snapshot.json'
+    if not snap.is_file():
+        return None
+    playable_shas = _local_playable_shas()
+    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as tf:
+        json.dump({'shas': playable_shas}, tf)
+        pf = Path(tf.name)
+    try:
+        argv = [node, '--experimental-strip-types', str(cli), 'queue',
+                '--mood', mood, '--n', str(n), '--space', str(sdir), '--profile', str(snap)]
+        if playable_shas:
+            argv += ['--playable', str(pf)]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        res = json.loads(proc.stdout)
+        # Hydrate raw engine picks ({s, ...}) from local space.json + catalogue.json so offline
+        # station.json carries full title/artist/album/duration/relativePath just like /api/queue.
+        sp_tracks = {t['s']: t for t in (load_json(sdir / 'space.json', {}).get('tracks') or []) if isinstance(t, dict) and t.get('s')}
+        cat_by_sha = {e['sha256']: e for e in (load_json(HOME / '.local/state/glancebar-music-library/catalogue.json', {}).get('entries') or []) if isinstance(e, dict) and e.get('sha256')}
+        hydrated = []
+        for p in res.get('picks') or []:
+            sha = p.get('s') or ''
+            t = sp_tracks.get(sha) or {}
+            ce = cat_by_sha.get(sha) or {}
+            rel = p.get('key') or t.get('key') or ce.get('relativePath') or ''
+            meta = ce.get('meta') or {}
+            hydrated.append({
+                **p,
+                'a': p.get('a') or t.get('a') or meta.get('artist') or '',
+                't': p.get('t') or t.get('t') or meta.get('title') or '',
+                'al': p.get('al') or t.get('al') or meta.get('album') or '',
+                'dur': p.get('dur') or t.get('d') or ce.get('durationSeconds'),
+                'key': rel,
+                'chips': p.get('chips') or ([p['reason']] if p.get('reason') else []),
+            })
+        res['picks'] = hydrated
+        return res
+    except Exception:
+        return None
+    finally:
+        pf.unlink(missing_ok=True)
+
+
+def cmd_queue(mood, offline=False):
+    """A queue from the shared engine, written in the New music station's file format. Songs
+    already on this Mac go first so it starts at once; falls back to the local music-core engine
+    CLI automatically when offline or when 6IAN is unreachable."""
+    r = None
+    source = 'remote'
+    if not offline and CONFIG.exists():
+        try:
+            r = api(config(), 'POST', '/api/queue', {'mood': mood, 'n': 40, 'lossless': True})
+        except (urllib.error.URLError, OSError, ValueError):
+            r = None
+    if r is None:
+        r = local_queue(mood, n=40)
+        source = 'local-engine'
+    if r is None:
+        raise RuntimeError('queue unavailable: 6IAN unreachable and local music-core engine inputs missing')
     picks = r.get('picks') or []
     rows = []
     for p in picks:
@@ -380,9 +470,9 @@ def cmd_queue(mood):
                      'why': ' · '.join(p.get('chips') or []), 'local': local_rel_exists(rel)})
     rows.sort(key=lambda x: not x['local'])
     rows = rows[:20]
-    doc = {'at': now_iso(), 'mood': mood, 'label': r.get('mood'), 'rule': (r.get('rule') or {}).get('label'), 'tracks': rows}
+    doc = {'at': now_iso(), 'mood': mood, 'label': r.get('mood'), 'rule': (r.get('rule') or {}).get('label'), 'source': source, 'tracks': rows}
     atomic_write(STATE / 'station.json', doc)
-    print(json.dumps({'ok': True, 'mood': mood, 'tracks': len(rows), 'local': sum(1 for x in rows if x['local'])}))
+    print(json.dumps({'ok': True, 'mood': mood, 'source': source, 'tracks': len(rows), 'local': sum(1 for x in rows if x['local'])}))
     return 0
 
 
@@ -404,13 +494,21 @@ def cmd_about(artist, title):
     c = config()
     try:
         s = api(c, 'GET', '/api/device/lookup?' + urllib.parse.urlencode({'artist': artist, 'title': title}))['s']
+        about = api(c, 'GET', f'/api/info/{s}?kind=about')
+        why = api(c, 'GET', f'/api/info/{s}?kind=why')
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            print(json.dumps({'ok': False, 'reason': 'not in the radio library'}))
+            print(json.dumps({'ok': False, 'reason': 'not in the radio library', **({'store': shared} if shared else {})}, ensure_ascii=False))
+            return 0
+        if shared:
+            print(json.dumps({'ok': True, 's': shared['sha'], 'offline': True, 'store': shared}, ensure_ascii=False))
             return 0
         raise
-    about = api(c, 'GET', f'/api/info/{s}?kind=about')
-    why = api(c, 'GET', f'/api/info/{s}?kind=why')
+    except (urllib.error.URLError, OSError):
+        if shared:
+            print(json.dumps({'ok': True, 's': shared['sha'], 'offline': True, 'store': shared}, ensure_ascii=False))
+            return 0
+        raise
     print(json.dumps({'ok': True, 's': s, 'facts': about.get('facts') or [], 'artist': about.get('artist'), 'why': why.get('rows') or [],
                       **({'store': shared} if shared else {})}, ensure_ascii=False))
     return 0
@@ -428,8 +526,10 @@ def main(argv):
     cmd, args = argv[0], argv[1:]
     if cmd == 'sync':
         return cmd_sync()
-    if cmd == 'queue' and len(args) == 1:
-        return cmd_queue(args[0])
+    if cmd == 'queue' and len(args) in (1, 2):
+        offline = '--offline' in args
+        mood = [a for a in args if a != '--offline'][0]
+        return cmd_queue(mood, offline=offline)
     if cmd == 'about' and len(args) == 2:
         return cmd_about(*args)
     if cmd == 'status':
