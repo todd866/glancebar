@@ -1085,6 +1085,8 @@ NSArray *MixSeedsNextPromotion(NSArray *pending, NSDictionary *tileStatesByKey, 
     BOOL syncBusy, double timeoutSec);
 BOOL MusicSilentQAEnabled(void);
 float MusicPlayerOutputVolume(BOOL silentQA);
+extern const float kMusicMicDuckLevel;
+float MusicDuckedVolume(BOOL silentQA, double depth);
 
 // Playback event log: one JSON object per line. Values JSON cannot hold are written as text.
 NSString *PlaybackEventLine(NSString *event, NSDictionary *fields, double epoch);

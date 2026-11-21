@@ -169,6 +169,16 @@ BOOL MusicSilentQAEnabled(void) {
 
 float MusicPlayerOutputVolume(BOOL silentQA) { return silentQA ? 0.f : 1.f; }
 
+// Owner, 21 Nov 2026: music plays from this Mac to a Bluetooth speaker while he talks to the Mac
+// (Spritz dictation, ChatGPT or Claude voice). While any app has the microphone open the music
+// sits at kMusicMicDuckLevel; depth 0 is normal, 1 fully ducked (ramped between by the caller).
+const float kMusicMicDuckLevel = 0.15f;
+float MusicDuckedVolume(BOOL silentQA, double depth) {
+    if (depth < 0) depth = 0;
+    if (depth > 1) depth = 1;
+    return MusicPlayerOutputVolume(silentQA) * (float)(1.0 - depth * (1.0 - kMusicMicDuckLevel));
+}
+
 BOOL MusicLibraryCannotFetch(BOOL networkOnline, BOOL metered, NSString *lastError, BOOL unmatched, BOOL overflow) {
     if (!networkOnline || metered) return YES;
     if (unmatched || overflow) return YES;

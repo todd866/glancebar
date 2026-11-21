@@ -6492,6 +6492,10 @@ static void GBHangWatchStart(void) {
     NSUInteger _mixSeedsNextGen;
     CFAbsoluteTime _mixSeedsNextSince;
     BOOL _musicSilentQA;
+    double _micDuckDepth;        // 0 normal .. 1 ducked while an app has the microphone (MusicDuckedVolume)
+    double _micDuckTarget;
+    NSTimer *_micDuckTimer;
+    AudioObjectID _micWatchedDevice;
     BOOL _localResumePending;
     NSUInteger _localTransportGeneration;
     NSString *_playbackCause, *_playbackRateState, *_playbackLoggedOutputUID;
@@ -6636,6 +6640,50 @@ static void GBHangWatchStart(void) {
         GBLog("terminate: AI state flush timed out; indexing resumes from the last write");
 }
 
+
+// ---------- Duck the music while any app has the microphone (owner, 21 Nov 2026) ----------
+// The default input device reports kAudioDevicePropertyDeviceIsRunningSomewhere while any process
+// records from it (Spritz hold-Fn dictation, ChatGPT or Claude voice). The player ramps to
+// kMusicMicDuckLevel over 0.3 s and back over 0.8 s once the mic is free. Follows default-input changes.
+static OSStatus GBMicDuckListener(AudioObjectID obj, UInt32 n, const AudioObjectPropertyAddress *addrs, void *ctx) {
+    (void)obj; (void)n; (void)addrs;
+    Controller *d = (__bridge Controller *)ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{ [d micDuckRefresh]; });
+    return noErr;
+}
+- (void)startMicDuckWatch {
+    AudioObjectPropertyAddress def = { kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectAddPropertyListener(kAudioObjectSystemObject, &def, GBMicDuckListener, (__bridge void *)self);
+    [self micDuckRefresh];
+}
+- (void)micDuckRefresh {
+    AudioObjectPropertyAddress def = { kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectPropertyAddress run = { kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectID dev = kAudioObjectUnknown; UInt32 size = sizeof(dev);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &def, 0, NULL, &size, &dev);
+    if (dev != _micWatchedDevice) {
+        if (_micWatchedDevice != kAudioObjectUnknown) AudioObjectRemovePropertyListener(_micWatchedDevice, &run, GBMicDuckListener, (__bridge void *)self);
+        _micWatchedDevice = dev;
+        if (dev != kAudioObjectUnknown) AudioObjectAddPropertyListener(dev, &run, GBMicDuckListener, (__bridge void *)self);
+    }
+    UInt32 busy = 0; size = sizeof(busy);
+    if (dev == kAudioObjectUnknown || AudioObjectGetPropertyData(dev, &run, 0, NULL, &size, &busy) != noErr) busy = 0;
+    double target = busy ? 1.0 : 0.0;
+    if (target == _micDuckTarget && (_micDuckTimer || _micDuckDepth == target)) return;
+    _micDuckTarget = target;
+    [_micDuckTimer invalidate];
+    _micDuckTimer = [NSTimer scheduledTimerWithTimeInterval:0.03 repeats:YES block:^(NSTimer *t) {
+        double step = 0.03 / (self->_micDuckTarget > self->_micDuckDepth ? 0.3 : 0.8);
+        double d = self->_micDuckDepth;
+        d = self->_micDuckTarget > d ? MIN(self->_micDuckTarget, d + step) : MAX(self->_micDuckTarget, d - step);
+        self->_micDuckDepth = d;
+        if (!self->_localBlendTimer) {  // a crossfade applies the cap itself on every tick
+            if (self->_localPlayer) self->_localPlayer.volume = MusicDuckedVolume(self->_musicSilentQA, d);
+        }
+        if (d == self->_micDuckTarget) { [t invalidate]; self->_micDuckTimer = nil; }
+    }];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     _appLaunched = YES;
     GBHangWatchStart();
@@ -6643,6 +6691,7 @@ static void GBHangWatchStart(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ [self registerPopoverHotKeys]; });
     dispatch_async(dispatch_get_main_queue(), ^{ GBFineVolumeStart(); });
     dispatch_async(dispatch_get_main_queue(), ^{ GBWindowRestoreStart(); });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self startMicDuckWatch]; });
     [ud registerDefaults:@{@"musicShowsRoot": [GBHomeDirectory() stringByAppendingPathComponent:@"Music/Radio Shows"],
                            @"showWatts": @YES, @"showHealth": @YES,
                            @"barShowDisk": @YES, @"barShowBattery": @YES,
@@ -10226,7 +10275,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _localBlendTimer = nil;
     // The incoming player is the one the UI already shows. Full volume, then the
     // outgoing player can go: a fade abandoned at the bottom would stay quiet.
-    if (_localPlayer) _localPlayer.volume = MusicPlayerOutputVolume(_musicSilentQA);
+    if (_localPlayer) _localPlayer.volume = MusicDuckedVolume(_musicSilentQA, _micDuckDepth);
     if (_localOutgoing) {
         [_localOutgoing pause];
         _localOutgoing = nil;
@@ -10270,7 +10319,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
         [_localOutgoing pause];
         _localOutgoing = nil;
     }
-    if (_localPlayer) _localPlayer.volume = MusicPlayerOutputVolume(_musicSilentQA);
+    if (_localPlayer) _localPlayer.volume = MusicDuckedVolume(_musicSilentQA, _micDuckDepth);
 }
 // The queue advances by itself and never updates the index, so Next would jump
 // backwards and the label would stay on the finished song. At the end, wrap the
@@ -10356,7 +10405,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     [self tearDownLocalPlayer];
     _localPlayer = [AVQueuePlayer queuePlayerWithItems:items];
     _localPlayer.automaticallyWaitsToMinimizeStalling = NO;
-    float level = MusicPlayerOutputVolume(_musicSilentQA);
+    float level = MusicDuckedVolume(_musicSilentQA, _micDuckDepth);
     _localPlayer.volume = level;
     _localPlayer.muted = _musicSilentQA;
     [self attachLocalObservers:items];
@@ -10404,7 +10453,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     double t = (CFAbsoluteTimeGetCurrent() - _localBlendStarted) / duration;
     if (!(t < 1)) { [self finishLocalBlend]; return; }
     MusicBlendGain gain = MusicBlendGainAt(t);
-    float cap = MusicPlayerOutputVolume(_musicSilentQA);
+    float cap = MusicDuckedVolume(_musicSilentQA, _micDuckDepth);
     _localOutgoing.volume = (float)gain.outgoing * cap;
     _localPlayer.volume = (float)gain.incoming * cap;
 }
@@ -10420,7 +10469,7 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     AVQueuePlayer *outgoing = _localPlayer;
     [self detachLocalObservers];
     [self keepOnlyCurrentItemOn:outgoing];
-    float cap = MusicPlayerOutputVolume(_musicSilentQA);
+    float cap = MusicDuckedVolume(_musicSilentQA, _micDuckDepth);
     outgoing.volume = cap;
     outgoing.muted = _musicSilentQA;
     _localOutgoing = outgoing;

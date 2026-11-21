@@ -73,6 +73,9 @@ int main(void) { @autoreleasepool {
     Check(MusicSilentQAEnabled(), @"silent QA follows GLANCEBAR_SILENT_QA");
     unsetenv("GLANCEBAR_SILENT_QA");
     Check(MusicPlayerOutputVolume(YES) == 0.f && MusicPlayerOutputVolume(NO) == 1.f, @"silent QA forces zero player volume");
+    Check(MusicDuckedVolume(NO, 0) == 1.f && fabsf(MusicDuckedVolume(NO, 1) - kMusicMicDuckLevel) < 1e-6f, @"mic duck lowers music to the duck level");
+    Check(MusicDuckedVolume(YES, 0) == 0.f && MusicDuckedVolume(YES, 1) == 0.f, @"silent QA stays silent when ducked");
+    Check(MusicDuckedVolume(NO, 2) == MusicDuckedVolume(NO, 1) && MusicDuckedVolume(NO, -1) == 1.f, @"duck depth is clamped");
     NSDictionary *full = @{@"total": @4, @"available": @4, @"complete": @YES, @"ready": @YES};
     NSDictionary *ready = OfflineMixTileState(full, NO, NO);
     Check([ready[@"state"] isEqual:@"ready"] && [ready[@"enabled"] boolValue], @"full mix tile is ready");
