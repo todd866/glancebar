@@ -8019,8 +8019,13 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (_musicSpace && now - _musicSpaceCheckedAt < 60.0) return _musicSpace;
     _musicSpaceCheckedAt = now;
-    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"music-space.json"];
+    // The merged map (Ian, 21 Nov 2026): Gemini neighbours where a song has them, the cheap coverage map's
+    // calibrated neighbours otherwise (music-core embed/relation.py). Falls back to the Gemini-only file.
+    NSString *path = [MixDirectory(nil) stringByAppendingPathComponent:@"music-space-merged.json"];
     struct stat st;
+    if (stat(path.fileSystemRepresentation, &st)) {
+        path = [MixDirectory(nil) stringByAppendingPathComponent:@"music-space.json"];
+    }
     if (stat(path.fileSystemRepresentation, &st)) {
         _musicSpace = nil;
         _musicSpaceMtime = 0;
