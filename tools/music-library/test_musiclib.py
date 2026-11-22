@@ -188,6 +188,23 @@ class MusicLibLogicTests(unittest.TestCase):
         self.assertEqual(len(plan2['local']), 1)
         self.assertEqual(len(plan2['toFetch']), 0)
 
+    def test_quarantined_master_is_never_wanted_until_its_sha_changes(self):
+        # A broken master (a 15 s download fragment) must not be fetched or kept wanted.
+        _, wanted, unmatched, _ = m.wanted_entries_from_requests(self.requests, self.catalogue)
+        self.assertEqual([w['catalogue']['sha256'] for w in wanted], [self.sha])
+        _, wanted, unmatched, _ = m.wanted_entries_from_requests(
+            self.requests, self.catalogue, quarantine=frozenset({self.sha}))
+        self.assertEqual(wanted, [])
+        self.assertEqual(unmatched[0]['reason'], 'no catalogue match')
+        # The list is keyed by sha, so a re-acquired master is wanted again with no config edit.
+        fixed = {'schemaVersion': 1, 'entries': [dict(self.catalogue['entries'][0], sha256='f' * 64)]}
+        _, wanted, _, _ = m.wanted_entries_from_requests(
+            self.requests, fixed, quarantine=frozenset({self.sha}))
+        self.assertEqual(len(wanted), 1)
+        cfg = dict(json.loads(self.config.read_text()), quarantine_sha256=[self.sha.upper()])
+        self.config.write_text(json.dumps(cfg))
+        self.assertEqual(m.load_config(self.config)['quarantine_sha256'], frozenset({self.sha}))
+
     def test_eviction_skips_wanted_recent_and_absent_remote(self):
         filler = 'filler/old.m4a'
         (self.hot / filler).parent.mkdir(parents=True)
