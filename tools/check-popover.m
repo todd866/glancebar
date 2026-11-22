@@ -457,8 +457,10 @@ static BOOL KindTileDetailsOK(NSView *root, NSString *kind, NSString *caption, N
     NSTextField *cap = (NSTextField *)FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@.caption", kind]);
     NSTextField *cnt = (NSTextField *)FindIdentifier(root, [NSString stringWithFormat:@"popover.music.kind.%@.songs", kind]);
     if (![cap.stringValue isEqual:caption]) return NO;
+    // One caption line (22 Nov 2026): the song count lives in the tile's tooltip, not under it.
+    if (cnt) return NO;
     NSString *want = songs == 1 ? @"1 song" : [NSString stringWithFormat:@"%lu songs", (unsigned long)songs];
-    if (![cnt.stringValue isEqual:want]) return NO;
+    if (!empty && ![tile.toolTip containsString:want]) return NO;
     if (playing && ![cap.textColor isEqual:NSColor.controlAccentColor]) return NO;
     return YES;
 }
@@ -496,7 +498,7 @@ static NSDictionary *KindHarnessTracks(NSString *musicDir, BOOL chillOnDisk) {
 static BOOL KindStationCaptionsOK(NSView *root) {
     NSTextField *stCap = (NSTextField *)FindIdentifier(root, @"popover.mix.caption.4");
     NSTextField *stArt = (NSTextField *)FindIdentifier(root, @"popover.mix.artist.4");
-    return stCap && stArt && [stCap.stringValue isEqual:@"New music"] && [stArt.stringValue isEqual:@"for you"];
+    return stCap && !stArt && [stCap.stringValue isEqual:@"New music"];
 }
 static BOOL KindMixRowOK(NSView *root, NSUInteger tileCount, CGFloat side,
                           NSDictionary<NSString *, NSNumber *> *songCounts, NSString *playingKind) {
@@ -1282,7 +1284,9 @@ int main(int argc, const char **argv) {
             NSTextField *rd = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.datum");
             NSTextField *rn = (NSTextField *)FindIdentifier(root, @"popover.remote.m2.name");
             if (!FindIdentifier(root, @"popover.row.remote.m2") || ![rn.stringValue isEqual:@"M2"] || !FindIdentifier(root, @"popover.remote.m2.chevron") ||
-                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue hasSuffix:@"CPU busy"] || ([rd.stringValue containsString:@"°"] ? ![[rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:rd.stringValue.length - 1 effectiveRange:NULL] isEqual:NSColor.systemRedColor] : ![rd.textColor isEqual:NSColor.systemRedColor]) ||
+                ![rv.stringValue isEqual:@"9%"] || ![rd.stringValue hasSuffix:@"CPU busy"] ||
+                // The bar and value carry the colour; the limit word stays grey (22 Nov 2026).
+                ([rd.stringValue containsString:@"°"] ? ![[rd.attributedStringValue attribute:NSForegroundColorAttributeName atIndex:rd.stringValue.length - 1 effectiveRange:NULL] isEqual:NSColor.secondaryLabelColor] : ![rd.textColor isEqual:NSColor.secondaryLabelColor]) ||
                 FindIdentifier(root, @"popover.remote.m2.storage") || FindIdentifier(root, @"popover.remote.m2.volume.0") ||
                 !SameColumn(rn, FindIdentifier(root, @"popover.system.name")) ||
                 !FitsChildren(root)) return Fail(__LINE__);
@@ -1660,8 +1664,9 @@ int main(int argc, const char **argv) {
             [c performSelector:@selector(loadRadioStation)];
             [c rebuildContent];
             root = p.contentViewController.view;
-            NSTextField *sixMood = (NSTextField *)FindIdentifier(root, @"popover.music.sixian.mood");
-            if (![sixMood.stringValue isEqual:@"Hip hop"]) return Fail(__LINE__);
+            // The current mood takes the tile's one caption line in place of "6IAN".
+            NSTextField *sixMood = (NSTextField *)FindIdentifier(root, @"popover.music.sixian.caption");
+            if (![sixMood.stringValue isEqual:@"Hip hop"] || FindIdentifier(root, @"popover.music.sixian.mood")) return Fail(__LINE__);
             if (!KindMixRowLayoutOK(root, FindIdentifier(root, @"popover.music.show") ? 7u : 6u,
                                     FindIdentifier(root, @"popover.music.show") ? 46 : 50) ||
                 !FitsChildren(root) || !InstrumentRowsFit(root)) return Fail(__LINE__);
@@ -1880,7 +1885,7 @@ int main(int argc, const char **argv) {
             NSView *showMark = FindIdentifier(root, @"popover.music.show.typemark");
             NSView *stMark = FindIdentifier(root, @"popover.mix.station.typemark");
             NSDictionary *counts = @{@"dance": @2, @"alt": @2, @"rap": @2, @"chill": @1};
-            if (!show || !station || !showCap || !showSub || !nmCap || !prog ||
+            if (!show || !station || !showCap || showSub || !nmCap || !prog ||
                 MixRowHasLegacySeedTiles(root) ||
                 !KindMixRowOK(root, 7, 46, counts, nil) || !FitsChildren(root))
                 return Fail(__LINE__);
@@ -1888,9 +1893,9 @@ int main(int argc, const char **argv) {
             if (NSMinX(show.frame) <= NSMaxX(chill.frame) + 0.5 || NSMinX(station.frame) <= NSMaxX(show.frame) + 0.5)
                 return Fail(__LINE__);
             if (![showCap.stringValue isEqual:@"House Party"] || ![nmCap.stringValue isEqual:@"New music"] ||
-                ![ShowTileCaptionLine2(day, @"Marita Lee", utc) isEqual:showSub.stringValue])
+                ![show.toolTip containsString:@"Marita Lee"])   // air date and presenter: on hover only
                 return Fail(__LINE__);
-            if (!CaptionFits(showCap) || !CaptionFits(showSub) || !CaptionFits(nmCap)) return Fail(__LINE__);
+            if (!CaptionFits(showCap) || !CaptionFits(nmCap)) return Fail(__LINE__);
             // The label's own test for "clipped" sets a tooltip with the full text: none here.
             if (showCap.toolTip.length || showSub.toolTip.length || nmCap.toolTip.length) return Fail(__LINE__);
             if (fabs(prog.fraction - (72.0 / savedDur)) > 0.05) return Fail(__LINE__);

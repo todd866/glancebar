@@ -5463,6 +5463,9 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     existing.accessibilityHelp = fresh.accessibilityHelp;
     existing.accessibilityRole = fresh.accessibilityRole;
     if ([fresh.accessibilityIdentifier isEqual:@"popover.burn.symbol"]) existing.toolTip = fresh.toolTip;
+    // A kind tile's song count lives only in its tooltip (22 Nov 2026), so it must follow a
+    // dislike or a sync; set it only when it changed, so an open tooltip isn't reset.
+    if ([existing isKindOfClass:GBKindTile.class] && ![existing.toolTip isEqual:fresh.toolTip]) existing.toolTip = fresh.toolTip;
 
     if ([existing isKindOfClass:NSTextField.class]) {
         NSTextField *old = (NSTextField *)existing, *new = (NSTextField *)fresh;
@@ -5761,7 +5764,7 @@ static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width)
 
 #pragma mark - Controller
 
-static const CGFloat kW = 380, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
+static const CGFloat kW = 388, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
 // One instrument row. Every row has the same lead (symbol + name column), so the
 // gauge, value and datum share an x. Every row names itself (Storage, Battery, Claude…):
 // a blank name column read as wasted space, and the word identifies the row. The panel
@@ -5773,8 +5776,8 @@ static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the fo
 static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
 static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW + 4; "Claude" at 13pt plus the label inset
 static const CGFloat kGaugeX = 110, kGaugeW = 92, kGaugeH = 8;  // kAINameX + kAINameW + 6; width = kValueX - 4 - kGaugeX
-static const CGFloat kValueX = 206, kValueW = 72;              // "26%·76M" at 15pt ("100%" before, 19 Nov 2026)
-static const CGFloat kDatumX = 282, kDatumW = 82;              // "resets 3 Dec 10:24" at 12.5pt, fitted
+static const CGFloat kValueX = 206, kValueW = 80;              // "26%" at 15pt + "·76M" at 11.5pt grey; panel 380 → 388 for it (22 Nov 2026)
+static const CGFloat kDatumX = 290, kDatumW = 82;              // "resets 3 Dec 10:24" at 12.5pt, fitted
 static const CGFloat kToggleH = 28, kToggleGap = 6;
 static const CGFloat kKeepW = 106, kLowW = 98, kChargeW = 96;  // 16pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
@@ -11641,7 +11644,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         [self instrumentValue:(ready ? [NSString stringWithFormat:@"%d%%", (int)lround(score * 100)] : @"—") color:color
                    identifier:[stem stringByAppendingString:@".value"] in:row];
         NSTextField *datum = [self instrumentDatum:(ready ? ready[@"limit"] : awayText)
-                        color:(ready && [ready[@"limit"] isEqual:@"ready"] ? NSColor.secondaryLabelColor : color)
+                        color:(ready ? NSColor.secondaryLabelColor : color)
                    identifier:[stem stringByAppendingString:@".datum"] in:row];
         // Chip temperature leads the datum: it is what Ian watches on the workers. The limit
         // follows only when something is limiting; "ready" adds nothing next to a green gauge.
@@ -11663,7 +11666,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
                                                                       MAX(0.0, NSWidth(datum.frame) - 5.0 - reserve), &fittedFont) mutableCopy];
             if (text && limit.length)
                 [text appendAttributedString:[[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:limit]
-                    attributes:@{NSFontAttributeName: fittedFont ?: datumFont, NSForegroundColorAttributeName: color}]];
+                    attributes:@{NSFontAttributeName: fittedFont ?: datumFont, NSForegroundColorAttributeName: NSColor.secondaryLabelColor}]];
             if (text) {
                 datum.attributedStringValue = text;
                 datum.font = fittedFont ?: datumFont;
@@ -11784,7 +11787,10 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     [self ensureShows];
     [self ensureStation];
     [self ensureKindTileSnapshot];
-    const CGFloat capH = 30, top = 6, rowH = 14;
+    // One caption line under each tile: its name (22 Nov 2026). The second line (song
+    // counts, "for you", the show's air date) repeated the tile's tooltip and made the
+    // row read as clutter; 6IAN's line shows the current mood in place of its name.
+    const CGFloat capH = 16, top = 6, rowH = 14;
     BOOL showTile = _showOffered != nil;
     NSUInteger tileCount = 6 + (showTile ? 1u : 0u);   // four kinds + New music + 6IAN (+ show)
     const CGFloat side = tileCount >= 7 ? 46 : (tileCount >= 6 ? 50 : 54);
@@ -11847,8 +11853,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             [kindTile addSubview:mark];
         }
         CGFloat capW = side + gap, capX = x - gap / 2.0;
-        NSString *countLine = KindSongCountLine(onCount);
-        NSArray *captions = @[name, countLine];
+        NSArray *captions = @[name];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.textColor = playing ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
@@ -11920,7 +11925,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
             [line addSubview:badgeV];
         }
         CGFloat capW = side + gap, capX = x - gap / 2.0;
-        NSArray *showCaps = @[offer[@"show"] ?: @"", ShowTileCaptionLine2(offer[@"broadcast"], offer[@"presenter"], nil)];
+        NSArray *showCaps = @[offer[@"show"] ?: @""];
         for (NSUInteger l = 0; l < showCaps.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:showCaps[l]];
             cap.textColor = showPlaying ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
@@ -11983,7 +11988,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     }
     {
         CGFloat capW = side + gap, capX = x - gap / 2.0;
-        NSArray *captions = @[@"New music", @"for you"];
+        NSArray *captions = @[@"New music"];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.textColor = stationPlaying ? NSColor.controlAccentColor
@@ -12031,7 +12036,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         }
         [line addSubview:six];
         CGFloat capW = side + gap, capX = x - gap / 2.0;
-        NSArray *captions = @[ @"6IAN", moodLabel.length ? moodLabel : @"moods" ];
+        NSArray *captions = @[ moodLabel.length ? moodLabel : @"6IAN" ];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
             cap.textColor = l ? NSColor.secondaryLabelColor : NSColor.labelColor;
@@ -14059,16 +14064,41 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
 }
 
 - (NSTextField *)instrumentValue:(NSString *)text color:(NSColor *)color identifier:(NSString *)identifier in:(NSView *)row {
-    // Fit the type, never clip: "26%·76M" at 15pt semibold overruns the 72pt column by
-    // the cell's ruler, so step the size down before creating the field.
-    static const CGFloat kValueFloor = 10.5, kValueCellSlack = 5.0;   // "100%·1.35B" needs ~11pt
-    CGFloat valueSize = 15;
-    for (; valueSize > kValueFloor; valueSize -= 0.5) {
+    // Fit the type, never clip. A pool value "26%·76M" keeps the percent at the column's
+    // 15pt in the row's colour and sets the token estimate after it, smaller and grey: one
+    // size for every percent down the panel, and the colour on the reading that carries it
+    // (22 Nov 2026, the shrunken all-red "20%·59.4M" read as clutter). The token part steps
+    // down first; the percent shrinks only when even the smallest token size cannot fit.
+    static const CGFloat kValueFloor = 10.5, kValueCellSlack = 5.0, kTokenTop = 11.5, kTokenFloor = 9.5;
+    NSRange dot = [text rangeOfString:@"·"];
+    NSString *lead = dot.location == NSNotFound ? text : [text substringToIndex:dot.location];
+    NSString *tail = dot.location == NSNotFound ? @"" : [text substringFromIndex:dot.location];
+    CGFloat valueSize = 15, tokenSize = kTokenTop;
+    for (;;) {
         NSFont *font = [NSFont monospacedDigitSystemFontOfSize:valueSize weight:NSFontWeightSemibold];
-        if ([text sizeWithAttributes:@{NSFontAttributeName: font}].width + kValueCellSlack <= kValueW) break;
+        NSFont *small = [NSFont monospacedDigitSystemFontOfSize:tokenSize weight:NSFontWeightMedium];
+        CGFloat w = [lead sizeWithAttributes:@{NSFontAttributeName: font}].width
+                  + (tail.length ? [tail sizeWithAttributes:@{NSFontAttributeName: small}].width : 0);
+        if (w + kValueCellSlack <= kValueW) break;
+        if (tail.length && tokenSize > kTokenFloor) tokenSize -= 0.5;
+        else if (valueSize > kValueFloor) { valueSize -= 0.5; if (tokenSize > valueSize - 2) tokenSize = valueSize - 2; }
+        else break;
     }
-    NSTextField *field = [self text:text font:[NSFont monospacedDigitSystemFontOfSize:valueSize weight:NSFontWeightSemibold]
+    NSFont *valueFont = [NSFont monospacedDigitSystemFontOfSize:valueSize weight:NSFontWeightSemibold];
+    NSTextField *field = [self text:text font:valueFont
                               color:color at:NSMakeRect(kValueX, (NSHeight(row.bounds) - kValueH) / 2.0, kValueW, kValueH) align:NSTextAlignmentRight];
+    if (tail.length) {
+        NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+        para.alignment = NSTextAlignmentRight;
+        NSMutableAttributedString *both = [[NSMutableAttributedString alloc] initWithString:lead
+            attributes:@{NSFontAttributeName: valueFont, NSForegroundColorAttributeName: color ?: NSColor.labelColor,
+                         NSParagraphStyleAttributeName: para}];
+        [both appendAttributedString:[[NSAttributedString alloc] initWithString:tail
+            attributes:@{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:tokenSize weight:NSFontWeightMedium],
+                         NSForegroundColorAttributeName: NSColor.secondaryLabelColor,
+                         NSBaselineOffsetAttributeName: @0, NSParagraphStyleAttributeName: para}]];
+        field.attributedStringValue = both;
+    }
     field.accessibilityIdentifier = identifier;
     [row addSubview:field];
     return field;
@@ -16110,6 +16140,19 @@ static NSColor *HealthColor(double fraction) {
     NSTextField *field = [self detailText:value font:font
                                      color:color frame:frame align:NSTextAlignmentRight
                                 identifier:identifier in:row];
+    // Same treatment as the popover: "26%" in the row's colour, "·76M" smaller and grey.
+    NSRange dot = [value rangeOfString:@"·"];
+    if (dot.location != NSNotFound && dot.location > 0) {
+        NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+        para.alignment = NSTextAlignmentRight;
+        NSMutableAttributedString *both = [[NSMutableAttributedString alloc] initWithString:[value substringToIndex:dot.location]
+            attributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: color ?: NSColor.labelColor,
+                         NSParagraphStyleAttributeName: para}];
+        [both appendAttributedString:[[NSAttributedString alloc] initWithString:[value substringFromIndex:dot.location]
+            attributes:@{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:MAX(9.5, pt - 3.5) weight:NSFontWeightMedium],
+                         NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSParagraphStyleAttributeName: para}]];
+        field.attributedStringValue = both;
+    }
     if (tip.length) field.accessibilityHelp = tip;
     return field;
 }
