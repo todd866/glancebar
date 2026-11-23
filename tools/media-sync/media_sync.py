@@ -1344,8 +1344,9 @@ def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> Ch
             money += f"/${float(cap):.0f}"
         parts.append(f"{money} today")
     free = lane.get("driveFreeGb") if lane else None
+    pool_label = str((lane or {}).get("poolLabel") or ("MusicPool" if isinstance(free, (int, float)) and float(free) > 1500 else "Stash"))
     if isinstance(free, (int, float)):
-        parts.append(f"Stash {float(free):.0f} GB free")
+        parts.append(f"{pool_label} {float(free):.0f} GB free")
     # A dated cap override (e.g. one day at $50) shows while it is on.
     cap_today = lane.get("capToday") if lane else None
     if isinstance(cap_today, (int, float)) and gaps and gaps.get("capUsd") is not None and float(cap_today) > float(gaps["capUsd"]):
@@ -1363,7 +1364,7 @@ def radio_library_row(cfg: Dict[str, Any], chk: Dict[str, Any], host: str) -> Ch
         if age_h > float(chk.get("radio_lane_warn_h", 36)):
             warns.append(f"lane {age_fact(age_h * 3600)} old" if at else "lane-status has no time")
         if isinstance(free, (int, float)) and float(free) < float(chk.get("radio_drive_warn_gb", 160)):
-            warns.append(f"Stash {float(free):.0f} GB free, near the lane's 150 GB reserve")
+            warns.append(f"{pool_label} {float(free):.0f} GB free, near the lane's 150 GB reserve")
     if scout_doc is None:
         warns.append(f"scout-status: {scout_err}")
     if gaps is None:
@@ -1614,9 +1615,16 @@ def cmd_check(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
                 fact = f"ok, {age_fact(age_h * 3600)} ago"
                 if doc.get("warning"):
                     # Since 19 Nov 2026 an unreadable drive or uncatalogued objects do not fail the
-                    # push (the bucket is the catalogue's truth); they warn.
-                    st = "warn"
-                    fact += f"; {str(doc['warning'])[:160]}"
+                    # push (the bucket is the catalogue's truth); they warn — except in 2 TB cloud-pool
+                    # mode, where USB /Volumes/* roots are optional legacy inputs, not canonical masters.
+                    pool_cfg, _ = read_json_file(expand(cfg.get("music_pool_config") or "~/.config/glancebar/music-pool.json"))
+                    cloud_mode = isinstance(pool_cfg, dict) and pool_cfg.get("mode") == "cloud" and bool(pool_cfg.get("cloud_remote"))
+                    w_parts = [w.strip() for w in str(doc["warning"]).split(";") if w.strip()]
+                    if cloud_mode:
+                        w_parts = [w for w in w_parts if not w.startswith(("unreadable: /Volumes/", "not mounted: /Volumes/"))]
+                    if w_parts:
+                        st = "warn"
+                        fact += f"; {'; '.join(w_parts)[:160]}"
                 if age_h > float(chk.get("upload_fail_h", 72)):
                     st = "fail"
                 elif age_h > float(chk.get("upload_warn_h", 36)):
