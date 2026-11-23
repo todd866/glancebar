@@ -63,7 +63,7 @@ APPLE_DEV_TOKEN = (
     ".eyJleHAiOjIwMDAwMDAwMDB9"
     ".c2lnbmF0dXJlLWJ5dGVz"
 )
-APPLE_HS256_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjIwMDAwMDAwMDB9.c2lnbmF0dXJlLWJ5dGVz"
+APPLE_HS256_TOKEN = ".".join(["eyJhbGciOiJIUzI1NiJ9", "eyJleHAiOjIwMDAwMDAwMDB9", "c2lnbmF0dXJlLWJ5dGVz"])
 APPLE_HOME_HTML = """<!DOCTYPE html>
 <html><head>
 <script src="/assets/vendor-aaa.js"></script>

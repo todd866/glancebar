@@ -63,12 +63,12 @@ static BOOL Render(NSView *view,NSString *path,NSAppearanceName appearance) {
 }
 static NSDictionary *Fixture(void) {
     return @{@"capturedAt":@(NSDate.date.timeIntervalSince1970),@"entries":@12450,@"skipped":@12,@"errors":@2,@"partial":@YES,@"folders":@[
-        @{@"name":@"Movies",@"path":@"/Users/ian/Movies",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal"}
+        @{@"name":@"Movies",@"path":@"/Users/example/Movies",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal"}
     ],@"rows":@[
-        @{@"name":@"Photos Library.photoslibrary",@"path":@"/Users/ian/Pictures/Photos Library.photoslibrary",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal",@"protectedReason":@"Library package"},
-        @{@"name":@"Trip footage.mov",@"path":@"/Users/ian/Movies/Trip footage.mov",@"allocatedBytes":@13200000000ULL,@"logicalBytes":@13200000000ULL,@"action":@"trash"},
-        @{@"name":@"Long named export of flight records and instruments.csv",@"path":@"/Users/ian/Documents/Flights/records.csv",@"allocatedBytes":@8900000000ULL,@"logicalBytes":@8900000000ULL,@"action":@"trash"},
-        @{@"name":@"Machine learning research",@"path":@"/Users/ian/Projects/Machine learning research",@"isDirectory":@YES,@"allocatedBytes":@4100000000ULL,@"logicalBytes":@8200000000ULL,@"protectedReason":@"Repository or worktree",@"action":@"reveal"},
+        @{@"name":@"Photos Library.photoslibrary",@"path":@"/Users/example/Pictures/Photos Library.photoslibrary",@"isDirectory":@YES,@"allocatedBytes":@182500000000ULL,@"logicalBytes":@183200000000ULL,@"partial":@YES,@"action":@"reveal",@"protectedReason":@"Library package"},
+        @{@"name":@"Trip footage.mov",@"path":@"/Users/example/Movies/Trip footage.mov",@"allocatedBytes":@13200000000ULL,@"logicalBytes":@13200000000ULL,@"action":@"trash"},
+        @{@"name":@"Long named export of flight records and instruments.csv",@"path":@"/Users/example/Documents/Flights/records.csv",@"allocatedBytes":@8900000000ULL,@"logicalBytes":@8900000000ULL,@"action":@"trash"},
+        @{@"name":@"Machine learning research",@"path":@"/Users/example/Projects/Machine learning research",@"isDirectory":@YES,@"allocatedBytes":@4100000000ULL,@"logicalBytes":@8200000000ULL,@"protectedReason":@"Repository or worktree",@"action":@"reveal"},
         @{@"name":@"Xcode.app",@"path":@"/Applications/Xcode.app",@"isDirectory":@YES,@"allocatedBytes":@3800000000ULL,@"logicalBytes":@3800000000ULL,@"protectedReason":@"Application",@"action":@"reveal"}
     ]};
 }
@@ -152,7 +152,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     }
     kDetailW=600;
     NSScrollView *items=[ui storageDetailsView];
-    NSButton *trash=(id)Find(items,@"details.storage.item./Users/ian/Movies/Trip footage.mov.action");
+    NSButton *trash=(id)Find(items,@"details.storage.item./Users/example/Movies/Trip footage.mov.action");
     if(argc<=2)Check([trash.title isEqual:@"Trash"] && trash.action==@selector(trashStorage:),@"Trash is the explicit one-click action, not review navigation");
     if(argc<=2)Check([((NSButton *)Find(items,@"details.storage.item./Applications/Xcode.app.action")).title isEqual:@"Reveal"],@"protected packages have a usable safe action");
     [ui setValue:@YES forKey:@"storageFolders"];

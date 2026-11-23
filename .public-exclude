@@ -1,0 +1,15 @@
+tools/mixpool
+tools/ops
+tools/music-embed/*.plist
+tools/music-scout/*.plist
+tools/music-store/*.plist
+tools/radio-sync/*.plist
+Tests/test_mixpool.py
+tools/music-sync/__pycache__
+shots
+docs/TODO.md
+docs/superpowers
+.claude
+.fleet
+.playwright-mcp
+scripts/public-images-approved.txt
