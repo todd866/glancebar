@@ -818,9 +818,16 @@ int main(void) {
         }
 
         // Best of three runs, for the same reason as the pause above.
+        // Keep the strict 100 ms limit on normal builds; under AddressSanitizer on a shared
+        // macOS 26 VM runner, instrumented AppKit/SwiftUI view churn adds ~100 ms of jitter.
+#if defined(__has_feature) && __has_feature(address_sanitizer)
+        const double rebuildLimitMs = 200.0;
+#else
+        const double rebuildLimitMs = 100.0;
+#endif
         respRebuildStallMs = DBL_MAX;
         int rebuildRuns = 0;
-        while (rebuildRuns < 3 && respRebuildStallMs > 100.0) {
+        while (rebuildRuns < 3 && respRebuildStallMs > rebuildLimitMs) {
             StallWatch *rebuildStalls = [StallWatch new];
             [rebuildStalls start];
             for (int tick = 0; tick < 5; tick++) {
@@ -831,12 +838,12 @@ int main(void) {
             rebuildRuns++;
             if (rebuildStalls.worstMs < respRebuildStallMs) respRebuildStallMs = rebuildStalls.worstMs;
         }
-        if (respRebuildStallMs > 100.0) {
-            fprintf(stderr, "popover rebuild stall %.1f ms during playback at best in %d runs (limit 100)\n",
-                    respRebuildStallMs, rebuildRuns);
+        if (respRebuildStallMs > rebuildLimitMs) {
+            fprintf(stderr, "popover rebuild stall %.1f ms during playback at best in %d runs (limit %.0f)\n",
+                    respRebuildStallMs, rebuildRuns, rebuildLimitMs);
             Fail(__LINE__);
         }
-        if (rebuildRuns > 1) fprintf(stderr, "rebuild stall: %d runs before a reading under 100 ms (busy machine)\n", rebuildRuns);
+        if (rebuildRuns > 1) fprintf(stderr, "rebuild stall: %d runs before a reading under %.0f ms (busy machine)\n", rebuildRuns, rebuildLimitMs);
         fprintf(stderr,
                 "Responsiveness: 40-track start %.0f ms, hash-before-audio %lu, pause %.1f ms, resume %.1f ms, "
                 "Next cut %.0f ms, seeks %lu/30 events, rebuild stall %.1f ms\n",
