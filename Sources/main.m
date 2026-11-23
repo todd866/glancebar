@@ -1732,28 +1732,37 @@ static void PlaybackLogAppend(NSString *event, NSDictionary *fields) {
 }
 __attribute__((unused)) static void PlaybackLogFlush(void) { dispatch_sync(PlaybackLogQueue(), ^{}); }
 
-// Reports every change of a player's timeControlStatus on the main thread, whoever caused it.
+// Reports every change of a player keyPath on the main thread, whoever caused it.
 static void *kPlayerWatchContext = &kPlayerWatchContext;
 @interface GBPlayerWatch : NSObject
 - (instancetype)initWithPlayer:(AVPlayer *)player handler:(void (^)(AVPlayer *player))handler;
+- (instancetype)initWithPlayer:(AVPlayer *)player keyPath:(NSString *)keyPath handler:(void (^)(AVPlayer *player))handler;
 - (void)invalidate;
 @end
 @implementation GBPlayerWatch {
     AVPlayer *_player;
+    NSString *_keyPath;
     void (^_handler)(AVPlayer *);
     BOOL _observing;
 }
 - (instancetype)initWithPlayer:(AVPlayer *)player handler:(void (^)(AVPlayer *))handler {
+    return [self initWithPlayer:player keyPath:@"timeControlStatus" handler:handler];
+}
+- (instancetype)initWithPlayer:(AVPlayer *)player keyPath:(NSString *)keyPath handler:(void (^)(AVPlayer *))handler {
     if ((self = [super init])) {
         _player = player;
+        _keyPath = [keyPath copy];
         _handler = [handler copy];
-        [player addObserver:self forKeyPath:@"timeControlStatus" options:0 context:kPlayerWatchContext];
+        [player addObserver:self forKeyPath:_keyPath options:0 context:kPlayerWatchContext];
         _observing = YES;
     }
     return self;
 }
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                         change:(NSDictionary *)change context:(void *)context {
+    (void)keyPath;
+    (void)object;
+    (void)change;
     if (context != kPlayerWatchContext) {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
         return;
@@ -1765,7 +1774,7 @@ static void *kPlayerWatchContext = &kPlayerWatchContext;
     else dispatch_async(dispatch_get_main_queue(), ^{ handler(player); });
 }
 - (void)invalidate {
-    if (_observing) [_player removeObserver:self forKeyPath:@"timeControlStatus" context:kPlayerWatchContext];
+    if (_observing) [_player removeObserver:self forKeyPath:_keyPath context:kPlayerWatchContext];
     _observing = NO;
     _handler = nil;
     _player = nil;
@@ -6794,6 +6803,11 @@ static void GBHangWatchStart(void) {
     NSArray<NSURL *> *_localURLs;
     NSArray<AVPlayerItem *> *_localObservedItems;
     NSInteger _localIndex;
+    GBPlayerWatch *_localItemWatch;
+    GBPlayerWatch *_localItemStatusWatch;
+    NSMapTable<AVPlayerItem *, NSNumber *> *_localItemIndices;
+    AVPlayerItem *_localAppliedItem;
+    AVPlayerItem *_localLastFailedItem;
     BOOL _remoteCommandsOn;
     NSString *_chargePendingName, *_chargePendingMode;
     NSTimer *_powerTickTimer;   // 1s battery/power refresh while a surface is visible
@@ -8978,12 +8992,14 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
     NSInteger current = _localIndex, removedBefore = 0;
     BOOL removedCurrent = NO;
     NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:_localURLs.count];
+    NSMutableDictionary<NSNumber *, NSNumber *> *oldToNew = [NSMutableDictionary dictionary];
     for (NSInteger i = 0; i < (NSInteger)_localURLs.count; i++) {
         if ([_localURLs[i].path isEqual:path]) {
             if (i < current) removedBefore++;
             else if (i == current) removedCurrent = YES;
             continue;
         }
+        oldToNew[@(i)] = @(urls.count);
         [urls addObject:_localURLs[i]];
     }
     if (urls.count == _localURLs.count) return;
@@ -9028,6 +9044,14 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         removedQueued++;
     }
     _localObservedItems = observed;
+    if (_localItemIndices) {
+        for (AVPlayerItem *item in _localPlayer.items) {
+            NSNumber *oldIdx = [_localItemIndices objectForKey:item];
+            if (oldIdx && oldToNew[oldIdx]) {
+                [_localItemIndices setObject:oldToNew[oldIdx] forKey:item];
+            }
+        }
+    }
     _localQueueEnd = MAX(_localIndex + 1, _localQueueEnd - removedQueued);
     [self maintainLocalPlayerQueue];
     if (_popover.isShown) [self rebuildContent];
@@ -10265,25 +10289,6 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
 }
 - (void)applyLocalItemURL:(NSURL *)url {
     [self coverNoteTrackChange];
-    double peak = NAN;
-    double gainDB = [self loudnessApplyGainForPath:url.path peakOut:&peak];
-    NSDictionary *loud = [self loudnessEntryForPath:url.path];
-    NSMutableDictionary *trackFields = [@{@"file": url.lastPathComponent ?: @"", @"title": @"", @"artist": @"",
-        @"cause": [PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt) isEqual:@"unattributed"]
-            ? @"auto-advance" : _playbackCause} mutableCopy];
-    if (loud) {
-        trackFields[@"lufs"] = loud[@"lufs"];
-        trackFields[@"peak"] = loud[@"peak"];
-        trackFields[@"gainDB"] = @(gainDB);
-    } else {
-        trackFields[@"loudness"] = @"unmeasured";
-    }
-    _localLoudnessGainDB = gainDB;
-    _localLoudnessDetail = (gainDB != 0 && MusicLevelLoudnessEnabled())
-        ? [NSString stringWithFormat:@"level %+.0f dB", gainDB] : nil;
-    [self notePlayback:@"track" fields:trackFields];
-    [self loudnessScheduleMeasure:@[url.path ?: @""]];
-    [self touchMusicLibraryFile:url.path];
     NSDictionary *showEp = nil;
     for (NSDictionary *ep in _showEpisodes)
         if ([ep[@"path"] isEqual:url.path]) { showEp = ep; break; }
@@ -10304,6 +10309,25 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
         if (![_mixPlayingKey hasPrefix:@"kind:"]) playedID = nil;
         if (playedID.length && _kindPlayedIDs && ![_kindPlayedIDs containsObject:playedID]) [_kindPlayedIDs addObject:playedID];
     }
+    double peak = NAN;
+    double gainDB = [self loudnessApplyGainForPath:url.path peakOut:&peak];
+    NSDictionary *loud = [self loudnessEntryForPath:url.path];
+    NSMutableDictionary *trackFields = [@{@"file": url.lastPathComponent ?: @"",
+        @"cause": [PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt) isEqual:@"unattributed"]
+            ? @"auto-advance" : _playbackCause} mutableCopy];
+    if (loud) {
+        trackFields[@"lufs"] = loud[@"lufs"];
+        trackFields[@"peak"] = loud[@"peak"];
+        trackFields[@"gainDB"] = @(gainDB);
+    } else {
+        trackFields[@"loudness"] = @"unmeasured";
+    }
+    _localLoudnessGainDB = gainDB;
+    _localLoudnessDetail = (gainDB != 0 && MusicLevelLoudnessEnabled())
+        ? [NSString stringWithFormat:@"level %+.0f dB", gainDB] : nil;
+    [self notePlayback:@"track" fields:trackFields];
+    [self loudnessScheduleMeasure:@[url.path ?: @""]];
+    [self touchMusicLibraryFile:url.path];
     _localHeartError = nil;
     _localHeartEpoch++;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
@@ -10316,9 +10340,18 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!self->_localMode || self->_localIndex < 0 || self->_localIndex >= (NSInteger)self->_localURLs.count) return;
             if (![self->_localURLs[self->_localIndex] isEqual:url]) return;
+            NSString *prevTitle = self->_localTitle ?: @"";
+            NSString *prevArtist = self->_localArtist ?: @"";
             if (title.length) self->_localTitle = title;
             if (artist.length) self->_localArtist = artist;
             self->_localTagsReady = title.length && artist.length;
+            if ((title.length && ![prevTitle isEqual:self->_localTitle ?: @""]) ||
+                (artist.length && ![prevArtist isEqual:self->_localArtist ?: @""])) {
+                [self notePlayback:@"meta" fields:@{
+                    @"title": self->_localTitle ?: @"",
+                    @"artist": self->_localArtist ?: @""
+                }];
+            }
             [self publishNowPlaying];
             if (self->_popover.isShown) [self rebuildContent];
         });
@@ -10363,33 +10396,6 @@ static NSArray<NSString *> *ScanLikedMusicDirectory(NSString *dir) {
     if (_musicSilentQA) doc[@"silentQA"] = @YES;
     [doc addEntriesFromDictionary:fields ?: @{}];
     PlaybackLogAppend(event, doc);
-}
-- (void)watchLocalPlayerRate {
-    [_localRateWatch invalidate];
-    _localRateWatch = nil;
-    AVQueuePlayer *player = _localPlayer;
-    if (!player) return;
-    __weak Controller *weakSelf = self;
-    _localRateWatch = [[GBPlayerWatch alloc] initWithPlayer:player handler:^(AVPlayer *changed) {
-        [weakSelf localPlayerRateChanged:changed];
-    }];
-    [self localPlayerRateChanged:player];
-}
-- (void)localPlayerRateChanged:(AVPlayer *)player {
-    if (player != _localPlayer) return;
-    NSString *state = @"paused";
-    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
-    if (player.timeControlStatus == AVPlayerTimeControlStatusPlaying) state = @"playing";
-    else if (player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
-        state = @"waiting";
-        if (player.reasonForWaitingToPlay) fields[@"waitingFor"] = player.reasonForWaitingToPlay;
-    }
-    if ([state isEqual:_playbackRateState]) return;
-    _playbackRateState = state;
-    fields[@"state"] = state;
-    fields[@"cause"] = PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt);
-    [self notePlayback:@"rate" fields:fields];
-    if ([self playingShowEpisode] && [state isEqual:@"paused"]) [self saveShowPositionNow];
 }
 - (void)playbackItemTrouble:(NSNotification *)note {
     AVPlayerItem *item = [note.object isKindOfClass:AVPlayerItem.class] ? note.object : nil;
@@ -10563,6 +10569,11 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     if (!_localPlayer || !_localURLs.count || _localQueueEnd >= (NSInteger)_localURLs.count) return;
     NSURL *url = _localURLs[_localQueueEnd];
     AVPlayerItem *item = [self localPlayerItemForURL:url];
+    if (!_localItemIndices) {
+        _localItemIndices = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality)
+                                                  valueOptions:NSPointerFunctionsStrongMemory];
+    }
+    [_localItemIndices setObject:@(_localQueueEnd) forKey:item];
     [_localPlayer insertItem:item afterItem:nil];
     NSMutableArray *observed = [_localObservedItems mutableCopy] ?: [NSMutableArray array];
     [observed addObject:item];
@@ -10575,6 +10586,116 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     if (!_localPlayer || !_localURLs.count) return;
     while (_localQueueEnd < (NSInteger)_localURLs.count && _localPlayer.items.count < kLocalPlayerQueueAhead)
         [self extendLocalPlayerQueueIfNeeded];
+}
+- (void)registerLocalItems:(NSArray<AVPlayerItem *> *)items startIndex:(NSInteger)startIndex {
+    _localItemIndices = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality)
+                                              valueOptions:NSPointerFunctionsStrongMemory];
+    for (NSInteger k = 0; k < (NSInteger)items.count; k++) {
+        [_localItemIndices setObject:@(startIndex + k) forKey:items[(NSUInteger)k]];
+    }
+}
+- (BOOL)syncLocalToCurrentItem:(AVPlayer *)player {
+    if (player != _localPlayer || !_localMode || !_localURLs.count) return NO;
+    AVPlayerItem *cur = player.currentItem;
+    if (!cur || cur == _localAppliedItem) return NO;
+    NSInteger resolved = NSNotFound;
+    NSNumber *mapped = [_localItemIndices objectForKey:cur];
+    if (mapped) {
+        resolved = mapped.integerValue;
+    } else {
+        NSURL *curURL = [cur.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)cur.asset).URL : nil;
+        if (curURL) {
+            NSInteger start = MAX(0, _localIndex);
+            for (NSInteger i = start; i < (NSInteger)_localURLs.count; i++) {
+                if ([_localURLs[(NSUInteger)i] isEqual:curURL]) { resolved = i; break; }
+            }
+            if (resolved == NSNotFound) {
+                for (NSInteger i = 0; i < MIN(start, (NSInteger)_localURLs.count); i++) {
+                    if ([_localURLs[(NSUInteger)i] isEqual:curURL]) { resolved = i; break; }
+                }
+            }
+        }
+    }
+    if (resolved == NSNotFound || resolved < 0 || resolved >= (NSInteger)_localURLs.count) return NO;
+    _localIndex = resolved;
+    _localAppliedItem = cur;
+    _playbackKnown = YES;
+    if (!_localStartPaused && player.rate > 0) _playbackPlaying = YES;
+    [self maintainLocalPlayerQueue];
+    [self maintainOfflineHashVerifyAhead];
+    [self applyLocalItemURL:_localURLs[(NSUInteger)resolved]];
+    [self publishNowPlaying];
+    if (_popover.isShown) [self rebuildContent];
+    return YES;
+}
+- (void)localPlayerCurrentItemStatusChanged:(AVPlayer *)player {
+    if (player != _localPlayer || !_localMode) return;
+    AVPlayerItem *cur = player.currentItem;
+    if (!cur || cur.status != AVPlayerItemStatusFailed || cur == _localLastFailedItem) return;
+    _localLastFailedItem = cur;
+    NSURL *url = [cur.asset isKindOfClass:AVURLAsset.class] ? ((AVURLAsset *)cur.asset).URL : nil;
+    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+    if (url) fields[@"item"] = url.lastPathComponent ?: @"";
+    if (cur.error) {
+        fields[@"error"] = cur.error.localizedDescription ?: @"";
+        fields[@"code"] = @(cur.error.code);
+        fields[@"domain"] = cur.error.domain ?: @"";
+    }
+    [self notePlayback:@"item-failed" fields:fields];
+    if (_localPlayer.items.count <= 1 && _localQueueEnd < (NSInteger)_localURLs.count) {
+        [self maintainLocalPlayerQueue];
+    }
+    if (_localPlayer.items.count > 1) {
+        [self playbackCause:@"item-failed"];
+        [_localPlayer advanceToNextItem];
+        if (_playbackPlaying && _localPlayer.rate == 0) [_localPlayer play];
+    } else {
+        _playbackPlaying = NO;
+        [self publishNowPlaying];
+        if (_popover.isShown) [self rebuildContent];
+    }
+}
+- (void)localPlayerCurrentItemChanged:(AVPlayer *)player {
+    [self syncLocalToCurrentItem:player];
+    [self localPlayerCurrentItemStatusChanged:player];
+}
+- (void)localPlayerRateChanged:(AVPlayer *)player {
+    if (player != _localPlayer) return;
+    NSString *state = @"paused";
+    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+    if (player.timeControlStatus == AVPlayerTimeControlStatusPlaying) state = @"playing";
+    else if (player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
+        state = @"waiting";
+        if (player.reasonForWaitingToPlay) fields[@"waitingFor"] = player.reasonForWaitingToPlay;
+    }
+    if ([state isEqual:_playbackRateState]) return;
+    _playbackRateState = state;
+    fields[@"state"] = state;
+    fields[@"cause"] = PlaybackRateCause(_playbackCause, CFAbsoluteTimeGetCurrent() - _playbackCauseAt);
+    [self notePlayback:@"rate" fields:fields];
+    if ([self playingShowEpisode] && [state isEqual:@"paused"]) [self saveShowPositionNow];
+}
+- (void)watchLocalPlayerRate {
+    [_localRateWatch invalidate];
+    _localRateWatch = nil;
+    [_localItemWatch invalidate];
+    _localItemWatch = nil;
+    [_localItemStatusWatch invalidate];
+    _localItemStatusWatch = nil;
+    AVQueuePlayer *player = _localPlayer;
+    if (!player) return;
+    __weak Controller *weakSelf = self;
+    _localRateWatch = [[GBPlayerWatch alloc] initWithPlayer:player handler:^(AVPlayer *changed) {
+        [weakSelf localPlayerRateChanged:changed];
+    }];
+    _localItemWatch = [[GBPlayerWatch alloc] initWithPlayer:player keyPath:@"currentItem" handler:^(AVPlayer *changed) {
+        [weakSelf localPlayerCurrentItemChanged:changed];
+    }];
+    _localItemStatusWatch = [[GBPlayerWatch alloc] initWithPlayer:player keyPath:@"currentItem.status" handler:^(AVPlayer *changed) {
+        [weakSelf localPlayerCurrentItemStatusChanged:changed];
+    }];
+    [self localPlayerRateChanged:player];
+    [self localPlayerCurrentItemChanged:player];
 }
 - (NSInteger)wrappedLocalIndex:(NSInteger)index {
     NSInteger n = (NSInteger)_localURLs.count;
@@ -10633,6 +10754,13 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     }
     [_localRateWatch invalidate];
     _localRateWatch = nil;
+    [_localItemWatch invalidate];
+    _localItemWatch = nil;
+    [_localItemStatusWatch invalidate];
+    _localItemStatusWatch = nil;
+    _localAppliedItem = nil;
+    _localLastFailedItem = nil;
+    _localItemIndices = nil;
     _playbackRateState = nil;
     [_localPlayer pause];
     _localPlayer = nil;
@@ -10667,46 +10795,39 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
 }
 - (void)advanceAfterLocalItem:(AVPlayerItem *)item {
     if (!_localMode || !_localPlayer || ![_localObservedItems containsObject:item]) return;
+    NSNumber *endedMapped = [_localItemIndices objectForKey:item];
+    NSInteger endedIdx = endedMapped ? endedMapped.integerValue : _localIndex;
     if ([self playingShowEpisode]) {
-        NSString *path = (_localIndex >= 0 && _localIndex < (NSInteger)_localURLs.count) ? _localURLs[_localIndex].path : nil;
+        NSString *path = (endedIdx >= 0 && endedIdx < (NSInteger)_localURLs.count) ? _localURLs[(NSUInteger)endedIdx].path : nil;
         if (path.length) [self updateShowEpisodeState:path position:_trackDuration duration:_trackDuration finished:YES];
         _showOffered = ShowsPickOfferedEpisode(_showEpisodes, _showsState);
     }
-    NSInteger next = _localIndex + 1;
-    if (next < 0 || next >= (NSInteger)_localURLs.count) {
-        if ([self extendKindPlaylistIfNeeded]) {
-            next = _localIndex + 1;
-            if (next >= 0 && next < (NSInteger)_localURLs.count) {
-                _localIndex = next;
-                _playbackKnown = YES;
-                _playbackPlaying = YES;
-                [self maintainLocalPlayerQueue];
-                [self maintainOfflineHashVerifyAhead];
-                if (!_localPlayer.currentItem && _localQueueEnd < (NSInteger)_localURLs.count) {
-                    [self extendLocalPlayerQueueIfNeeded];
-                    [_localPlayer play];
-                }
-                [self applyLocalItemURL:_localURLs[_localIndex]];
-                [self publishNowPlaying];
-                if (_popover.isShown) [self rebuildContent];
-                return;
-            }
-        }
-        [self playLocalIndex:0];
+    if (_localPlayer.currentItem != nil && _localPlayer.currentItem != item) {
+        [self syncLocalToCurrentItem:_localPlayer];
         return;
     }
-    _localIndex = next;
-    _playbackKnown = YES;
-    _playbackPlaying = YES;
-    [self maintainLocalPlayerQueue];
-    [self maintainOfflineHashVerifyAhead];
-    if (!_localPlayer.currentItem && _localQueueEnd < (NSInteger)_localURLs.count) {
-        [self extendLocalPlayerQueueIfNeeded];
-        [_localPlayer play];
+    if (_localPlayer.currentItem == item) {
+        if (_localQueueEnd < (NSInteger)_localURLs.count) [self maintainLocalPlayerQueue];
+        NSArray<AVPlayerItem *> *queued = _localPlayer.items;
+        NSUInteger pos = [queued indexOfObjectIdenticalTo:item];
+        if (pos != NSNotFound && pos + 1 < queued.count) {
+            return;
+        }
     }
-    [self applyLocalItemURL:_localURLs[_localIndex]];
-    [self publishNowPlaying];
-    if (_popover.isShown) [self rebuildContent];
+    if (_localQueueEnd < (NSInteger)_localURLs.count) {
+        [self maintainLocalPlayerQueue];
+        if (_localPlayer.currentItem != nil && _localPlayer.currentItem != item) {
+            if (_playbackPlaying && _localPlayer.rate == 0) [_localPlayer play];
+            [self syncLocalToCurrentItem:_localPlayer];
+            return;
+        }
+    }
+    _localIndex = endedIdx;
+    if ([self extendKindPlaylistIfNeeded] && endedIdx + 1 < (NSInteger)_localURLs.count) {
+        [self playLocalIndex:endedIdx + 1];
+        return;
+    }
+    [self playLocalIndex:0];
 }
 // One source at a time. The deck and the local player are started from here while Apple
 // Music may still be playing (10 Nov 2026: the station played over the Apple Music song).
@@ -10741,6 +10862,8 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     _localPlayer.volume = level;
     _localPlayer.muted = _musicSilentQA;
     [self attachLocalObservers:items];
+    [self registerLocalItems:items startIndex:index];
+    _localAppliedItem = items.firstObject;
     _localMode = YES;
     _localEmpty = NO;
     _playbackKnown = YES;
@@ -10811,15 +10934,18 @@ static const NSInteger kLocalPlayerQueueAhead = 8;
     incoming.muted = _musicSilentQA;
     _localPlayer = incoming;
     _playbackRateState = nil;
-    [self playbackCauseIfNone:@"crossfade"];
-    [self watchLocalPlayerRate];
     [self attachLocalObservers:items];
+    [self registerLocalItems:items startIndex:index];
+    _localAppliedItem = items.firstObject;
     _localIndex = index;
     _localMode = YES;
     _localEmpty = NO;
     _playbackKnown = YES;
     _playbackPlaying = YES;
+    [self maintainLocalPlayerQueue];
+    [self playbackCauseIfNone:@"crossfade"];
     [self applyLocalItemURL:_localURLs[index]];
+    [self watchLocalPlayerRate];
     [self enableRemoteCommands];
     [_localPlayer play];
     [self applyPlayerAudioOutput];

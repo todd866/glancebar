@@ -1061,6 +1061,50 @@ int main(void) {
         if ([[c valueForKey:@"kindPlaySeed"] unsignedLongLongValue] == seedBefore) Fail(__LINE__);
         fprintf(stderr, "Kind tile: click starts dance, each further click starts a different song\n");
 
+        // --- missing queued file skips without shifting localIndex or Now Playing ---
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        [c setValue:nil forKey:@"mixPlayingKey"];
+        NSString *skipDir = [musicRoot stringByAppendingPathComponent:@"SkipSync"];
+        if (![NSFileManager.defaultManager createDirectoryAtPath:skipDir withIntermediateDirectories:YES attributes:nil error:nil]) Fail(__LINE__);
+        NSString *wav0 = [skipDir stringByAppendingPathComponent:@"w0.wav"];
+        NSString *wav2 = [skipDir stringByAppendingPathComponent:@"w2.wav"];
+        NSString *m0 = [skipDir stringByAppendingPathComponent:@"Skip Artist - Track Zero [SK0].m4a"];
+        NSString *m1Missing = [skipDir stringByAppendingPathComponent:@"Skip Artist - Missing Middle [SK1].m4a"];
+        NSString *m2 = [skipDir stringByAppendingPathComponent:@"Skip Artist - Track Two [SK2].m4a"];
+        if (!WriteToneWAV(wav0, 440.0, 1.2) || !WriteToneWAV(wav2, 554.37, 3.5)) Fail(__LINE__);
+        if (!Afconvert(wav0, m0, @"aac") || !Afconvert(wav2, m2, @"aac")) Fail(__LINE__);
+        [c playLocalPaths:@[m0, m1Missing, m2]];
+        if (!WaitUntil(^BOOL {
+            return LocalPlayer(c) != nil && LocalPlayer(c).rate > 0 && LocalIndex(c) == 0 &&
+                   [[c valueForKey:@"localTitle"] isEqual:@"Track Zero"];
+        }, 5.0)) Fail(__LINE__);
+        AssertSilentQA(c, __LINE__);
+        if (!WaitUntil(^BOOL {
+            AVQueuePlayer *lp = LocalPlayer(c);
+            AVURLAsset *a = [lp.currentItem.asset isKindOfClass:AVURLAsset.class] ? (AVURLAsset *)lp.currentItem.asset : nil;
+            return lp != nil && LocalIndex(c) == 2 &&
+                   [a.URL.lastPathComponent isEqual:@"Skip Artist - Track Two [SK2].m4a"] &&
+                   [[c valueForKey:@"localTitle"] isEqual:@"Track Two"] &&
+                   [[c valueForKey:@"localArtist"] isEqual:@"Skip Artist"];
+        }, 6.0)) Fail(__LINE__);
+        AssertSilentQA(c, __LINE__);
+
+        // Missing file at index 0 must advance to index 1 and sync title immediately.
+        [c tearDownLocalPlayer];
+        [c setValue:@NO forKey:@"localMode"];
+        [c playLocalPaths:@[m1Missing, m2]];
+        if (!WaitUntil(^BOOL {
+            AVQueuePlayer *lp = LocalPlayer(c);
+            AVURLAsset *a = [lp.currentItem.asset isKindOfClass:AVURLAsset.class] ? (AVURLAsset *)lp.currentItem.asset : nil;
+            return lp != nil && LocalIndex(c) == 1 &&
+                   [a.URL.lastPathComponent isEqual:@"Skip Artist - Track Two [SK2].m4a"] &&
+                   [[c valueForKey:@"localTitle"] isEqual:@"Track Two"] &&
+                   [[c valueForKey:@"localArtist"] isEqual:@"Skip Artist"];
+        }, 6.0)) Fail(__LINE__);
+        AssertSilentQA(c, __LINE__);
+        fprintf(stderr, "Missing queued file: localIndex and Now Playing track actual AVQueuePlayer item\n");
+
         // --- 2,000-track scale: fast start, bounded queue, no main-thread stalls ---
         [c tearDownLocalPlayer];
         [c setValue:@NO forKey:@"localMode"];

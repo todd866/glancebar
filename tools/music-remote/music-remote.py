@@ -65,25 +65,80 @@ def is_hearted(artist, title):
         return False
 
 
-def last_rate():
+def _fallback_from_filename(fname):
+    stem = os.path.splitext(os.path.basename(fname or ''))[0]
+    stem = re.sub(r'\s*\[[A-Za-z0-9_-]{6,}\]$', '', stem)
+    stem = re.sub(r'^\d{1,3}\.\s+', '', stem)
+    if ' - ' in stem:
+        a, t = stem.split(' - ', 1)
+        return a.strip() or None, t.strip() or None
+    return None, stem.strip() or None
+
+
+def current_playback(playlog_path=PLAYLOG):
     try:
-        with open(PLAYLOG, 'rb') as f:
-            f.seek(max(0, os.path.getsize(PLAYLOG) - 30000))
-            lines = f.read().decode(errors='ignore').splitlines()[1:]
+        size = os.path.getsize(playlog_path)
+        window = 262144
+        with open(playlog_path, 'rb') as f:
+            if size > window:
+                f.seek(size - window)
+            raw = f.read().decode(errors='ignore').splitlines()
+            lines = raw[1:] if size > window else raw
     except OSError:
         return None
-    for l in reversed(lines):
+    state = title = artist = cur_file = None
+    epoch = 0.0
+    for l in lines:
         try:
             d = json.loads(l)
         except ValueError:
             continue
-        if d.get('event') == 'rate' and d.get('title'):
-            return d
-    return None
+        if not isinstance(d, dict) or d.get('silentQA'):
+            continue
+        ev = d.get('event')
+        if isinstance(d.get('epoch'), (int, float)):
+            epoch = float(d['epoch'])
+        if ev == 'launch':
+            state = title = artist = cur_file = None
+        elif ev == 'track':
+            cur_file = d.get('file') or cur_file
+            t = (d.get('title') or '').strip()
+            a = (d.get('artist') or '').strip()
+            if not t and d.get('file'):
+                fb_a, fb_t = _fallback_from_filename(d['file'])
+                t = fb_t or ''
+                a = a or (fb_a or '')
+            title = t or None
+            artist = a or None
+        elif ev == 'meta':
+            ev_file = d.get('file')
+            if not ev_file or not cur_file or ev_file == cur_file:
+                if (d.get('title') or '').strip():
+                    title = d['title'].strip()
+                if (d.get('artist') or '').strip():
+                    artist = d['artist'].strip()
+        elif ev == 'rate':
+            if d.get('state'):
+                state = d['state']
+            ev_file = d.get('file')
+            if not ev_file or not cur_file or ev_file == cur_file:
+                if (d.get('title') or '').strip():
+                    title = d['title'].strip()
+                if (d.get('artist') or '').strip():
+                    artist = d['artist'].strip()
+                if ev_file and not cur_file:
+                    cur_file = ev_file
+    if not state and not title:
+        return None
+    return {'state': state, 'title': title, 'artist': artist, 'file': cur_file, 'epoch': epoch}
+
+
+def last_rate():
+    return current_playback(PLAYLOG)
 
 
 def run(cred, cmd):
-    r = last_rate()
+    r = current_playback()
     playing = bool(r and r.get('state') in ('playing', 'waiting'))
     if cmd == 'toggle':
         cmd = 'pause' if playing else 'play'
@@ -100,9 +155,9 @@ def run(cred, cmd):
 
 
 def publish_now(cred):
-    r = last_rate()
+    r = current_playback()
     age = time.time() - (r or {}).get('epoch', 0)
-    if r and (r.get('state') in ('playing', 'waiting') or age < 1800):
+    if r and r.get('title') and (r.get('state') in ('playing', 'waiting') or age < 1800):
         api(cred, 'PUT', '/api/device/now', {
             'surface': 'mac', 'host': HOST, 'title': r.get('title'), 'artist': r.get('artist') or None,
             'state': 'playing' if r.get('state') in ('playing', 'waiting') else 'paused',
