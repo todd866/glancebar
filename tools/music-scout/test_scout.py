@@ -983,6 +983,66 @@ class ScoutLogicTests(unittest.TestCase):
         self.assertNotIn("Song", titles)
         self.assertNotIn("Drop", titles)
 
+    def test_publish_promise_retention_and_lane_catalogue_binding(self):
+        hearts_path = self.root / "hearts.json"
+        hearts_path.write_text(json.dumps({"tracks": []}), encoding="utf-8")
+        play_log = self.root / "playback.jsonl"
+        ml_state = self.root / "ml-state"
+        ml_state.mkdir(parents=True, exist_ok=True)
+        (ml_state / "catalogue.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "entries": [{
+                    "relativePath": "AM-Lossless/Pale Jay/Rodeo.m4a",
+                    "sizeBytes": 12345,
+                    "sha256": "a" * 64,
+                    "tags": {"artist": "Pale Jay", "title": "Rodeo", "album": "Bewilderment"},
+                    "durationSeconds": 212.0,
+                }],
+            }),
+            encoding="utf-8",
+        )
+        old_30d = "2026-10-11T12:00:00Z"
+        scout.append_jsonl(self.paths.ledger, {
+            "at": old_30d, "action": "acquired", "artist": "Unheard Shazam", "title": "Keep Me",
+            "source": "shazam", "why": "Shazamed 11 Oct", "track_key": scout.track_key("Unheard Shazam", "Keep Me"),
+            "duration_seconds": 180.0,
+        })
+        scout.append_jsonl(self.paths.ledger, {
+            "at": old_30d, "action": "acquired", "artist": "Heard Shazam", "title": "Age Out",
+            "source": "shazam", "why": "Shazamed 11 Oct", "track_key": scout.track_key("Heard Shazam", "Age Out"),
+            "duration_seconds": 180.0,
+        })
+        play_log.write_text(
+            json.dumps({"event": "track", "artist": "Heard Shazam", "title": "Age Out", "epoch": 1000.0, "cause": "click"}) + "\n"
+            + json.dumps({"event": "track", "artist": "Next", "title": "Other", "epoch": 1180.0, "cause": "auto-advance"}) + "\n",
+            encoding="utf-8",
+        )
+        scout.append_jsonl(self.paths.ledger, {
+            "at": "2026-11-09T12:00:00Z", "action": "lane", "artist": "Pale Jay", "title": "Rodeo",
+            "source": "radio:kcrw", "why": "Heard on BBC 6 Music and KCRW", "era": "new",
+            "track_key": scout.track_key("Pale Jay", "Rodeo"),
+        })
+        scout.append_jsonl(self.paths.ledger, {
+            "at": "2026-11-09T12:00:00Z", "action": "lane", "artist": "AC/DC", "title": "Back Classic",
+            "source": "back:canon", "why": "1980 canon", "era": "back",
+            "track_key": scout.track_key("AC/DC", "Back Classic"),
+        })
+        cfg = dict(
+            self.cfg,
+            fresh_days=14,
+            hearts_path=str(hearts_path),
+            playback_log=str(play_log),
+            music_library_state=str(ml_state),
+        )
+        doc = scout.cmd_publish(cfg, self.paths, scout.Runners(clock=lambda: "2026-11-10T12:00:00Z"))
+        by_title = {t["title"]: t for t in doc["tracks"]}
+        self.assertIn("Keep Me", by_title)
+        self.assertNotIn("Age Out", by_title)
+        self.assertIn("Rodeo", by_title)
+        self.assertEqual(by_title["Rodeo"]["sha256"], "a" * 64)
+        self.assertNotIn("Back Classic", by_title)
+
     def test_dry_run_does_not_acquire(self):
         self.paths.queue.write_text(
             json.dumps(

@@ -3706,7 +3706,17 @@ static NSUInteger MusicKindArtistCount(NSArray<NSString *> *ordered, NSDictionar
 }
 
 NSString *const GBControlUsageLine =
-    @"Usage: Glancebar --play [dance|alt|rap|chill|any|new|show] | --play | --pause | --next | --kind\n";
+    @"Usage: Glancebar --play [dance|alt|rap|chill|any|new|show|radio:<id>] | --play | --pause | --next | --prev | --like | --dislike | --kind\n";
+
+static BOOL GBValidRadioMoodArg(NSString *arg) {
+    if (![arg hasPrefix:@"radio:"] || arg.length <= 6 || arg.length > 48) return NO;
+    for (NSUInteger i = 6; i < arg.length; i++) {
+        unichar c = [arg characterAtIndex:i];
+        BOOL ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ':' || c == '_' || c == '-';
+        if (!ok) return NO;
+    }
+    return YES;
+}
 
 GBControlCLIOutcome GBControlParseArgs(int argc, const char **argv) {
     GBControlCLIOutcome out = {0, nil};
@@ -3719,16 +3729,21 @@ GBControlCLIOutcome GBControlParseArgs(int argc, const char **argv) {
     });
     for (int i = 1; i < argc; i++) {
         BOOL isControl = strcmp(argv[i], "--pause") == 0 || strcmp(argv[i], "--next") == 0 ||
+                         strcmp(argv[i], "--prev") == 0 || strcmp(argv[i], "--previous") == 0 ||
+                         strcmp(argv[i], "--like") == 0 || strcmp(argv[i], "--dislike") == 0 ||
                          strcmp(argv[i], "--play") == 0 || strcmp(argv[i], "--kind") == 0;
         if (isControl && sawControl) { out.kind = 2; return out; }
         if (strcmp(argv[i], "--pause") == 0) { sawControl = YES; command = @"pause"; }
         else if (strcmp(argv[i], "--next") == 0) { sawControl = YES; command = @"next"; }
+        else if (strcmp(argv[i], "--prev") == 0 || strcmp(argv[i], "--previous") == 0) { sawControl = YES; command = @"prev"; }
+        else if (strcmp(argv[i], "--like") == 0) { sawControl = YES; command = @"like"; }
+        else if (strcmp(argv[i], "--dislike") == 0) { sawControl = YES; command = @"dislike"; }
         else if (strcmp(argv[i], "--kind") == 0) { out.kind = 3; return out; }
         else if (strcmp(argv[i], "--play") == 0) {
             sawControl = YES;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 NSString *arg = [NSString stringWithUTF8String:argv[++i]];
-                if (![playKinds containsObject:arg]) { out.kind = 2; return out; }
+                if (![playKinds containsObject:arg] && !GBValidRadioMoodArg(arg)) { out.kind = 2; return out; }
                 command = [NSString stringWithFormat:@"play %@", arg];
             } else command = @"play";
         } else if (sawControl) {
@@ -4213,13 +4228,14 @@ NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NS
     return picked;
 }
 
-NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
-                                                        NSString *kind, BOOL (^hasCover)(NSString *trackID, NSDictionary *track)) {
+NSArray<NSString *> *MusicKindMosaicTrackIDsWithCoversInSpace(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                                               NSString *kind, NSDictionary *space,
+                                                               BOOL (^hasCover)(NSString *trackID, NSDictionary *track)) {
     if (!kind.length || !tracks.count || !hasCover) return @[];
     NSMutableArray<NSDictionary *> *eligible = [NSMutableArray array];
     for (NSDictionary *t in tracks) {
         if (![t isKindOfClass:NSDictionary.class] || [t[@"dislike"] boolValue] || ![t[@"id"] length]) continue;
-        if (!MusicKindMatches(kind, t)) continue;
+        if (!MusicKindMatchesWithSpace(kind, t, space)) continue;
         if (onDiskIDs.count && ![onDiskIDs containsObject:t[@"id"]]) continue;
         if (!hasCover(t[@"id"], t)) continue;
         [eligible addObject:t];
@@ -4247,6 +4263,11 @@ NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *
     NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:4];
     for (NSUInteger i = 0; i < 4; i++) [out addObject:picked[i % picked.count]];
     return out;
+}
+
+NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                                        NSString *kind, BOOL (^hasCover)(NSString *trackID, NSDictionary *track)) {
+    return MusicKindMosaicTrackIDsWithCoversInSpace(tracks, onDiskIDs, kind, nil, hasCover);
 }
 
 BOOL AlbumArtLooksSquare(CGSize size) {

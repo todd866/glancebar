@@ -234,6 +234,38 @@ class MusicLibLogicTests(unittest.TestCase):
         plan = m.compute_plan(self.requests, cat, self.hot, {}, {}, {self.rel}, 5_000_000, 14)
         self.assertTrue(plan['overflow'])
 
+    def test_cap_pressure_evicts_younger_unwanted_lru_and_prioritizes_stations(self):
+        now = time.time()
+        f_older = 'filler/older.m4a'
+        f_newer = 'filler/newer.m4a'
+        for rel, age_days in ((f_older, 5), (f_newer, 2)):
+            p = self.hot / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(audio_bytes(rel, 'A', 'B', extra=b'x' * 600))
+            ts = now - age_days * 86400
+            os.utime(p, (ts, ts))
+        hot_map = m.hot_file_state(self.hot)
+        cap = sum(r['sizeBytes'] for r in hot_map.values())
+        self.assertEqual(m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, {f_older, f_newer}, cap, 14, now, 0), [])
+        ev = m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, {f_older, f_newer}, cap, 14, now, 400)
+        self.assertEqual([r['relativePath'] for r in ev], [f_older])
+        self.assertEqual(m.plan_evictions(self.hot, hot_map, {self.rel}, {}, {}, set(), cap, 14, now, 400), [])
+        rows = [
+            {'playlistKey': 'song:seed1'},
+            {'playlistKey': 'kind:chill'},
+            {'playlistKey': 'radio:likes'},
+            {'playlistKey': 'station:triplej'},
+            {'playlistKey': 'station:6ian'},
+        ]
+        self.assertEqual(
+            m.playlist_fetch_order(rows),
+            ['station:6ian', 'station:triplej', 'radio:likes', 'kind:chill', 'song:seed1'],
+        )
+        self.assertEqual(
+            m.playlist_fetch_order(rows, playlist_first='song:seed1')[0],
+            'song:seed1',
+        )
+
     def test_metered_guard(self):
         flag = self.root / 'metered'
         flag.write_text('1')

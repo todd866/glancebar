@@ -792,6 +792,20 @@ def wanted_entries_from_requests(requests_doc, catalogue, max_tracks=120, quaran
     return playlists, list(wanted_by_rel.values()), unmatched, library_playlists
 
 
+def _playlist_priority_tier(key, playlist_first=None):
+    if playlist_first and key == playlist_first:
+        return 0
+    if key == 'station:6ian':
+        return 1
+    if key.startswith('station:'):
+        return 2
+    if key == 'radio:likes' or key.startswith('radio:'):
+        return 3
+    if key.startswith('kind:') or key.startswith('reserve:'):
+        return 4
+    return 5
+
+
 def playlist_fetch_order(to_fetch, playlist_first=None):
     order = []
     seen = set()
@@ -803,7 +817,9 @@ def playlist_fetch_order(to_fetch, playlist_first=None):
         if key and key not in seen:
             order.append(key)
             seen.add(key)
-    return order
+    indexed = list(enumerate(order))
+    indexed.sort(key=lambda pair: (_playlist_priority_tier(pair[1], playlist_first), pair[0]))
+    return [key for _, key in indexed]
 
 
 def group_to_fetch_by_playlist(to_fetch):
@@ -908,12 +924,12 @@ def reconcile_wanted_hot(hot_dir, wanted_entries, verified_state, trash_cmd=None
     return local, refetch
 
 
-def prioritize_to_fetch(to_fetch, playlist_key=None):
-    if not playlist_key:
-        return list(to_fetch)
-    first = [row for row in to_fetch if row.get('playlistKey') == playlist_key]
-    rest = [row for row in to_fetch if row.get('playlistKey') != playlist_key]
-    return first + rest
+def prioritize_to_fetch(to_fetch, playlist_first=None):
+    order = playlist_fetch_order(to_fetch, playlist_first)
+    rank = {key: i for i, key in enumerate(order)}
+    indexed = list(enumerate(to_fetch))
+    indexed.sort(key=lambda pair: (rank.get(pair[1].get('playlistKey'), len(order)), pair[0]))
+    return [row for _, row in indexed]
 
 
 def catalogue_index(catalogue):
@@ -957,11 +973,33 @@ def plan_evictions(hot_dir, hot_map, wanted_rels, played, fetched, remote_rels, 
     evict = []
     if target <= 0:
         return evict
+    seen = set()
     for row in evictable_files(hot_map, wanted_rels, played, fetched, remote_rels, keep_days, now):
         evict.append(row)
+        seen.add(row['relativePath'])
         target -= row['sizeBytes']
         if target <= 0:
-            break
+            return evict
+    # Under cap pressure for explicitly wanted tracks, evict younger unwanted R2-backed files
+    # in LRU order rather than starving active stations/likes (e.g. when the whole hot set is
+    # younger than keep_days). Wanted files and anything missing from R2 remain protected.
+    if target > 0 and extra_fetch_bytes > 0 and keep_days > 0:
+        younger = []
+        for rel, row in hot_map.items():
+            if rel in wanted_rels or rel in seen or rel not in remote_rels:
+                continue
+            younger.append({
+                'relativePath': rel,
+                'sizeBytes': row['sizeBytes'],
+                'path': row['path'],
+                'lastActivity': activity_timestamp(rel, played, fetched, row, now),
+            })
+        younger.sort(key=lambda r: r['lastActivity'])
+        for row in younger:
+            evict.append(row)
+            target -= row['sizeBytes']
+            if target <= 0:
+                break
     return evict
 
 

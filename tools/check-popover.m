@@ -310,9 +310,10 @@ static BOOL EmbedCoverInM4A(NSString *m4a, NSData *coverPNG) {
     if (![coverPNG writeToFile:cover atomically:YES]) return NO;
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:ffmpeg];
-    task.arguments = @[@"-y", @"-loglevel", @"error", @"-i", m4a, @"-i", cover,
+    task.arguments = @[@"-nostdin", @"-y", @"-loglevel", @"error", @"-i", m4a, @"-i", cover,
                        @"-map", @"0:a", @"-map", @"1:v", @"-c:a", @"copy", @"-c:v", @"mjpeg",
                        @"-disposition:v:0", @"attached_pic", out];
+    task.standardInput = [NSFileHandle fileHandleWithNullDevice];
     BOOL ok = NO;
     if ([task launchAndReturnError:NULL]) {
         [task waitUntilExit];

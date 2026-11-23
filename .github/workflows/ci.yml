@@ -26,10 +26,13 @@ jobs:
           zsh -n tests.sh
           zsh -n Tests/make_fixture_home.sh
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg and rclone
         # tools/check-popover.m embeds cover art in its fixture tracks with ffmpeg
-        # (EmbedCoverInM4A); the runner image does not ship it.
-        run: command -v ffmpeg || brew install ffmpeg
+        # (EmbedCoverInM4A), and tools/music-library/test_musiclib.py exercises
+        # rclone-backed remote catalogues; the runner image ships neither.
+        run: |
+          command -v ffmpeg || brew install ffmpeg
+          command -v rclone || brew install rclone
 
       - name: Wait for the runner's boot load to settle
         # tests.sh defers (exit 75) while the 1-minute load exceeds the CPU count. A new

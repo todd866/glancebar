@@ -42,6 +42,26 @@ int main(int argc, const char **argv) {
         const char *pause[] = {"Glancebar", "--pause"};
         o = GBControlParseArgs(2, pause);
         check(o.kind == 1 && [o.command isEqual:@"pause"], "cli: pause");
+
+        const char *radioMood[] = {"Glancebar", "--play", "radio:station:kexp"};
+        o = GBControlParseArgs(3, radioMood);
+        check(o.kind == 1 && [o.command isEqual:@"play radio:station:kexp"], "cli: play radio:station:kexp");
+
+        const char *badRadio[] = {"Glancebar", "--play", "radio:"};
+        o = GBControlParseArgs(3, badRadio);
+        check(o.kind == 2, "cli: bare radio: → exit 2");
+
+        const char *prev[] = {"Glancebar", "--prev"};
+        o = GBControlParseArgs(2, prev);
+        check(o.kind == 1 && [o.command isEqual:@"prev"], "cli: prev");
+
+        const char *like[] = {"Glancebar", "--like"};
+        o = GBControlParseArgs(2, like);
+        check(o.kind == 1 && [o.command isEqual:@"like"], "cli: like");
+
+        const char *dislike[] = {"Glancebar", "--dislike"};
+        o = GBControlParseArgs(2, dislike);
+        check(o.kind == 1 && [o.command isEqual:@"dislike"], "cli: dislike");
     }
     if (failures) {
         fprintf(stderr, "%d control CLI test(s) failed\n", failures);

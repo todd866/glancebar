@@ -944,6 +944,9 @@ NSArray<NSString *> *MusicKindMosaicTrackIDs(NSArray<NSDictionary *> *tracks, NS
 // Same as MusicKindMosaicTrackIDs but only ids where hasCover returns YES; repeats to fill four.
 NSArray<NSString *> *MusicKindMosaicTrackIDsWithCovers(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
                                                         NSString *kind, BOOL (^hasCover)(NSString *trackID, NSDictionary *track));
+NSArray<NSString *> *MusicKindMosaicTrackIDsWithCoversInSpace(NSArray<NSDictionary *> *tracks, NSSet<NSString *> *onDiskIDs,
+                                                               NSString *kind, NSDictionary *space,
+                                                               BOOL (^hasCover)(NSString *trackID, NSDictionary *track));
 // Embedded album art is roughly square (aspect 0.9…1.1).
 BOOL AlbumArtLooksSquare(CGSize size);
 // Centre square crop for a non-square picture.

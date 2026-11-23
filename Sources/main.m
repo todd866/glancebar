@@ -4726,8 +4726,26 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @interface ClickRow : NSView
 @property (nonatomic, weak) id target;
 @property (nonatomic) SEL action;
+@property (nonatomic) BOOL hovered;
 @end
 @implementation ClickRow
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *area in self.trackingAreas) [self removeTrackingArea:area];
+    NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                        options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect)
+                                                          owner:self userInfo:nil];
+    [self addTrackingArea:area];
+}
+- (void)mouseEntered:(NSEvent *)event { (void)event; _hovered = YES; self.needsDisplay = YES; }
+- (void)mouseExited:(NSEvent *)event { (void)event; _hovered = NO; self.needsDisplay = YES; }
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    if (_hovered) {
+        [[NSColor.labelColor colorWithAlphaComponent:0.055] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 8, 1) xRadius:6 yRadius:6] fill];
+    }
+}
 - (NSView *)hitTest:(NSPoint)point {
     // `point` is in the superview's coordinates. The battery symbol is its own control
     // (charge limit). Everything else in the row, including the labels, still opens Details.
@@ -4903,8 +4921,12 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 - (BOOL)isOpaque { return NO; }
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
+    NSBezierPath *oval = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(self.bounds, 0.5, 0.5)];
     [[NSColor whiteColor] setFill];
-    [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(self.bounds, 0.5, 0.5)] fill];
+    [oval fill];
+    [[NSColor colorWithWhite:0 alpha:0.14] setStroke];
+    oval.lineWidth = 0.5;
+    [oval stroke];
     NSString *text = [NSString stringWithFormat:@"%ld", (long)self.count];
     NSFont *font = [NSFont systemFontOfSize:self.count > 9 ? 8 : 9 weight:NSFontWeightBold];
     NSDictionary *attrs = @{NSFontAttributeName: font,
@@ -4970,24 +4992,33 @@ static void GBPresentLarge(NSView *anchor, NSString *key, NSView *card) {
 }
 @end
 
-static NSImage *StationTileImage(BOOL dimmed) {
+static const CGFloat kTileCornerRadius = 7.0;
+
+static void DrawTileHairlineBorder(NSRect rect, CGFloat radius) {
+    NSBezierPath *border = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(rect, 0.25, 0.25)
+                                                           xRadius:MAX(0, radius - 0.25)
+                                                           yRadius:MAX(0, radius - 0.25)];
+    border.lineWidth = 0.5;
+    [[NSColor colorWithWhite:0.5 alpha:0.24] setStroke];
+    [border stroke];
+}
+
+static NSImage *StationTileImage(BOOL dimmed, CGFloat side) {
     NSImage *symbol = [NSImage imageWithSystemSymbolName:@"dot.radiowaves.left.and.right" accessibilityDescription:nil];
     if (!symbol) symbol = [NSImage imageWithSystemSymbolName:@"antenna.radiowaves.left.and.right" accessibilityDescription:nil];
-    symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:22 weight:NSFontWeightSemibold]] ?: symbol;
-    NSImage *image = [NSImage imageWithSize:NSMakeSize(54, 54) flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+    symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:20 weight:NSFontWeightSemibold]] ?: symbol;
+    NSImage *image = [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         if (dimmed) {
             [[NSColor colorWithWhite:0.5 alpha:0.22] setFill];
-            [path fill];
         } else {
-            NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedRed:0.95 green:0.33 blue:0.04 alpha:1]
-                                                                  endingColor:[NSColor colorWithCalibratedRed:1.0 green:0.62 blue:0.22 alpha:1]];
-            [gradient drawInBezierPath:path angle:90];
+            [[NSColor colorWithCalibratedRed:0.91 green:0.36 blue:0.10 alpha:1] setFill];
         }
+        [path fill];
         if (symbol) {
-            NSSize size = symbol.size.width > 1 ? symbol.size : NSMakeSize(22, 22);
-            CGFloat side = MIN(26, MAX(size.width, size.height));
-            NSRect box = NSMakeRect((54 - side) / 2.0, (54 - side) / 2.0, side, side);
+            NSSize size = symbol.size.width > 1 ? symbol.size : NSMakeSize(20, 20);
+            CGFloat glyph = MIN(side * 0.48, MAX(size.width, size.height));
+            NSRect box = NSMakeRect((side - glyph) / 2.0, (side - glyph) / 2.0, glyph, glyph);
             // Mask the symbol with a flat colour. imageWithTintColor: is not on the macOS 13 SDK.
             NSImage *mark = [NSImage imageWithSize:box.size flipped:NO drawingHandler:^BOOL(NSRect r) {
                 [(dimmed ? NSColor.tertiaryLabelColor : NSColor.whiteColor) setFill];
@@ -4997,6 +5028,32 @@ static NSImage *StationTileImage(BOOL dimmed) {
             }];
             [mark drawInRect:box fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
         }
+        DrawTileHairlineBorder(rect, kTileCornerRadius);
+        return YES;
+    }];
+    image.template = NO;
+    return image;
+}
+
+static NSImage *SixianTileImage(CGFloat side) {
+    NSImage *image = [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
+        [clip addClip];
+        // Studio midnight slate surface with crisp white 6IAN callsign + warm broadcast bar.
+        [[NSColor colorWithCalibratedRed:0.12 green:0.16 blue:0.24 alpha:1] setFill];
+        NSRectFill(rect);
+        NSFont *font = [NSFont monospacedDigitSystemFontOfSize:round(side * 0.27) weight:NSFontWeightBold];
+        NSDictionary *attrs = @{NSFontAttributeName: font,
+                                NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.95],
+                                NSKernAttributeName: @(-0.3)};
+        NSSize sz = [@"6IAN" sizeWithAttributes:attrs];
+        CGFloat textY = (rect.size.height - sz.height) / 2.0 + 2.5;
+        [@"6IAN" drawAtPoint:NSMakePoint((rect.size.width - sz.width) / 2.0, textY) withAttributes:attrs];
+        CGFloat barW = round(side * 0.34), barH = 2.5;
+        NSRect bar = NSMakeRect((rect.size.width - barW) / 2.0, textY - 4.5, barW, barH);
+        [[NSColor colorWithCalibratedRed:0.96 green:0.45 blue:0.12 alpha:1] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:barH / 2.0 yRadius:barH / 2.0] fill];
+        DrawTileHairlineBorder(rect, kTileCornerRadius);
         return YES;
     }];
     image.template = NO;
@@ -5041,9 +5098,8 @@ static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
     }
     if (!initials.length) [initials appendString:@"?"];
     return [NSImage imageWithSize:size flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        NSGradient *g = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedHue:0.58 saturation:0.35 brightness:0.45 alpha:1]
-                                                       endingColor:[NSColor colorWithCalibratedHue:0.62 saturation:0.4 brightness:0.55 alpha:1]];
-        [g drawInRect:rect angle:45];
+        [[NSColor colorWithCalibratedHue:0.60 saturation:0.38 brightness:0.46 alpha:1] setFill];
+        NSRectFill(rect);
         NSDictionary *attrs = @{NSFontAttributeName: [NSFont systemFontOfSize:MIN(rect.size.width, rect.size.height) * 0.38 weight:NSFontWeightBold],
                                 NSForegroundColorAttributeName: NSColor.whiteColor};
         NSString *text = initials.uppercaseString;
@@ -5058,8 +5114,8 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
     if (!symbol) return nil;
     symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:9 weight:NSFontWeightSemibold]] ?: symbol;
     return [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        NSBezierPath *box = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:3 yRadius:3];
-        [[NSColor colorWithWhite:0 alpha:0.55] setFill];
+        NSBezierPath *box = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+        [[NSColor colorWithWhite:0 alpha:0.52] setFill];
         [box fill];
         NSSize sz = symbol.size.width > 1 ? symbol.size : NSMakeSize(10, 10);
         NSRect r = NSMakeRect((16 - sz.width) / 2.0, (16 - sz.height) / 2.0, sz.width, sz.height);
@@ -5081,7 +5137,7 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
     if (_fraction <= 0) return;
-    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:4 yRadius:4];
+    NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
     [clip addClip];
     NSRect track = NSMakeRect(0, 0, NSWidth(self.bounds), 3);
     [[NSColor colorWithWhite:0 alpha:0.45] setFill];
@@ -5150,15 +5206,16 @@ static NSImage *KindTilePlaceholderImage(NSString *kind, NSString *name, CGFloat
     unichar initial = name.length ? [name characterAtIndex:0] : '?';
     NSColor *bg = KindTileFlatColor(kind);
     return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         [clip addClip];
         [bg setFill];
         NSRectFill(rect);
         NSString *letter = [NSString stringWithCharacters:&initial length:1];
         NSFont *font = [NSFont systemFontOfSize:side * 0.42 weight:NSFontWeightSemibold];
-        NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.88]};
+        NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.90]};
         NSSize sz = [letter sizeWithAttributes:attrs];
         [letter drawAtPoint:NSMakePoint((rect.size.width - sz.width) / 2.0, (rect.size.height - sz.height) / 2.0) withAttributes:attrs];
+        DrawTileHairlineBorder(rect, kTileCornerRadius);
         return YES;
     }];
 }
@@ -5176,7 +5233,7 @@ static NSImage *TileMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOOL d
     }
     if (!tiles.count) return nil;
     return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
-        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
+        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         [clip addClip];
         const CGFloat half = rect.size.width / 2.0;
         for (NSUInteger i = 0; i < 4; i++) {
@@ -5184,19 +5241,20 @@ static NSImage *TileMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOOL d
             [tiles[i] drawInRect:cell fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
                         fraction:dimmed ? 0.55 : 1.0 respectFlipped:YES hints:nil];
         }
+        DrawTileHairlineBorder(rect, kTileCornerRadius);
         return YES;
     }];
 }
 
-static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
+static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOOL dimmed) {
     NSMutableArray<NSImage *> *tiles = [NSMutableArray arrayWithCapacity:4];
     for (NSImage *img in covers) if (img) [tiles addObject:img];
     while (tiles.count < 4) {
         if (tiles.count) [tiles addObject:tiles[tiles.count - 1]];
         else break;
     }
-    if (!tiles.count) return StationTileImage(dimmed);
-    return TileMosaicImage(tiles, 54, dimmed) ?: StationTileImage(dimmed);
+    if (!tiles.count) return StationTileImage(dimmed, side);
+    return TileMosaicImage(tiles, side, dimmed) ?: StationTileImage(dimmed, side);
 }
 
 @interface GBRecoverableTextField : NSTextField
@@ -5275,17 +5333,36 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, BOOL dimmed) {
 // activates — so a tinted bezel never appeared there, and Keep Awake looked dead.
 @interface PillButton : NSButton
 @property (nonatomic, strong) NSColor *onColor;
+@property (nonatomic) BOOL hovered;
 @end
 @implementation PillButton
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *area in self.trackingAreas) [self removeTrackingArea:area];
+    NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                        options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect)
+                                                          owner:self userInfo:nil];
+    [self addTrackingArea:area];
+}
+- (void)mouseEntered:(NSEvent *)event { (void)event; _hovered = YES; self.needsDisplay = YES; }
+- (void)mouseExited:(NSEvent *)event { (void)event; _hovered = NO; self.needsDisplay = YES; }
 - (void)drawRect:(NSRect)dirtyRect {
-    BOOL on = self.state == NSControlStateValueOn;
-    CGFloat alpha = self.isHighlighted ? 0.16 : 0.08;
+    BOOL on = self.state == NSControlStateValueOn && self.onColor != nil;
+    CGFloat alpha = self.isHighlighted ? 0.16 : (_hovered ? 0.11 : 0.065);
+    NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:7 yRadius:7];
     [(on ? self.onColor : [NSColor.labelColor colorWithAlphaComponent:alpha]) setFill];
-    [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6] fill];
+    [pill fill];
     if (on && self.isHighlighted) {
         [[NSColor.blackColor colorWithAlphaComponent:0.12] setFill];
-        [[NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6] fill];
+        [pill fill];
+    } else if (on && _hovered) {
+        [[NSColor.whiteColor colorWithAlphaComponent:0.08] setFill];
+        [pill fill];
     }
+    NSBezierPath *stroke = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 0.25, 0.25) xRadius:6.75 yRadius:6.75];
+    stroke.lineWidth = 0.5;
+    [(on ? [NSColor.whiteColor colorWithAlphaComponent:0.14] : [NSColor.labelColor colorWithAlphaComponent:0.10]) setStroke];
+    [stroke stroke];
     [super drawRect:dirtyRect];
 }
 @end
@@ -5764,22 +5841,22 @@ static NSImage *BarImageFromLayout(NSArray<NSDictionary *> *draw, CGFloat width)
 
 #pragma mark - Controller
 
-static const CGFloat kW = 388, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
+static const CGFloat kW = 396, kPad = 16, kDetailMinW = 600, kDetailPad = 24;
 // One instrument row. Every row has the same lead (symbol + name column), so the
 // gauge, value and datum share an x. Every row names itself (Storage, Battery, Claude…):
 // a blank name column read as wasted space, and the word identifies the row. The panel
 // grew by that column; the value column's 19 Nov widening took 10pt off the gauge
 // (RowGaugeW computes it; kGaugeW is only the fallback floor). kDatumX + kDatumW == kW - kPad.
-static const CGFloat kRowH = 30, kSoundH = 40;
+static const CGFloat kRowH = 30, kSubRowH = 24, kSoundH = 40;
 static const CGFloat kLeadSymbol = 22;
-static const CGFloat kFooterSymbol = 16;   // beside a 12pt label, inside the footer pill
+static const CGFloat kFooterSymbol = 13.5; // beside a 12pt label, inside the footer pill
 static const CGFloat kLeadW = 28;                              // kLeadSymbol + 6
 static const CGFloat kAINameX = 48, kAINameW = 56;             // kPad + kLeadW + 4; "Claude" at 13pt plus the label inset
 static const CGFloat kGaugeX = 110, kGaugeW = 92, kGaugeH = 8;  // kAINameX + kAINameW + 6; width = kValueX - 4 - kGaugeX
-static const CGFloat kValueX = 206, kValueW = 80;              // "26%" at 15pt + "·76M" at 11.5pt grey; panel 380 → 388 for it (22 Nov 2026)
-static const CGFloat kDatumX = 290, kDatumW = 82;              // "resets 3 Dec 10:24" at 12.5pt, fitted
+static const CGFloat kValueX = 206, kValueW = 82;              // "26%" at 15pt + "·76M" at 11.5pt grey; 8pt gutter before datum
+static const CGFloat kDatumX = 296, kDatumW = 84;              // "resets 3 Dec 10:24" at 12.5pt, fitted
 static const CGFloat kToggleH = 28, kToggleGap = 6;
-static const CGFloat kKeepW = 106, kLowW = 98, kChargeW = 96;  // 16pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
+static const CGFloat kKeepW = 108, kLowW = 104, kChargeW = 100; // 13.5pt glyph + 12pt "Keep Awake" / "Low Power" / "Limit 80%"
 static const CGFloat kValueH = 19, kDatumH = 16, kDatumFont = 12.5;
 // A volume name wider than the column grows it, and every gauge moves with it.
 // The gauge stays at least this wide; a joined name that still cannot fit uses
@@ -5867,6 +5944,8 @@ static NSString *PopoverRequestObject(void) {
 - (NSArray<NSImage *> *)kindMosaicCoversForIDs:(NSArray<NSString *> *)ids;
 - (NSUInteger)kindTileStamp;
 - (BOOL)playKind:(NSString *)kind cause:(NSString *)cause;
+- (void)refreshKindReserveRequests;
+- (void)bindRadioManifestImmediate:(NSArray<NSDictionary *> *)tracks;
 - (void)handleControlCommand:(NSString *)command;
 - (void)updateIdleRemoteCommands;
 - (BOOL)musicPlayKeyStartsMusic;
@@ -7174,6 +7253,7 @@ static NSDictionary<NSString *, NSString *> *GBGenresForPaths(NSArray<NSString *
         }
     }
     [self ensureOfflinePlaylists];
+    [self refreshKindReserveRequests];
     if (!_musicProbesEnabled || !AppleMusicIsRunning()) return;
     // Scripting Music launches it: read the library only while it is already open. On a Mac with an
     // empty library this retried and relaunched Music (1 Nov 2026).
@@ -7199,6 +7279,7 @@ static NSDictionary<NSString *, NSString *> *GBGenresForPaths(NSArray<NSString *
             self->_kindTileAt = 0;
             [self scheduleCoverCacheWarm];
             [self saveMixLibraryCache:tracks];
+            [self refreshKindReserveRequests];
             [self chooseMixSeeds:NO];
         });
         return;
@@ -8100,7 +8181,7 @@ static NSArray<NSDictionary *> *GBKindTileOrder(void) {
     for (NSDictionary *def in GBKindTileOrder()) {
         NSString *kind = def[@"kind"];
         NSUInteger count = MusicKindOnMacCountInSpace(library, onDisk, kind, space);
-        NSArray *ids = count ? MusicKindMosaicTrackIDsWithCovers(library, onDisk, kind, ^BOOL(NSString *trackID, NSDictionary *track) {
+        NSArray *ids = count ? MusicKindMosaicTrackIDsWithCoversInSpace(library, onDisk, kind, space, ^BOOL(NSString *trackID, NSDictionary *track) {
             (void)track;
             NSString *path = nil;
             // Path comes from the library snapshot's companion: callers pass on-disk ids only.
@@ -8521,15 +8602,52 @@ static const NSUInteger kLibraryRefreshReadingStatus = 3;
         });
     });
 }
+- (void)refreshKindReserveRequests {
+    if (!_musicProbesEnabled || _mixFrozen || _musicOff || _mixLibrary.count < 8) return;
+    if (!_offlineRequests) _offlineRequests = [NSMutableDictionary dictionary];
+    NSInteger day = (NSInteger)floor((NSDate.date.timeIntervalSince1970 + NSTimeZone.localTimeZone.secondsFromGMT) / 86400);
+    NSArray<NSString *> *heard = [self recentPlayIDs];
+    NSDictionary *space = [self musicSpaceForKindRotation];
+    BOOL changed = NO;
+    NSArray<NSString *> *kinds = @[@"dance", @"alt", @"rap", @"chill"];
+    for (NSUInteger i = 0; i < kinds.count; i++) {
+        NSString *kind = kinds[i];
+        NSString *key = [@"reserve:" stringByAppendingString:kind];
+        NSArray<NSString *> *ids = MusicKindRotationInSpace(_mixLibrary, kind, [NSSet set], 40,
+                                                            (uint64_t)day * 131ULL + i * 17ULL, heard, space);
+        NSArray *tracks = [self mixTracksForIDs:ids];
+        if (!tracks.count) continue;
+        NSMutableArray *identities = [NSMutableArray arrayWithCapacity:tracks.count];
+        for (NSDictionary *track in tracks) {
+            if (![track isKindOfClass:NSDictionary.class] || ![track[@"id"] isKindOfClass:NSString.class] || ![track[@"id"] length]) continue;
+            NSMutableDictionary *identity = [NSMutableDictionary dictionary];
+            for (NSString *field in @[@"id", @"title", @"artist", @"album"])
+                identity[field] = [track[field] isKindOfClass:NSString.class] ? track[field] : @"";
+            if ([track[@"duration"] isKindOfClass:NSNumber.class]) identity[@"duration"] = track[@"duration"];
+            [identities addObject:identity];
+        }
+        if (!identities.count) continue;
+        NSDictionary *req = @{@"key": key, @"title": [NSString stringWithFormat:@"Kind · %@", [self kindDisplayTitle:kind]], @"tracks": identities};
+        if (![_offlineRequests[key] isEqual:req]) {
+            _offlineRequests[key] = req;
+            changed = YES;
+        }
+    }
+    if (changed) [self saveOfflineRequests];
+}
 - (void)saveOfflineRequests {
     NSMutableArray *requests = [NSMutableArray array];
+    if (_offlineRequests[kRadioStationKey]) [requests addObject:_offlineRequests[kRadioStationKey]];
+    if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
+    for (NSString *kind in @[@"dance", @"alt", @"rap", @"chill"]) {
+        NSString *rkey = [@"reserve:" stringByAppendingString:kind];
+        if (_offlineRequests[rkey]) [requests addObject:_offlineRequests[rkey]];
+    }
     for (NSDictionary *seed in _mixSeeds) if (_offlineRequests[seed[@"key"]]) [requests addObject:_offlineRequests[seed[@"key"]]];
     for (NSDictionary *seed in _mixSeedsNext)
         if (_offlineRequests[seed[@"key"]]) [requests addObject:_offlineRequests[seed[@"key"]]];
     NSDictionary *primary = _offlineRequests[[self offlinePrimaryKey]];
     if (primary) [requests addObject:primary];
-    if (_offlineRequests[@"station:triplej"]) [requests addObject:_offlineRequests[@"station:triplej"]];
-    if (_offlineRequests[kRadioStationKey]) [requests addObject:_offlineRequests[kRadioStationKey]];
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"playlists": requests} options:0 error:nil];
     if ([data writeToFile:[MixDirectory(nil) stringByAppendingPathComponent:@"offline-requests.json"] atomically:YES]) {
         _offlineRequestsGeneration++;
@@ -9032,6 +9150,18 @@ static const double kMusicRecentHorizon = 3 * 86400.0;
         [self musicNext:nil];
         return;
     }
+    if ([verb isEqual:@"prev"] || [verb isEqual:@"previous"]) {
+        [self musicPrevious:nil];
+        return;
+    }
+    if ([verb isEqual:@"like"]) {
+        [self musicThumbsUp:nil];
+        return;
+    }
+    if ([verb isEqual:@"dislike"]) {
+        [self musicThumbsDown:nil];
+        return;
+    }
     if (![verb isEqual:@"play"]) return;
     if (tokens.count == 1) {
         if (_localPlayer) {
@@ -9459,6 +9589,7 @@ static NSString *const kShowMixKey = @"show:episode";
     NSString *mood = [raw[@"mood"] isKindOfClass:NSString.class] ? raw[@"mood"] : @"";
     _radioMood = mood;
     _radioMoodLabel = [self radioLabelFor:mood];
+    [self bindRadioManifestImmediate:tracks];
     [self setOfflineRequest:kRadioStationKey title:[@"6IAN · " stringByAppendingString:_radioMoodLabel] tracks:tracks];
     return YES;
 }
@@ -9471,7 +9602,48 @@ static NSString *const kShowMixKey = @"show:episode";
 - (NSString *)radioHelper {
     return [NSBundle.mainBundle pathForResource:@"radio_sync" ofType:@"py"];
 }
-// Ask the radio for a queue (in the background), then play it as station:6ian.
+- (void)bindRadioManifestImmediate:(NSArray<NSDictionary *> *)tracks {
+    NSString *hotRoot = [[GBHomeDirectory() stringByAppendingPathComponent:@"Music/Glancebar Lossless"] stringByStandardizingPath];
+    NSMutableArray *wanted = [NSMutableArray arrayWithCapacity:tracks.count];
+    NSMutableArray *records = [NSMutableArray array];
+    for (NSDictionary *t in tracks) {
+        NSDictionary *ident = @{@"id": t[@"id"] ?: @"", @"title": t[@"title"] ?: @"",
+                                @"artist": t[@"artist"] ?: @"", @"album": t[@"album"] ?: @""};
+        [wanted addObject:ident];
+        NSString *rel = [t[@"catalogue_relative_path"] isKindOfClass:NSString.class] ? t[@"catalogue_relative_path"] : @"";
+        NSString *sha = [t[@"sha256"] isKindOfClass:NSString.class] ? [t[@"sha256"] lowercaseString] : @"";
+        if (!rel.length || sha.length != 64 || [rel containsString:@".."] || [rel hasPrefix:@"/"]) continue;
+        NSString *full = [[hotRoot stringByAppendingPathComponent:rel] stringByStandardizingPath];
+        if (![full hasPrefix:[hotRoot stringByAppendingString:@"/"]]) continue;
+        struct stat st;
+        if (lstat(full.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) continue;
+        NSString *stamp = [NSString stringWithFormat:@"%lld", (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec];
+        NSString *ino = [NSString stringWithFormat:@"%llu", (unsigned long long)st.st_ino];
+        [records addObject:@{@"id": ident[@"id"], @"title": ident[@"title"], @"artist": ident[@"artist"],
+                             @"album": ident[@"album"], @"path": full, @"sizeBytes": @((long long)st.st_size),
+                             @"mtimeNs": stamp, @"inode": ino, @"sha256": sha}];
+    }
+    NSMutableDictionary *manifest = [_offlineManifest isKindOfClass:NSDictionary.class] ? [_offlineManifest mutableCopy]
+                                                                                      : [@{@"schemaVersion": @1} mutableCopy];
+    NSMutableArray *playlists = [[manifest[@"playlists"] isKindOfClass:NSArray.class] ? manifest[@"playlists"] : @[] mutableCopy];
+    for (NSInteger i = playlists.count - 1; i >= 0; i--)
+        if ([playlists[i] isKindOfClass:NSDictionary.class] && [playlists[i][@"key"] isEqual:kRadioStationKey])
+            [playlists removeObjectAtIndex:(NSUInteger)i];
+    [playlists addObject:@{@"key": kRadioStationKey, @"requestedTracks": wanted,
+                           @"requestedTrackIDs": [wanted valueForKey:@"id"],
+                           @"tracks": records, @"ready": @(records.count > 0)}];
+    manifest[@"playlists"] = playlists;
+    _offlineManifest = manifest;
+    [self invalidateOfflineCoverageCache];
+}
++ (NSString *)fallbackKindForRadioMood:(NSString *)mood {
+    NSString *m = [mood lowercaseString] ?: @"";
+    if ([m isEqual:@"chill"] || [m isEqual:@"focus"]) return @"chill";
+    if ([m isEqual:@"dance"] || [m isEqual:@"energise"] || [m isEqual:@"workout"] || [m isEqual:@"party"]) return @"dance";
+    if ([m isEqual:@"rap"] || [m isEqual:@"hiphop"]) return @"rap";
+    if ([m isEqual:@"alt"] || [m isEqual:@"drive"] || [m isEqual:@"heavy"] || [m hasPrefix:@"station:"]) return @"alt";
+    return @"any";
+}
 - (void)playRadio:(NSString *)mood {
     if (!_musicProbesEnabled || !mood.length || _radioBusy) return;
     NSString *script = [self radioHelper];
@@ -9500,7 +9672,16 @@ static NSString *const kShowMixKey = @"show:episode";
             if (ok && [self loadRadioStation]) {
                 self->_radioNote = nil;
                 [self saveOfflineRequests];
-                [self playOfflinePlaylist:kRadioStationKey];
+                NSDictionary *cov = [self offlineCoverage:kRadioStationKey verifyHash:NO];
+                if ([cov[@"ready"] boolValue]) {
+                    [self playOfflinePlaylist:kRadioStationKey];
+                    if (![cov[@"complete"] boolValue]) [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+                } else {
+                    // Zero tracks cached yet: start the closest local kind immediately so there is no
+                    // dead air while musiclib pulls the lossless radio set in the background.
+                    [self maybeScheduleMusicLibrarySyncBypassingBackoff:YES];
+                    [self playKind:[Controller fallbackKindForRadioMood:mood] cause:@"kind"];
+                }
             } else self->_radioNote = @"radio unreachable";
             if (self->_popover.isShown) [self rebuildContent];
         });
@@ -11293,7 +11474,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSoundH)];
     row.accessibilityIdentifier = @"popover.sound.row";
     CGFloat x = kPad;
-    NSButton *prev = [self transportButton:@"backward.end.fill" pointSize:18 side:22
+    NSButton *prev = [self transportButton:@"backward.end.fill" pointSize:15 side:22
                                     action:@selector(musicPrevious:) identifier:@"popover.music.previous"
                                      label:@"Previous track"];
     prev.frame = NSOffsetRect(prev.frame, x, 0);
@@ -11301,7 +11482,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     if (!loaded) prev.contentTintColor = NSColor.tertiaryLabelColor;
     [row addSubview:prev];
     x = NSMaxX(prev.frame) + 2;
-    NSButton *play = [self transportButton:symbol pointSize:24 side:28
+    NSButton *play = [self transportButton:symbol pointSize:21 side:26
                                     action:@selector(musicPlay:) identifier:@"popover.music.play" label:playLabel];
     play.frame = NSOffsetRect(play.frame, x, 0);
     if (!loaded) {
@@ -11314,7 +11495,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     [row addSubview:play];
     x = NSMaxX(play.frame) + 2;
-    NSButton *next = [self transportButton:@"forward.end.fill" pointSize:18 side:22
+    NSButton *next = [self transportButton:@"forward.end.fill" pointSize:15 side:22
                                     action:@selector(musicNext:) identifier:@"popover.music.next" label:kMusicNextTip];
     next.accessibilityHelp = kMusicNextTip;
     next.toolTip = kMusicNextTip;
@@ -11421,9 +11602,9 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
     }
     CGFloat textW = textRight - textX;
     NSString *titleText = trackTitle.length ? trackTitle : @"Liked Music";
-    const CGFloat titleH = 15, subtitleH = 14, textGap = 1;
+    const CGFloat titleH = 16, subtitleH = 14, textGap = 1;
     CGFloat textBottom = (kSoundH - (titleH + textGap + subtitleH)) / 2.0;
-    NSTextField *title = [self text:titleText font:[NSFont systemFontOfSize:12 weight:NSFontWeightSemibold]
+    NSTextField *title = [self text:titleText font:[NSFont systemFontOfSize:12.5 weight:NSFontWeightSemibold]
                               color:nil at:NSMakeRect(textX, textBottom + subtitleH + textGap, textW, titleH)
                              align:NSTextAlignmentLeft];
     title.accessibilityIdentifier = @"popover.music.title";
@@ -11447,7 +11628,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         subtitleText = [NSString stringWithFormat:@"%@ · %@", trackArtist, time];
     } else subtitleText = trackArtist.length ? trackArtist : (time ?: @"");
     NSTextField *subtitle = [self text:subtitleText
-                                  font:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]
+                                  font:[NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightRegular]
                                  color:NSColor.secondaryLabelColor
                                     at:NSMakeRect(textX, textBottom, textW, subtitleH) align:NSTextAlignmentLeft];
     subtitle.accessibilityIdentifier = @"popover.music.subtitle";
@@ -11834,7 +12015,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         kindTile.imagePosition = NSImageOnly;
         kindTile.imageScaling = NSImageScaleNone;
         kindTile.wantsLayer = YES;
-        kindTile.layer.cornerRadius = 4;
+        kindTile.layer.cornerRadius = kTileCornerRadius;
         kindTile.layer.masksToBounds = YES;
         kindTile.enabled = !empty;
         kindTile.alphaValue = empty ? 0.45 : 1;
@@ -11893,7 +12074,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         show.imagePosition = NSImageOnly;
         show.imageScaling = NSImageScaleProportionallyUpOrDown;
         show.wantsLayer = YES;
-        show.layer.cornerRadius = 4;
+        show.layer.cornerRadius = kTileCornerRadius;
         show.layer.masksToBounds = YES;
         show.accessibilityIdentifier = @"popover.music.show";
         NSString *tip = ShowEpisodeTooltip(offer[@"show"], offer[@"broadcast"], offer[@"presenter"],
@@ -11949,7 +12130,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     BOOL stationOn = _stationAvailable && [stationTile[@"enabled"] boolValue];
     if (!_stationAvailable) stationTile = @{@"alpha": @0.4, @"tooltip": stationTile[@"tooltip"] ?: @"", @"enabled": @NO, @"state": @"empty"};
     BOOL stationPlaying = [_mixPlayingKey isEqual:@"station:triplej"];
-    NSImage *stationImg = StationMosaicImage([self stationMosaicCovers], !stationOn);
+    NSImage *stationImg = StationMosaicImage([self stationMosaicCovers], side, !stationOn);
     GBStationTile *station = [GBStationTile buttonWithImage:stationImg target:self action:@selector(playStation:)];
     station.seedKey = @"station:triplej";
     station.picks = _stationPicks ?: @[];
@@ -11958,7 +12139,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     station.imagePosition = NSImageOnly;
     station.imageScaling = NSImageScaleNone;
     station.wantsLayer = YES;
-    station.layer.cornerRadius = 4;
+    station.layer.cornerRadius = kTileCornerRadius;
     station.layer.masksToBounds = YES;
     station.alphaValue = [stationTile[@"alpha"] doubleValue];
     station.enabled = stationOn;
@@ -12013,12 +12194,12 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
     // on any surface (browser tab, another Mac, the TV) the transport row above shows it.
     {
         NSButton *six = [NSButton buttonWithTitle:@"" target:self action:@selector(showRadioMenu:)];
-        six.image = KindTilePlaceholderImage(@"sixian", @"6IAN", side);   // flat "6" tile, same family as the kind tiles
+        six.image = SixianTileImage(side);
         six.imagePosition = NSImageOnly;
         six.imageScaling = NSImageScaleNone;
         six.bordered = NO;
         six.wantsLayer = YES;
-        six.layer.cornerRadius = 4;
+        six.layer.cornerRadius = kTileCornerRadius;
         six.layer.masksToBounds = YES;
         six.frame = NSMakeRect(x, capH, side, side);
         six.accessibilityIdentifier = @"popover.music.sixian";
@@ -13376,6 +13557,7 @@ static NSFont *GBFontFittedToWidth(NSFont *font, NSString *text, CGFloat width) 
     [b setButtonType:NSButtonTypePushOnPushOff];
     b.bordered = NO;   // PillButton draws the background itself
     b.imagePosition = NSImageLeft;
+    b.imageHugsTitle = YES;
     b.imageScaling = NSImageScaleProportionallyDown;
     b.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kFooterSymbol
@@ -14154,15 +14336,27 @@ static NSImage *AIProviderIcon(NSString *provider) {
 }
 static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
     if ([provider isEqualToString:@"Z.ai"]) {
-        // The GLM Coding Plan has no app to borrow an icon from: a plain bold Z fills the
-        // same logo box every other provider's mark occupies, on every surface at once.
+        // The GLM Coding Plan has no desktop app icon to borrow: draw a rounded-square
+        // app-icon badge matching Claude/Codex/Cursor's visual weight on every surface.
         NSImage *z = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
-            NSFont *font = [NSFont systemFontOfSize:ceil(dst.size.width * 0.92) weight:NSFontWeightBold];
+            CGFloat inset = MAX(1.0, dst.size.width * 0.08);
+            NSRect box = NSInsetRect(dst, inset, inset);
+            CGFloat rad = box.size.width * 0.24;
+            NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:box xRadius:rad yRadius:rad];
+            [[NSColor colorWithCalibratedRed:0.15 green:0.16 blue:0.22 alpha:1] setFill];
+            [bg fill];
+            NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.25, 0.25)
+                                                                 xRadius:MAX(0, rad - 0.25)
+                                                                 yRadius:MAX(0, rad - 0.25)];
+            ring.lineWidth = 0.5;
+            [[NSColor colorWithWhite:1 alpha:0.16] setStroke];
+            [ring stroke];
+            NSFont *font = [NSFont systemFontOfSize:round(box.size.width * 0.66) weight:NSFontWeightBold];
             NSDictionary *attrs = @{NSFontAttributeName: font,
-                                    NSForegroundColorAttributeName: NSColor.labelColor};
+                                    NSForegroundColorAttributeName: NSColor.whiteColor};
             NSSize size = [@"Z" sizeWithAttributes:attrs];
-            [@"Z" drawAtPoint:NSMakePoint(dst.origin.x + (dst.size.width - size.width) / 2.0,
-                                          dst.origin.y + (dst.size.height - size.height) / 2.0)
+            [@"Z" drawAtPoint:NSMakePoint(box.origin.x + (box.size.width - size.width) / 2.0,
+                                          box.origin.y + (box.size.height - size.height) / 2.0)
                 withAttributes:attrs];
             return YES;
         }];
@@ -14170,12 +14364,23 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
         return z;
     }
     if ([provider isEqualToString:@"Gemini"]) {
-        // Gemini four-point sparkle mark in the same logo box, tinted with labelColor so
-        // light and dark appearances stay crisp without adding chrome.
+        // Gemini rounded-square app-icon badge (signature royal blue + white four-point
+        // sparkle) so it sits as a peer beside Claude, Codex, Cursor and Z.ai.
         NSImage *gem = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
-            CGFloat w = dst.size.width, h = dst.size.height;
-            CGFloat cx = dst.origin.x + w / 2.0, cy = dst.origin.y + h / 2.0;
-            CGFloat r = MIN(w, h) * 0.46;
+            CGFloat inset = MAX(1.0, dst.size.width * 0.08);
+            NSRect box = NSInsetRect(dst, inset, inset);
+            CGFloat rad = box.size.width * 0.24;
+            NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:box xRadius:rad yRadius:rad];
+            [[NSColor colorWithCalibratedRed:0.10 green:0.45 blue:0.91 alpha:1] setFill];
+            [bg fill];
+            NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.25, 0.25)
+                                                                 xRadius:MAX(0, rad - 0.25)
+                                                                 yRadius:MAX(0, rad - 0.25)];
+            ring.lineWidth = 0.5;
+            [[NSColor colorWithWhite:1 alpha:0.16] setStroke];
+            [ring stroke];
+            CGFloat cx = NSMidX(box), cy = NSMidY(box);
+            CGFloat r = MIN(box.size.width, box.size.height) * 0.34;
             CGFloat q = r * 0.14;
             NSBezierPath *star = [NSBezierPath bezierPath];
             [star moveToPoint:NSMakePoint(cx, cy + r)];
@@ -14192,7 +14397,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
                  controlPoint1:NSMakePoint(cx - q, cy + q)
                  controlPoint2:NSMakePoint(cx - q, cy + q)];
             [star closePath];
-            [NSColor.labelColor setFill];
+            [NSColor.whiteColor setFill];
             [star fill];
             return YES;
         }];
@@ -14476,21 +14681,23 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     row.accessibilityLabel = named;
     [root addSubview:row];
     y += rowH;
-    // Cursor's API pool is its own plain row under the Grok row: same bar, same column,
-    // nothing to decode. Only when Grok is the row above (both pools reported).
+    // Cursor's API pool is its own tighter sub-row under the Grok row: same column,
+    // slimmer bar so the parent/child pair reads as one group. Only when Grok is above.
+    const CGFloat subGaugeH = 6.0;
+    BOOL addedSubRow = NO;
     double api = cursorPools ? CursorPoolFraction(cursorPools, @"api") : -1;
     if (api >= 0 && CursorPoolFraction(cursorPools, @"cursor") >= 0) {
-        NSView *apiRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+        NSView *apiRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSubRowH)];
         apiRow.accessibilityIdentifier = @"popover.row.ai.cursor.api";
         NSColor *ink = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(api);
         long long apiTokens = PoolTokensLeft(cursorPools[@"api"]);
         NSString *apiTip = [NSString stringWithFormat:@"Cursor API · %@", AIQuotaValueTip(api, apiTokens, resetDate)];
-        NSTextField *apiName = [self text:@"API" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+        NSTextField *apiName = [self text:@"API" font:[NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium]
                                     color:NSColor.secondaryLabelColor
-                                       at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
+                                       at:NSMakeRect(kAINameX, (kSubRowH - 15) / 2.0, kAINameW, 15) align:NSTextAlignmentLeft];
         apiName.accessibilityIdentifier = @"popover.ai.cursor.api.name";
         [apiRow addSubview:apiName];
-        Gauge *apiBar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
+        Gauge *apiBar = [[Gauge alloc] initWithFrame:NSMakeRect(RowGaugeX(), (kSubRowH - subGaugeH) / 2.0, RowGaugeW(), subGaugeH)];
         apiBar.fraction = api; apiBar.color = ink;
         apiBar.metricLabel = @"Cursor API remaining";
         apiBar.accessibilityIdentifier = @"popover.ai.cursor.api.gauge";
@@ -14501,9 +14708,10 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         apiRow.accessibilityHelp = apiTip;
         for (NSView *sub in apiRow.subviews) sub.accessibilityHelp = apiTip;
         [root addSubview:apiRow];
-        y += kRowH;
+        y += kSubRowH;
+        addedSubRow = YES;
     }
-    // Z.ai and Gemini 5-hour windows are their own plain rows under the weekly row, in that same shape.
+    // Z.ai and Gemini 5-hour windows are tighter sub-rows under the weekly row, in that same shape.
     // Like Cursor's API row they only ride under a live provider row, never a dead one.
     if (([name isEqualToString:@"Z.ai"] || [name isEqualToString:@"Gemini"]) && u.limitStatusAvailable) {
         NSString *slug = name.lowercaseString;
@@ -14516,16 +14724,16 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
             long long tokens = PoolTokensLeft(five);
             NSDate *fiveReset = [five[@"resetsAt"] isKindOfClass:NSNumber.class]
                 ? [NSDate dateWithTimeIntervalSince1970:[five[@"resetsAt"] doubleValue]] : nil;
-            NSView *fiveRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kRowH)];
+            NSView *fiveRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSubRowH)];
             fiveRow.accessibilityIdentifier = [NSString stringWithFormat:@"popover.row.ai.%@.5h", slug];
             NSColor *ink = AIQuotaColor(MAX(frac, 0));
             NSString *fiveTip = AIQuotaValueTip(frac, tokens, fiveReset);
-            NSTextField *fiveName = [self text:@"5h" font:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+            NSTextField *fiveName = [self text:@"5h" font:[NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium]
                                         color:NSColor.secondaryLabelColor
-                                           at:NSMakeRect(kAINameX, (kRowH - 16) / 2.0, kAINameW, 16) align:NSTextAlignmentLeft];
+                                           at:NSMakeRect(kAINameX, (kSubRowH - 15) / 2.0, kAINameW, 15) align:NSTextAlignmentLeft];
             fiveName.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.name", slug];
             [fiveRow addSubview:fiveName];
-            Gauge *fiveBar = [[Gauge alloc] initWithFrame:RowGaugeRect()];
+            Gauge *fiveBar = [[Gauge alloc] initWithFrame:NSMakeRect(RowGaugeX(), (kSubRowH - subGaugeH) / 2.0, RowGaugeW(), subGaugeH)];
             fiveBar.fraction = MAX(frac, 0); fiveBar.color = ink;
             fiveBar.metricLabel = [NSString stringWithFormat:@"%@ 5-hour window remaining", name];
             fiveBar.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.gauge", slug];
@@ -14540,9 +14748,11 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
             fiveRow.accessibilityHelp = fiveTip;
             for (NSView *sub in fiveRow.subviews) sub.accessibilityHelp = fiveTip;
             [root addSubview:fiveRow];
-            y += kRowH;
+            y += kSubRowH;
+            addedSubRow = YES;
         }
     }
+    if (addedSubRow) y += 3;
     return y;
 }
 
@@ -14808,7 +15018,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     NSWindow *popoverWindow = previousView.window;
     NSDictionary *focusSnapshot = [self focusSnapshotForWindow:popoverWindow rootView:previousView];
     FlippedView *root = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0,0,kW,2000)];
-    CGFloat y = 8;   // no header row any more; the first instrument starts at the top
+    CGFloat y = 10;   // no header row any more; the first instrument starts at the top
 
     // Machine group. No section labels: the symbol's colour is the state, and the
     // name, the sentence and the breakdown live on the row's tooltip and in Details.
@@ -14954,19 +15164,19 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     // ---------- fixed footer ----------
     // Keep navigation and freshness visible even when the metric document is
     // taller than the current display and needs to scroll.
-    y += 2;
+    y += 6;
     NSString *freshness = _aiTotalsIncomplete && _aiCatchUpStatus.length
         ? _aiCatchUpStatus
         : [NSString stringWithFormat:@"Checked: machine %@ · AI %@",
            [self shortAgeForDate:_lastMachineRefresh], [self shortAgeForDate:_lastAIRefresh]];
-    const CGFloat footerH = kToggleH + 12;   // 6pt above and below the icon toggles
+    const CGFloat footerH = kToggleH + 16;   // 8pt above and below the footer pills
     // Fills windowBackgroundColor in drawRect: instead of freezing it into a CALayer CGColor,
     // so the footer follows a live Light/Dark switch like the panel above it.
     PopoverRootView *footer = [[PopoverRootView alloc] initWithFrame:NSMakeRect(0, 0, kW, footerH)];
     NSBox *footerRule = [self dividerAt:0];
     footerRule.accessibilityIdentifier = @"popover.divider.footer";
     [footer addSubview:footerRule];
-    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 6, kW, kToggleH)];
+    NSView *foot = [[NSView alloc] initWithFrame:NSMakeRect(0, 8, kW, kToggleH)];
     _keepAwakeButton = [self powerToggle:@"Keep Awake" symbol:@"cup.and.saucer.fill"
                                    action:@selector(toggleKeepAwake:)];
     _keepAwakeButton.accessibilityIdentifier = @"popover.keepAwake";
@@ -14981,16 +15191,16 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [foot addSubview:_keepAwakeButton];
     [foot addSubview:_lowPowerButton];
     if (_chargeButton) [foot addSubview:_chargeButton];
-    NSImageSymbolConfiguration *moreCfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol
-                                                                                         weight:NSFontWeightRegular];
-    NSImage *moreImage = [[NSImage imageWithSystemSymbolName:@"ellipsis.circle" accessibilityDescription:@"More"]
+    NSImageSymbolConfiguration *moreCfg = [NSImageSymbolConfiguration configurationWithPointSize:14
+                                                                                         weight:NSFontWeightMedium];
+    NSImage *moreImage = [[NSImage imageWithSystemSymbolName:@"ellipsis" accessibilityDescription:@"More"]
                           imageWithSymbolConfiguration:moreCfg];
-    NSButton *more = [NSButton buttonWithImage:moreImage target:self action:@selector(showMenu:)];
+    PillButton *more = [PillButton buttonWithImage:moreImage target:self action:@selector(showMenu:)];
     more.title = @"";   // buttonWithImage: leaves the stock "Button" title
     more.bordered = NO;
     more.imagePosition = NSImageOnly;
     more.imageScaling = NSImageScaleProportionallyDown;
-    more.contentTintColor = NSColor.secondaryLabelColor;
+    more.contentTintColor = NSColor.labelColor;
     more.frame = NSMakeRect(kW - kPad - kToggleH, 0, kToggleH, kToggleH);
     more.accessibilityHelp = [@"Details, settings and Quit. " stringByAppendingString:freshness];
     more.accessibilityIdentifier = @"popover.more";
