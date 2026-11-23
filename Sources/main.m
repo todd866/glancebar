@@ -5095,11 +5095,6 @@ static void GBApplyTileCaptionFloor(NSTextField *cap, NSString *text, CGFloat ca
     CGFloat pt = TileCaptionFitPointSizeFloor(text, capW, basePt, MIN(floorPt, basePt > 0 ? basePt : kTileCaptionBasePt));
     cap.font = [NSFont systemFontOfSize:pt];
     cap.stringValue = text;
-    if ([cap respondsToSelector:@selector(updateClippedTextHelp)])
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [cap performSelector:@selector(updateClippedTextHelp)];
-#pragma clang diagnostic pop
 }
 
 static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
@@ -5287,26 +5282,55 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOO
     return TileMosaicImage(tiles, side, dimmed) ?: StationTileImage(dimmed, side);
 }
 
+static NSImage *CachedSymbolImage(NSString *name, CGFloat pointSize, NSFontWeight weight, NSString *fallback) {
+    static NSMutableDictionary<NSString *, id> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *key = [NSString stringWithFormat:@"%@|%.1f|%.2f|%@", name ?: @"", pointSize, weight, fallback ?: @""];
+    id hit = cache[key];
+    if (hit) return hit == NSNull.null ? nil : hit;
+    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:weight];
+    NSImage *img = name.length ? [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil] imageWithSymbolConfiguration:cfg] : nil;
+    if (!img && fallback.length)
+        img = [[NSImage imageWithSystemSymbolName:fallback accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
+    cache[key] = img ?: NSNull.null;
+    return img;
+}
+
 @interface GBRecoverableTextField : NSTextField
 - (void)updateClippedTextHelp;
 @end
-@implementation GBRecoverableTextField
+@implementation GBRecoverableTextField {
+    BOOL _hasCustomAttributed;
+}
 - (void)updateClippedTextHelp {
-    if (!self.cell || !self.stringValue.length) {
+    if (!self.cell || !self.stringValue.length || NSWidth(self.bounds) <= 0 || NSHeight(self.bounds) <= 0) {
         [super setToolTip:nil];
         return;
     }
-    BOOL clipped = !NSIsEmptyRect([self.cell expansionFrameWithFrame:self.bounds inView:self]);
-    if (clipped && self.maximumNumberOfLines <= 1) {
+    if (self.maximumNumberOfLines <= 1) {
         NSLineBreakMode mode = self.lineBreakMode;
         BOOL truncates = mode == NSLineBreakByTruncatingTail || mode == NSLineBreakByTruncatingMiddle ||
                          mode == NSLineBreakByTruncatingHead || mode == NSLineBreakByClipping;
-        if (!truncates) clipped = NO;
+        if (!truncates) {
+            [super setToolTip:nil];
+            return;
+        }
+        // Fast path: if the single-line text comfortably fits inside bounds, skip CoreText's
+        // expensive expansionFrameWithFrame: pass (saves >100 layout passes per popover rebuild).
+        if (!_hasCustomAttributed && self.font) {
+            CGFloat textW = [self.stringValue sizeWithAttributes:@{NSFontAttributeName: self.font}].width;
+            if (textW + 10.0 <= NSWidth(self.bounds)) {
+                [super setToolTip:nil];
+                return;
+            }
+        }
     }
+    BOOL clipped = !NSIsEmptyRect([self.cell expansionFrameWithFrame:self.bounds inView:self]);
     [super setToolTip:clipped ? self.stringValue : nil];
 }
-- (void)setStringValue:(NSString *)value { [super setStringValue:value]; [self updateClippedTextHelp]; }
-- (void)setAttributedStringValue:(NSAttributedString *)value { [super setAttributedStringValue:value]; [self updateClippedTextHelp]; }
+- (void)setStringValue:(NSString *)value { _hasCustomAttributed = NO; [super setStringValue:value]; [self updateClippedTextHelp]; }
+- (void)setAttributedStringValue:(NSAttributedString *)value { _hasCustomAttributed = YES; [super setAttributedStringValue:value]; [self updateClippedTextHelp]; }
 - (void)setFont:(NSFont *)font { [super setFont:font]; [self updateClippedTextHelp]; }
 - (void)setFrameSize:(NSSize)size { [super setFrameSize:size]; [self updateClippedTextHelp]; }
 - (void)setLineBreakMode:(NSLineBreakMode)mode { [super setLineBreakMode:mode]; [self updateClippedTextHelp]; }
@@ -11405,9 +11429,7 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
 - (NSButton *)transportButton:(NSString *)symbol pointSize:(CGFloat)pointSize side:(CGFloat)side
                          action:(SEL)action identifier:(NSString *)identifier label:(NSString *)label {
     // Same configuration family as the output mark and the lead symbols: regular weight, point size only.
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:pointSize weight:NSFontWeightRegular];
-    NSImage *image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
-    if (!image) image = [NSImage imageWithSystemSymbolName:@"play.fill" accessibilityDescription:nil];
+    NSImage *image = CachedSymbolImage(symbol, pointSize, NSFontWeightRegular, @"play.fill");
     NSButton *button = [GBFirstMouseButton buttonWithImage:image target:self action:action];
     button.title = @"";   // buttonWithImage: leaves the stock "Button" title
     button.bordered = NO;
@@ -12066,12 +12088,12 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *captions = @[name];
         for (NSUInteger l = 0; l < captions.count; l++) {
-            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
+            NSTextField *cap = [GBRecoverableTextField labelWithString:@""];
             cap.textColor = playing ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
-            if (l) cap.font = capFont;
+            if (l) { cap.font = capFont; cap.stringValue = captions[l]; }
             else GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? [NSString stringWithFormat:@"popover.music.kind.%@.songs", kind]
                                              : [NSString stringWithFormat:@"popover.music.kind.%@.caption", kind];
@@ -12138,7 +12160,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *showCaps = @[offer[@"show"] ?: @""];
         for (NSUInteger l = 0; l < showCaps.count; l++) {
-            NSTextField *cap = [GBRecoverableTextField labelWithString:showCaps[l]];
+            NSTextField *cap = [GBRecoverableTextField labelWithString:@""];
             cap.textColor = showPlaying ? NSColor.controlAccentColor : (l ? NSColor.secondaryLabelColor : NSColor.labelColor);
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
@@ -12201,13 +12223,13 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *captions = @[@"New music"];
         for (NSUInteger l = 0; l < captions.count; l++) {
-            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
+            NSTextField *cap = [GBRecoverableTextField labelWithString:@""];
             cap.textColor = stationPlaying ? NSColor.controlAccentColor
                 : (l ? NSColor.secondaryLabelColor : (stationOn ? NSColor.labelColor : NSColor.tertiaryLabelColor));
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;   // GBApplyTileCaption already fits the type; never dots
             cap.frame = NSMakeRect(capX - kLabelPad / 2, capH - 2 - rowH * (l + 1), capW + kLabelPad, rowH);
-            if (l) cap.font = capFont;
+            if (l) { cap.font = capFont; cap.stringValue = captions[l]; }
             else GBApplyTileCaptionFloor(cap, captions[l], capW + kLabelPad, namePt, rowFloorPt);
             cap.accessibilityIdentifier = l ? @"popover.mix.artist.4" : @"popover.mix.caption.4";
             [line addSubview:cap];
@@ -12249,7 +12271,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         CGFloat capW = side + gap, capX = x - gap / 2.0;
         NSArray *captions = @[ moodLabel.length ? moodLabel : @"6IAN" ];
         for (NSUInteger l = 0; l < captions.count; l++) {
-            NSTextField *cap = [GBRecoverableTextField labelWithString:captions[l]];
+            NSTextField *cap = [GBRecoverableTextField labelWithString:@""];
             cap.textColor = l ? NSColor.secondaryLabelColor : NSColor.labelColor;
             cap.alignment = NSTextAlignmentCenter;
             cap.lineBreakMode = NSLineBreakByClipping;
@@ -13563,9 +13585,14 @@ static NSFont *GBFontFittedToWidth(NSFont *font, NSString *text, CGFloat width) 
     return font;
 }
 - (NSTextField *)text:(NSString *)s font:(NSFont *)f color:(NSColor *)c at:(NSRect)fr align:(NSTextAlignment)a {
-    NSTextField *t = [GBRecoverableTextField labelWithString:s ?: @""];
-    t.font = GBFontFittedToWidth(f, s ?: @"", fr.size.width); if (c) t.textColor = c; t.alignment = a; t.frame = fr;
+    NSString *str = s ?: @"";
+    NSTextField *t = [GBRecoverableTextField labelWithString:@""];
+    t.font = GBFontFittedToWidth(f, str, fr.size.width);
+    if (c) t.textColor = c;
+    t.alignment = a;
     t.lineBreakMode = NSLineBreakByClipping;
+    t.frame = fr;
+    t.stringValue = str;
     return t;
 }
 - (NSView *)sectionHeader:(NSString *)title at:(CGFloat)y {
@@ -13590,10 +13617,7 @@ static NSFont *GBFontFittedToWidth(NSFont *font, NSString *text, CGFloat width) 
     b.imageHugsTitle = YES;
     b.imageScaling = NSImageScaleProportionallyDown;
     b.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kFooterSymbol
-                                                                                     weight:NSFontWeightMedium];
-    b.image = [[NSImage imageWithSystemSymbolName:symbol accessibilityDescription:title]
-               imageWithSymbolConfiguration:cfg];
+    b.image = CachedSymbolImage(symbol, kFooterSymbol, NSFontWeightMedium, nil);
     b.accessibilityLabel = title;
     return b;
 }
@@ -14241,9 +14265,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
 }
 
 - (NSImageView *)instrumentSymbol:(NSString *)name tint:(NSColor *)tint identifier:(NSString *)identifier in:(NSView *)row {
-    NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:kLeadSymbol weight:NSFontWeightRegular];
-    NSImage *image = [[NSImage imageWithSystemSymbolName:name accessibilityDescription:nil] imageWithSymbolConfiguration:cfg];
-    if (!image) image = [NSImage imageWithSystemSymbolName:@"questionmark.circle" accessibilityDescription:nil];
+    NSImage *image = CachedSymbolImage(name, kLeadSymbol, NSFontWeightRegular, @"questionmark.circle");
     NSImageView *iv = [NSImageView imageViewWithImage:image];
     iv.imageScaling = NSImageScaleProportionallyDown;
     iv.contentTintColor = tint ?: NSColor.secondaryLabelColor;
@@ -15232,10 +15254,7 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
     [foot addSubview:_keepAwakeButton];
     [foot addSubview:_lowPowerButton];
     if (_chargeButton) [foot addSubview:_chargeButton];
-    NSImageSymbolConfiguration *moreCfg = [NSImageSymbolConfiguration configurationWithPointSize:14
-                                                                                         weight:NSFontWeightMedium];
-    NSImage *moreImage = [[NSImage imageWithSystemSymbolName:@"ellipsis" accessibilityDescription:@"More"]
-                          imageWithSymbolConfiguration:moreCfg];
+    NSImage *moreImage = CachedSymbolImage(@"ellipsis", 14, NSFontWeightMedium, nil);
     PillButton *more = [PillButton buttonWithImage:moreImage target:self action:@selector(showMenu:)];
     more.title = @"";   // buttonWithImage: leaves the stock "Button" title
     more.bordered = NO;
