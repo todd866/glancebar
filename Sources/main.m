@@ -4731,7 +4731,7 @@ static NSColor *ClaudeQuotaColor(double fraction) {
 @implementation ClickRow
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
-    for (NSTrackingArea *area in self.trackingAreas) [self removeTrackingArea:area];
+    if (self.trackingAreas.count) return;
     NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:NSZeroRect
                                                         options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect)
                                                           owner:self userInfo:nil];
@@ -5004,6 +5004,12 @@ static void DrawTileHairlineBorder(NSRect rect, CGFloat radius) {
 }
 
 static NSImage *StationTileImage(BOOL dimmed, CGFloat side) {
+    static NSMutableDictionary<NSString *, NSImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *key = [NSString stringWithFormat:@"%d|%.1f", dimmed ? 1 : 0, side];
+    NSImage *hit = cache[key];
+    if (hit) return hit;
     NSImage *symbol = [NSImage imageWithSystemSymbolName:@"dot.radiowaves.left.and.right" accessibilityDescription:nil];
     if (!symbol) symbol = [NSImage imageWithSystemSymbolName:@"antenna.radiowaves.left.and.right" accessibilityDescription:nil];
     symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:20 weight:NSFontWeightSemibold]] ?: symbol;
@@ -5032,10 +5038,17 @@ static NSImage *StationTileImage(BOOL dimmed, CGFloat side) {
         return YES;
     }];
     image.template = NO;
+    cache[key] = image;
     return image;
 }
 
 static NSImage *SixianTileImage(CGFloat side) {
+    static NSMutableDictionary<NSNumber *, NSImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSNumber *key = @(lround(side * 10));
+    NSImage *hit = cache[key];
+    if (hit) return hit;
     NSImage *image = [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
         NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         [clip addClip];
@@ -5057,6 +5070,7 @@ static NSImage *SixianTileImage(CGFloat side) {
         return YES;
     }];
     image.template = NO;
+    cache[key] = image;
     return image;
 }
 
@@ -5110,10 +5124,16 @@ static NSImage *GBShowInitialsImage(NSString *showName, NSSize size) {
 }
 
 static NSImage *GBTypeMarkImage(NSString *symbolName) {
+    static NSMutableDictionary<NSString *, id> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *key = symbolName ?: @"";
+    id hit = cache[key];
+    if (hit) return hit == NSNull.null ? nil : hit;
     NSImage *symbol = [NSImage imageWithSystemSymbolName:symbolName accessibilityDescription:nil];
-    if (!symbol) return nil;
+    if (!symbol) { cache[key] = NSNull.null; return nil; }
     symbol = [symbol imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:9 weight:NSFontWeightSemibold]] ?: symbol;
-    return [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+    NSImage *img = [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect rect) {
         NSBezierPath *box = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:4 yRadius:4];
         [[NSColor colorWithWhite:0 alpha:0.52] setFill];
         [box fill];
@@ -5127,6 +5147,8 @@ static NSImage *GBTypeMarkImage(NSString *symbolName) {
         [mark drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1];
         return YES;
     }];
+    cache[key] = img;
+    return img;
 }
 
 @interface GBShowProgressView : NSView
@@ -5203,9 +5225,15 @@ static NSColor *KindTileFlatColor(NSString *kind) {
 }
 
 static NSImage *KindTilePlaceholderImage(NSString *kind, NSString *name, CGFloat side) {
+    static NSMutableDictionary<NSString *, NSImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
     unichar initial = name.length ? [name characterAtIndex:0] : '?';
+    NSString *key = [NSString stringWithFormat:@"%@|%C|%.1f", kind ?: @"", initial, side];
+    NSImage *hit = cache[key];
+    if (hit) return hit;
     NSColor *bg = KindTileFlatColor(kind);
-    return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+    NSImage *img = [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
         NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         [clip addClip];
         [bg setFill];
@@ -5218,6 +5246,8 @@ static NSImage *KindTilePlaceholderImage(NSString *kind, NSString *name, CGFloat
         DrawTileHairlineBorder(rect, kTileCornerRadius);
         return YES;
     }];
+    cache[key] = img;
+    return img;
 }
 
 static NSString *KindSongCountLine(NSUInteger count) {
@@ -5338,7 +5368,7 @@ static NSImage *StationMosaicImage(NSArray<NSImage *> *covers, CGFloat side, BOO
 @implementation PillButton
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
-    for (NSTrackingArea *area in self.trackingAreas) [self removeTrackingArea:area];
+    if (self.trackingAreas.count) return;
     NSTrackingArea *area = [[NSTrackingArea alloc] initWithRect:NSZeroRect
                                                         options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect)
                                                           owner:self userInfo:nil];
@@ -14335,7 +14365,13 @@ static NSImage *AIProviderIcon(NSString *provider) {
     return nil;
 }
 static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
+    static NSMutableDictionary<NSString *, NSImage *> *badgeCache;
+    static dispatch_once_t badgeOnce;
+    dispatch_once(&badgeOnce, ^{ badgeCache = [NSMutableDictionary dictionary]; });
     if ([provider isEqualToString:@"Z.ai"]) {
+        NSString *key = [NSString stringWithFormat:@"Z.ai|%.1f", pt];
+        NSImage *hit = badgeCache[key];
+        if (hit) return hit;
         // The GLM Coding Plan has no desktop app icon to borrow: draw a rounded-square
         // app-icon badge matching Claude/Codex/Cursor's visual weight on every surface.
         NSImage *z = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
@@ -14361,9 +14397,13 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
             return YES;
         }];
         z.template = NO;
+        badgeCache[key] = z;
         return z;
     }
     if ([provider isEqualToString:@"Gemini"]) {
+        NSString *key = [NSString stringWithFormat:@"Gemini|%.1f", pt];
+        NSImage *hit = badgeCache[key];
+        if (hit) return hit;
         // Gemini rounded-square app-icon badge (signature royal blue + white four-point
         // sparkle) so it sits as a peer beside Claude, Codex, Cursor and Z.ai.
         NSImage *gem = [NSImage imageWithSize:NSMakeSize(pt, pt) flipped:NO drawingHandler:^BOOL(NSRect dst) {
@@ -14402,6 +14442,7 @@ static NSImage *AIProviderLogo(NSString *provider, CGFloat pt) {
             return YES;
         }];
         gem.template = NO;
+        badgeCache[key] = gem;
         return gem;
     }
     NSImage *icon = AIProviderIcon(provider);
