@@ -71,6 +71,9 @@ jobs:
           # Explicit, not incidental: a runner has no signing identity, but the build must
           # not start picking one up if that ever changes.
           GLANCEBAR_ADHOC: "1"
+          # The sanitized test suite just passed for this exact commit above; do not run
+          # ./tests.sh a second time inside build.sh.
+          GLANCEBAR_TESTS_GREEN: ${{ github.sha }}
         run: ./build.sh
 
       - name: Verify CLI JSON contract
