@@ -146,8 +146,10 @@ static BOOL RecoveryTip(NSView *view) {
 // token count and full reset time the row's compact number approximates. Terse by shape.
 static BOOL QuotaValueTip(NSView *view) {
     NSString *ident = view.accessibilityIdentifier ?: @"";
-    if (![ident hasPrefix:@"popover.ai."] || ![ident hasSuffix:@".value"]) return NO;
     NSString *tip = view.toolTip ?: @"";
+    if ([view isKindOfClass:FiveHourDiamond.class] && [ident hasPrefix:@"popover.ai."] && [ident hasSuffix:@".5h"])
+        return [tip hasPrefix:@"5h · "] && [tip containsString:@"% left"];
+    if (![ident hasPrefix:@"popover.ai."] || ![ident hasSuffix:@".value"]) return NO;
     return [tip containsString:@"% left · "] && [tip containsString:@" tokens left · resets "];
 }
 static NSView *WordyTip(NSView *view) {
@@ -2610,39 +2612,64 @@ int main(int argc, const char **argv) {
             NSTextField *cursorValue = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.value");
             NSTextField *apiTokenValue = (NSTextField *)FindIdentifier(root, @"popover.ai.cursor.api.value");
             NSTextField *zaiValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.value");
-            NSTextField *zaiFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.value");
             Gauge *zaiGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.gauge");
-            Gauge *zaiFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.z.ai.5h.gauge");
+            FiveHourDiamond *zaiFive = (FiveHourDiamond *)FindIdentifier(root, @"popover.ai.z.ai.5h");
             NSTextField *gemValue = (NSTextField *)FindIdentifier(root, @"popover.ai.gemini.value");
-            NSTextField *gemFiveValue = (NSTextField *)FindIdentifier(root, @"popover.ai.gemini.5h.value");
             Gauge *gemGauge = (Gauge *)FindIdentifier(root, @"popover.ai.gemini.gauge");
-            Gauge *gemFiveGauge = (Gauge *)FindIdentifier(root, @"popover.ai.gemini.5h.gauge");
-            if (![cursorValue.stringValue isEqual:@"26%·76M"] || ![apiTokenValue.stringValue isEqual:@"46%·11M"] ||
-                ![zaiValue.stringValue isEqual:@"100%·1.35B"] || ![zaiFiveValue.stringValue isEqual:@"100%·269M"] ||
-                ![gemValue.stringValue isEqual:@"94%·195M"] || ![gemFiveValue.stringValue isEqual:@"80%·50M"] ||
-                ![((NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.5h.datum")).stringValue hasPrefix:@"resets "] ||
-                ![((NSTextField *)FindIdentifier(root, @"popover.ai.gemini.5h.datum")).stringValue hasPrefix:@"resets "] ||
+            FiveHourDiamond *gemFive = (FiveHourDiamond *)FindIdentifier(root, @"popover.ai.gemini.5h");
+            FiveHourDiamond *claudeFive = (FiveHourDiamond *)FindIdentifier(root, @"popover.ai.claude.5h");
+            if (FindIdentifier(root, @"popover.row.ai.z.ai.5h") || FindIdentifier(root, @"popover.row.ai.gemini.5h") ||
+                ![cursorValue.stringValue isEqual:@"26%·76M"] || ![apiTokenValue.stringValue isEqual:@"46%·11M"] ||
+                ![zaiValue.stringValue isEqual:@"100%·1.35B"] ||
+                ![gemValue.stringValue isEqual:@"94%·195M"] ||
                 ![zaiGauge isKindOfClass:Gauge.class] || fabs(zaiGauge.fraction - 1.0) > 0.001 ||
-                ![zaiFiveGauge isKindOfClass:Gauge.class] || fabs(zaiFiveGauge.fraction - 0.999) > 0.001 ||
+                ![zaiFive isKindOfClass:FiveHourDiamond.class] || fabs(zaiFive.fraction - 0.999) > 0.001 ||
                 ![gemGauge isKindOfClass:Gauge.class] || fabs(gemGauge.fraction - 0.94) > 0.001 ||
-                ![gemFiveGauge isKindOfClass:Gauge.class] || fabs(gemFiveGauge.fraction - 0.80) > 0.001 ||
+                ![gemFive isKindOfClass:FiveHourDiamond.class] || fabs(gemFive.fraction - 0.80) > 0.001 ||
+                ![claudeFive isKindOfClass:FiveHourDiamond.class] || fabs(claudeFive.fraction - 0.57) > 0.001 ||
                 !SameColumn(zaiGauge, FindIdentifier(root, @"popover.ai.cursor.gauge")) ||
-                !SameColumn(zaiFiveGauge, zaiGauge) || !SameColumn(zaiValue, cursorValue) ||
-                !SameColumn(zaiFiveValue, zaiValue) ||
-                !SameColumn(gemGauge, zaiGauge) || !SameColumn(gemFiveGauge, gemGauge) ||
-                !SameColumn(gemValue, zaiValue) || !SameColumn(gemFiveValue, gemValue) ||
+                !SameColumn(zaiValue, cursorValue) ||
+                !SameColumn(gemGauge, zaiGauge) ||
+                !SameColumn(gemValue, zaiValue) ||
                 !SameSize(FindIdentifier(root, @"popover.ai.z.ai.symbol"), FindIdentifier(root, @"popover.ai.cursor.symbol")) ||
                 !SameSize(FindIdentifier(root, @"popover.ai.gemini.symbol"), FindIdentifier(root, @"popover.ai.cursor.symbol")) ||
                 !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
             if (![zaiValue.toolTip hasPrefix:@"100% left · 1,347,000,000 tokens left · resets "] ||
-                ![zaiFiveValue.toolTip containsString:@"269,000,000 tokens left"] ||
+                ![zaiFive.toolTip containsString:@"269,000,000 tokens left"] ||
                 ![gemValue.toolTip hasPrefix:@"94% left · 195,000,000 tokens left · resets "] ||
-                ![gemFiveValue.toolTip containsString:@"50,000,000 tokens left"] ||
+                ![gemFive.toolTip containsString:@"50,000,000 tokens left"] ||
                 ![cursorValue.toolTip containsString:@"76,000,000 tokens left · resets "]) return Fail(__LINE__);
             if (argc > 1) {
                 NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
                 NSAppearanceName look = argc > 2 ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
                 if (!RenderOffscreen(root, [stem stringByAppendingString:@"-zai.png"], look)) return Fail(__LINE__);
+            }
+            // Tight 5-hour bottleneck (<= 35% and lower than weekly): diamond moves left and turns
+            // orange/red, and the datum surfaces the 5-hour reset clock.
+            gemini.limitWindows = @[
+                @{@"pool": @"week", @"window": @"weekly", @"remainingFraction": @0.94,
+                  @"resetsAt": @(nowEpoch + 6 * 86400), @"tokensLeft": @195000000},
+                @{@"pool": @"5h", @"window": @"5-hour", @"remainingFraction": @0.12,
+                  @"resetsAt": @(nowEpoch + 2 * 3600), @"tokensLeft": @7500000}];
+            zai.limitWindows = @[
+                @{@"pool": @"week", @"window": @"weekly", @"remainingFraction": @1.0,
+                  @"resetsAt": @(nowEpoch + 7 * 86400), @"tokensLeft": @1347000000},
+                @{@"pool": @"5h", @"window": @"5-hour", @"remainingFraction": @0.30,
+                  @"resetsAt": @(nowEpoch + 3 * 3600), @"tokensLeft": @80000000}];
+            [c rebuildContent]; root = p.contentViewController.view;
+            NSTextField *gemTightDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.gemini.datum");
+            NSTextField *zaiTightDatum = (NSTextField *)FindIdentifier(root, @"popover.ai.z.ai.datum");
+            FiveHourDiamond *gemTightFive = (FiveHourDiamond *)FindIdentifier(root, @"popover.ai.gemini.5h");
+            FiveHourDiamond *zaiTightFive = (FiveHourDiamond *)FindIdentifier(root, @"popover.ai.z.ai.5h");
+            if (![gemTightDatum.stringValue hasPrefix:@"5h · "] ||
+                ![zaiTightDatum.stringValue hasPrefix:@"5h · "] ||
+                ![gemTightFive isKindOfClass:FiveHourDiamond.class] || fabs(gemTightFive.fraction - 0.12) > 0.001 ||
+                ![zaiTightFive isKindOfClass:FiveHourDiamond.class] || fabs(zaiTightFive.fraction - 0.30) > 0.001 ||
+                !InstrumentRowsFit(root) || !FitsChildren(root)) return Fail(__LINE__);
+            if (argc > 1) {
+                NSString *stem = [[NSString stringWithUTF8String:argv[1]] stringByDeletingPathExtension];
+                if (!RenderOffscreen(root, [stem stringByAppendingString:@"-zai-tight-light.png"], NSAppearanceNameAqua)) return Fail(__LINE__);
+                if (!RenderOffscreen(root, [stem stringByAppendingString:@"-zai-tight-dark.png"], NSAppearanceNameDarkAqua)) return Fail(__LINE__);
             }
             cursorSized.limitWindows = cursorBeforeTokens;
             [c setValue:usage forKey:@"aiUsage"];

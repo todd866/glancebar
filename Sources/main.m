@@ -4652,6 +4652,93 @@ static NSColor *AIQuotaColor(double fraction) {
     return NSColor.systemGreenColor;
 }
 
+// 5-hour rolling quota diamond riding on top of a 7-day weekly bar (right-to-left as it drains).
+// Uses the same windowBackgroundColor knock-out halo as TrendArrow so it stays crisp over any
+// bar fill or empty track in Light and Dark appearances alike.
+static const CGFloat kFiveHourDiamondPad = 2.0;
+static const CGFloat kFiveHourDiamondRX = 4.5;
+static const CGFloat kFiveHourDiamondRY = 5.5;
+@interface FiveHourDiamond : NSView
+@property (nonatomic) double fraction;
+@property (nonatomic, strong) NSColor *color;
+@end
+@implementation FiveHourDiamond
+- (instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setAccessibilityElement:YES];
+        self.accessibilityRole = NSAccessibilityValueIndicatorRole;
+        self.accessibilityLabel = @"5-hour window remaining";
+    }
+    return self;
+}
+- (BOOL)isOpaque { return NO; }
+- (void)setFraction:(double)fraction {
+    _fraction = MIN(1.0, MAX(0.0, fraction));
+    self.accessibilityValue = [NSString stringWithFormat:@"%.0f%%", _fraction * 100];
+    self.needsDisplay = YES;
+}
+- (void)setColor:(NSColor *)color { _color = color; self.needsDisplay = YES; }
+- (CGFloat)centerX {
+    CGFloat barMinX = kFiveHourDiamondPad;
+    CGFloat barW = MAX(0, NSWidth(self.bounds) - 2 * kFiveHourDiamondPad);
+    CGFloat travel = MAX(0, barW - 2 * kFiveHourDiamondRX);
+    return barMinX + kFiveHourDiamondRX + travel * _fraction;
+}
+- (NSView *)hitTest:(NSPoint)point {
+    NSPoint local = [self convertPoint:point fromView:self.superview];
+    if (!NSPointInRect(local, self.bounds)) return nil;
+    return fabs(local.x - [self centerX]) <= 8.0 ? self : nil;
+}
+- (void)drawRect:(NSRect)dirty {
+    (void)dirty;
+    CGFloat cx = [self centerX], cy = NSMidY(self.bounds);
+    NSBezierPath *diamond = [NSBezierPath bezierPath];
+    [diamond moveToPoint:NSMakePoint(cx, cy + kFiveHourDiamondRY)];
+    [diamond lineToPoint:NSMakePoint(cx + kFiveHourDiamondRX, cy)];
+    [diamond lineToPoint:NSMakePoint(cx, cy - kFiveHourDiamondRY)];
+    [diamond lineToPoint:NSMakePoint(cx - kFiveHourDiamondRX, cy)];
+    [diamond closePath];
+    [NSGraphicsContext saveGraphicsState];
+    [[NSColor.windowBackgroundColor colorWithAlphaComponent:0.95] setStroke];
+    diamond.lineWidth = 2.6;
+    diamond.lineJoinStyle = NSLineJoinStyleRound;
+    [diamond stroke];
+    [NSGraphicsContext restoreGraphicsState];
+    [(self.color ?: AIQuotaColor(_fraction)) setFill];
+    [diamond fill];
+    [NSGraphicsContext saveGraphicsState];
+    [[NSColor.labelColor colorWithAlphaComponent:0.22] setStroke];
+    diamond.lineWidth = 0.5;
+    [diamond stroke];
+    [NSGraphicsContext restoreGraphicsState];
+}
+@end
+
+static NSRect FiveHourDiamondFrameForBar(NSRect bar) {
+    return NSMakeRect(NSMinX(bar) - kFiveHourDiamondPad,
+                      NSMidY(bar) - 7.0,
+                      NSWidth(bar) + 2 * kFiveHourDiamondPad,
+                      14.0);
+}
+
+// Returns the 5-hour window dict only when the provider also reports a longer (e.g. weekly)
+// primary window; a solo 5h window is already represented by the bar itself.
+static NSDictionary *AIUsageFiveHourWindow(AIUsage *u) {
+    if (!u || !u.limitStatusAvailable || u.overageActive || !u.limitWindows.count) return nil;
+    NSDictionary *five = nil;
+    BOOL hasLonger = NO;
+    for (NSDictionary *w in u.limitWindows) {
+        if (![w isKindOfClass:NSDictionary.class]) continue;
+        if (![w[@"remainingFraction"] isKindOfClass:NSNumber.class]) continue;
+        NSString *pool = [w[@"pool"] isKindOfClass:NSString.class] ? w[@"pool"] : @"";
+        NSString *win = [w[@"window"] isKindOfClass:NSString.class] ? w[@"window"] : @"";
+        BOOL isFive = [pool isEqualToString:@"5h"] || [win isEqualToString:@"5-hour"] || [win isEqualToString:@"5h"];
+        if (isFive) { if (!five) five = w; }
+        else hasLonger = YES;
+    }
+    return (five && hasLonger) ? five : nil;
+}
+
 // Overlay distinct endpoints; use fixed lanes only when they are nearly equal.
 static BOOL QuotaFractionsClose(double first, double second) {
     return first >= 0 && second >= 0 && fabs(first-second) <= 0.030000001;
@@ -5694,6 +5781,13 @@ static void ApplyFreshViewState(NSView *existing, NSView *fresh) {
     } else if ([existing isKindOfClass:TrendArrow.class]) {
         TrendArrow *old = (TrendArrow *)existing, *new = (TrendArrow *)fresh;
         old.from = new.from; old.to = new.to; old.drawTo = new.drawTo;
+    } else if ([existing isKindOfClass:FiveHourDiamond.class]) {
+        FiveHourDiamond *old = (FiveHourDiamond *)existing, *new = (FiveHourDiamond *)fresh;
+        old.fraction = new.fraction; old.color = new.color;
+        old.accessibilityIdentifier = new.accessibilityIdentifier;
+        old.accessibilityLabel = new.accessibilityLabel;
+        old.accessibilityHelp = new.accessibilityHelp;
+        old.toolTip = new.toolTip;
     } else if ([existing isKindOfClass:PowerFlowGauge.class]) {
         PowerFlowGauge *old = (PowerFlowGauge *)existing, *new = (PowerFlowGauge *)fresh;
         old.scaleWatts = new.scaleWatts; old.systemWatts = new.systemWatts;
@@ -14697,9 +14791,35 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         plainGauge.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.gauge", slug];
         [row addSubview:plainGauge];
     }
+    NSDictionary *fiveWindow = (hasGauge && !cursorPools) ? AIUsageFiveHourWindow(u) : nil;
+    double fiveFrac = fiveWindow ? [fiveWindow[@"remainingFraction"] doubleValue] : -1;
+    long long fiveTokens = fiveWindow ? PoolTokensLeft(fiveWindow) : 0;
+    NSDate *fiveReset = (fiveWindow && [fiveWindow[@"resetsAt"] isKindOfClass:NSNumber.class])
+        ? [NSDate dateWithTimeIntervalSince1970:[fiveWindow[@"resetsAt"] doubleValue]] : nil;
+    NSString *fiveClock = fiveReset ? CompactResetClock(fiveReset, NSDate.date) : nil;
+    NSString *fiveTip = fiveWindow ? [@"5h · " stringByAppendingString:AIQuotaValueTip(fiveFrac, fiveTokens, fiveReset)] : nil;
+    if (hasGauge && !cursorPools) {
+        FiveHourDiamond *diamond = [[FiveHourDiamond alloc] initWithFrame:FiveHourDiamondFrameForBar(RowGaugeRect())];
+        diamond.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h", slug];
+        diamond.accessibilityLabel = [NSString stringWithFormat:@"%@ 5-hour window remaining", name];
+        if (fiveWindow) {
+            diamond.fraction = fiveFrac;
+            diamond.color = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(fiveFrac);
+            diamond.accessibilityHelp = fiveTip;
+            diamond.toolTip = fiveTip;
+            diamond.hidden = NO;
+        } else {
+            diamond.hidden = YES;
+            diamond.toolTip = nil;
+        }
+        [row addSubview:diamond];
+    }
     NSDate *resetDate = cursorPools ? CursorPoolReset(cursorPools) : u.resetAt;
     if (claudeMeter && [quotas[@"resetsAt"] isKindOfClass:NSNumber.class])
         resetDate = [NSDate dateWithTimeIntervalSince1970:[quotas[@"resetsAt"] doubleValue]];
+    if (fiveTip.length && ![tip containsString:@"5h"] && ![tip containsString:@"5 h"]) {
+        tip = tip.length ? [NSString stringWithFormat:@"%@ · %@", tip, fiveTip] : fiveTip;
+    }
     NSString *named = tip.length ? [NSString stringWithFormat:@"%@ — %@", name, tip] : name;   // spoken
     NSString *shortTip = tip.length ? tip : name;   // shown: the row already names itself
     if (!logo) mark.contentTintColor = valueColor;
@@ -14731,10 +14851,17 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         datum = u.statusNotice;
         datumColor = NSColor.systemOrangeColor;
     } else if (!u.overageActive) {
-        NSDate *reset = resetDate;
-        // A bare "21:00" beside a bar could mean anything; one word says what it is.
-        NSString *clock = CompactResetClock(reset, NSDate.date);
-        datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
+        double weeklyFrac = claudeMeter ? week : u.remainingFraction;
+        if (fiveWindow && fiveFrac <= 0.35 && (weeklyFrac < 0 || fiveFrac < weeklyFrac) && fiveClock.length) {
+            // When the 5-hour window is tight (orange/red) and is the active bottleneck,
+            // surface its reset clock so you know when the short window unlocks.
+            datum = [@"5h · " stringByAppendingString:fiveClock];
+        } else {
+            NSDate *reset = resetDate;
+            // A bare "21:00" beside a bar could mean anything; one word says what it is.
+            NSString *clock = CompactResetClock(reset, NSDate.date);
+            datum = clock.length ? [@"resets " stringByAppendingString:clock] : @"";
+        }
     }
     NSTextField *datumField = [self instrumentDatum:datum color:datumColor
                                         identifier:[NSString stringWithFormat:@"popover.ai.%@.datum", slug] in:row];
@@ -14773,47 +14900,6 @@ static NSImage *BurnAppIcon(NSDictionary *group) {
         [root addSubview:apiRow];
         y += kSubRowH;
         addedSubRow = YES;
-    }
-    // Z.ai and Gemini 5-hour windows are tighter sub-rows under the weekly row, in that same shape.
-    // Like Cursor's API row they only ride under a live provider row, never a dead one.
-    if (([name isEqualToString:@"Z.ai"] || [name isEqualToString:@"Gemini"]) && u.limitStatusAvailable) {
-        NSString *slug = name.lowercaseString;
-        NSDictionary *five = nil;
-        for (NSDictionary *window in u.limitWindows)
-            if ([window[@"pool"] isEqual:@"5h"]) five = window;
-        if (five) {
-            double frac = [five[@"remainingFraction"] isKindOfClass:NSNumber.class]
-                ? [five[@"remainingFraction"] doubleValue] : -1;
-            long long tokens = PoolTokensLeft(five);
-            NSDate *fiveReset = [five[@"resetsAt"] isKindOfClass:NSNumber.class]
-                ? [NSDate dateWithTimeIntervalSince1970:[five[@"resetsAt"] doubleValue]] : nil;
-            NSView *fiveRow = [[NSView alloc] initWithFrame:NSMakeRect(0, y, kW, kSubRowH)];
-            fiveRow.accessibilityIdentifier = [NSString stringWithFormat:@"popover.row.ai.%@.5h", slug];
-            NSColor *ink = AIQuotaColor(MAX(frac, 0));
-            NSString *fiveTip = AIQuotaValueTip(frac, tokens, fiveReset);
-            NSTextField *fiveName = [self text:@"5h" font:[NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium]
-                                        color:NSColor.secondaryLabelColor
-                                           at:NSMakeRect(kAINameX, (kSubRowH - 15) / 2.0, kAINameW, 15) align:NSTextAlignmentLeft];
-            fiveName.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.name", slug];
-            [fiveRow addSubview:fiveName];
-            Gauge *fiveBar = [[Gauge alloc] initWithFrame:NSMakeRect(RowGaugeX(), (kSubRowH - subGaugeH) / 2.0, RowGaugeW(), subGaugeH)];
-            fiveBar.fraction = MAX(frac, 0); fiveBar.color = ink;
-            fiveBar.metricLabel = [NSString stringWithFormat:@"%@ 5-hour window remaining", name];
-            fiveBar.accessibilityIdentifier = [NSString stringWithFormat:@"popover.ai.%@.5h.gauge", slug];
-            [fiveRow addSubview:fiveBar];
-            NSTextField *fiveValue = [self instrumentValue:AIQuotaBothText(frac, tokens, frac >= 0
-                ? [NSString stringWithFormat:@"%.0f%%", frac * 100] : @"—")
-                                                      color:ink identifier:[NSString stringWithFormat:@"popover.ai.%@.5h.value", slug] in:fiveRow];
-            if (tokens > 0) fiveValue.toolTip = fiveTip;
-            NSString *fiveClock = CompactResetClock(fiveReset, NSDate.date);
-            [self instrumentDatum:fiveClock.length ? [@"resets " stringByAppendingString:fiveClock] : @""
-                            color:NSColor.secondaryLabelColor identifier:[NSString stringWithFormat:@"popover.ai.%@.5h.datum", slug] in:fiveRow];
-            fiveRow.accessibilityHelp = fiveTip;
-            for (NSView *sub in fiveRow.subviews) sub.accessibilityHelp = fiveTip;
-            [root addSubview:fiveRow];
-            y += kSubRowH;
-            addedSubRow = YES;
-        }
     }
     if (addedSubRow) y += 3;
     return y;
@@ -16595,6 +16681,20 @@ static NSColor *HealthColor(double fraction) {
         [self detailGauge:DetailGaugeRect(c) fraction:u.remainingFraction color:valueColor
                     label:[NSString stringWithFormat:@"%@ quota remaining", name]
                identifier:[stem stringByAppendingString:@".gauge"] tip:named in:row];
+    }
+    NSDictionary *overviewFive = (overview && hasGauge && !cursorPools) ? AIUsageFiveHourWindow(u) : nil;
+    if (overviewFive) {
+        double fiveFrac = [overviewFive[@"remainingFraction"] doubleValue];
+        long long fiveTokens = PoolTokensLeft(overviewFive);
+        NSDate *fiveReset = [overviewFive[@"resetsAt"] isKindOfClass:NSNumber.class]
+            ? [NSDate dateWithTimeIntervalSince1970:[overviewFive[@"resetsAt"] doubleValue]] : nil;
+        FiveHourDiamond *diamond = [[FiveHourDiamond alloc] initWithFrame:FiveHourDiamondFrameForBar(DetailGaugeRect(c))];
+        diamond.fraction = fiveFrac;
+        diamond.color = [self aiSnapshotStaleWarns:u] ? NSColor.systemOrangeColor : AIQuotaColor(fiveFrac);
+        diamond.accessibilityIdentifier = [stem stringByAppendingString:@".5h"];
+        diamond.accessibilityLabel = [NSString stringWithFormat:@"%@ 5-hour window remaining", name];
+        diamond.accessibilityHelp = [@"5h · " stringByAppendingString:AIQuotaValueTip(fiveFrac, fiveTokens, fiveReset)];
+        [row addSubview:diamond];
     }
     NSTextField *value = [self detailValue:pct color:valueColor
                                 identifier:[stem stringByAppendingString:@".value"] tip:named in:row cols:c];
