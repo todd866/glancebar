@@ -633,6 +633,42 @@ class OtrConnectorTests(unittest.TestCase):
         self.assertEqual(rh["content-type"], "image/jpeg")
         self.assertEqual(body, b"\xff\xd8\xff\xe0ATJPEG")
 
+    def test_audio_aac_transcode_caching_and_lossless_bypass(self):
+        # Large ALAC .m4a (> 8 MB) triggers transcoder once for ?q=aac, caches result, and bypasses for lossless
+        big_src = self.hot / "AM-Lossless" / "Artist One" / "Album A" / "07. Big Lossless.m4a"
+        big_src.write_bytes(b"ALAC-DATA" * (1_000_000))  # ~9 MB
+        self.server.index.reload()
+        rec = next(t for t in self.server.index.tracks if t.title == "Big Lossless")
+
+        calls = []
+        aac_payload = b"ftypM4A-256K-AAC" * 100
+
+        def fake_transcoder(src, dst):
+            calls.append((src, dst))
+            dst.write_bytes(aac_payload)
+            return True
+
+        self.server.aac_transcoder = fake_transcoder
+        hdrs = {"Authorization": f"Bearer {self.password}"}
+
+        # First ?q=aac call transcodes and caches
+        st, rh, body = self._req("GET", f"/api/audio/{rec.s}?q=aac", headers=hdrs)
+        self.assertEqual(st, 200)
+        self.assertEqual(rh["content-type"], "audio/mp4")
+        self.assertEqual(body, aac_payload)
+        self.assertEqual(len(calls), 1)
+
+        # Second ?q=aac call + Range hits cache (no second transcode)
+        st, rh, body = self._req("GET", f"/api/audio/{rec.s}?q=aac", headers={**hdrs, "Range": "bytes=0-15"})
+        self.assertEqual(st, 206)
+        self.assertEqual(body, aac_payload[:16])
+        self.assertEqual(len(calls), 1)
+
+        # Omitted query or ?q=lossless serves original file directly
+        st, rh, _ = self._req("HEAD", f"/api/audio/{rec.s}?q=lossless", headers=hdrs)
+        self.assertEqual(st, 200)
+        self.assertEqual(int(rh["content-length"]), big_src.stat().st_size)
+
 
 if __name__ == "__main__":
     unittest.main()

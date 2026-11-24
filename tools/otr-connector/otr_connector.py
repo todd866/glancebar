@@ -1230,6 +1230,22 @@ def _detect_tailscale_login(
         return ""
 
 
+def default_aac_transcoder(src: Path, dst: Path) -> bool:
+    """Transcode lossless audio to 256 kbps AAC .m4a using macOS afconvert."""
+    afconvert = "/usr/bin/afconvert" if os.path.isfile("/usr/bin/afconvert") else shutil.which("afconvert")
+    if not afconvert:
+        return False
+    try:
+        res = subprocess.run(
+            [afconvert, "-f", "m4af", "-d", "aac", "-b", "256000", str(src), str(dst)],
+            capture_output=True,
+            timeout=60,
+        )
+        return res.returncode == 0 and dst.is_file() and dst.stat().st_size > 1024
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1249,6 +1265,8 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         offline: bool,
         command_runner: Callable[[List[str], str], None],
         trusted_tailscale_user: str = "",
+        aac_cache_dir: Optional[Path] = None,
+        aac_transcoder: Optional[Callable[[Path, Path], bool]] = None,
     ) -> None:
         super().__init__(server_address, RequestHandlerClass)
         self.server_name = server_name
@@ -1261,6 +1279,8 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.offline = offline
         self.command_runner = command_runner
         self.trusted_tailscale_user = trusted_tailscale_user.strip().lower()
+        self.aac_cache_dir = aac_cache_dir or (mix_dir / "aac-cache")
+        self.aac_transcoder = aac_transcoder if aac_transcoder is not None else default_aac_transcoder
 
         self.auth_lock = threading.Lock()
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -1269,9 +1289,42 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.feedback_lock = threading.Lock()
         self.art_cache_lock = threading.Lock()
         self._art_cache: OrderedDict[str, Tuple[bytes, str]] = OrderedDict()
+        self.aac_locks_lock = threading.Lock()
+        self.aac_locks: Dict[str, threading.Lock] = {}
         self.lens_lock = threading.Lock()
         self._lenses_cache: List[Dict[str, Any]] = []
         self._lenses_fetched_at: float = 0.0
+
+    def get_aac_audio(self, rec: TrackRecord) -> Path:
+        try:
+            src_stat = rec.path.stat()
+        except OSError:
+            return rec.path
+        ext = rec.path.suffix.lower()
+        if ext in (".mp3", ".aac", ".ogg"):
+            return rec.path
+        if ext in (".m4a", ".mp4", ".m4b") and src_stat.st_size <= 8 * 1024 * 1024:
+            return rec.path
+        with self.aac_locks_lock:
+            track_lock = self.aac_locks.setdefault(rec.s, threading.Lock())
+        target = self.aac_cache_dir / f"{rec.s}.m4a"
+        with track_lock:
+            try:
+                if target.is_file():
+                    tstat = target.stat()
+                    if tstat.st_mtime >= src_stat.st_mtime and tstat.st_size > 1024:
+                        return target
+                self.aac_cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp = self.aac_cache_dir / f"{rec.s}.{os.getpid()}.{threading.get_ident()}.tmp.m4a"
+                ok = self.aac_transcoder(rec.path, tmp)
+                if ok and tmp.is_file() and tmp.stat().st_size > 1024:
+                    os.replace(tmp, target)
+                    return target
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        return rec.path
 
     def get_embedded_art(self, rec: TrackRecord) -> Optional[Tuple[bytes, str]]:
         if not rec.has_embedded_art:
@@ -1758,13 +1811,16 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
         if rec is None or not rec.path.is_file():
             self._send_json(404, {"error": "not_found"}, head_only=head_only)
             return
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        quality = (qs.get("q") or [""])[0].strip().lower()
+        serve_path = self.server.get_aac_audio(rec) if quality == "aac" else rec.path
         try:
-            total = rec.path.stat().st_size
+            total = serve_path.stat().st_size
         except OSError:
             self._send_json(404, {"error": "not_found"}, head_only=head_only)
             return
-        ext = rec.path.suffix.lower()
-        ctype = AUDIO_MIME.get(ext) or mimetypes.guess_type(rec.path.name)[0] or "application/octet-stream"
+        ext = serve_path.suffix.lower()
+        ctype = AUDIO_MIME.get(ext) or mimetypes.guess_type(serve_path.name)[0] or "application/octet-stream"
 
         range_hdr = self.headers.get("Range")
         if range_hdr:
@@ -1796,7 +1852,7 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
         if head_only or length == 0:
             return
         try:
-            with open(rec.path, "rb") as fh:
+            with open(serve_path, "rb") as fh:
                 fh.seek(start)
                 remaining = length
                 while remaining > 0:
@@ -1948,6 +2004,8 @@ def create_server(
     tailscale_auth: bool = True,
     tailscale_user: Optional[str] = None,
     command_runner: Optional[Callable[[List[str], str], None]] = None,
+    aac_cache_dir: Optional[Path] = None,
+    aac_transcoder: Optional[Callable[[Path, Path], bool]] = None,
 ) -> OtrHTTPServer:
     resolved_mix = Path(mix_dir or "~/Library/Application Support/Glancebar/mix").expanduser()
     resolved_hot = Path(hot_dir or "~/Music/Glancebar Lossless").expanduser()
@@ -1955,6 +2013,7 @@ def create_server(
     resolved_hearts = Path(hearts_path or "~/.local/state/selector/hearts.json").expanduser()
     resolved_state = Path(state_dir or "~/.local/state/glancebar-otr").expanduser()
     resolved_pass_file = Path(pass_file).expanduser() if pass_file is not None else None
+    resolved_aac_cache = Path(aac_cache_dir).expanduser() if aac_cache_dir is not None else (resolved_state / "aac-cache")
 
     secret = load_or_create_passphrase(passphrase, resolved_pass_file, resolved_state)
     trusted_ts = _detect_tailscale_login(tailscale_user, offline=offline) if tailscale_auth else ""
@@ -1973,6 +2032,8 @@ def create_server(
         offline=offline,
         command_runner=runner,
         trusted_tailscale_user=trusted_ts,
+        aac_cache_dir=resolved_aac_cache,
+        aac_transcoder=aac_transcoder,
     )
 
 
