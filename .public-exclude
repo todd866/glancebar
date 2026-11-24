@@ -4,6 +4,8 @@ tools/music-embed/*.plist
 tools/music-scout/*.plist
 tools/music-store/*.plist
 tools/radio-sync/*.plist
+tools/otr-connector/*.plist
+tools/otr-connector/__pycache__
 Tests/test_mixpool.py
 tools/music-sync/__pycache__
 shots

@@ -89,10 +89,6 @@ class Pull(Base):
         self.assertFalse(any(l['trackID'] == 'z|unmatched' for l in self.feedback()))
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class AliasLookup(unittest.TestCase):
     """Events are named by sha through music/ids.json; unresolved ones fall back to artist+title."""
     def test_resolve_by_library_id_then_key(self):
@@ -135,3 +131,92 @@ class TasteLog(Base):
         self.assertEqual(sorted((e['kind'], e.get('sha', '')[:1]) for e in evs),
                          [('early-skip', 'd'), ('heart', 'c'), ('like', 'c')])
         self.assertTrue(all(e['listener'] == 'ian' and e['app'] == 'glancebar' for e in evs))
+
+
+class OtrFallbackTests(Base):
+    def test_config_respects_legacy_and_otr_backend(self):
+        cfg = Path(self.tmp.name) / 'radio.json'
+        with mock.patch.object(rs, 'CONFIG', cfg):
+            self.assertIsNone(rs._remote_config())
+            with self.assertRaises(SystemExit):
+                rs.config()
+
+            cfg.write_text(json.dumps({'url': 'https://example.com', 'token': 'tok'}))
+            self.assertEqual(rs.config()['token'], 'tok')
+
+            cfg.write_text(json.dumps({'url': 'https://example.com', 'token': 'tok', 'backend': 'otr'}))
+            self.assertIsNone(rs._remote_config())
+            with self.assertRaises(SystemExit):
+                rs.config()
+
+    def test_otr_moods_and_sync_without_radio_json(self):
+        cfg = Path(self.tmp.name) / 'missing-radio.json'
+        fake_resp = mock.MagicMock()
+        fake_resp.__enter__.return_value = fake_resp
+        fake_resp.read.return_value = json.dumps({
+            'lenses': [{'id': 'late-night', 'name': 'Late Night', 'kinds': ['chill']}]
+        }).encode()
+        with mock.patch.object(rs, 'CONFIG', cfg), \
+                mock.patch.object(rs, 'log_taste', return_value={'written': 0}), \
+                mock.patch('urllib.request.urlopen', return_value=fake_resp):
+            rc = rs.cmd_sync()
+        self.assertEqual(rc, 0)
+        moods_doc = json.loads((self.state / 'moods.json').read_text())
+        self.assertEqual([m['id'] for m in moods_doc['moods']], ['dance', 'alt', 'rap', 'chill', 'new', 'all'])
+        self.assertEqual(moods_doc['stations'][0]['id'], 'station:late-night')
+        status_doc = json.loads((self.state / 'status.json').read_text())
+        self.assertTrue(status_doc['ok'])
+        self.assertEqual(status_doc['mode'], 'otr')
+
+    def test_local_otr_queue_and_cmd_queue(self):
+        root = Path(self.tmp.name)
+        hot = root / 'hot'
+        f1 = hot / 'AM-Lossless' / 'Artist A' / 'Album A' / '01. Song A.m4a'
+        f1.parent.mkdir(parents=True)
+        f1.write_bytes(b'audio')
+        f2 = hot / 'AM-Lossless' / 'Artist B' / 'Album B' / '02. Song B.m4a'
+        f2.parent.mkdir(parents=True)
+        f2.write_bytes(b'audio')
+
+        (self.mix / 'offline-manifest.json').write_text(json.dumps({
+            'playlists': [{
+                'key': 'kind:dance',
+                'tracks': [
+                    {'id': 'aaa1', 'sha256': 'a' * 64, 'title': 'Song A', 'artist': 'Artist A', 'album': 'Album A', 'path': str(f1)},
+                    {'id': 'bbb2', 'sha256': 'b' * 64, 'title': 'Song B', 'artist': 'Artist B', 'album': 'Album B', 'path': str(f2)},
+                    {'id': 'ccc3', 'sha256': 'c' * 64, 'title': 'Bad Song', 'artist': 'Artist C', 'album': 'Album C', 'path': str(hot / 'missing.m4a')},
+                ],
+            }]
+        }))
+        (self.mix / 'library.json').write_text(json.dumps({
+            'tracks': [
+                {'id': 'aaa1', 'artist': 'Artist A', 'title': 'Song A', 'fav': 0, 'dislike': 0, 'genre': 'Alt'},
+                {'id': 'bbb2', 'artist': 'Artist B', 'title': 'Song B', 'fav': 1, 'dislike': 0, 'genre': 'Dance'},
+                {'id': 'ccc3', 'artist': 'Artist C', 'title': 'Bad Song', 'fav': 0, 'dislike': 1, 'genre': 'Dance'},
+            ]
+        }))
+        (self.mix / 'music-space.json').write_text(json.dumps({
+            'kindNeighbours': {'dance': ['alt', 'rap', 'chill']},
+            'tracks': {
+                'aaa1': {'kind': 'alt', 'kindScore': 0.8, 'next': []},
+                'bbb2': {'kind': 'dance', 'kindScore': 0.95, 'next': [['aaa1', 0.9]]},
+            }
+        }))
+
+        cfg = root / 'missing-radio.json'
+        lib_cfg = root / 'lib-cfg.json'
+        lib_cfg.write_text(json.dumps({'hot_dir': str(hot)}))
+        with mock.patch.object(rs, 'CONFIG', cfg), mock.patch.object(rs, 'LIB_CONFIG', lib_cfg):
+            rc = rs.cmd_queue('dance')
+        self.assertEqual(rc, 0)
+        station = json.loads((self.state / 'station.json').read_text())
+        self.assertEqual(station['source'], 'otr-local')
+        self.assertEqual(station['mood'], 'dance')
+        tracks = station['tracks']
+        self.assertEqual([t['title'] for t in tracks], ['Song B', 'Song A'])
+        self.assertTrue(all(t['local'] for t in tracks))
+        self.assertEqual(tracks[0]['catalogue_relative_path'], 'AM-Lossless/Artist B/Album B/02. Song B.m4a')
+
+
+if __name__ == '__main__':
+    unittest.main()

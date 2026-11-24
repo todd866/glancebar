@@ -5148,16 +5148,16 @@ static NSImage *SixianTileImage(CGFloat side) {
     NSImage *image = [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect rect) {
         NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:kTileCornerRadius yRadius:kTileCornerRadius];
         [clip addClip];
-        // Studio midnight slate surface with crisp white 6IAN callsign + warm broadcast bar.
+        // Studio midnight slate surface with crisp white OtR callsign + warm broadcast bar.
         [[NSColor colorWithCalibratedRed:0.12 green:0.16 blue:0.24 alpha:1] setFill];
         NSRectFill(rect);
         NSFont *font = [NSFont monospacedDigitSystemFontOfSize:round(side * 0.27) weight:NSFontWeightBold];
         NSDictionary *attrs = @{NSFontAttributeName: font,
                                 NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.95],
                                 NSKernAttributeName: @(-0.3)};
-        NSSize sz = [@"6IAN" sizeWithAttributes:attrs];
+        NSSize sz = [@"OtR" sizeWithAttributes:attrs];
         CGFloat textY = (rect.size.height - sz.height) / 2.0 + 2.5;
-        [@"6IAN" drawAtPoint:NSMakePoint((rect.size.width - sz.width) / 2.0, textY) withAttributes:attrs];
+        [@"OtR" drawAtPoint:NSMakePoint((rect.size.width - sz.width) / 2.0, textY) withAttributes:attrs];
         CGFloat barW = round(side * 0.34), barH = 2.5;
         NSRect bar = NSMakeRect((rect.size.width - barW) / 2.0, textY - 4.5, barW, barH);
         [[NSColor colorWithCalibratedRed:0.96 green:0.45 blue:0.12 alpha:1] setFill];
@@ -9762,14 +9762,14 @@ static NSString *const kShowMixKey = @"show:episode";
     _radioMood = mood;
     _radioMoodLabel = [self radioLabelFor:mood];
     [self bindRadioManifestImmediate:tracks];
-    [self setOfflineRequest:kRadioStationKey title:[@"6IAN · " stringByAppendingString:_radioMoodLabel] tracks:tracks];
+    [self setOfflineRequest:kRadioStationKey title:[@"OtR · " stringByAppendingString:_radioMoodLabel] tracks:tracks];
     return YES;
 }
 - (NSString *)radioLabelFor:(NSString *)mood {
     [self ensureRadioMoods];
     for (NSDictionary *r in [_radioMoods arrayByAddingObjectsFromArray:_radioStations ?: @[]])
         if ([r[@"id"] isEqual:mood]) return r[@"label"];
-    return mood.length ? mood : @"6IAN";
+    return mood.length ? mood : @"OtR";
 }
 - (NSString *)radioHelper {
     return [NSBundle.mainBundle pathForResource:@"radio_sync" ofType:@"py"];
@@ -9865,6 +9865,14 @@ static NSString *const kShowMixKey = @"show:episode";
     [self playbackCause:@"click"];
     [self playRadio:mood];
 }
+- (IBAction)openOntoTheRadio:(id)sender {
+    (void)sender;
+    NSURL *appURL = [NSURL fileURLWithPath:@"/Applications/Onto the Radio.app"];
+    if (![NSFileManager.defaultManager fileExistsAtPath:appURL.path]) return;
+    [NSWorkspace.sharedWorkspace openApplicationAtURL:appURL
+                                        configuration:[NSWorkspaceOpenConfiguration configuration]
+                                    completionHandler:^(__unused NSRunningApplication *app, __unused NSError *err) {}];
+}
 - (NSMenu *)radioMenu {
     [self ensureRadioMoods];
     NSMenu *menu = [NSMenu new]; menu.autoenablesItems = NO;
@@ -9883,6 +9891,12 @@ static NSString *const kShowMixKey = @"show:episode";
     if (!menu.numberOfItems) {
         NSMenuItem *none = [menu addItemWithTitle:@"No radio list yet (radio-sync has not run)" action:nil keyEquivalent:@""];
         none.enabled = NO;
+    }
+    if ([[NSBundle mainBundle].bundleIdentifier isEqual:@"com.iantodd.glancebar"] &&
+        [[NSFileManager defaultManager] fileExistsAtPath:@"/Applications/Onto the Radio.app"]) {
+        [menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem *openItem = [menu addItemWithTitle:@"Open Onto the Radio" action:@selector(openOntoTheRadio:) keyEquivalent:@""];
+        openItem.target = self;
     }
     return menu;
 }
@@ -11795,8 +11809,8 @@ static NSDictionary *LoveResultJSON(NSString *stdoutText) {
         NSImageView *source = [NSImageView imageViewWithImage:sym];
         source.imageScaling = NSImageScaleProportionallyDown;
         source.frame = NSMakeRect(textRight - 22, (kSoundH - 20) / 2.0, 20, 20);
-        NSString *where = [radioNow[@"surface"] isEqual:@"tv"] ? @"Playing on the TV (6IAN)"
-            : ([radioNow[@"surface"] isEqual:@"mac"] ? @"Playing on a Mac (6IAN)" : @"Playing in the browser (6IAN)");
+        NSString *where = [radioNow[@"surface"] isEqual:@"tv"] ? @"Playing on the TV (OtR)"
+            : ([radioNow[@"surface"] isEqual:@"mac"] ? @"Playing on a Mac (OtR)" : @"Playing on Onto the Radio");
         source.accessibilityIdentifier = @"popover.music.radionow.surface";
         source.accessibilityLabel = where;
         source.accessibilityHelp = where;
@@ -12480,8 +12494,8 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         for (NSDictionary *r in [_radioMoods arrayByAddingObjectsFromArray:_radioStations])
             if ([r[@"id"] isEqual:_radioMood]) { moodLabel = r[@"label"]; break; }
         NSString *tip = moodLabel.length
-            ? [NSString stringWithFormat:@"6IAN personal radio - %@", moodLabel]
-            : @"6IAN personal radio";
+            ? [NSString stringWithFormat:@"Onto the Radio - %@", moodLabel]
+            : @"Onto the Radio";
         six.accessibilityLabel = tip;
         if ([_mixPlayingKey isEqual:kRadioStationKey]) {
             six.layer.borderWidth = 2;
@@ -12489,7 +12503,7 @@ static NSAttributedString *HeatTempsReadoutFitted(double chipC, NSColor *chipCol
         }
         [line addSubview:six];
         CGFloat capW = side + gap, capX = x - gap / 2.0;
-        NSArray *captions = @[ moodLabel.length ? moodLabel : @"6IAN" ];
+        NSArray *captions = @[ moodLabel.length ? moodLabel : @"OtR" ];
         for (NSUInteger l = 0; l < captions.count; l++) {
             NSTextField *cap = [GBRecoverableTextField labelWithString:@""];
             cap.textColor = l ? NSColor.secondaryLabelColor : NSColor.labelColor;

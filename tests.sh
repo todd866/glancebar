@@ -14,6 +14,7 @@ cd "${0:A:h}"
 /usr/bin/python3 -m unittest discover -s tools/radio-sync -v
 /usr/bin/python3 -m unittest discover -s tools/music-store -v
 /usr/bin/python3 -m unittest discover -s tools/music-remote -v
+/usr/bin/python3 -m unittest discover -s tools/otr-connector -v
 
 CC="${CC:-$(xcrun --find clang)}"
 SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"

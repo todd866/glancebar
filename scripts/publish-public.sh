@@ -286,6 +286,7 @@ zsh -n "$EXPORT/build.sh"
 zsh -n "$EXPORT/tests.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$EXPORT/tools/music-sync" -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$EXPORT/tools/music-remote" -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$EXPORT/tools/otr-connector" -v
 echo "Gate 6 PASS"
 
 echo "==> Staging into $PUBLIC_DIR"

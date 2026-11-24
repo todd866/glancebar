@@ -33,6 +33,23 @@ HEARTS = Path(os.environ.get('GLANCEBAR_HEARTS', HOME / '.local/state/selector/h
 EARLY = 0.4          # a Next before 40% of the song is an early skip (the scout's rule)
 SOURCE = '6ian'      # lines this tool writes into Glancebar's feedback carry this, so they never echo back
 UA = 'glancebar-radio-sync/1.0'
+MANIFOLD_HUB = os.environ.get('MANIFOLD_HUB', 'https://manifold-chi.vercel.app')
+OTR_MOODS = [
+    {'id': 'dance', 'label': 'Dance'},
+    {'id': 'alt', 'label': 'Alt'},
+    {'id': 'rap', 'label': 'Rap'},
+    {'id': 'chill', 'label': 'Chill'},
+    {'id': 'new', 'label': 'New music'},
+    {'id': 'all', 'label': 'All Lossless'},
+]
+OTR_MOOD_ALIASES = {
+    'dance': 'dance', 'energise': 'dance', 'energize': 'dance', 'workout': 'dance', 'party': 'dance',
+    'alt': 'alt', 'alternative': 'alt', 'drive': 'alt', 'heavy': 'alt', 'rock': 'alt', 'indie': 'alt',
+    'rap': 'rap', 'hiphop': 'rap', 'hip-hop': 'rap', 'hip hop': 'rap',
+    'chill': 'chill', 'focus': 'chill', 'ambient': 'chill', 'calm': 'chill',
+    'new': 'new', 'new music': 'new', 'new-music': 'new', 'triplej': 'new',
+    'all': 'all', 'all lossless': 'all', 'all-lossless': 'all', 'any': 'all',
+}
 
 
 def music_store():
@@ -164,9 +181,18 @@ def atomic_write(p, doc):
     os.replace(tmp, p)
 
 
-def config():
+def _remote_config():
     c = load_json(CONFIG, None)
-    if not c or not c.get('url') or not c.get('token'):
+    if not isinstance(c, dict) or c.get('backend') == 'otr':
+        return None
+    if c.get('url') and c.get('token'):
+        return c
+    return None
+
+
+def config():
+    c = _remote_config()
+    if not c:
         raise SystemExit(f'radio-sync: no device token in {CONFIG}')
     return c
 
@@ -318,39 +344,83 @@ def hot_requests(taste):
     return len(tracks)
 
 
+def _otr_moods(hub_url=None, offline=False):
+    """Glancebar kinds plus best-effort Manifold radio lenses."""
+    cfg = load_json(CONFIG, {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    hub = (hub_url or cfg.get('manifold_hub') or MANIFOLD_HUB or '').rstrip('/')
+    stations = []
+    if not offline and hub:
+        try:
+            req = urllib.request.Request(
+                f'{hub}/api/v1/lenses?domain=radio',
+                headers={'accept': 'application/json', 'user-agent': UA},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = json.loads(resp.read().decode('utf-8', errors='replace') or 'null')
+            items = raw.get('lenses') if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                lid = str(item.get('id') or item.get('slug') or '').strip()
+                label = str(item.get('name') or item.get('title') or lid).strip()
+                if not lid or not label:
+                    continue
+                sid = lid if lid.startswith('station:') else f'station:{lid}'
+                entry = {'id': sid, 'label': label}
+                for key in ('kinds', 'genres', 'tags'):
+                    if isinstance(item.get(key), list):
+                        entry[key] = [str(v) for v in item[key] if isinstance(v, str)]
+                stations.append(entry)
+        except (urllib.error.URLError, OSError, ValueError):
+            stations = []
+    return {'moods': list(OTR_MOODS), 'stations': stations}
+
+
 def cmd_sync():
-    c = config()
+    c = _remote_config()
     cur = load_json(STATE / 'cursor.json', {})
     applied = load_json(STATE / 'applied.json', {})
     out = {'at': now_iso(), 'ok': False}
-    try:
-        evs = glancebar_events(cur)
-        out['resolved'] = resolve_events(evs)
-        sent = unmatched = 0
-        for i in range(0, len(evs), 400):
-            r = api(c, 'POST', '/api/device/signals', {'events': evs[i:i + 400]})
-            sent += r.get('applied', 0)
-            unmatched += len(r.get('unmatched') or [])
-        own = load_json(STATE / 'own.json', {})
-        for e in evs:  # Glancebar's own marks: never written back into its feedback by this tool
-            key = track_key(e['artist'], e['title'])
-            if not key:
-                continue
-            if e['ev'] in ('like', 'dislike'):
-                own[f"{e['ev']}s:{key}"] = now_iso()
-            if e['ev'] in ('unlike', 'undislike'):
-                own.pop(f"{e['ev'][2:]}s:{key}", None)
-        taste = api(c, 'GET', '/api/device/taste')
-        written = apply_radio_taste(taste, applied, own)
-        hot = hot_requests(taste)
-        moods = api(c, 'GET', '/api/device/moods')
-        atomic_write(STATE / 'moods.json', {'at': now_iso(), 'moods': moods.get('moods') or [], 'stations': moods.get('stations') or []})
-        atomic_write(STATE / 'cursor.json', cur)
-        atomic_write(STATE / 'applied.json', applied)
-        atomic_write(STATE / 'own.json', own)
-        out.update(ok=True, sent=sent, unmatched=unmatched, pulled=written, likes=len(taste.get('likes') or []), dislikes=len(taste.get('dislikes') or []), hot=hot)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        out['error'] = str(exc)[:200]
+    if c is None:
+        try:
+            cfg = load_json(CONFIG, {})
+            offline = bool(cfg.get('offline')) if isinstance(cfg, dict) else False
+            moods = _otr_moods(offline=offline)
+            atomic_write(STATE / 'moods.json', {'at': now_iso(), 'moods': moods.get('moods') or [], 'stations': moods.get('stations') or []})
+            out.update(ok=True, mode='otr', moods=len(moods.get('moods') or []), stations=len(moods.get('stations') or []))
+        except (OSError, ValueError) as exc:
+            out['error'] = str(exc)[:200]
+    else:
+        try:
+            evs = glancebar_events(cur)
+            out['resolved'] = resolve_events(evs)
+            sent = unmatched = 0
+            for i in range(0, len(evs), 400):
+                r = api(c, 'POST', '/api/device/signals', {'events': evs[i:i + 400]})
+                sent += r.get('applied', 0)
+                unmatched += len(r.get('unmatched') or [])
+            own = load_json(STATE / 'own.json', {})
+            for e in evs:  # Glancebar's own marks: never written back into its feedback by this tool
+                key = track_key(e['artist'], e['title'])
+                if not key:
+                    continue
+                if e['ev'] in ('like', 'dislike'):
+                    own[f"{e['ev']}s:{key}"] = now_iso()
+                if e['ev'] in ('unlike', 'undislike'):
+                    own.pop(f"{e['ev'][2:]}s:{key}", None)
+            taste = api(c, 'GET', '/api/device/taste')
+            written = apply_radio_taste(taste, applied, own)
+            hot = hot_requests(taste)
+            moods = api(c, 'GET', '/api/device/moods')
+            atomic_write(STATE / 'moods.json', {'at': now_iso(), 'moods': moods.get('moods') or [], 'stations': moods.get('stations') or []})
+            atomic_write(STATE / 'cursor.json', cur)
+            atomic_write(STATE / 'applied.json', applied)
+            atomic_write(STATE / 'own.json', own)
+            out.update(ok=True, sent=sent, unmatched=unmatched, pulled=written, likes=len(taste.get('likes') or []), dislikes=len(taste.get('dislikes') or []), hot=hot)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            out['error'] = str(exc)[:200]
     try:  # the taste log does not depend on the radio being reachable
         out['taste'] = log_taste()
     except (OSError, ValueError) as exc:
@@ -445,29 +515,229 @@ def local_queue(mood, *, n=40, space_dir=None, store_dir=None, listener=None, cl
         pf.unlink(missing_ok=True)
 
 
+def _local_otr_queue(mood, *, n=40, mix_dir=None, hot_dir=None):
+    """Build a ranked local queue directly from offline-manifest.json and music-space.json."""
+    mix = Path(mix_dir) if mix_dir else MIX
+    manifest = load_json(mix / 'offline-manifest.json', {})
+    playlists = manifest.get('playlists') if isinstance(manifest, dict) else []
+    if not playlists:
+        return None
+    if hot_dir is not None:
+        hot_root = Path(hot_dir)
+    else:
+        cfg = load_json(LIB_CONFIG, {})
+        hot_root = Path(os.path.expanduser((cfg or {}).get('hot_dir', '~/Music/Glancebar Lossless')))
+    hot_prefix = str(hot_root).rstrip('/') + '/'
+    try:
+        hot_resolved_prefix = str(hot_root.resolve()).rstrip('/') + '/'
+    except OSError:
+        hot_resolved_prefix = hot_prefix
+
+    lib_rows = load_json(mix / 'library.json', {}).get('tracks') or []
+    lib_by_id = {r.get('id'): r for r in lib_rows if isinstance(r, dict) and r.get('id')}
+    lib_by_key = {track_key(r.get('artist'), r.get('title')): r for r in lib_rows
+                  if isinstance(r, dict) and track_key(r.get('artist'), r.get('title'))}
+
+    space = load_json(mix / 'music-space.json', {})
+    sp_tracks = space.get('tracks') if isinstance(space, dict) else {}
+    if not isinstance(sp_tracks, dict):
+        sp_tracks = {}
+    kind_neighbours = space.get('kindNeighbours') if isinstance(space, dict) else {}
+    if not isinstance(kind_neighbours, dict):
+        kind_neighbours = {}
+
+    liked_ids, disliked_ids = set(), set()
+    fb_path = mix / 'feedback.jsonl'
+    if fb_path.is_file():
+        lines, _ = read_lines(fb_path, 0)
+        for o in lines:
+            tid = str(o.get('trackID') or '').strip()
+            tkey = str(o.get('track_key') or track_key(o.get('artist'), o.get('title')) or '').strip()
+            ev = str(o.get('event') or '').strip().lower()
+            if not ev:
+                ev = 'like' if o.get('liked') is True else ('unlike' if o.get('liked') is False else '')
+            for k in (x for x in (tid, tkey) if x):
+                if ev == 'like':
+                    liked_ids.add(k); disliked_ids.discard(k)
+                elif ev == 'unlike':
+                    liked_ids.discard(k)
+                elif ev == 'dislike':
+                    disliked_ids.add(k); liked_ids.discard(k)
+                elif ev == 'undislike':
+                    disliked_ids.discard(k)
+
+    raw_mood = (mood or 'all').strip()
+    mood_key = raw_mood[8:] if raw_mood.lower().startswith('station:') else raw_mood
+    target_kind = OTR_MOOD_ALIASES.get(mood_key.lower(), mood_key.lower())
+
+    lens_meta = None
+    cached_moods = load_json(STATE / 'moods.json', {})
+    for st in (cached_moods.get('stations') or []):
+        if isinstance(st, dict) and st.get('id') in (raw_mood, f'station:{mood_key}'):
+            lens_meta = st
+            break
+
+    candidates = {}
+    for pl in playlists:
+        if not isinstance(pl, dict):
+            continue
+        pl_key = str(pl.get('key') or '').lower()
+        is_new_pl = pl_key in ('station:triplej', 'new-music') or 'new' in pl_key
+        fb_kind = pl_key.split(':', 1)[1] if pl_key.startswith('kind:') else None
+        for t in pl.get('tracks') or []:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get('id') or '').strip()
+            sha = str(t.get('sha256') or '').strip()
+            artist = str(t.get('artist') or '').strip()
+            title = str(t.get('title') or '').strip()
+            tkey = track_key(artist, title) or ''
+            dedup = tid or sha or tkey
+            if not dedup:
+                continue
+            if dedup in candidates:
+                if is_new_pl:
+                    candidates[dedup]['is_new'] = True
+                continue
+            path_str = str(t.get('path') or '').strip()
+            rel = ''
+            if path_str.startswith(hot_prefix):
+                rel = path_str[len(hot_prefix):]
+            elif path_str.startswith(hot_resolved_prefix):
+                rel = path_str[len(hot_resolved_prefix):]
+            local = bool((path_str and Path(path_str).is_file()) or (rel and (hot_root / rel).is_file()))
+            lib = lib_by_id.get(tid) or (lib_by_key.get(tkey) if tkey else None) or {}
+            sp = sp_tracks.get(tid) or {}
+            if not isinstance(sp, dict):
+                sp = {}
+            if tid in disliked_ids or tkey in disliked_ids or (lib.get('dislike') and tid not in liked_ids and tkey not in liked_ids):
+                continue
+            candidates[dedup] = {
+                'dedup': dedup, 'tid': tid, 'sha': sha, 'tkey': tkey,
+                'artist': artist, 'title': title, 'album': str(t.get('album') or lib.get('album') or ''),
+                'dur': t.get('duration') or lib.get('duration'),
+                'rel': rel, 'local': local,
+                'fav': bool(lib.get('fav') or tid in liked_ids or tkey in liked_ids),
+                'genre': str(lib.get('genre') or ''),
+                'year': lib.get('year'),
+                'kind': str(sp.get('kind') or fb_kind or '').lower(),
+                'kind_score': float(sp['kindScore']) if isinstance(sp.get('kindScore'), (int, float)) else 0.6,
+                'next': {str(x[0]): float(x[1]) for x in (sp.get('next') or []) if isinstance(x, (list, tuple)) and len(x) >= 2},
+                'is_new': is_new_pl,
+            }
+
+    if not candidates:
+        return None
+
+    neighbours = [str(k).lower() for k in (kind_neighbours.get(target_kind) or [])]
+
+    def _score(c):
+        sc = 0.0
+        if lens_meta:
+            lk = {str(x).lower() for x in (lens_meta.get('kinds') or [])}
+            lg = {str(x).lower() for x in (lens_meta.get('genres') or [])}
+            lt = {str(x).lower() for x in (lens_meta.get('tags') or [])}
+            if c['kind'] and c['kind'] in lk:
+                sc += 2.0 * c['kind_score']
+            if c['genre'] and any(w in c['genre'].lower() for w in (lg | lt)):
+                sc += 1.2
+        elif target_kind == 'all':
+            sc += 0.5 + 0.4 * c['kind_score']
+        elif target_kind == 'new':
+            sc += 2.2 if c['is_new'] else (1.0 if isinstance(c['year'], (int, float)) and c['year'] >= 2024 else 0.2)
+        else:
+            if c['kind'] == target_kind:
+                sc += 2.0 * c['kind_score'] + 0.5
+            elif c['kind'] in neighbours:
+                sc += (0.8 / (neighbours.index(c['kind']) + 1)) * c['kind_score']
+            elif c['genre'] and target_kind in c['genre'].lower():
+                sc += 1.0
+        if c['fav']:
+            sc += 0.6
+        if c['local']:
+            sc += 0.25
+        return sc
+
+    pool = list(candidates.values())
+    for c in pool:
+        c['score'] = _score(c)
+    pool.sort(key=lambda c: (-c['score'], c['dedup']))
+
+    chosen = [pool[0]]
+    used = {pool[0]['dedup']}
+    recent_artists = [pool[0]['artist'].lower()]
+    limit = max(1, min(n, len(pool)))
+    while len(chosen) < limit:
+        prev = chosen[-1]
+        best = None
+        best_val = -1e9
+        for cand in pool:
+            if cand['dedup'] in used:
+                continue
+            sim = prev['next'].get(cand['tid'], 0.0)
+            a = cand['artist'].lower()
+            pen = 0.8 if recent_artists and a == recent_artists[-1] else (0.3 if a in recent_artists[-3:] else 0.0)
+            val = 0.65 * cand['score'] + 0.35 * sim - pen
+            if val > best_val:
+                best_val = val
+                best = cand
+        if best is None:
+            break
+        chosen.append(best)
+        used.add(best['dedup'])
+        recent_artists.append(best['artist'].lower())
+
+    picks = []
+    for c in chosen:
+        chips = [c['kind'].capitalize() if c['kind'] else 'Lossless']
+        if c['fav']:
+            chips.append('Favorite')
+        elif c['genre']:
+            chips.append(c['genre'])
+        picks.append({
+            's': c['sha'] or c['tid'],
+            'a': c['artist'],
+            't': c['title'],
+            'al': c['album'],
+            'dur': c['dur'],
+            'key': c['rel'],
+            'local': c['local'],
+            'chips': chips,
+        })
+    return {'mood': mood, 'rule': {'label': 'OtR'}, 'source': 'otr-local', 'picks': picks}
+
+
 def cmd_queue(mood, offline=False):
     """A queue from the shared engine, written in the New music station's file format. Songs
-    already on this Mac go first so it starts at once; falls back to the local music-core engine
-    CLI automatically when offline or when 6IAN is unreachable."""
+    already on this Mac go first so it starts at once; falls back to local OtR manifest/space
+    or the local music-core engine CLI automatically when offline or without 6IAN."""
     r = None
     source = 'remote'
-    if not offline and CONFIG.exists():
+    c = None if offline else _remote_config()
+    if c is not None:
         try:
-            r = api(config(), 'POST', '/api/queue', {'mood': mood, 'n': 40, 'lossless': True})
+            r = api(c, 'POST', '/api/queue', {'mood': mood, 'n': 40, 'lossless': True})
         except (urllib.error.URLError, OSError, ValueError):
             r = None
-    if r is None:
+    if r is None and c is not None:
         r = local_queue(mood, n=40)
         source = 'local-engine'
     if r is None:
-        raise RuntimeError('queue unavailable: 6IAN unreachable and local music-core engine inputs missing')
+        r = _local_otr_queue(mood, n=40)
+        source = 'otr-local'
+    if r is None and c is None:
+        r = local_queue(mood, n=40)
+        source = 'local-engine'
+    if r is None:
+        raise RuntimeError('queue unavailable: no remote radio, local OtR manifest, or music-core engine inputs')
     picks = r.get('picks') or []
     rows = []
     for p in picks:
         rel = p.get('key') or ''
+        is_local = p['local'] if 'local' in p else local_rel_exists(rel)
         rows.append({'track_key': track_key(p.get('a'), p.get('t')) or p.get('s'), 'title': p.get('t', ''), 'artist': p.get('a', ''),
                      'album': p.get('al', ''), 'duration': p.get('dur'), 'sha256': p.get('s'), 'catalogue_relative_path': rel,
-                     'why': ' · '.join(p.get('chips') or []), 'local': local_rel_exists(rel)})
+                     'why': ' · '.join(p.get('chips') or []), 'local': is_local})
     rows.sort(key=lambda x: not x['local'])
     rows = rows[:20]
     doc = {'at': now_iso(), 'mood': mood, 'label': r.get('mood'), 'rule': (r.get('rule') or {}).get('label'), 'source': source, 'tracks': rows}
@@ -488,10 +758,13 @@ def store_facts(artist, title):
 
 def cmd_about(artist, title):
     shared = store_facts(artist, title)
-    if shared and not CONFIG.exists():  # no radio on this Mac: the shared record alone
-        print(json.dumps({'ok': True, 's': shared['sha'], 'store': shared}, ensure_ascii=False))
+    c = _remote_config()
+    if c is None:
+        if shared:
+            print(json.dumps({'ok': True, 's': shared['sha'], 'store': shared}, ensure_ascii=False))
+        else:
+            print(json.dumps({'ok': False, 'reason': 'no remote radio configured'}, ensure_ascii=False))
         return 0
-    c = config()
     try:
         s = api(c, 'GET', '/api/device/lookup?' + urllib.parse.urlencode({'artist': artist, 'title': title}))['s']
         about = api(c, 'GET', f'/api/info/{s}?kind=about')
