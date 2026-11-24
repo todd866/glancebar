@@ -1202,7 +1202,7 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
                         "title": t.title,
                         "sub": sub,
                         "artist": t.artist,
-                        "art": f"/api/art/{t.s}" if t.art_path else None,
+                        "art": t.art_path is not None,
                         "color": t.color,
                     }
                 )
@@ -1280,6 +1280,7 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
                     "mood": mood,
                     "created": time.time(),
                 }
+            heaviness_by_kind = {"dance": 0.58, "alt": 0.52, "rap": 0.65, "chill": 0.22, "new": 0.45}
             item: Dict[str, Any] = {
                 "s": rec.s,
                 "a": rec.artist,
@@ -1288,11 +1289,11 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
                 "y": rec.year,
                 "g": rec.genre,
                 "e": round(float(rec.kind_score if rec.kind_score is not None else 0.5), 3),
-                "h": self.server.index.is_liked(rec, self.server.hearts_path),
+                "h": heaviness_by_kind.get(rec.kind or "", 0.35),
                 "tag": tag,
                 "dur": rec.dur,
                 "color": rec.color,
-                "art": f"/api/art/{rec.s}" if rec.art_path else None,
+                "art": rec.art_path is not None,
                 "pt": pt,
             }
             if rec.x is not None:

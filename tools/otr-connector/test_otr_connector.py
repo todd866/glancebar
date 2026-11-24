@@ -319,6 +319,7 @@ class OtrConnectorTests(unittest.TestCase):
         self.assertEqual(len(song_tiles), 3)  # disliked Track Four excluded
         for tile in song_tiles:
             self.assertEqual(tile["kind"], "song")
+            self.assertIsInstance(tile["art"], bool)
             for k in ("s", "title", "sub", "artist", "art", "color"):
                 self.assertIn(k, tile)
 
@@ -340,10 +341,15 @@ class OtrConnectorTests(unittest.TestCase):
         self.assertEqual(len(picks), 3)
         # Favorite dance track 1111111111111111 ranks first and carries x/yy
         self.assertEqual(picks[0]["s"], "1111111111111111")
-        self.assertTrue(picks[0]["h"])
+        self.assertIsInstance(picks[0]["h"], float)
+        self.assertIsInstance(picks[0]["art"], bool)
+        self.assertTrue(picks[0]["art"])
         self.assertIn("x", picks[0])
         self.assertIn("yy", picks[0])
         for p in picks:
+            self.assertIsInstance(p["h"], (int, float))
+            self.assertNotIsInstance(p["h"], bool)
+            self.assertIsInstance(p["art"], bool)
             for req_key in ("s", "a", "t", "al", "y", "g", "e", "h", "tag", "dur", "color", "art", "pt"):
                 self.assertIn(req_key, p)
 
