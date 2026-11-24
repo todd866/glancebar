@@ -3,6 +3,7 @@ import http.server
 import json
 import os
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -13,12 +14,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import otr_connector as oc  # noqa: E402
 
 
+def _mp4_box(box_type: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), box_type) + payload
+
+
+def _build_m4a_with_cover(image_bytes: bytes, type_ind: int = 13) -> bytes:
+    data_box = _mp4_box(b"data", struct.pack(">II", type_ind, 0) + image_bytes)
+    covr_box = _mp4_box(b"covr", data_box)
+    ilst_box = _mp4_box(b"ilst", covr_box)
+    meta_box = _mp4_box(b"meta", b"\x00\x00\x00\x00" + ilst_box)
+    udta_box = _mp4_box(b"udta", meta_box)
+    moov_box = _mp4_box(b"moov", udta_box)
+    ftyp_box = _mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A mp42isom")
+    return ftyp_box + moov_box + b"\x00\x00\x00\x08mdat"
+
+
 class _MockHubHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
     def do_GET(self):
-        if self.path.startswith("/api/v1/lenses"):
+        if self.path.startswith("/api/v1/works"):
+            payload = {
+                "works": [
+                    {
+                        "workId": "mbid:test-anchor-ambient",
+                        "kind": "ambient · tape loops",
+                        "category": "electronic",
+                        "creator": "Brian Eno",
+                        "energy": 0.14,
+                        "heaviness": 0.12,
+                    }
+                ]
+            }
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/api/v1/lenses"):
             payload = {
                 "lenses": [
                     {
@@ -28,7 +63,13 @@ class _MockHubHandler(http.server.BaseHTTPRequestHandler):
                         "kinds": ["chill"],
                         "genres": ["Ambient"],
                         "tags": ["ambient", "night"],
-                    }
+                    },
+                    {
+                        "id": "lens:radio:anchor-wire",
+                        "name": "Anchor wire",
+                        "summary": "Tape-loop ambient and slow electronic nocturnes",
+                        "anchors": [{"workId": "mbid:test-anchor-ambient", "weight": 1.0}],
+                    },
                 ]
             }
             body = json.dumps(payload).encode("utf-8")
@@ -530,6 +571,67 @@ class OtrConnectorTests(unittest.TestCase):
             self.assertEqual(st, 401)
         finally:
             self.server.trusted_tailscale_user = prev
+
+    def test_coordinates_embedded_m4a_art_and_manifold_anchor_lens(self):
+        # Track 2 & Track 3 had no x/y in music-space.json -> synthesized deterministically in [-1, 1]
+        cookie = self._login_cookie()
+        st, _, data = self._req("GET", "/api/home", headers={"Cookie": cookie})
+        self.assertEqual(st, 200)
+        doc = json.loads(data)
+        shelves = {s["id"]: s for s in doc["shelves"]}
+        song_tiles = shelves["library"]["tiles"]
+        for tile in song_tiles:
+            self.assertIn("point", tile)
+            self.assertLessEqual(-1.0, tile["point"]["x"])
+            self.assertLessEqual(tile["point"]["x"], 1.0)
+            self.assertLessEqual(-1.0, tile["point"]["y"])
+            self.assertLessEqual(tile["point"]["y"], 1.0)
+            self.assertIn("e", tile)
+            self.assertIn("h", tile)
+
+        # Manifold anchor-derived lens (without explicit kinds/genres) matches chill/ambient track with count > 0
+        st_tiles = {t["station"]["id"]: t["station"] for t in shelves["stations"]["tiles"]}
+        self.assertGreater(st_tiles["lens:radio:anchor-wire"]["count"], 0)
+        st, _, qdata = self._req(
+            "POST",
+            "/api/queue",
+            {"mood": "lens:radio:anchor-wire", "n": 18},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(st, 200)
+        qpicks = json.loads(qdata)["picks"]
+        self.assertGreaterEqual(len(qpicks), 1)
+        self.assertEqual(qpicks[0]["t"], "Scanned Chill")
+
+        # Embedded M4A cover art extraction + artist|title mix/art lookup + /api/art serving
+        embedded_jpeg = b"\xff\xd8\xff\xe0" + b"EMBEDDED_COVER_DATA" * 4
+        m4a_path = self.hot / "AM-Lossless" / "Embedded Artist" / "05. Embedded Song.m4a"
+        m4a_path.parent.mkdir(parents=True, exist_ok=True)
+        m4a_path.write_bytes(_build_m4a_with_cover(embedded_jpeg, type_ind=13))
+
+        at_file = self.hot / "AM-Lossless" / "Trophy Wyfe" / "Single" / "06. Spiders.m4a"
+        at_file.parent.mkdir(parents=True, exist_ok=True)
+        at_file.write_bytes(b"NO-EMBEDDED-ART")
+        (self.mix / "art" / "trophy wyfe|spiders.jpg").write_bytes(b"\xff\xd8\xff\xe0ATJPEG")
+
+        self.server.index.reload()
+        emb_rec = next(t for t in self.server.index.tracks if t.title == "Embedded Song")
+        at_rec = next(t for t in self.server.index.tracks if t.title == "Spiders")
+        self.assertTrue(emb_rec.has_art)
+        self.assertIsNone(emb_rec.art_path)
+        self.assertTrue(emb_rec.has_embedded_art)
+        self.assertTrue(at_rec.has_art)
+
+        hdrs = {"Authorization": f"Bearer {self.password}"}
+        st, rh, body = self._req("GET", f"/api/art/{emb_rec.s}", headers=hdrs)
+        self.assertEqual(st, 200)
+        self.assertEqual(rh["content-type"], "image/jpeg")
+        self.assertEqual(body, embedded_jpeg)
+
+        st, rh, body = self._req("GET", f"/api/art/{at_rec.s}", headers=hdrs)
+        self.assertEqual(st, 200)
+        self.assertEqual(rh["content-type"], "image/jpeg")
+        self.assertEqual(body, b"\xff\xd8\xff\xe0ATJPEG")
 
 
 if __name__ == "__main__":

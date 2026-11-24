@@ -8,17 +8,20 @@ endpoints (/api/glancebar/now, /api/glancebar/cmd) using only Python 3 stdlib.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import hmac
 import http.cookies
 import http.server
 import json
+import math
 import mimetypes
 import os
 import re
 import secrets
 import shutil
 import socketserver
+import struct
 import subprocess
 import sys
 import threading
@@ -329,18 +332,105 @@ def _track_color(kind: Optional[str], track_id: str) -> str:
     return PALETTE[idx]
 
 
+MP4_AUDIO_EXTS = {".m4a", ".mp4", ".m4b", ".alac"}
+MAX_EMBEDDED_ART_BYTES = 16 * 1024 * 1024
+KIND_MAP_CENTROIDS: Dict[str, Tuple[float, float]] = {
+    "chill": (-0.42, 0.46),
+    "alt": (0.30, 0.48),
+    "dance": (0.52, -0.46),
+    "rap": (-0.44, -0.54),
+}
+
+
+def extract_m4a_cover(path: Path) -> Optional[Tuple[bytes, str]]:
+    """Extract embedded cover art (JPEG/PNG) from an MP4/M4A file using stdlib only."""
+    if path.suffix.lower() not in MP4_AUDIO_EXTS or not path.is_file():
+        return None
+    target_path = (b"moov", b"udta", b"meta", b"ilst", b"covr")
+    try:
+        with open(path, "rb") as fh:
+            total_size = os.fstat(fh.fileno()).st_size
+
+            def iter_boxes(start: int, end: int):
+                pos = start
+                while pos + 8 <= end:
+                    fh.seek(pos)
+                    hdr = fh.read(8)
+                    if len(hdr) < 8:
+                        break
+                    bsize, btype = struct.unpack(">I4s", hdr)
+                    hdr_len = 8
+                    if bsize == 1:
+                        ext = fh.read(8)
+                        if len(ext) < 8:
+                            break
+                        bsize = struct.unpack(">Q", ext)[0]
+                        hdr_len = 16
+                    elif bsize == 0:
+                        bsize = end - pos
+                    if bsize < hdr_len or pos + bsize > end:
+                        break
+                    yield btype, pos + hdr_len, pos + bsize
+                    pos += bsize
+
+            def walk(start: int, end: int, depth: int) -> Optional[Tuple[bytes, str]]:
+                want = target_path[depth]
+                for btype, dstart, dend in iter_boxes(start, end):
+                    if btype != want:
+                        continue
+                    if depth == len(target_path) - 1:
+                        for ctype, cstart, cend in iter_boxes(dstart, dend):
+                            if ctype == b"data" and 8 < (cend - cstart) <= MAX_EMBEDDED_ART_BYTES:
+                                fh.seek(cstart)
+                                type_ind = struct.unpack(">I", fh.read(4))[0]
+                                fh.seek(cstart + 8)
+                                payload = fh.read(cend - cstart - 8)
+                                if payload.startswith(b"\xff\xd8\xff"):
+                                    return payload, "image/jpeg"
+                                if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                                    return payload, "image/png"
+                                if type_ind == 13 and len(payload) > 16:
+                                    return payload, "image/jpeg"
+                                if type_ind == 14 and len(payload) > 16:
+                                    return payload, "image/png"
+                        return None
+                    child_start = dstart + (4 if btype == b"meta" else 0)
+                    if child_start < dend:
+                        found = walk(child_start, dend, depth + 1)
+                        if found is not None:
+                            return found
+                return None
+
+            return walk(0, total_size, 0)
+    except OSError:
+        return None
+
+
+def _hash_unit_pair(seed: str) -> Tuple[float, float]:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    a = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+    b = int.from_bytes(digest[4:8], "big") / 0xFFFFFFFF
+    return a, b
+
+
 def _resolve_art_path(
     mix_dir: Path,
     track_path: Path,
     track_id: str,
     sha256: str,
+    artist: str = "",
+    title: str = "",
 ) -> Optional[Path]:
     art_dir = mix_dir / "art"
     if art_dir.is_dir():
         candidates: List[str] = []
-        for token in (sha256, track_id):
+        norm_at = norm_key(artist, title) or ""
+        raw_at = f"{artist.strip().lower()}|{title.strip().lower()}" if artist.strip() and title.strip() else ""
+        for token in (sha256, track_id, norm_at, raw_at):
             if token:
-                candidates.extend([token, token.lower(), token.upper()])
+                safe = token.replace("/", " ").replace("\\", " ").replace("..", "")
+                if safe:
+                    candidates.extend([safe, safe.lower(), safe.upper()])
         seen_names = set()
         for tok in candidates:
             for ext in (".jpg", ".png", ".jpeg"):
@@ -375,6 +465,8 @@ class TrackRecord:
         "dur",
         "kind",
         "kind_score",
+        "energy",
+        "heaviness",
         "next_links",
         "x",
         "yy",
@@ -383,6 +475,7 @@ class TrackRecord:
         "color",
         "path",
         "art_path",
+        "has_embedded_art",
         "tkey",
     )
 
@@ -402,6 +495,8 @@ class TrackRecord:
         dur: Optional[float],
         kind: Optional[str],
         kind_score: Optional[float],
+        energy: float,
+        heaviness: float,
         next_links: List[Tuple[str, float]],
         x: Optional[float],
         yy: Optional[float],
@@ -410,6 +505,7 @@ class TrackRecord:
         color: str,
         path: Path,
         art_path: Optional[Path],
+        has_embedded_art: bool,
     ) -> None:
         self.s = s
         self.raw_id = raw_id
@@ -424,6 +520,8 @@ class TrackRecord:
         self.dur = dur
         self.kind = kind
         self.kind_score = kind_score
+        self.energy = energy
+        self.heaviness = heaviness
         self.next_links = next_links
         self.x = x
         self.yy = yy
@@ -432,7 +530,12 @@ class TrackRecord:
         self.color = color
         self.path = path
         self.art_path = art_path
+        self.has_embedded_art = has_embedded_art
         self.tkey = norm_key(artist, title) or ""
+
+    @property
+    def has_art(self) -> bool:
+        return self.art_path is not None or self.has_embedded_art
 
 
 class LibraryIndex:
@@ -554,7 +657,11 @@ class LibraryIndex:
             y_num = float(y_val) if isinstance(y_val, (int, float)) else None
             dur_raw = dur_hint if dur_hint is not None else lib.get("duration")
             dur = float(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
-            art_path = _resolve_art_path(self.mix_dir, fpath, raw_id or s, sha256)
+            energy, heaviness = self._compute_energy_heaviness(kind, genre, kind_score, s)
+            art_path = _resolve_art_path(
+                self.mix_dir, fpath, raw_id or s, sha256, artist=artist, title=title
+            )
+            has_embedded_art = (art_path is None) and (extract_m4a_cover(fpath) is not None)
             color = _track_color(kind, s)
 
             rec = TrackRecord(
@@ -571,6 +678,8 @@ class LibraryIndex:
                 dur=dur,
                 kind=kind,
                 kind_score=kind_score,
+                energy=energy,
+                heaviness=heaviness,
                 next_links=next_links,
                 x=x_num,
                 yy=y_num,
@@ -579,6 +688,7 @@ class LibraryIndex:
                 color=color,
                 path=fpath,
                 art_path=art_path,
+                has_embedded_art=has_embedded_art,
             )
             records.append(rec)
             by_id[s] = rec
@@ -666,6 +776,8 @@ class LibraryIndex:
                         fallback_kind=None,
                     )
 
+        self._assign_map_coordinates(records, aliases)
+
         with self.lock:
             self.tracks = records
             self.by_id = by_id
@@ -674,6 +786,107 @@ class LibraryIndex:
             self.taste_weights = taste_weights
             self.liked_keys = liked_keys
             self.disliked_keys = disliked_keys
+
+    @staticmethod
+    def _compute_energy_heaviness(
+        kind: Optional[str],
+        genre: Optional[str],
+        kind_score: Optional[float],
+        track_id: str,
+    ) -> Tuple[float, float]:
+        u1, u2 = _hash_unit_pair(f"eh:{track_id}")
+        if kind == "chill":
+            e = 0.16 + 0.12 * u1
+            h = 0.10 + 0.12 * u2
+        elif kind == "alt":
+            e = 0.38 + 0.24 * u1
+            h = 0.28 + 0.16 * u2
+        elif kind == "dance":
+            e = 0.68 + 0.22 * u1
+            h = 0.36 + 0.18 * u2
+        elif kind == "rap":
+            e = 0.54 + 0.20 * u1
+            h = 0.50 + 0.22 * u2
+        else:
+            e = 0.35 + 0.20 * u1
+            h = 0.25 + 0.17 * u2
+        if kind_score is not None and kind in ("dance", "rap"):
+            e += 0.04 * (float(kind_score) - 0.5)
+        g = (genre or "").lower()
+        if any(w in g for w in ("ambient", "classical", "jazz", "acoustic", "folk", "new age")):
+            e = min(e, 0.38)
+            h = min(h, 0.30)
+        elif any(w in g for w in ("hard rock", "metal", "punk")):
+            e = max(e, 0.72)
+            h = max(h, 0.60)
+        return round(min(0.98, max(0.05, e)), 3), round(min(0.98, max(0.05, h)), 3)
+
+    @staticmethod
+    def _assign_map_coordinates(
+        records: List[TrackRecord],
+        aliases: Dict[str, TrackRecord],
+    ) -> None:
+        if not records:
+            return
+        pos: Dict[str, Tuple[float, float]] = {}
+        seeds: Dict[str, Tuple[float, float]] = {}
+        locked: set = set()
+        for rec in records:
+            if rec.x is not None and rec.yy is not None:
+                cx = max(-0.95, min(0.95, float(rec.x)))
+                cy = max(-0.95, min(0.95, float(rec.yy)))
+                pos[rec.s] = (cx, cy)
+                seeds[rec.s] = (cx, cy)
+                locked.add(rec.s)
+            else:
+                kx, ky = KIND_MAP_CENTROIDS.get(rec.kind or "", (0.0, 0.0))
+                u_ang, u_rad = _hash_unit_pair(f"xy:{rec.s}")
+                ang = u_ang * 2.0 * math.pi
+                rad = 0.08 + 0.24 * math.sqrt(u_rad)
+                sx = max(-0.92, min(0.92, kx + rad * math.cos(ang)))
+                sy = max(-0.92, min(0.92, ky + rad * math.sin(ang)))
+                pos[rec.s] = (sx, sy)
+                seeds[rec.s] = (sx, sy)
+
+        for _ in range(18):
+            next_pos: Dict[str, Tuple[float, float]] = {}
+            for rec in records:
+                if rec.s in locked:
+                    next_pos[rec.s] = pos[rec.s]
+                    continue
+                px, py = pos[rec.s]
+                sx, sy = seeds[rec.s]
+                wx = 0.0
+                wy = 0.0
+                wsum = 0.0
+                for nid, sim in rec.next_links:
+                    nb = aliases.get(nid) or aliases.get(nid.lower())
+                    if nb is None or nb.s == rec.s:
+                        continue
+                    nb_pos = pos.get(nb.s)
+                    if nb_pos is None:
+                        continue
+                    w = max(0.05, float(sim))
+                    wx += w * nb_pos[0]
+                    wy += w * nb_pos[1]
+                    wsum += w
+                if wsum > 0.0:
+                    nx = 0.62 * px + 0.24 * (wx / wsum) + 0.14 * sx
+                    ny = 0.62 * py + 0.24 * (wy / wsum) + 0.14 * sy
+                else:
+                    nx = 0.85 * px + 0.15 * sx
+                    ny = 0.85 * py + 0.15 * sy
+                next_pos[rec.s] = (
+                    max(-0.92, min(0.92, nx)),
+                    max(-0.92, min(0.92, ny)),
+                )
+            pos = next_pos
+
+        for rec in records:
+            if rec.s not in locked:
+                px, py = pos[rec.s]
+                rec.x = round(px, 4)
+                rec.yy = round(py, 4)
 
     @staticmethod
     def _infer_kind_from_genre(genre: str) -> Optional[str]:
@@ -809,16 +1022,44 @@ class LibraryIndex:
         kinds = {str(x).lower() for x in (lens.get("kinds") or []) if isinstance(x, str)}
         genres = {str(x).lower() for x in (lens.get("genres") or []) if isinstance(x, str)}
         tags = {str(x).lower() for x in (lens.get("tags") or []) if isinstance(x, str)}
-        if rec.kind and rec.kind in kinds:
-            score += 2.0 * (rec.kind_score if rec.kind_score is not None else 0.7)
+        target_e = lens.get("target_energy")
+        target_h = lens.get("target_heaviness")
+
+        kind_hit = bool(rec.kind and rec.kind in kinds)
+        if kind_hit:
+            if isinstance(target_e, (int, float)) and not lens.get("explicit_kinds"):
+                if abs(rec.energy - float(target_e)) <= 0.34:
+                    score += 1.6 * (rec.kind_score if rec.kind_score is not None else 0.7)
+            else:
+                score += 2.0 * (rec.kind_score if rec.kind_score is not None else 0.7)
+
+        genre_hit = False
         if rec.genre:
             g = rec.genre.lower()
-            if any(w in g for w in genres | tags):
-                score += 1.2
+            if g in genres or any(w in g for w in genres | tags if w):
+                score += 1.6
+                genre_hit = True
+
         text_blob = f"{rec.artist} {rec.title} {rec.album}".lower()
+        kw_hits = 0
         for kw in tags:
-            if kw and kw in text_blob:
-                score += 0.6
+            if len(kw) >= 3 and kw in text_blob:
+                kw_hits += 1
+        if kw_hits:
+            score += min(1.8, 0.75 * kw_hits)
+
+        if score <= 0.0 and isinstance(target_e, (int, float)) and isinstance(target_h, (int, float)):
+            # Dramatic/orchestral/synth-heavy lenses can pull high-energy, heavy instrumental/electronic cuts
+            if bool(lens.get("allow_heavy_profile")) and rec.heaviness >= 0.48 and rec.energy >= 0.45:
+                dist = abs(rec.energy - float(target_e)) + abs(rec.heaviness - float(target_h))
+                if dist <= 0.55:
+                    score += 0.9 * (1.0 - dist)
+
+        if score > 0.0 and isinstance(target_e, (int, float)) and isinstance(target_h, (int, float)):
+            dist = abs(rec.energy - float(target_e)) + abs(rec.heaviness - float(target_h))
+            score += max(0.0, 0.55 - 0.5 * dist)
+            if not genre_hit and kw_hits == 0 and kind_hit:
+                score *= 0.9
         return score
 
     def rank_queue(
@@ -879,7 +1120,7 @@ class LibraryIndex:
                     if key and key in self.taste_weights:
                         score += self.taste_weights[key]
                         break
-                if rec.art_path:
+                if rec.has_art:
                     score += 0.05
                 return score
 
@@ -1026,9 +1267,135 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.pick_lock = threading.Lock()
         self.pick_tokens: Dict[str, Dict[str, Any]] = {}
         self.feedback_lock = threading.Lock()
+        self.art_cache_lock = threading.Lock()
+        self._art_cache: OrderedDict[str, Tuple[bytes, str]] = OrderedDict()
         self.lens_lock = threading.Lock()
         self._lenses_cache: List[Dict[str, Any]] = []
         self._lenses_fetched_at: float = 0.0
+
+    def get_embedded_art(self, rec: TrackRecord) -> Optional[Tuple[bytes, str]]:
+        if not rec.has_embedded_art:
+            return None
+        with self.art_cache_lock:
+            cached = self._art_cache.get(rec.s)
+            if cached is not None:
+                self._art_cache.move_to_end(rec.s)
+                return cached
+        extracted = extract_m4a_cover(rec.path)
+        if extracted is None:
+            return None
+        with self.art_cache_lock:
+            self._art_cache[rec.s] = extracted
+            self._art_cache.move_to_end(rec.s)
+            while len(self._art_cache) > 128:
+                self._art_cache.popitem(last=False)
+        return extracted
+
+    @staticmethod
+    def _enrich_manifold_lens(
+        item: Dict[str, Any],
+        works_by_id: Dict[str, Dict[str, Any]],
+        idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        lid = str(item.get("id") or item.get("slug") or "").strip()
+        lname = str(item.get("name") or item.get("title") or lid).strip()
+        if not lid or not lname:
+            return None
+        summary = str(item.get("summary") or "").strip()
+        explicit_kinds = [str(x).lower() for x in (item.get("kinds") or []) if isinstance(x, str) and x.strip()]
+        kinds = set(explicit_kinds)
+        genres = {str(x).lower() for x in (item.get("genres") or []) if isinstance(x, str) and x.strip()}
+        tags = {str(x).lower() for x in (item.get("tags") or []) if isinstance(x, str) and x.strip()}
+
+        blob_parts = [lid.lower(), lname.lower(), summary.lower()]
+        e_weighted = 0.0
+        h_weighted = 0.0
+        weight_sum = 0.0
+        for anc in item.get("anchors") or []:
+            if not isinstance(anc, dict):
+                continue
+            wid = str(anc.get("workId") or "").strip()
+            wt_raw = anc.get("weight", 1.0)
+            wt = float(wt_raw) if isinstance(wt_raw, (int, float)) and wt_raw > 0 else 1.0
+            work = works_by_id.get(wid)
+            if isinstance(work, dict):
+                blob_parts.append(str(work.get("kind") or "").lower())
+                blob_parts.append(str(work.get("category") or "").lower())
+                blob_parts.append(str(work.get("creator") or "").lower())
+                we = work.get("energy")
+                wh = work.get("heaviness")
+                if isinstance(we, (int, float)) and isinstance(wh, (int, float)):
+                    e_weighted += float(we) * wt
+                    h_weighted += float(wh) * wt
+                    weight_sum += wt
+
+        blob = " ".join(blob_parts)
+        keyword_rules = [
+            (
+                r"\b(?:ambient|tape[- ]loops?|uk garage|dub|sub-bass|late wire|electronic)\b",
+                ("chill",),
+                ("electronic", "ambient", "new age"),
+                ("ambient", "dub", "electronic"),
+            ),
+            (
+                r"\b(?:krautrock|motorik|post-punk|kosmische|synth-pop)\b",
+                ("alt", "dance"),
+                ("rock", "indie rock", "indie pop", "punk", "electronic"),
+                ("krautrock", "motorik", "post-punk", "synth"),
+            ),
+            (
+                r"\b(?:chamber|counterpoint|cello|solo keyboard|solo strings|chamber focus)\b",
+                ("chill",),
+                ("classical", "classical crossover", "singer/songwriter", "traditional folk", "jazz"),
+                ("chamber", "cello", "strings", "solo", "classical"),
+            ),
+            (
+                r"\b(?:jazz|modal|rhodes|noir|miles)\b",
+                ("chill",),
+                ("jazz", "r&b/soul", "soul", "funk", "afro-beat"),
+                ("jazz", "modal", "noir", "soul", "rhodes"),
+            ),
+            (
+                r"\b(?:hip-hop|hip hop|rap|horns|soul pocket)\b",
+                ("rap",),
+                ("hip-hop/rap", "hip-hop", "rap", "r&b/soul", "soul", "funk"),
+                ("hip-hop", "rap", "horns", "soul"),
+            ),
+            (
+                r"\b(?:classical|orchestral|minimalism|post-minimalism|thunder|menace)\b",
+                (),
+                ("classical", "classical crossover", "soundtrack", "hard rock"),
+                ("classical", "orchestral", "minimalism", "thunder"),
+            ),
+        ]
+        for pattern, add_kinds, add_genres, add_tags in keyword_rules:
+            if re.search(pattern, blob):
+                if not explicit_kinds:
+                    kinds.update(add_kinds)
+                genres.update(add_genres)
+                tags.update(add_tags)
+
+        target_energy = round(e_weighted / weight_sum, 3) if weight_sum > 0 else None
+        target_heaviness = round(h_weighted / weight_sum, 3) if weight_sum > 0 else None
+        allow_heavy = bool(
+            re.search(r"\b(?:classical|orchestral|heavy|thunder|menace)\b", blob)
+            and target_heaviness is not None
+            and target_heaviness >= 0.55
+        )
+        default_color = PALETTE[(idx + 2) % len(PALETTE)]
+        return {
+            "id": lid,
+            "name": lname,
+            "summary": summary,
+            "color": str(item.get("color") or default_color),
+            "kinds": sorted(kinds),
+            "genres": sorted(genres),
+            "tags": sorted(tags),
+            "explicit_kinds": bool(explicit_kinds),
+            "target_energy": target_energy,
+            "target_heaviness": target_heaviness,
+            "allow_heavy_profile": allow_heavy,
+        }
 
     def get_lenses(self) -> List[Dict[str, Any]]:
         if self.offline or not self.manifold_hub:
@@ -1037,33 +1404,38 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         with self.lens_lock:
             if self._lenses_fetched_at and (now - self._lenses_fetched_at) < 900.0:
                 return list(self._lenses_cache)
-        url = f"{self.manifold_hub}/api/v1/lenses?domain=radio"
+        lenses_url = f"{self.manifold_hub}/api/v1/lenses?domain=radio"
+        works_url = f"{self.manifold_hub}/api/v1/works?domain=radio"
         fetched: List[Dict[str, Any]] = []
+        works_by_id: Dict[str, Dict[str, Any]] = {}
+        try:
+            req_w = urllib.request.Request(
+                works_url,
+                headers={"Accept": "application/json", "User-Agent": "glancebar-otr-connector/1.0"},
+            )
+            with urllib.request.urlopen(req_w, timeout=3) as wresp:
+                wraw = json.loads(wresp.read().decode("utf-8", errors="replace") or "null")
+            witems = wraw.get("works") if isinstance(wraw, dict) else (wraw if isinstance(wraw, list) else [])
+            for w in witems or []:
+                if isinstance(w, dict) and w.get("workId"):
+                    works_by_id[str(w["workId"])] = w
+        except Exception:
+            works_by_id = {}
+
         try:
             req = urllib.request.Request(
-                url,
+                lenses_url,
                 headers={"Accept": "application/json", "User-Agent": "glancebar-otr-connector/1.0"},
             )
             with urllib.request.urlopen(req, timeout=3) as resp:
                 raw = json.loads(resp.read().decode("utf-8", errors="replace") or "null")
             items = raw.get("lenses") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-            for item in items or []:
+            for idx, item in enumerate(items or []):
                 if not isinstance(item, dict):
                     continue
-                lid = str(item.get("id") or item.get("slug") or "").strip()
-                lname = str(item.get("name") or item.get("title") or lid).strip()
-                if not lid or not lname:
-                    continue
-                fetched.append(
-                    {
-                        "id": lid,
-                        "name": lname,
-                        "color": str(item.get("color") or "#6366f1"),
-                        "kinds": item.get("kinds") or [],
-                        "genres": item.get("genres") or [],
-                        "tags": item.get("tags") or [],
-                    }
-                )
+                enriched = self._enrich_manifold_lens(item, works_by_id, idx)
+                if enriched is not None:
+                    fetched.append(enriched)
         except Exception:
             fetched = []
         with self.lens_lock:
@@ -1256,26 +1628,35 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
             eligible.sort(
                 key=lambda t: (
                     not self.server.index.is_liked(t, self.server.hearts_path),
-                    t.art_path is None,
+                    not t.has_art,
                     -(t.kind_score or 0.0),
                     -t.plays,
                     t.s,
                 )
             )
             song_tiles = []
-            for t in eligible[:18]:
+            for t in eligible[:36]:
                 sub = f"{t.artist} · {t.album}" if t.album else t.artist
-                song_tiles.append(
-                    {
-                        "kind": "song",
-                        "s": t.s,
-                        "title": t.title,
-                        "sub": sub,
-                        "artist": t.artist,
-                        "art": t.art_path is not None,
-                        "color": t.color,
-                    }
-                )
+                tile: Dict[str, Any] = {
+                    "kind": "song",
+                    "s": t.s,
+                    "title": t.title,
+                    "sub": sub,
+                    "artist": t.artist,
+                    "art": t.has_art,
+                    "color": t.color,
+                    "e": round(t.energy, 3),
+                    "h": round(t.heaviness, 3),
+                }
+                if t.x is not None and t.yy is not None:
+                    tile["point"] = {"x": t.x, "y": t.yy}
+                if t.dur is not None:
+                    tile["dur"] = t.dur
+                if t.genre:
+                    tile["genre"] = t.genre
+                if t.year is not None:
+                    tile["year"] = t.year
+                song_tiles.append(tile)
 
         station_tiles = []
         for sid, sname, scolor in KIND_STATIONS:
@@ -1350,7 +1731,6 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
                     "mood": mood,
                     "created": time.time(),
                 }
-            heaviness_by_kind = {"dance": 0.58, "alt": 0.52, "rap": 0.65, "chill": 0.22, "new": 0.45}
             item: Dict[str, Any] = {
                 "s": rec.s,
                 "a": rec.artist,
@@ -1358,12 +1738,12 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
                 "al": rec.album,
                 "y": rec.year,
                 "g": rec.genre,
-                "e": round(float(rec.kind_score if rec.kind_score is not None else 0.5), 3),
-                "h": heaviness_by_kind.get(rec.kind or "", 0.35),
+                "e": round(rec.energy, 3),
+                "h": round(rec.heaviness, 3),
                 "tag": tag,
                 "dur": rec.dur,
                 "color": rec.color,
-                "art": rec.art_path is not None,
+                "art": rec.has_art,
                 "pt": pt,
             }
             if rec.x is not None:
@@ -1430,15 +1810,24 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_art(self, sha: str, *, head_only: bool) -> None:
         rec = self.server.index.lookup(sha)
-        if rec is None or rec.art_path is None or not rec.art_path.is_file():
+        if rec is None or not rec.has_art:
             self._send_json(404, {"error": "not_found"}, head_only=head_only)
             return
-        try:
-            data = rec.art_path.read_bytes()
-        except OSError:
+        data: Optional[bytes] = None
+        ctype = "image/jpeg"
+        if rec.art_path is not None and rec.art_path.is_file():
+            try:
+                data = rec.art_path.read_bytes()
+                ctype = IMAGE_MIME.get(rec.art_path.suffix.lower(), "image/jpeg")
+            except OSError:
+                data = None
+        if data is None and rec.has_embedded_art:
+            emb = self.server.get_embedded_art(rec)
+            if emb is not None:
+                data, ctype = emb
+        if data is None:
             self._send_json(404, {"error": "not_found"}, head_only=head_only)
             return
-        ctype = IMAGE_MIME.get(rec.art_path.suffix.lower(), "image/jpeg")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
