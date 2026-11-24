@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -941,6 +942,53 @@ class LibraryIndex:
             return chosen
 
 
+def _tailscale_cli() -> Optional[str]:
+    for candidate in (
+        shutil.which("tailscale"),
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _detect_tailscale_login(
+    explicit_user: Optional[str] = None,
+    *,
+    offline: bool = False,
+) -> str:
+    if explicit_user is not None:
+        return explicit_user.strip().lower()
+    env_user = os.environ.get("OTR_TAILSCALE_USER", "").strip().lower()
+    if env_user:
+        return env_user
+    if offline:
+        return ""
+    cli = _tailscale_cli()
+    if not cli:
+        return ""
+    try:
+        proc = subprocess.run(
+            [cli, "status", "--json"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=3,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return ""
+        doc = json.loads(proc.stdout)
+        self_info = doc.get("Self") or {}
+        uid = str(self_info.get("UserID") or "")
+        users = doc.get("User") or {}
+        user_info = users.get(uid) or {}
+        return str(user_info.get("LoginName") or "").strip().lower()
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return ""
+
+
 class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -959,6 +1007,7 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         manifold_hub: str,
         offline: bool,
         command_runner: Callable[[List[str], str], None],
+        trusted_tailscale_user: str = "",
     ) -> None:
         super().__init__(server_address, RequestHandlerClass)
         self.server_name = server_name
@@ -970,6 +1019,7 @@ class OtrHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.manifold_hub = manifold_hub.rstrip("/")
         self.offline = offline
         self.command_runner = command_runner
+        self.trusted_tailscale_user = trusted_tailscale_user.strip().lower()
 
         self.auth_lock = threading.Lock()
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -1089,7 +1139,21 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def _is_trusted_tailscale_request(self) -> bool:
+        expected = self.server.trusted_tailscale_user
+        if not expected:
+            return False
+        peer = self.client_address[0] if self.client_address else ""
+        if peer not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return False
+        if self.headers.get("Origin"):
+            return False
+        offered = (self.headers.get("Tailscale-User-Login") or "").strip().lower()
+        return bool(offered) and hmac.compare_digest(offered, expected)
+
     def _is_authorized(self) -> bool:
+        if self._is_trusted_tailscale_request():
+            return True
         auth = self.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
             token = auth[7:].strip()
@@ -1161,12 +1225,18 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_login(self) -> None:
         body = self._read_json_body()
-        if not body or not isinstance(body.get("pass"), str):
+        if body is None:
             self._send_json(401, {"error": "unauthorized"})
             return
-        if not hmac.compare_digest(body["pass"], self.server.passphrase):
-            self._send_json(401, {"error": "unauthorized"})
-            return
+        raw_pass = body.get("pass")
+        trusted_ts = self._is_trusted_tailscale_request()
+        auth_kind = "passphrase"
+        if trusted_ts and (raw_pass is None or raw_pass == ""):
+            auth_kind = "tailnet"
+        else:
+            if not isinstance(raw_pass, str) or not hmac.compare_digest(raw_pass, self.server.passphrase):
+                self._send_json(401, {"error": "unauthorized"})
+                return
         token = secrets.token_urlsafe(32)
         client_name = str(body.get("name") or "OtR Client")
         with self.server.auth_lock:
@@ -1174,7 +1244,7 @@ class OtrHandler(http.server.BaseHTTPRequestHandler):
         cookie = f"otr_session={token}; Path=/; HttpOnly; SameSite=Lax"
         self._send_json(
             200,
-            {"name": self.server.server_name, "capabilities": ["library", "glancebar-remote"]},
+            {"name": self.server.server_name, "capabilities": ["library", "glancebar-remote"], "auth": auth_kind},
             extra_headers=[("Set-Cookie", cookie)],
         )
 
@@ -1486,6 +1556,8 @@ def create_server(
     offline: bool = False,
     passphrase: Optional[str] = None,
     pass_file: Optional[Path] = None,
+    tailscale_auth: bool = True,
+    tailscale_user: Optional[str] = None,
     command_runner: Optional[Callable[[List[str], str], None]] = None,
 ) -> OtrHTTPServer:
     resolved_mix = Path(mix_dir or "~/Library/Application Support/Glancebar/mix").expanduser()
@@ -1496,6 +1568,7 @@ def create_server(
     resolved_pass_file = Path(pass_file).expanduser() if pass_file is not None else None
 
     secret = load_or_create_passphrase(passphrase, resolved_pass_file, resolved_state)
+    trusted_ts = _detect_tailscale_login(tailscale_user, offline=offline) if tailscale_auth else ""
     index = LibraryIndex(resolved_mix, resolved_hot)
     runner = command_runner if command_runner is not None else default_command_runner
     return OtrHTTPServer(
@@ -1510,6 +1583,7 @@ def create_server(
         manifold_hub=manifold_hub,
         offline=offline,
         command_runner=runner,
+        trusted_tailscale_user=trusted_ts,
     )
 
 
@@ -1527,6 +1601,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--pass", dest="passphrase", default=None)
     ap.add_argument("--pass-file", default=None)
+    ap.add_argument("--tailscale-user", default=None)
+    ap.add_argument("--no-tailscale-auth", action="store_true")
     return ap.parse_args(argv)
 
 
@@ -1545,9 +1621,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         offline=args.offline,
         passphrase=args.passphrase,
         pass_file=Path(args.pass_file) if args.pass_file else None,
+        tailscale_auth=not args.no_tailscale_auth,
+        tailscale_user=args.tailscale_user,
     )
     addr, port = srv.server_address[:2]
-    print(f"otr-connector listening on http://{addr}:{port} ({len(srv.index.tracks)} tracks)", flush=True)
+    ts_mode = "tailnet-id" if srv.trusted_tailscale_user else "passphrase-only"
+    print(f"otr-connector listening on http://{addr}:{port} ({len(srv.index.tracks)} tracks, {ts_mode})", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

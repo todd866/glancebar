@@ -233,6 +233,7 @@ class OtrConnectorTests(unittest.TestCase):
             state_dir=self.state,
             manifold_hub=f"http://127.0.0.1:{hub_port}",
             offline=False,
+            tailscale_user="trusted@example.com",
             command_runner=fake_runner,
         )
         self.srv_thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -487,6 +488,48 @@ class OtrConnectorTests(unittest.TestCase):
             st, _, data = self._req("POST", "/api/glancebar/cmd", {"cmd": bad}, headers=hdrs)
             self.assertEqual(st, 400)
             self.assertEqual(json.loads(data), {"error": "invalid_cmd"})
+
+    def test_tailscale_identity_auth_and_csrf_guards(self):
+        trusted = {"Tailscale-User-Login": "Trusted@Example.com"}
+        # Trusted Tailscale login without Origin authorizes read/remote routes
+        st, _, data = self._req("GET", "/api/home", headers=trusted)
+        self.assertEqual(st, 200)
+        self.assertIn("shelves", json.loads(data))
+
+        st, _, _ = self._req("GET", "/api/glancebar/now", headers=trusted)
+        self.assertEqual(st, 200)
+
+        # Passwordless /api/login issues session cookie for trusted tailnet caller
+        st, rh, data = self._req("POST", "/api/login", {"name": "iPhone"}, headers=trusted)
+        self.assertEqual(st, 200)
+        doc = json.loads(data)
+        self.assertEqual(doc["auth"], "tailnet")
+        self.assertIn("otr_session=", rh["set-cookie"])
+
+        # Explicit wrong password is still rejected even over tailnet
+        st, _, _ = self._req("POST", "/api/login", {"pass": "wrong", "name": "iPhone"}, headers=trusted)
+        self.assertEqual(st, 401)
+
+        # Wrong Tailscale user -> 401
+        st, _, _ = self._req("GET", "/api/home", headers={"Tailscale-User-Login": "intruder@example.com"})
+        self.assertEqual(st, 401)
+
+        # Browser CORS/CSRF request carrying Origin -> 401 even with matching header
+        st, _, _ = self._req(
+            "GET",
+            "/api/home",
+            headers={**trusted, "Origin": "https://evil.example"},
+        )
+        self.assertEqual(st, 401)
+
+        # Disabling tailscale auth blocks Tailscale header
+        prev = self.server.trusted_tailscale_user
+        self.server.trusted_tailscale_user = ""
+        try:
+            st, _, _ = self._req("GET", "/api/home", headers=trusted)
+            self.assertEqual(st, 401)
+        finally:
+            self.server.trusted_tailscale_user = prev
 
 
 if __name__ == "__main__":
